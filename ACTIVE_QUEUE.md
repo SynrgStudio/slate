@@ -1,0 +1,399 @@
+# ACTIVE_QUEUE.md
+
+## Queue
+
+### T001 — Review ThreadSuite generated context
+
+Status: pending
+Scope:
+- Review inferred Rust/Cargo project context and confirm or edit generated facts.
+
+### T002 — Command palette as Slate's primary interface
+
+Status: pending
+Scope:
+- Add fuzzy command search instead of substring-only matching.
+- Add command aliases such as `w`, `q`, `wa`, `md`, `wrap`, `:w`, `:q`, and `:wq`.
+- Add recent/frequent commands.
+- Explore command arguments such as `open ~/notes/todo.md`.
+- Keep Slate command-palette-first: commands before menus/toolbars.
+
+### T003 — Persistent configuration
+
+Status: pending
+Scope:
+- Persist editor preferences: theme, word wrap, preview mode, last file, selected vault/notes folder, scratch behavior, wiki-link insert style, and link resolver behavior.
+- Keep configuration lightweight and human-readable.
+- Add an optional configurable vault/root notes directory for knowledge-management workflows.
+- Support toggleable wiki-link styles: compact deep link (`file.md:line:column`) and full Markdown-friendly display link (`file.md:line:column|visible text`).
+- Support a future literate Markdown config as the human-facing configuration source.
+
+### T004 — Recent files workflow
+
+Status: pending
+Scope:
+- Track recently opened/saved files.
+- Add `Open recent` command in the command palette.
+- Optionally reopen the last file at startup.
+
+### T005 — Scratch buffer and quick capture
+
+Status: pending
+Scope:
+- Improve scratch mode as a fast capture inbox.
+- Support daily archive sections and quick append behavior.
+- Consider command palette entries for `scratch`, `capture`, and `daily note`.
+- Treat scratch as the central mental inbox: capture now, organize later.
+- Support sending selected text/current line to scratch.
+
+### T006 — Daily notes
+
+Status: pending
+Scope:
+- Add command to create/open today's note.
+- Use a configurable notes directory and simple Markdown template.
+- Preserve the terminal-like, minimal interaction style.
+- Consider commands for `daily`, `yesterday`, `tomorrow`, and `append daily`.
+
+### T007 — Core editing improvements
+
+Status: pending
+Scope:
+- Add find in file and replace.
+- Track and display current line/column.
+- Add duplicate line, move line up/down, and delete line commands.
+- Add useful Vim-inspired text operations without requiring a full Vim mode.
+
+### T008 — Lightweight Markdown improvements
+
+Status: pending
+Scope:
+- Improve preview rendering without making Slate heavy.
+- Support checklists, blockquotes, separators, local links, better code blocks, and simple tables where practical.
+- Keep Markdown as plain files plus lightweight conventions, not a custom database format.
+
+### T009 — Theme system
+
+Status: pending
+Scope:
+- Formalize current theme as terminal-dark.
+- Add alternate themes such as nord, amber-terminal, green-phosphor, and blueprint.
+- Add theme selection via command palette and persist the choice.
+
+### T010 — Minimal file explorer / project file opening
+
+Status: pending
+Scope:
+- Add a command-palette-first file opener for a directory/project.
+- Search files by name without adding a heavy sidebar.
+- Keep the UI minimal: no menubar, no toolbar.
+
+### T011 — Buffers / multi-file workflow
+
+Status: pending
+Scope:
+- Support multiple open buffers.
+- Add switch-buffer and close-buffer commands.
+- Prefer command-palette-driven buffers before visible tabs.
+- Borrow the useful Emacs concept of buffers without adopting Emacs complexity.
+
+### T012 — Optional auto-save
+
+Status: pending
+Scope:
+- Add configurable auto-save for suitable workflows.
+- Consider save-on-focus-loss or timed auto-save.
+- Keep auto-save especially useful for scratch and daily notes.
+
+### T013 — Terminal/Vim-like command language
+
+Status: pending
+Scope:
+- Support command palette commands like `save`, `quit`, `save quit`, `new`, `open`, `wrap`, and `preview`.
+- Support common aliases such as `:w`, `:q`, and `:wq`.
+- Allow knowledge commands like `:daily`, `:scratch`, `:recent`, and `:theme amber`.
+
+### T014 — Templates
+
+Status: pending
+Scope:
+- Add templates for daily notes, meetings, projects, ideas, and journaling.
+- Add `New from template` through the command palette.
+- Keep templates as editable plain text/Markdown files where possible.
+
+### T015 — Task/checklist commands
+
+Status: pending
+Scope:
+- Detect Markdown task lines like `- [ ]` and `- [x]`.
+- Add command to toggle the current task.
+- Later consider listing tasks from the current file or notes folder.
+- Consider archiving completed tasks without creating a full productivity system.
+
+### T016 — Richer status bar and command line layout
+
+Status: pending
+Scope:
+- Show file path/name, modified state, status message, line/column, mode, wrap state, word count, and shortcut hint.
+- Move status bar to the penultimate line instead of the final line.
+- Reserve the final line as a dedicated command line / minibuffer.
+- Let transient UI modes such as Ctrl-hold command layer, command entry, search, link resolver, and future swipe-like actions use the command line.
+- When the command line is active, status remains visible above it instead of being replaced.
+- Keep the visual style terminal-like: status line plus command line, similar to Vim/Emacs minibuffer concepts.
+
+### T017 — Slate knowledge-work philosophy
+
+Status: pending
+Scope:
+- Define Slate as a personal text workspace / terminal-like knowledge editor, not an Obsidian/Logseq clone.
+- Prioritize: local files, capture first, commands before UI, progressive organization, and simple Markdown.
+- Explicitly avoid early graph views, mandatory databases, heavy sidebars, plugin complexity, sync systems, and Emacs-level configurability.
+
+### T018 — Optional vault / local knowledge base
+
+Status: pending
+Scope:
+- Add a `Select vault` command that picks a normal folder as Slate's optional knowledge workspace.
+- Keep Slate usable as a regular text editor even when no vault is selected.
+- Treat the configured vault as the root for scratch, daily notes, ideas, projects, wiki links, and search.
+- Use normal folders/files such as `daily/`, `scratch.md`, `ideas/`, and `projects/`.
+- Add commands for creating, opening, and searching notes within that root.
+
+### T019 — Wiki links and note navigation
+
+Status: pending
+Scope:
+- Support simple wiki links like `[[Slate roadmap]]` in Markdown text.
+- Support deep wiki links to exact positions: `[[path/file.md:line:column]]`.
+- Support full display links for readability: `[[path/file.md:line:column|visible text]]`.
+- Add a toggle/preference for compact links vs full display links.
+- Add command to open/create the note under cursor or selected wiki link.
+- Add shortcut to follow link under cursor and jump to target file/line/column.
+- Later support backlinks without requiring a graph view or database-heavy model.
+
+### T020 — Global notes search
+
+Status: pending
+Scope:
+- Add text search across the configured notes directory.
+- Search by note/file name, content, tags, and later backlinks.
+- Prefer search results in the command palette or a minimal modal.
+- Reuse the same search/index primitives for the `[[` link resolver.
+
+### T021 — Progressive organization commands
+
+Status: pending
+Scope:
+- Add commands to move selection/current line to a new note, append to daily note, append to scratch, convert line to task, and archive completed tasks.
+- Support commands that both edit the current text and append/capture a copy elsewhere.
+- Support the workflow: write first, organize later.
+
+### T022 — Tags and lightweight metadata
+
+Status: pending
+Scope:
+- Support simple inline tags like `#idea`, `#project`, and `#todo`.
+- Search/filter notes by tags.
+- Avoid complex frontmatter requirements unless clearly useful.
+
+### T023 — Vault index architecture: Markdown source plus rebuildable SQLite cache
+
+Status: pending
+Scope:
+- Keep Markdown files as the source of truth.
+- Use SQLite only as an optional/rebuildable index/cache for search, links, backlinks, tags, tasks, and recent/frequent results.
+- Evaluate SQLite FTS5 for fast content search and snippets.
+- Ensure Slate can delete/rebuild the index from the vault at any time.
+- Do not store canonical note content only inside SQLite.
+
+### T024 — Link resolver trigger for `[[`
+
+Status: pending
+Scope:
+- Detect when the user types `[[` in the editor.
+- Open an inline fzf-like resolver/modal without disrupting normal writing.
+- Keep filtering live as the user types inside the unfinished link.
+- Support Escape to cancel and Enter to insert the selected result.
+- Make the resolver available as a command too, not only through automatic trigger.
+
+### T025 — Link resolver ranking and result groups
+
+Status: pending
+Scope:
+- Merge multiple result types into one selector: most-linked notes, recent notes, filename/title matches, content matches, tag matches, and create-new-note action.
+- Rank filename/title matches above content matches when both are strong.
+- Show content matches with snippet, file path, line, and column.
+- Highlight matched query text in results where practical.
+- Prefer deterministic ordering when scores tie.
+
+### T026 — Content-match deep link insertion
+
+Status: pending
+Scope:
+- When selecting a filename/title result, insert a normal wiki link such as `[[path/file.md]]` or `[[Note title]]`.
+- When selecting a content result, insert a deep link to exact position.
+- Support compact style: `[[path/file.md:line:column]]`.
+- Support full style: `[[path/file.md:line:column|visible text]]`.
+- Choose visible text from matched word, selected snippet, note title, or user-edited label depending on context.
+
+### T027 — Wiki-link parser and target resolver
+
+Status: pending
+Scope:
+- Parse wiki links robustly: `[[Note]]`, `[[path/file.md]]`, `[[path/file.md:line]]`, `[[path/file.md:line:column]]`, and `[[path/file.md:line:column|label]]`.
+- Resolve note titles and relative paths inside the selected vault.
+- Safely handle spaces, punctuation, duplicate titles, missing files, and renamed/moved notes.
+- Define behavior for links outside the vault or when no vault is selected.
+
+### T028 — Follow-link navigation and cursor jump
+
+Status: pending
+Scope:
+- Add shortcut such as Ctrl+Enter to follow the wiki link under cursor.
+- Open the target file and jump to the target line/column when present.
+- If target file does not exist, offer to create it in the vault.
+- Preserve current buffer state and dirty checks when navigating.
+- Later integrate with buffer history/back navigation.
+
+### T029 — Link display ergonomics and visual affordances
+
+Status: pending
+Scope:
+- Keep plain Markdown text editable and readable.
+- Optionally provide subtle highlighting for wiki links in the editor/preview.
+- Avoid making long deep links annoying in prose by supporting full display links.
+- Add commands/toggles to convert compact links to full links and full links to compact links.
+- Consider a statusbar/tooltip preview of the real target when cursor is on a link.
+
+### T030 — Backlinks and most-linked notes
+
+Status: pending
+Scope:
+- Track wiki-link references across the vault through the index.
+- Use backlink counts to power the resolver's `most linked` group.
+- Add command to show backlinks for the current note.
+- Avoid graph-view-first UX; backlinks should be textual/searchable first.
+
+### T031 — Link resolver performance and indexing lifecycle
+
+Status: pending
+Scope:
+- Start with simple filesystem scanning if needed, then move to SQLite/FTS when vault size demands it.
+- Incrementally update the index when files are opened/saved/changed.
+- Provide manual `Rebuild vault index` command.
+- Keep resolver responsive for large vaults by limiting result counts and doing expensive work off the UI path where possible.
+
+### T032 — Soft Vim-inspired editing grammar
+
+Status: pending
+Scope:
+- Explore Vim's useful editing grammar without adding a permanent Vim mode.
+- Support temporary/operator-style commands such as delete word, change word, delete line, change inside quotes/parens, and jump by word/paragraph.
+- Avoid requiring constant mode toggling; prefer transient command capture, command palette actions, or leader/chord-style interactions.
+- Keep normal typing as the default behavior.
+- Make commands discoverable and configurable before expanding too far.
+
+### T033 — Ctrl-hold command layer
+
+Status: pending
+Scope:
+- Design a low-friction way to execute short editing commands like `dw` without becoming a full modal editor.
+- Use Ctrl as a physical temporary command layer: collect key sequence while Ctrl is held, then confirm when Ctrl is released.
+- Preserve normal shortcuts by interpreting single-key sequences on Ctrl release: Ctrl+C then release copies, Ctrl+V then release pastes, Ctrl+S then release saves.
+- Support multi-key sequences while Ctrl remains held: Ctrl+C then W then release can mean change word; Ctrl+D then W then release can mean delete word; Ctrl+D then D then release can mean delete line.
+- Prefer Ctrl-release as the primary commit signal instead of post-key timeout recognition.
+- Use timeout only as a safety/cancel mechanism for stuck keys or abandoned sequences, not as the normal recognition path.
+- Avoid awkward multi-key modifier combos that require “pulpo manotas”.
+- Show the pending command in the dedicated command line while Ctrl is held, e.g. `ctrl:c` then `ctrl:cw`, while the status bar remains visible above it.
+- Provide Escape/cancel and safe fallback so accidental command entry is harmless.
+- Avoid conflicts with essential OS/window-manager shortcuts; decide which Ctrl sequences Slate owns and which stay native.
+
+### T034 — Repeatable edits and lightweight macros
+
+Status: pending
+Scope:
+- Add repeat-last-edit behavior inspired by Vim's `.` command.
+- Consider recording/replaying a short sequence of editor operations later.
+- Keep this lightweight and optional; do not implement a full macro language early.
+- Ensure repeated commands work with Slate-native operations such as append-to-scratch/daily and task toggles where sensible.
+
+### T035 — Append/capture side effects from normal editing
+
+Status: pending
+Scope:
+- Add commands that insert or transform text in the current buffer while also appending/capturing related content elsewhere.
+- Examples: insert a note link and append context to scratch; create task here and append to daily; mark an idea inline and append it to `ideas/inbox.md`; create a new note from selection while replacing selection with a wiki link.
+- Make side effects explicit, previewable, and undo-safe where possible.
+- Prefer vault-relative plain Markdown targets.
+
+### T036 — Textual result buffers
+
+Status: pending
+Scope:
+- Borrow Emacs' useful concept that tool outputs can be buffers.
+- Show search results, backlinks, task lists, command output, and index diagnostics as navigable text-like buffers or minimal panels.
+- Allow opening/jumping from result entries with keyboard shortcuts.
+- Keep these buffers optional and command-driven, not permanent UI clutter.
+
+### T037 — Curated defaults instead of infinite configurability
+
+Status: pending
+Scope:
+- Borrow Doom Emacs' concept of curated power: strong defaults, coherent aesthetics, and discoverability.
+- Avoid exposing every internal behavior as a setting too early.
+- Add configuration only when it protects distinct workflows, such as compact/full links or vault location.
+- Keep Slate powerful but not life-consuming.
+
+### T038 — Literate Markdown configuration
+
+Status: pending
+Scope:
+- Support a Markdown configuration document where prose explains the config and fenced config blocks define the actual settings.
+- Prefer TOML blocks inside Markdown, such as code fences tagged `toml slate-config` or `slate-config`.
+- Treat the Markdown config as the human-facing source and optionally generate/cache a machine-readable `config.toml` from it.
+- Add commands such as `Open Slate config`, `Reload Slate config`, `Validate Slate config`, and later `Tangle Slate config`.
+- Show validation/tangle errors in a textual result buffer.
+- Keep config documentation close to the actual settings so the config file becomes self-documenting.
+- Ensure normal plain config still works for users who do not want literate configuration.
+
+## Suggested implementation order
+
+1. Define/preserve Slate knowledge-work philosophy.
+2. Persistent configuration, literate Markdown config, and optional vault selection.
+3. Vault index architecture: Markdown source plus rebuildable SQLite cache.
+4. Command palette improvements and terminal/Vim-like command language.
+5. Scratch/inbox and quick capture.
+6. Daily notes.
+7. Recent files.
+8. Link resolver trigger for `[[`.
+9. Link resolver ranking/result groups.
+10. Wiki-link parser and target resolver.
+11. Content-match deep link insertion with compact/full style toggle.
+12. Follow-link navigation and cursor jump.
+13. Global vault search.
+14. Backlinks and most-linked notes.
+15. Tasks, tags, and progressive organization commands.
+16. Append/capture side effects from normal editing.
+17. Status bar plus dedicated command line layout.
+18. Soft Vim-inspired editing grammar and Ctrl-hold command layer.
+19. Repeatable edits and lightweight macros.
+20. Textual result buffers.
+21. Templates.
+22. Core editing improvements.
+23. Theme system.
+24. Buffers.
+25. Curated defaults / Doom-like ergonomics.
+26. Literate Markdown configuration polish.
+27. Markdown preview improvements.
+
+<!-- THREADSUITE:START -->
+# ACTIVE_QUEUE.md
+
+## Queue
+
+### T001 — Review ThreadSuite generated context
+
+Status: pending
+Scope:
+- Review inferred Rust/Cargo project context and confirm or edit generated facts.
+<!-- THREADSUITE:END -->

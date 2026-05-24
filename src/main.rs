@@ -1,0 +1,937 @@
+use std::{fs, io::Write, path::PathBuf};
+
+use eframe::egui::{self, Color32, FontFamily, FontId, Key, RichText, Stroke, TextEdit, Vec2};
+
+fn main() -> eframe::Result {
+    let mut scratch = false;
+    let mut path = None;
+
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--scratch" | "-s" => scratch = true,
+            _ => path = Some(PathBuf::from(arg)),
+        }
+    }
+
+    let title = if scratch { "Slate Scratch" } else { "Slate" };
+    let size = if scratch {
+        [760.0, 460.0]
+    } else {
+        [980.0, 700.0]
+    };
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title(title)
+            .with_inner_size(size)
+            .with_min_inner_size([420.0, 260.0]),
+        vsync: false,
+        renderer: eframe::Renderer::Glow,
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        title,
+        options,
+        Box::new(|cc| Ok(Box::new(SlateApp::new(cc, path, scratch)))),
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Command {
+    New,
+    Open,
+    Save,
+    TogglePreview,
+    ToggleWrap,
+    Quit,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingAction {
+    New,
+    Open,
+    Quit,
+}
+
+impl PendingAction {
+    fn prompt(self) -> &'static str {
+        match self {
+            PendingAction::New => "buffer has unsaved changes; start a new buffer anyway?",
+            PendingAction::Open => "buffer has unsaved changes; open another file anyway?",
+            PendingAction::Quit => "buffer has unsaved changes; close anyway?",
+        }
+    }
+}
+
+impl Command {
+    fn label(self) -> &'static str {
+        match self {
+            Command::New => "New buffer",
+            Command::Open => "Open file",
+            Command::Save => "Save",
+            Command::TogglePreview => "Toggle Markdown preview",
+            Command::ToggleWrap => "Toggle word wrap",
+            Command::Quit => "Quit",
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Command::New => "Ctrl+N",
+            Command::Open => "Ctrl+O",
+            Command::Save => "Ctrl+S",
+            Command::TogglePreview => "Ctrl+M",
+            Command::ToggleWrap => "",
+            Command::Quit => "Ctrl+Q",
+        }
+    }
+}
+
+struct SlateApp {
+    text: String,
+    path: Option<PathBuf>,
+    dirty: bool,
+    status: String,
+    palette_open: bool,
+    palette_query: String,
+    selected_command: usize,
+    preview: bool,
+    wrap: bool,
+    focus_editor_once: bool,
+    scratch: bool,
+    pending_action: Option<PendingAction>,
+    command_line: String,
+    command_line_focused: bool,
+}
+
+impl SlateApp {
+    fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>, scratch: bool) -> Self {
+        setup_style(&cc.egui_ctx);
+
+        let mut app = Self {
+            text: String::new(),
+            path: None,
+            dirty: false,
+            status: "Ready".to_string(),
+            palette_open: false,
+            palette_query: String::new(),
+            selected_command: 0,
+            preview: false,
+            wrap: true,
+            focus_editor_once: true,
+            scratch,
+            pending_action: None,
+            command_line: String::new(),
+            command_line_focused: false,
+        };
+
+        if let Some(path) = path {
+            app.open_path(path);
+        }
+
+        app
+    }
+
+    fn title(&self) -> String {
+        let name = self
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .unwrap_or("untitled");
+        if self.scratch && self.path.is_none() {
+            format!("{}Slate Scratch", if self.dirty { "*" } else { "" })
+        } else {
+            format!("{}{} — Slate", if self.dirty { "*" } else { "" }, name)
+        }
+    }
+
+    fn open_path(&mut self, path: PathBuf) {
+        match fs::read_to_string(&path) {
+            Ok(text) => {
+                self.text = text;
+                self.path = Some(path.clone());
+                self.dirty = false;
+                self.status = format!("Opened {}", path.display());
+            }
+            Err(err) => self.status = format!("Open failed: {err}"),
+        }
+    }
+
+    fn save(&mut self) {
+        if let Some(path) = self.path.clone() {
+            self.save_path(path);
+        } else {
+            self.save_as();
+        }
+    }
+
+    fn append_to_scratch_archive(&mut self) {
+        if !self.scratch || self.path.is_some() || !self.dirty || self.text.trim().is_empty() {
+            return;
+        }
+
+        let Some(mut dir) = dirs_next::data_dir() else {
+            self.status = "Scratch append failed: no data dir".to_string();
+            return;
+        };
+        dir.push("slate");
+
+        if let Err(err) = fs::create_dir_all(&dir) {
+            self.status = format!("Scratch append failed: {err}");
+            return;
+        }
+
+        let path = dir.join("scratch.md");
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        let needs_header =
+            !path.exists() || fs::metadata(&path).map(|m| m.len() == 0).unwrap_or(true);
+        let entry = if needs_header {
+            format!("# Scratch\n\n## {now}\n\n{}\n", self.text.trim_end())
+        } else {
+            format!("\n\n## {now}\n\n{}\n", self.text.trim_end())
+        };
+
+        match fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(mut file) => match file.write_all(entry.as_bytes()) {
+                Ok(_) => {
+                    self.dirty = false;
+                    self.status = format!("Appended to {}", path.display());
+                }
+                Err(err) => self.status = format!("Scratch append failed: {err}"),
+            },
+            Err(err) => self.status = format!("Scratch append failed: {err}"),
+        }
+    }
+
+    fn save_path(&mut self, path: PathBuf) {
+        match fs::write(&path, &self.text) {
+            Ok(_) => {
+                self.path = Some(path.clone());
+                self.dirty = false;
+                self.status = format!("Saved {}", path.display());
+            }
+            Err(err) => self.status = format!("Save failed: {err}"),
+        }
+    }
+
+    fn new_buffer(&mut self) {
+        self.text.clear();
+        self.path = None;
+        self.dirty = false;
+        self.status = "New buffer".to_string();
+    }
+
+    fn open_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new().pick_file() {
+            self.open_path(path);
+        }
+    }
+
+    fn save_as(&mut self) {
+        if let Some(path) = rfd::FileDialog::new().save_file() {
+            self.save_path(path);
+        }
+    }
+
+    fn run_command(&mut self, command: Command, ctx: &egui::Context) {
+        self.palette_open = false;
+        self.palette_query.clear();
+        self.selected_command = 0;
+        self.command_line_focused = false;
+        self.focus_editor_once = true;
+
+        match command {
+            Command::New => {
+                if self.dirty {
+                    self.confirm(PendingAction::New);
+                } else {
+                    self.new_buffer();
+                }
+            }
+            Command::Open => {
+                if self.dirty {
+                    self.confirm(PendingAction::Open);
+                } else {
+                    self.open_dialog();
+                }
+            }
+            Command::Save => self.save(),
+            Command::TogglePreview => {
+                self.preview = !self.preview;
+                self.status = if self.preview {
+                    "Preview on"
+                } else {
+                    "Preview off"
+                }
+                .to_string();
+            }
+            Command::ToggleWrap => {
+                self.wrap = !self.wrap;
+                self.status = if self.wrap {
+                    "Word wrap on"
+                } else {
+                    "Word wrap off"
+                }
+                .to_string();
+            }
+            Command::Quit => self.request_close(ctx),
+        }
+    }
+
+    fn run_command_line(&mut self, ctx: &egui::Context) {
+        let raw = self.command_line.trim().to_string();
+        self.command_line.clear();
+        self.command_line_focused = false;
+        self.focus_editor_once = true;
+
+        let input = raw.strip_prefix(':').unwrap_or(&raw).trim();
+        if input.is_empty() {
+            self.status = "Command cancelled".to_string();
+            return;
+        }
+
+        let mut parts = input.split_whitespace();
+        let Some(command) = parts.next() else {
+            self.status = "Command cancelled".to_string();
+            return;
+        };
+
+        match command {
+            "w" | "write" | "save" => self.run_command(Command::Save, ctx),
+            "q" | "quit" | "exit" => self.run_command(Command::Quit, ctx),
+            "wq" | "x" => {
+                self.save();
+                if !self.dirty {
+                    self.run_command(Command::Quit, ctx);
+                }
+            }
+            "new" | "enew" => self.run_command(Command::New, ctx),
+            "open" | "edit" | "e" => {
+                let path = parts.collect::<Vec<_>>().join(" ");
+                if path.is_empty() {
+                    self.run_command(Command::Open, ctx);
+                } else if self.dirty {
+                    self.status = "Save or discard changes before opening another file".to_string();
+                } else {
+                    let expanded = path
+                        .strip_prefix("~/")
+                        .and_then(|rest| dirs_next::home_dir().map(|home| home.join(rest)))
+                        .unwrap_or_else(|| PathBuf::from(path));
+                    self.open_path(expanded);
+                }
+            }
+            "preview" | "md" => self.run_command(Command::TogglePreview, ctx),
+            "wrap" => self.run_command(Command::ToggleWrap, ctx),
+            _ => self.status = format!("Unknown command: {input}"),
+        }
+    }
+
+    fn confirm(&mut self, action: PendingAction) {
+        self.pending_action = Some(action);
+        self.focus_editor_once = false;
+    }
+
+    fn finish_pending_action(&mut self, action: PendingAction, ctx: &egui::Context) {
+        match action {
+            PendingAction::New => self.new_buffer(),
+            PendingAction::Open => self.open_dialog(),
+            PendingAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+        }
+    }
+
+    fn request_close(&mut self, ctx: &egui::Context) {
+        if self.dirty && !self.scratch {
+            self.confirm(PendingAction::Quit);
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    fn handle_window_close_request(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().close_requested()) && self.dirty && !self.scratch {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm(PendingAction::Quit);
+        }
+    }
+
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        let mut command = None;
+        ctx.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::CTRL, Key::P) {
+                self.palette_open = true;
+                self.palette_query.clear();
+                self.selected_command = 0;
+            }
+            if i.consume_key(egui::Modifiers::CTRL, Key::N) {
+                command = Some(Command::New);
+            }
+            if i.consume_key(egui::Modifiers::CTRL, Key::O) {
+                command = Some(Command::Open);
+            }
+            let save_pressed = i.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: Key::S,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                        ..
+                    } if modifiers.ctrl && !modifiers.alt && !modifiers.shift
+                )
+            });
+            if save_pressed {
+                command = Some(Command::Save);
+            }
+            if i.consume_key(egui::Modifiers::CTRL, Key::M) {
+                command = Some(Command::TogglePreview);
+            }
+            if i.consume_key(egui::Modifiers::CTRL, Key::Q) {
+                command = Some(Command::Quit);
+            }
+            if i.consume_key(egui::Modifiers::NONE, Key::Escape) {
+                if self.palette_open {
+                    self.palette_open = false;
+                    self.focus_editor_once = true;
+                } else if self.pending_action.is_some() {
+                    self.pending_action = None;
+                    self.focus_editor_once = true;
+                } else if self.scratch {
+                    command = Some(Command::Quit);
+                }
+            }
+        });
+
+        if let Some(command) = command {
+            self.run_command(command, ctx);
+        }
+    }
+
+    fn filtered_commands(&self) -> Vec<Command> {
+        let all = [
+            Command::New,
+            Command::Open,
+            Command::Save,
+            Command::TogglePreview,
+            Command::ToggleWrap,
+            Command::Quit,
+        ];
+        let q = self.palette_query.to_lowercase();
+        all.into_iter()
+            .filter(|c| c.label().to_lowercase().contains(&q))
+            .collect()
+    }
+
+    fn command_palette(&mut self, ctx: &egui::Context) {
+        if !self.palette_open {
+            return;
+        }
+
+        let commands = self.filtered_commands();
+        if self.selected_command >= commands.len() {
+            self.selected_command = commands.len().saturating_sub(1);
+        }
+
+        ctx.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::NONE, Key::ArrowDown) {
+                self.selected_command =
+                    (self.selected_command + 1).min(commands.len().saturating_sub(1));
+            }
+            if i.consume_key(egui::Modifiers::NONE, Key::ArrowUp) {
+                self.selected_command = self.selected_command.saturating_sub(1);
+            }
+        });
+
+        let frame = egui::Frame::new()
+            .fill(Color32::from_rgb(25, 31, 40))
+            .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
+            .corner_radius(0.0)
+            .inner_margin(14.0)
+            .shadow(egui::epaint::Shadow {
+                offset: [0, 10],
+                blur: 24,
+                spread: 0,
+                color: Color32::from_black_alpha(140),
+            });
+
+        egui::Area::new("command_palette".into())
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, -80.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                frame.show(ui, |ui| {
+                    ui.set_width(520.0);
+                    ui.label(
+                        RichText::new("command palette")
+                            .font(FontId::new(16.0, FontFamily::Monospace))
+                            .color(Color32::from_rgb(136, 192, 208)),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("slate:~$")
+                                .font(FontId::new(15.0, FontFamily::Monospace))
+                                .color(Color32::from_rgb(163, 190, 140)),
+                        );
+                        let response = ui.add(
+                            TextEdit::singleline(&mut self.palette_query)
+                                .hint_text("type a command")
+                                .desired_width(f32::INFINITY)
+                                .font(FontId::new(15.0, FontFamily::Monospace))
+                                .text_color(Color32::from_rgb(216, 222, 233))
+                                .frame(egui::Frame::NONE),
+                        );
+                        response.request_focus();
+                    });
+                    ui.add_space(8.0);
+                    ui.painter().hline(
+                        ui.available_rect_before_wrap().x_range(),
+                        ui.cursor().top(),
+                        Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
+                    );
+                    ui.add_space(8.0);
+
+                    if commands.is_empty() {
+                        ui.label(
+                            RichText::new("no matching commands")
+                                .font(FontId::new(14.0, FontFamily::Monospace))
+                                .color(Color32::from_rgb(94, 105, 126)),
+                        );
+                    }
+
+                    for (idx, command) in commands.iter().enumerate() {
+                        let selected = idx == self.selected_command;
+                        let fill = if selected {
+                            Color32::from_rgb(46, 56, 72)
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+                        let label_color = if selected {
+                            Color32::from_rgb(236, 239, 244)
+                        } else {
+                            Color32::from_rgb(216, 222, 233)
+                        };
+                        let row = egui::Frame::new()
+                            .fill(fill)
+                            .corner_radius(0.0)
+                            .inner_margin(6.0);
+                        let clicked = row
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(if selected { ">" } else { " " })
+                                            .font(FontId::new(14.0, FontFamily::Monospace))
+                                            .color(Color32::from_rgb(136, 192, 208)),
+                                    );
+                                    ui.label(
+                                        RichText::new(command.label())
+                                            .font(FontId::new(14.0, FontFamily::Monospace))
+                                            .color(label_color),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                RichText::new(command.hint())
+                                                    .font(FontId::new(13.0, FontFamily::Monospace))
+                                                    .color(Color32::from_rgb(136, 154, 176)),
+                                            );
+                                        },
+                                    );
+                                })
+                            })
+                            .response
+                            .clicked();
+                        if clicked {
+                            self.run_command(*command, ctx);
+                            return;
+                        }
+                    }
+
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        for (key, label) in [("↑↓", "move"), ("enter", "run"), ("esc", "close")]
+                        {
+                            ui.label(
+                                RichText::new(format!("[{key}]"))
+                                    .font(FontId::new(13.0, FontFamily::Monospace))
+                                    .color(Color32::from_rgb(235, 203, 139)),
+                            );
+                            ui.label(
+                                RichText::new(label)
+                                    .font(FontId::new(13.0, FontFamily::Monospace))
+                                    .color(Color32::from_rgb(136, 154, 176)),
+                            );
+                            ui.add_space(10.0);
+                        }
+                    });
+
+                    let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
+                    if enter {
+                        if let Some(command) = commands.get(self.selected_command).copied() {
+                            self.run_command(command, ctx);
+                        }
+                    }
+                });
+            });
+    }
+
+    fn confirm_action_dialog(&mut self, ctx: &egui::Context) {
+        let Some(action) = self.pending_action else {
+            return;
+        };
+
+        let mut discard = false;
+        let mut go_back = false;
+        let mut save = false;
+        ctx.input_mut(|i| {
+            discard |= i.consume_key(egui::Modifiers::NONE, Key::Y);
+            go_back |= i.consume_key(egui::Modifiers::NONE, Key::N);
+            save |= i.consume_key(egui::Modifiers::NONE, Key::S);
+            go_back |= i.consume_key(egui::Modifiers::NONE, Key::Escape);
+        });
+
+        if discard {
+            self.dirty = false;
+            self.pending_action = None;
+            self.finish_pending_action(action, ctx);
+            return;
+        }
+        if go_back {
+            self.pending_action = None;
+            self.focus_editor_once = true;
+            return;
+        }
+        if save {
+            self.save();
+            if !self.dirty {
+                self.pending_action = None;
+                self.finish_pending_action(action, ctx);
+            }
+            return;
+        }
+
+        egui::Area::new("confirm_close_prompt".into())
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(25, 31, 40))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
+                    .corner_radius(0.0)
+                    .inner_margin(14.0)
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 10],
+                        blur: 24,
+                        spread: 0,
+                        color: Color32::from_black_alpha(140),
+                    })
+                    .show(ui, |ui| {
+                        ui.set_width(520.0);
+                        ui.label(
+                            RichText::new("unsaved changes")
+                                .font(FontId::new(16.0, FontFamily::Monospace))
+                                .color(Color32::from_rgb(136, 192, 208)),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(action.prompt())
+                                .font(FontId::new(14.0, FontFamily::Monospace))
+                                .color(Color32::from_rgb(216, 222, 233)),
+                        );
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            for (key, label, color) in [
+                                ("y", "yes / discard", Color32::from_rgb(191, 97, 106)),
+                                ("n", "no / return", Color32::from_rgb(163, 190, 140)),
+                                ("s", "save…", Color32::from_rgb(235, 203, 139)),
+                            ] {
+                                ui.label(
+                                    RichText::new(format!("[{key}]"))
+                                        .font(FontId::new(14.0, FontFamily::Monospace))
+                                        .color(color),
+                                );
+                                ui.label(
+                                    RichText::new(label)
+                                        .font(FontId::new(14.0, FontFamily::Monospace))
+                                        .color(Color32::from_rgb(136, 154, 176)),
+                                );
+                                ui.add_space(10.0);
+                            }
+                        });
+                    });
+            });
+    }
+
+    fn preview_ui(&self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let mut in_code = false;
+            for line in self.text.lines() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("```") {
+                    in_code = !in_code;
+                    continue;
+                }
+
+                if in_code {
+                    ui.label(
+                        RichText::new(line)
+                            .font(FontId::new(14.0, FontFamily::Monospace))
+                            .background_color(Color32::from_rgb(25, 31, 40)),
+                    );
+                } else if let Some(h) = trimmed.strip_prefix("### ") {
+                    ui.label(RichText::new(h).size(18.0).strong());
+                } else if let Some(h) = trimmed.strip_prefix("## ") {
+                    ui.label(RichText::new(h).size(22.0).strong());
+                } else if let Some(h) = trimmed.strip_prefix("# ") {
+                    ui.label(RichText::new(h).size(28.0).strong());
+                } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+                    ui.label(format!("• {}", &trimmed[2..]));
+                } else if trimmed.is_empty() {
+                    ui.add_space(8.0);
+                } else {
+                    ui.label(RichText::new(line).size(15.0));
+                }
+            }
+        });
+    }
+}
+
+impl eframe::App for SlateApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.append_to_scratch_archive();
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title()));
+        self.handle_window_close_request(&ctx);
+        self.shortcuts(&ctx);
+
+        if self.pending_action.is_some() {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(Color32::from_rgb(30, 36, 48)))
+                .show_inside(ui, |_ui| {});
+            self.confirm_action_dialog(&ctx);
+            return;
+        }
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(30, 36, 48))
+                    .inner_margin(0.0),
+            )
+            .show_inside(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let footer_font = FontId::new(13.0, FontFamily::Monospace);
+                let footer_color = Color32::from_rgb(136, 154, 176);
+                let footer_dim = Color32::from_rgb(94, 105, 126);
+                let footer_accent = Color32::from_rgb(136, 192, 208);
+                let footer_ok = Color32::from_rgb(163, 190, 140);
+                let footer_warn = Color32::from_rgb(235, 203, 139);
+                let status_height = 30.0;
+                let command_height = 30.0;
+                let footer_height = status_height + command_height;
+                let editor_size = Vec2::new(
+                    ui.available_width(),
+                    (ui.available_height() - footer_height).max(80.0),
+                );
+
+                ui.allocate_ui_with_layout(
+                    editor_size,
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        if self.preview {
+                            ui.columns(2, |columns| {
+                                let mut edit = TextEdit::multiline(&mut self.text)
+                                    .font(FontId::new(15.0, FontFamily::Monospace))
+                                    .lock_focus(true)
+                                    .frame(egui::Frame::NONE);
+                                if !self.wrap {
+                                    edit = edit.code_editor();
+                                }
+                                let response =
+                                    columns[0].add_sized(columns[0].available_size(), edit);
+                                if self.focus_editor_once
+                                    && !self.palette_open
+                                    && !self.command_line_focused
+                                {
+                                    response.request_focus();
+                                    self.focus_editor_once = false;
+                                }
+                                if response.changed() {
+                                    self.dirty = true;
+                                }
+                                columns[1].vertical(|ui| self.preview_ui(ui));
+                            });
+                        } else {
+                            let mut edit = TextEdit::multiline(&mut self.text)
+                                .font(FontId::new(15.0, FontFamily::Monospace))
+                                .desired_width(f32::INFINITY)
+                                .lock_focus(true)
+                                .frame(egui::Frame::NONE);
+                            if !self.wrap {
+                                edit = edit.code_editor();
+                            }
+                            let response = ui.add_sized(ui.available_size(), edit);
+                            if self.focus_editor_once
+                                && !self.palette_open
+                                && !self.command_line_focused
+                            {
+                                response.request_focus();
+                                self.focus_editor_once = false;
+                            }
+                            if response.changed() {
+                                self.dirty = true;
+                            }
+                        }
+                    },
+                );
+
+                let filename = self
+                    .path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "untitled".to_string());
+                let dirty_label = if self.dirty { "modified" } else { "saved" };
+                let dirty_color = if self.dirty { footer_warn } else { footer_ok };
+                let lines = self.text.lines().count().max(1);
+                let chars = self.text.chars().count();
+                let words = self.text.split_whitespace().count();
+                let mode = if self.preview { "preview" } else { "edit" };
+                let wrap = if self.wrap { "wrap" } else { "nowrap" };
+
+                let (status_rect, _) = ui.allocate_exact_size(
+                    Vec2::new(ui.available_width(), status_height),
+                    egui::Sense::hover(),
+                );
+                let painter = ui.painter_at(status_rect);
+                painter.rect_filled(status_rect, 0.0, Color32::from_rgb(25, 31, 40));
+
+                // Raw-painted monospace text needs only a tiny optical correction here.
+                let status_y = status_rect.center().y - 0.5;
+                let mut status_x = status_rect.left() + 10.0;
+                for (text, color) in [
+                    ("slate".to_string(), footer_accent),
+                    ("::".to_string(), footer_dim),
+                    (filename, footer_color),
+                    (format!("[{dirty_label}]"), dirty_color),
+                    (format!("— {}", self.status), footer_dim),
+                ] {
+                    let text_rect = painter.text(
+                        egui::pos2(status_x, status_y),
+                        egui::Align2::LEFT_CENTER,
+                        text,
+                        footer_font.clone(),
+                        color,
+                    );
+                    status_x = text_rect.right() + 8.0;
+                }
+
+                let mut status_right = status_rect.right() - 10.0;
+                let shortcut_rect = painter.text(
+                    egui::pos2(status_right, status_y),
+                    egui::Align2::RIGHT_CENTER,
+                    "[Ctrl+P]",
+                    footer_font.clone(),
+                    footer_accent,
+                );
+                status_right = shortcut_rect.left() - 12.0;
+                painter.text(
+                    egui::pos2(status_right, status_y),
+                    egui::Align2::RIGHT_CENTER,
+                    format!("{mode} · {wrap} · {lines}l · {words}w · {chars}c"),
+                    footer_font.clone(),
+                    footer_dim,
+                );
+
+                let (command_rect, _) = ui.allocate_exact_size(
+                    Vec2::new(ui.available_width(), command_height),
+                    egui::Sense::hover(),
+                );
+                let painter = ui.painter_at(command_rect);
+                painter.rect_filled(command_rect, 0.0, Color32::from_rgb(25, 31, 40));
+                let command_y = command_rect.center().y - 2.0;
+                painter.text(
+                    egui::pos2(command_rect.left() + 10.0, command_y),
+                    egui::Align2::LEFT_CENTER,
+                    ":",
+                    footer_font.clone(),
+                    footer_accent,
+                );
+
+                let input_rect = egui::Rect::from_min_max(
+                    egui::pos2(command_rect.left() + 28.0, command_rect.top() + 3.0),
+                    egui::pos2(command_rect.right() - 10.0, command_rect.bottom() - 3.0),
+                );
+                let response = ui.put(
+                    input_rect,
+                    TextEdit::singleline(&mut self.command_line)
+                        .hint_text(
+                            RichText::new("command  w · q · wq · open <file> · preview · wrap")
+                                .font(footer_font.clone())
+                                .color(footer_dim),
+                        )
+                        .desired_width(f32::INFINITY)
+                        .font(footer_font.clone())
+                        .text_color(footer_color)
+                        .frame(egui::Frame::NONE),
+                );
+                self.command_line_focused = response.has_focus();
+                let command_enter = response.has_focus()
+                    && ui.input(|i| i.key_pressed(Key::Enter) || i.key_pressed(Key::Tab));
+                if command_enter {
+                    self.run_command_line(&ctx);
+                }
+            });
+
+        self.command_palette(&ctx);
+    }
+}
+
+fn setup_style(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    if let Ok(bytes) = fs::read("/usr/share/fonts/noto/NotoSansMono-Regular.ttf") {
+        fonts.font_data.insert(
+            "noto_mono".to_string(),
+            std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+        );
+        fonts
+            .families
+            .entry(FontFamily::Monospace)
+            .or_default()
+            .insert(0, "noto_mono".to_string());
+    }
+
+    if let Ok(bytes) = fs::read("/usr/share/fonts/noto/NotoSans-Regular.ttf") {
+        fonts.font_data.insert(
+            "noto_sans".to_string(),
+            std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+        );
+        fonts
+            .families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .insert(0, "noto_sans".to_string());
+    }
+
+    ctx.set_fonts(fonts);
+
+    let mut style = (*ctx.global_style()).clone();
+    style.visuals = egui::Visuals::dark();
+    style.visuals.window_fill = Color32::from_rgb(30, 36, 48);
+    style.visuals.panel_fill = Color32::from_rgb(30, 36, 48);
+    style.visuals.extreme_bg_color = Color32::from_rgb(25, 31, 40);
+    style.visuals.faint_bg_color = Color32::from_rgb(38, 47, 61);
+    style.visuals.selection.bg_fill = Color32::from_rgb(67, 76, 94);
+    style.visuals.selection.stroke = Stroke::new(1.0, Color32::from_rgb(136, 192, 208));
+    style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(33, 41, 54);
+    style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(46, 56, 72);
+    style.visuals.widgets.active.bg_fill = Color32::from_rgb(59, 66, 82);
+    style.spacing.item_spacing = Vec2::new(8.0, 8.0);
+    ctx.set_global_style(style);
+}
