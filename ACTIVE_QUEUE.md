@@ -59,7 +59,6 @@ Scope:
 
 Status: pending
 Scope:
-- Add find in file and replace.
 - Track and display current line/column.
 - Add duplicate line, move line up/down, and delete line commands.
 - Add useful Vim-inspired text operations without requiring a full Vim mode.
@@ -356,35 +355,117 @@ Scope:
 - Keep config documentation close to the actual settings so the config file becomes self-documenting.
 - Ensure normal plain config still works for users who do not want literate configuration.
 
+### T039 — Native editor architecture: leave `egui::TextEdit` behind
+
+Status: completed
+Scope:
+- Replace the main editing surface architecture from `String + egui::TextEdit` to Slate-owned editor primitives.
+- Keep `egui::TextEdit` only for small inputs such as command line, palette, and settings fields.
+- Do not attempt search/highlight/scroll features on top of `TextEdit`; build them on Slate-owned buffer/view state.
+- Preserve current normal-editor behavior during migration: typing, saving, opening, wrapping, preview toggle, command line, status bar, and scratch behavior.
+- Treat this as prerequisite infrastructure for reliable find, selections, cursor jumps, link following, and future editing grammar.
+
+### T040 — EditorBuffer text model
+
+Status: completed
+Scope:
+- Introduce an `EditorBuffer` that owns text, dirty state inputs, cursor byte/char position, optional selection, revision counter, and line index.
+- Maintain `line_starts` or equivalent for efficient byte offset ↔ line/column conversion.
+- Implement minimal mutation primitives: insert text, newline, backspace, delete, replace selection, set cursor, set selection, clear selection.
+- Rebuild/update indexes safely after edits and file open/new buffer.
+- Add focused unit tests for line indexing, Unicode-safe cursor movement where practical, insertion, deletion, and offset conversions.
+- Initially allow Slate to still render through `TextEdit` only if useful for a staged migration, but keep mutation logic in the buffer.
+
+### T041 — Native EditorView renderer
+
+Status: completed
+Scope:
+- Build an egui-based custom editor view that paints visible lines with `Painter` instead of delegating the document to `TextEdit`.
+- Track viewport/scroll state, line height, first visible line, visible line count, cursor rectangle, and selection rectangles.
+- Render only visible lines for responsiveness on large files.
+- Paint cursor, current line, selection, and later search/link highlights from explicit ranges.
+- Support word wrap later; start with reliable no-wrap or simple wrap if needed.
+- Keep the status bar and command line layout unchanged: editor area should shrink upward when bottom panels are visible.
+
+### T042 — Native editor input handling
+
+Status: completed
+Scope:
+- Route text input and keyboard events into `EditorBuffer` when the editor has focus.
+- Implement minimum viable normal editing: character input, Enter, Backspace, Delete, Arrow keys, Home/End, PageUp/PageDown, mouse click to place cursor, and scroll wheel.
+- Preserve existing global shortcuts such as Ctrl+S, Ctrl+O, Ctrl+N, Ctrl+P, Ctrl+Q, Ctrl+M, and Ctrl+.
+- Avoid stealing OS/window-manager shortcuts such as Ctrl+Shift+S.
+- Make focus transitions explicit between editor, command line, palette, settings, and future search mode.
+- Add tests for buffer operations; manually validate GUI event behavior after changes.
+
+### T043 — Native selection, cursor jump, and scroll-to-position
+
+Status: completed
+Scope:
+- Support explicit cursor movement to byte offset or line/column.
+- Support programmatic selection ranges independent of command line focus.
+- Implement `scroll_to_cursor` / `scroll_to_line` so commands can jump to results reliably.
+- Keep selection visible even when command line or a panel has focus where appropriate.
+- Use this for future find results, wiki-link follow, backlinks, task result buffers, and command outputs.
+
+### T044 — Search/find on native editor primitives
+
+Status: pending
+Scope:
+- Reintroduce find only after `EditorBuffer`, `EditorView`, cursor jump, selection, and scroll-to-position exist.
+- Use command line/minibuffer as the search input: Ctrl+F opens `find `; `:find query` and `:f query` are supported.
+- Keep live search as `SearchState` over `EditorBuffer`, cache by buffer revision and query, and never recompute unnecessarily per frame.
+- Start with exact case-insensitive search; later evaluate a real matcher such as `nucleo-matcher` for fzf-like ranking.
+- Render search results in the bottom expansion area without touching the document during typing.
+- Render highlights only through the native editor view and only for visible ranges.
+- Support Up/Down to move selected result, Enter to jump/select, Escape to cancel, and status text such as `match 2/10`.
+- Add regression tests using `test-fixtures/lorem-find.md`, including one-line-many-matches and single-letter queries.
+
+### T045 — Find fixture and regression harness
+
+Status: pending
+Scope:
+- Keep `test-fixtures/lorem-find.md` as a manual and automated fixture for search behavior.
+- Cover single-letter queries, repeated words on one line, case-insensitive matches, no-match query, and large-ish text behavior.
+- Add unit tests for search result offsets and line/column mapping.
+- Add a lightweight performance guard where feasible so common one-letter queries do not regress into UI freezes.
+
 ## Suggested implementation order
 
-1. Define/preserve Slate knowledge-work philosophy.
-2. Persistent configuration, literate Markdown config, and optional vault selection.
-3. Vault index architecture: Markdown source plus rebuildable SQLite cache.
-4. Command palette improvements and terminal/Vim-like command language.
-5. Scratch/inbox and quick capture.
-6. Daily notes.
-7. Recent files.
-8. Link resolver trigger for `[[`.
-9. Link resolver ranking/result groups.
-10. Wiki-link parser and target resolver.
-11. Content-match deep link insertion with compact/full style toggle.
-12. Follow-link navigation and cursor jump.
-13. Global vault search.
-14. Backlinks and most-linked notes.
-15. Tasks, tags, and progressive organization commands.
-16. Append/capture side effects from normal editing.
-17. Status bar plus dedicated command line layout.
-18. Soft Vim-inspired editing grammar and Ctrl-hold command layer.
-19. Repeatable edits and lightweight macros.
-20. Textual result buffers.
-21. Templates.
-22. Core editing improvements.
-23. Theme system.
-24. Buffers.
-25. Curated defaults / Doom-like ergonomics.
-26. Literate Markdown configuration polish.
-27. Markdown preview improvements.
+1. Native editor architecture: leave `egui::TextEdit` behind for the main document.
+2. EditorBuffer text model with tests.
+3. Native EditorView renderer for visible lines.
+4. Native editor input handling for minimum viable editing.
+5. Native selection, cursor jump, and scroll-to-position.
+6. Search/find on native editor primitives, using the command line as minibuffer.
+7. Find fixture and regression harness.
+8. Define/preserve Slate knowledge-work philosophy.
+9. Persistent configuration, literate Markdown config, and optional vault selection.
+10. Vault index architecture: Markdown source plus rebuildable SQLite cache.
+11. Command palette improvements and terminal/Vim-like command language.
+12. Scratch/inbox and quick capture.
+13. Daily notes.
+14. Recent files.
+15. Link resolver trigger for `[[`.
+16. Link resolver ranking/result groups.
+17. Wiki-link parser and target resolver.
+18. Content-match deep link insertion with compact/full style toggle.
+19. Follow-link navigation and cursor jump.
+20. Global vault search.
+21. Backlinks and most-linked notes.
+22. Tasks, tags, and progressive organization commands.
+23. Append/capture side effects from normal editing.
+24. Status bar plus dedicated command line layout.
+25. Soft Vim-inspired editing grammar and Ctrl-hold command layer.
+26. Repeatable edits and lightweight macros.
+27. Textual result buffers.
+28. Templates.
+29. Core editing improvements.
+30. Theme system.
+31. Buffers.
+32. Curated defaults / Doom-like ergonomics.
+33. Literate Markdown configuration polish.
+34. Markdown preview improvements.
 
 <!-- THREADSUITE:START -->
 # ACTIVE_QUEUE.md
