@@ -139,6 +139,8 @@ impl SlateApp {
             command_history_limit: 5,
         };
 
+        app.load_settings();
+
         if let Some(path) = path {
             app.open_path(path);
         }
@@ -245,6 +247,55 @@ impl SlateApp {
     fn save_as(&mut self) {
         if let Some(path) = rfd::FileDialog::new().save_file() {
             self.save_path(path);
+        }
+    }
+
+    fn settings_path() -> Option<PathBuf> {
+        let mut dir = dirs_next::config_dir()?;
+        dir.push("slate");
+        Some(dir.join("config.toml"))
+    }
+
+    fn load_settings(&mut self) {
+        let Some(path) = Self::settings_path() else {
+            return;
+        };
+        let Ok(contents) = fs::read_to_string(path) else {
+            return;
+        };
+
+        for line in contents.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            if key.trim() == "command_history_limit" {
+                if let Ok(limit) = value.trim().parse::<usize>() {
+                    self.command_history_limit = limit.clamp(1, 50);
+                }
+            }
+        }
+    }
+
+    fn save_settings(&self) -> Result<(), String> {
+        let Some(path) = Self::settings_path() else {
+            return Err("no config dir".to_string());
+        };
+        let parent = path
+            .parent()
+            .ok_or_else(|| "invalid config path".to_string())?;
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        fs::write(
+            path,
+            format!("command_history_limit = {}\n", self.command_history_limit),
+        )
+        .map_err(|err| err.to_string())
+    }
+
+    fn set_command_history_limit(&mut self, limit: usize) {
+        self.command_history_limit = limit.clamp(1, 50);
+        match self.save_settings() {
+            Ok(_) => self.status = format!("History length: {}", self.command_history_limit),
+            Err(err) => self.status = format!("Settings save failed: {err}"),
         }
     }
 
@@ -464,14 +515,12 @@ impl SlateApp {
         });
 
         if settings_decrement {
-            self.command_history_limit = self.command_history_limit.saturating_sub(1).max(1);
-            self.status = format!("History length: {}", self.command_history_limit);
+            self.set_command_history_limit(self.command_history_limit.saturating_sub(1));
             return;
         }
 
         if settings_increment {
-            self.command_history_limit = (self.command_history_limit + 1).min(50);
-            self.status = format!("History length: {}", self.command_history_limit);
+            self.set_command_history_limit(self.command_history_limit + 1);
             return;
         }
 
@@ -809,11 +858,16 @@ impl SlateApp {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
-                                            ui.add(
+                                            let response = ui.add(
                                                 egui::DragValue::new(&mut self.command_history_limit)
                                                     .range(1..=50)
                                                     .speed(1),
                                             );
+                                            if response.changed() {
+                                                self.set_command_history_limit(
+                                                    self.command_history_limit,
+                                                );
+                                            }
                                         },
                                     );
                                 });
@@ -883,6 +937,7 @@ impl SlateApp {
 impl eframe::App for SlateApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.append_to_scratch_archive();
+        let _ = self.save_settings();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
