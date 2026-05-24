@@ -434,9 +434,9 @@ impl EditorView {
             )
             .on_hover_cursor(egui::CursorIcon::Text);
         let painter = ui.painter_at(rect);
-        let gutter_width = 48.0;
-        let text_x = rect.left() + gutter_width + 8.0;
-        let gutter_x = rect.left() + gutter_width - 8.0;
+        let gutter_width = 22.0;
+        let text_x = rect.left() + gutter_width + 6.0;
+        let gutter_x = rect.left() + gutter_width - 4.0;
         let wrap_width = (rect.right() - text_x - 8.0).max(40.0);
         let mut rows = self.visual_rows(&painter, buffer, &font, wrap_width, wrap);
         let mut max_scroll = (rows.len() as f32 * line_height - rect.height()).max(0.0);
@@ -525,7 +525,7 @@ impl EditorView {
             }
 
             painter.text(
-                egui::pos2(gutter_x, y + line_height * 0.5),
+                egui::pos2(gutter_x, y + line_height * 0.5 + 2.0),
                 egui::Align2::RIGHT_CENTER,
                 if row.start == buffer.line_start(row.line_index) {
                     format!("{}", row.line_index + 1)
