@@ -44,6 +44,7 @@ enum Command {
     Save,
     TogglePreview,
     ToggleWrap,
+    Settings,
     Quit,
 }
 
@@ -72,6 +73,7 @@ impl Command {
             Command::Save => "Save",
             Command::TogglePreview => "Toggle Markdown preview",
             Command::ToggleWrap => "Toggle word wrap",
+            Command::Settings => "Settings",
             Command::Quit => "Quit",
         }
     }
@@ -83,6 +85,7 @@ impl Command {
             Command::Save => "Ctrl+S",
             Command::TogglePreview => "Ctrl+M",
             Command::ToggleWrap => "",
+            Command::Settings => ":settings",
             Command::Quit => "Ctrl+Q",
         }
     }
@@ -101,11 +104,13 @@ struct SlateApp {
     focus_editor_once: bool,
     scratch: bool,
     pending_action: Option<PendingAction>,
+    settings_open: bool,
     command_line: String,
     command_line_focused: bool,
     focus_command_line_once: bool,
     command_history: Vec<String>,
     command_history_index: Option<usize>,
+    command_history_limit: usize,
 }
 
 impl SlateApp {
@@ -125,11 +130,13 @@ impl SlateApp {
             focus_editor_once: true,
             scratch,
             pending_action: None,
+            settings_open: false,
             command_line: String::new(),
             command_line_focused: false,
             focus_command_line_once: false,
             command_history: Vec::new(),
             command_history_index: None,
+            command_history_limit: 5,
         };
 
         if let Some(path) = path {
@@ -283,6 +290,10 @@ impl SlateApp {
                 }
                 .to_string();
             }
+            Command::Settings => {
+                self.settings_open = true;
+                self.focus_editor_once = false;
+            }
             Command::Quit => self.request_close(ctx),
         }
     }
@@ -337,6 +348,9 @@ impl SlateApp {
             }
             "preview" | "md" => self.run_command(Command::TogglePreview, ctx),
             "wrap" => self.run_command(Command::ToggleWrap, ctx),
+            "settings" | "set" | "prefs" | "preferences" => {
+                self.run_command(Command::Settings, ctx)
+            }
             _ => self.status = format!("Unknown command: {input}"),
         }
     }
@@ -374,7 +388,13 @@ impl SlateApp {
         let mut execute_command_line = false;
         let mut previous_command = false;
         let mut next_command = false;
+        let mut settings_decrement = false;
+        let mut settings_increment = false;
         ctx.input_mut(|i| {
+            if self.settings_open {
+                settings_decrement |= i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft);
+                settings_increment |= i.consume_key(egui::Modifiers::NONE, Key::ArrowRight);
+            }
             if i.consume_key(egui::Modifiers::CTRL, Key::P) {
                 self.palette_open = true;
                 self.palette_query.clear();
@@ -422,7 +442,10 @@ impl SlateApp {
                 command = Some(Command::Quit);
             }
             if i.consume_key(egui::Modifiers::NONE, Key::Escape) {
-                if self.command_line_focused || self.focus_command_line_once {
+                if self.settings_open {
+                    self.settings_open = false;
+                    self.focus_editor_once = true;
+                } else if self.command_line_focused || self.focus_command_line_once {
                     self.command_line.clear();
                     self.command_line_focused = false;
                     self.focus_command_line_once = false;
@@ -439,6 +462,18 @@ impl SlateApp {
                 }
             }
         });
+
+        if settings_decrement {
+            self.command_history_limit = self.command_history_limit.saturating_sub(1).max(1);
+            self.status = format!("History length: {}", self.command_history_limit);
+            return;
+        }
+
+        if settings_increment {
+            self.command_history_limit = (self.command_history_limit + 1).min(50);
+            self.status = format!("History length: {}", self.command_history_limit);
+            return;
+        }
 
         if previous_command && !self.command_history.is_empty() {
             let index = self
@@ -483,6 +518,7 @@ impl SlateApp {
             Command::Save,
             Command::TogglePreview,
             Command::ToggleWrap,
+            Command::Settings,
             Command::Quit,
         ];
         let q = self.palette_query.to_lowercase();
@@ -731,6 +767,84 @@ impl SlateApp {
             });
     }
 
+    fn settings_dialog(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+
+        egui::Area::new("settings_dialog".into())
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, -30.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(25, 31, 40))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
+                    .corner_radius(0.0)
+                    .inner_margin(14.0)
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 10],
+                        blur: 24,
+                        spread: 0,
+                        color: Color32::from_black_alpha(140),
+                    })
+                    .show(ui, |ui| {
+                        ui.set_width(520.0);
+                        ui.label(
+                            RichText::new("settings")
+                                .font(FontId::new(16.0, FontFamily::Monospace))
+                                .color(Color32::from_rgb(136, 192, 208)),
+                        );
+                        ui.add_space(10.0);
+
+                        egui::Frame::new()
+                            .fill(Color32::from_rgb(30, 36, 48))
+                            .inner_margin(8.0)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new("History length")
+                                            .font(FontId::new(14.0, FontFamily::Monospace))
+                                            .color(Color32::from_rgb(216, 222, 233)),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.add(
+                                                egui::DragValue::new(&mut self.command_history_limit)
+                                                    .range(1..=50)
+                                                    .speed(1),
+                                            );
+                                        },
+                                    );
+                                });
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new("Visible command history rows when Ctrl+. opens the commandline.")
+                                        .font(FontId::new(13.0, FontFamily::Monospace))
+                                        .color(Color32::from_rgb(136, 154, 176)),
+                                );
+                            });
+
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            for (key, label) in [("←→", "adjust"), ("esc", "close")] {
+                                ui.label(
+                                    RichText::new(format!("[{key}]"))
+                                        .font(FontId::new(13.0, FontFamily::Monospace))
+                                        .color(Color32::from_rgb(235, 203, 139)),
+                                );
+                                ui.label(
+                                    RichText::new(label)
+                                        .font(FontId::new(13.0, FontFamily::Monospace))
+                                        .color(Color32::from_rgb(136, 154, 176)),
+                                );
+                                ui.add_space(10.0);
+                            }
+                        });
+                    });
+            });
+    }
+
     fn preview_ui(&self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -806,7 +920,7 @@ impl eframe::App for SlateApp {
                     || self.focus_command_line_once)
                     && !self.command_history.is_empty();
                 let visible_history_rows = if command_history_active {
-                    self.command_history.len().min(5)
+                    self.command_history.len().min(self.command_history_limit)
                 } else {
                     0
                 };
@@ -834,6 +948,7 @@ impl eframe::App for SlateApp {
                                     columns[0].add_sized(columns[0].available_size(), edit);
                                 if self.focus_editor_once
                                     && !self.palette_open
+                                    && !self.settings_open
                                     && !self.command_line_focused
                                 {
                                     response.request_focus();
@@ -856,6 +971,7 @@ impl eframe::App for SlateApp {
                             let response = ui.add_sized(ui.available_size(), edit);
                             if self.focus_editor_once
                                 && !self.palette_open
+                                && !self.settings_open
                                 && !self.command_line_focused
                             {
                                 response.request_focus();
@@ -1023,6 +1139,7 @@ impl eframe::App for SlateApp {
             });
 
         self.command_palette(&ctx);
+        self.settings_dialog(&ctx);
     }
 }
 
