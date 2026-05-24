@@ -103,6 +103,7 @@ struct SlateApp {
     pending_action: Option<PendingAction>,
     command_line: String,
     command_line_focused: bool,
+    focus_command_line_once: bool,
 }
 
 impl SlateApp {
@@ -124,6 +125,7 @@ impl SlateApp {
             pending_action: None,
             command_line: String::new(),
             command_line_focused: false,
+            focus_command_line_once: false,
         };
 
         if let Some(path) = path {
@@ -240,6 +242,7 @@ impl SlateApp {
         self.palette_query.clear();
         self.selected_command = 0;
         self.command_line_focused = false;
+        self.focus_command_line_once = false;
         self.focus_editor_once = true;
 
         match command {
@@ -284,6 +287,7 @@ impl SlateApp {
         let raw = self.command_line.trim().to_string();
         self.command_line.clear();
         self.command_line_focused = false;
+        self.focus_command_line_once = false;
         self.focus_editor_once = true;
 
         let input = raw.strip_prefix(':').unwrap_or(&raw).trim();
@@ -363,6 +367,13 @@ impl SlateApp {
                 self.palette_open = true;
                 self.palette_query.clear();
                 self.selected_command = 0;
+            }
+            if i.consume_key(egui::Modifiers::CTRL, Key::Period) {
+                self.palette_open = false;
+                self.command_line.clear();
+                self.command_line_focused = true;
+                self.focus_command_line_once = true;
+                self.focus_editor_once = false;
             }
             if i.consume_key(egui::Modifiers::CTRL, Key::N) {
                 command = Some(Command::New);
@@ -864,8 +875,8 @@ impl eframe::App for SlateApp {
                 );
 
                 let input_rect = egui::Rect::from_min_max(
-                    egui::pos2(command_rect.left() + 28.0, command_rect.top() + 3.0),
-                    egui::pos2(command_rect.right() - 10.0, command_rect.bottom() - 3.0),
+                    egui::pos2(command_rect.left() + 19.0, command_rect.top() + 4.0),
+                    egui::pos2(command_rect.right() - 10.0, command_rect.bottom() - 4.0),
                 );
                 let response = ui.put(
                     input_rect,
@@ -880,6 +891,10 @@ impl eframe::App for SlateApp {
                         .text_color(footer_color)
                         .frame(egui::Frame::NONE),
                 );
+                if self.focus_command_line_once {
+                    response.request_focus();
+                    self.focus_command_line_once = false;
+                }
                 self.command_line_focused = response.has_focus();
                 let command_enter = response.has_focus()
                     && ui.input(|i| i.key_pressed(Key::Enter) || i.key_pressed(Key::Tab));
