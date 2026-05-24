@@ -104,6 +104,8 @@ struct SlateApp {
     command_line: String,
     command_line_focused: bool,
     focus_command_line_once: bool,
+    command_history: Vec<String>,
+    command_history_index: Option<usize>,
 }
 
 impl SlateApp {
@@ -126,6 +128,8 @@ impl SlateApp {
             command_line: String::new(),
             command_line_focused: false,
             focus_command_line_once: false,
+            command_history: Vec::new(),
+            command_history_index: None,
         };
 
         if let Some(path) = path {
@@ -289,11 +293,16 @@ impl SlateApp {
         self.command_line_focused = false;
         self.focus_command_line_once = false;
         self.focus_editor_once = true;
+        self.command_history_index = None;
 
         let input = raw.strip_prefix(':').unwrap_or(&raw).trim();
         if input.is_empty() {
             self.status = "Command cancelled".to_string();
             return;
+        }
+
+        if self.command_history.last().is_none_or(|last| last != input) {
+            self.command_history.push(input.to_string());
         }
 
         let mut parts = input.split_whitespace();
@@ -362,6 +371,9 @@ impl SlateApp {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let mut command = None;
+        let mut execute_command_line = false;
+        let mut previous_command = false;
+        let mut next_command = false;
         ctx.input_mut(|i| {
             if i.consume_key(egui::Modifiers::CTRL, Key::P) {
                 self.palette_open = true;
@@ -371,9 +383,16 @@ impl SlateApp {
             if i.consume_key(egui::Modifiers::CTRL, Key::Period) {
                 self.palette_open = false;
                 self.command_line.clear();
+                self.command_history_index = None;
                 self.command_line_focused = true;
                 self.focus_command_line_once = true;
                 self.focus_editor_once = false;
+            }
+            if self.command_line_focused || self.focus_command_line_once {
+                execute_command_line |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
+                execute_command_line |= i.consume_key(egui::Modifiers::NONE, Key::Tab);
+                previous_command |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
+                next_command |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
             }
             if i.consume_key(egui::Modifiers::CTRL, Key::N) {
                 command = Some(Command::New);
@@ -403,7 +422,13 @@ impl SlateApp {
                 command = Some(Command::Quit);
             }
             if i.consume_key(egui::Modifiers::NONE, Key::Escape) {
-                if self.palette_open {
+                if self.command_line_focused || self.focus_command_line_once {
+                    self.command_line.clear();
+                    self.command_line_focused = false;
+                    self.focus_command_line_once = false;
+                    self.command_history_index = None;
+                    self.focus_editor_once = true;
+                } else if self.palette_open {
                     self.palette_open = false;
                     self.focus_editor_once = true;
                 } else if self.pending_action.is_some() {
@@ -414,6 +439,37 @@ impl SlateApp {
                 }
             }
         });
+
+        if previous_command && !self.command_history.is_empty() {
+            let index = self
+                .command_history_index
+                .unwrap_or(self.command_history.len())
+                .saturating_sub(1);
+            self.command_history_index = Some(index);
+            self.command_line = self.command_history[index].clone();
+            self.focus_command_line_once = true;
+            return;
+        }
+
+        if next_command {
+            if let Some(index) = self.command_history_index {
+                if index + 1 < self.command_history.len() {
+                    let index = index + 1;
+                    self.command_history_index = Some(index);
+                    self.command_line = self.command_history[index].clone();
+                } else {
+                    self.command_history_index = None;
+                    self.command_line.clear();
+                }
+                self.focus_command_line_once = true;
+            }
+            return;
+        }
+
+        if execute_command_line {
+            self.run_command_line(ctx);
+            return;
+        }
 
         if let Some(command) = command {
             self.run_command(command, ctx);
@@ -745,7 +801,17 @@ impl eframe::App for SlateApp {
                 let footer_warn = Color32::from_rgb(235, 203, 139);
                 let status_height = 30.0;
                 let command_height = 30.0;
-                let footer_height = status_height + command_height;
+                let history_row_height = 22.0;
+                let command_history_active = (self.command_line_focused
+                    || self.focus_command_line_once)
+                    && !self.command_history.is_empty();
+                let visible_history_rows = if command_history_active {
+                    self.command_history.len().min(5)
+                } else {
+                    0
+                };
+                let history_height = visible_history_rows as f32 * history_row_height;
+                let footer_height = status_height + history_height + command_height;
                 let editor_size = Vec2::new(
                     ui.available_width(),
                     (ui.available_height() - footer_height).max(80.0),
@@ -859,6 +925,64 @@ impl eframe::App for SlateApp {
                     footer_dim,
                 );
 
+                if visible_history_rows > 0 {
+                    let (history_rect, _) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), history_height),
+                        egui::Sense::hover(),
+                    );
+                    let painter = ui.painter_at(history_rect);
+                    painter.rect_filled(history_rect, 0.0, Color32::from_rgb(25, 31, 40));
+
+                    let len = self.command_history.len();
+                    let rows = visible_history_rows;
+                    let selected_index = self.command_history_index;
+                    let start = selected_index
+                        .map(|idx| idx.min(len.saturating_sub(rows)))
+                        .unwrap_or_else(|| len.saturating_sub(rows));
+                    let end = (start + rows).min(len);
+
+                    for (row, index) in (start..end).enumerate() {
+                        let row_rect = egui::Rect::from_min_size(
+                            egui::pos2(
+                                history_rect.left(),
+                                history_rect.top() + row as f32 * history_row_height,
+                            ),
+                            Vec2::new(history_rect.width(), history_row_height),
+                        );
+                        let selected = selected_index == Some(index);
+                        if selected {
+                            painter.rect_filled(row_rect, 0.0, Color32::from_rgb(38, 47, 61));
+                        }
+
+                        let marker = if selected { ">" } else { " " };
+                        painter.text(
+                            egui::pos2(row_rect.left() + 10.0, row_rect.center().y - 1.0),
+                            egui::Align2::LEFT_CENTER,
+                            marker,
+                            footer_font.clone(),
+                            footer_accent,
+                        );
+                        painter.text(
+                            egui::pos2(row_rect.left() + 28.0, row_rect.center().y - 1.0),
+                            egui::Align2::LEFT_CENTER,
+                            &self.command_history[index],
+                            footer_font.clone(),
+                            if selected { footer_color } else { footer_dim },
+                        );
+
+                        let response = ui.interact(
+                            row_rect,
+                            ui.id().with(("command_history", index)),
+                            egui::Sense::click(),
+                        );
+                        if response.clicked() {
+                            self.command_history_index = Some(index);
+                            self.command_line = self.command_history[index].clone();
+                            self.focus_command_line_once = true;
+                        }
+                    }
+                }
+
                 let (command_rect, _) = ui.allocate_exact_size(
                     Vec2::new(ui.available_width(), command_height),
                     egui::Sense::hover(),
@@ -896,11 +1020,6 @@ impl eframe::App for SlateApp {
                     self.focus_command_line_once = false;
                 }
                 self.command_line_focused = response.has_focus();
-                let command_enter = response.has_focus()
-                    && ui.input(|i| i.key_pressed(Key::Enter) || i.key_pressed(Key::Tab));
-                if command_enter {
-                    self.run_command_line(&ctx);
-                }
             });
 
         self.command_palette(&ctx);
