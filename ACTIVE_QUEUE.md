@@ -312,6 +312,9 @@ Scope:
 - Provide Escape/cancel and safe fallback so accidental command entry is harmless.
 - Avoid conflicts with essential OS/window-manager shortcuts; decide which Ctrl sequences Slate owns and which stay native.
 - First implementation supports existing single-key Ctrl commands on release (`s`, `o`, `n`, `p`, `q`, `m`, `.`, `f`) plus `dl` for delete current line and `ol` for open last file.
+- Additional early Ctrl-layer commands: `sw` select word, `sl` select line, `dw` delete word, `gt` go to top, `gb` go to bottom.
+- Ctrl+Shift live navigation: while both modifiers are held, the selected movement mode moves immediately without waiting for release.
+- Movement mode is configurable in settings: Vim `h/j/k/l` or Slate `i/j/k/l` (`i` up, `j` left, `k` down, `l` right).
 
 ### T034 — Repeatable edits and lightweight macros
 
@@ -457,7 +460,9 @@ Editing lines:
 - `:trim-buffer` — trim trailing whitespace in the whole file.
 
 Editing words/selections:
-- `:delete-word` / `:dw` — delete word after cursor.
+- `:select-word` / `:sw` — select the word under/near the cursor; Ctrl-layer `sw`.
+- `:select-line` / `:sl` — select the current line; Ctrl-layer `sl`.
+- `:delete-word` / `:dw` — delete word under/near cursor; Ctrl-layer `dw`.
 - `:delete-prev-word` — delete word before cursor.
 - `:change-word` / `:cw` — select/delete word and enter normal typing.
 - `:uppercase` / `:upper` — uppercase selection or word.
@@ -468,7 +473,7 @@ Editing words/selections:
 
 Navigation:
 - Already implemented: `:goto` / `:g` / `:line` / `:l` with absolute and explicit relative targets.
-- `:top` / `:bottom` — jump to start/end of file.
+- `:top` / `:bottom` — jump to start/end of file; Ctrl-layer `gt` / `gb`.
 - `:next-heading` / `:nh` — jump to next Markdown heading.
 - `:prev-heading` / `:ph` — jump to previous Markdown heading.
 - `:next-blank` / `:prev-blank` — jump between paragraph boundaries.

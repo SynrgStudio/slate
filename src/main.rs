@@ -65,6 +65,50 @@ enum PendingAction {
     Quit,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CtrlShiftMoveMode {
+    Vim,
+    Slate,
+}
+
+impl CtrlShiftMoveMode {
+    fn label(self) -> &'static str {
+        match self {
+            CtrlShiftMoveMode::Vim => "Vim hjkl",
+            CtrlShiftMoveMode::Slate => "Slate ijkl",
+        }
+    }
+
+    fn config_value(self) -> &'static str {
+        match self {
+            CtrlShiftMoveMode::Vim => "vim",
+            CtrlShiftMoveMode::Slate => "slate",
+        }
+    }
+
+    fn from_config_value(value: &str) -> Option<Self> {
+        match value.trim().trim_matches('"') {
+            "vim" | "hjkl" => Some(Self::Vim),
+            "slate" | "ijkl" => Some(Self::Slate),
+            _ => None,
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            CtrlShiftMoveMode::Vim => Self::Slate,
+            CtrlShiftMoveMode::Slate => Self::Vim,
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            CtrlShiftMoveMode::Vim => "Ctrl+Shift: h left, j down, k up, l right",
+            CtrlShiftMoveMode::Slate => "Ctrl+Shift: i up, j left, k down, l right",
+        }
+    }
+}
+
 impl PendingAction {
     fn prompt(self) -> &'static str {
         match self {
@@ -125,6 +169,7 @@ struct SlateApp {
     command_history_index: Option<usize>,
     command_history_limit: usize,
     line_number_mode: LineNumberMode,
+    ctrl_shift_move_mode: CtrlShiftMoveMode,
     last_opened_path: Option<PathBuf>,
     search_state: Option<SearchState>,
     ctrl_layer_active: bool,
@@ -158,6 +203,7 @@ impl SlateApp {
             command_history_index: None,
             command_history_limit: 5,
             line_number_mode: LineNumberMode::Absolute,
+            ctrl_shift_move_mode: CtrlShiftMoveMode::Vim,
             last_opened_path: None,
             search_state: None,
             ctrl_layer_active: false,
@@ -323,6 +369,11 @@ impl SlateApp {
                         self.line_number_mode = mode;
                     }
                 }
+                "ctrl_shift_move_mode" => {
+                    if let Some(mode) = CtrlShiftMoveMode::from_config_value(value) {
+                        self.ctrl_shift_move_mode = mode;
+                    }
+                }
                 "last_opened_path" => {
                     let value = value.trim().trim_matches('"');
                     if !value.is_empty() {
@@ -345,9 +396,10 @@ impl SlateApp {
         fs::write(
             path,
             format!(
-                "command_history_limit = {}\nline_number_mode = \"{}\"\nlast_opened_path = \"{}\"\n",
+                "command_history_limit = {}\nline_number_mode = \"{}\"\nctrl_shift_move_mode = \"{}\"\nlast_opened_path = \"{}\"\n",
                 self.command_history_limit,
                 self.line_number_mode.config_value(),
+                self.ctrl_shift_move_mode.config_value(),
                 self.last_opened_path
                     .as_ref()
                     .map(|path| path.display().to_string())
@@ -370,6 +422,16 @@ impl SlateApp {
         self.line_number_mode = mode;
         match self.save_settings() {
             Ok(_) => self.status = format!("Line numbers: {}", self.line_number_mode.label()),
+            Err(err) => self.status = format!("Settings save failed: {err}"),
+        }
+    }
+
+    fn set_ctrl_shift_move_mode(&mut self, mode: CtrlShiftMoveMode) {
+        self.ctrl_shift_move_mode = mode;
+        match self.save_settings() {
+            Ok(_) => {
+                self.status = format!("Ctrl+Shift movement: {}", self.ctrl_shift_move_mode.label())
+            }
             Err(err) => self.status = format!("Settings save failed: {err}"),
         }
     }
@@ -490,11 +552,50 @@ impl SlateApp {
                 let target = parts.collect::<Vec<_>>().join(" ");
                 self.goto_target(&target);
             }
+            "select-word" | "sw" => self.select_word(),
+            "select-line" | "sl" => self.select_line(),
+            "delete-word" | "dw" => self.delete_word(),
             "delete-line" | "dl" => self.delete_current_line(),
+            "top" | "go-top" | "gt" => self.go_to_top(),
+            "bottom" | "go-bottom" | "gb" => self.go_to_bottom(),
             "settings" | "set" | "prefs" | "preferences" => {
                 self.run_command(Command::Settings, ctx)
             }
             _ => self.status = format!("Unknown command: {input}"),
+        }
+    }
+
+    fn select_word(&mut self) {
+        if self.buffer.select_word() {
+            self.search_state = None;
+            self.editor_view.request_scroll_to_cursor(&self.buffer);
+            self.status = "Selected word".to_string();
+            self.focus_editor_once = true;
+        } else {
+            self.status = "No word to select".to_string();
+        }
+    }
+
+    fn select_line(&mut self) {
+        if self.buffer.select_current_line() {
+            self.search_state = None;
+            self.editor_view.request_scroll_to_cursor(&self.buffer);
+            self.status = "Selected line".to_string();
+            self.focus_editor_once = true;
+        } else {
+            self.status = "No line to select".to_string();
+        }
+    }
+
+    fn delete_word(&mut self) {
+        if self.buffer.delete_word() {
+            self.dirty = true;
+            self.search_state = None;
+            self.editor_view.request_scroll_to_cursor(&self.buffer);
+            self.status = "Deleted word".to_string();
+            self.focus_editor_once = true;
+        } else {
+            self.status = "No word to delete".to_string();
         }
     }
 
@@ -506,6 +607,22 @@ impl SlateApp {
             self.status = "Deleted line".to_string();
             self.focus_editor_once = true;
         }
+    }
+
+    fn go_to_top(&mut self) {
+        self.buffer.move_to_top();
+        self.search_state = None;
+        self.editor_view.request_scroll_to_cursor(&self.buffer);
+        self.status = "Top".to_string();
+        self.focus_editor_once = true;
+    }
+
+    fn go_to_bottom(&mut self) {
+        self.buffer.move_to_bottom();
+        self.search_state = None;
+        self.editor_view.request_scroll_to_cursor(&self.buffer);
+        self.status = "Bottom".to_string();
+        self.focus_editor_once = true;
     }
 
     fn goto_target(&mut self, target: &str) {
@@ -686,6 +803,10 @@ impl SlateApp {
 
         if self.ctrl_layer_active && ctrl_down {
             let keys = ctx.input(|input| input.events.clone());
+            if self.handle_ctrl_shift_navigation(&keys) {
+                return true;
+            }
+
             for event in keys {
                 let egui::Event::Key {
                     key,
@@ -722,6 +843,52 @@ impl SlateApp {
         }
 
         false
+    }
+
+    fn handle_ctrl_shift_navigation(&mut self, events: &[egui::Event]) -> bool {
+        let mut moved = false;
+        for event in events {
+            let egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            if !modifiers.ctrl || !modifiers.shift || modifiers.alt {
+                continue;
+            }
+
+            match (self.ctrl_shift_move_mode, key) {
+                (CtrlShiftMoveMode::Vim, Key::H) | (CtrlShiftMoveMode::Slate, Key::J) => {
+                    self.buffer.move_left();
+                    moved = true;
+                }
+                (CtrlShiftMoveMode::Vim, Key::J) | (CtrlShiftMoveMode::Slate, Key::K) => {
+                    self.buffer.move_down();
+                    moved = true;
+                }
+                (CtrlShiftMoveMode::Vim, Key::K) | (CtrlShiftMoveMode::Slate, Key::I) => {
+                    self.buffer.move_up();
+                    moved = true;
+                }
+                (CtrlShiftMoveMode::Vim, Key::L) | (CtrlShiftMoveMode::Slate, Key::L) => {
+                    self.buffer.move_right();
+                    moved = true;
+                }
+                _ => {}
+            }
+        }
+
+        if moved {
+            self.search_state = None;
+            self.editor_view.request_scroll_to_cursor(&self.buffer);
+            self.status = format!("Ctrl+Shift nav: {}", self.ctrl_shift_move_mode.label());
+            self.focus_editor_once = true;
+        }
+        moved
     }
 
     fn ctrl_layer_key(key: Key) -> Option<char> {
@@ -781,7 +948,12 @@ impl SlateApp {
             "f" if self.search_state.is_some() => self.place_cursor_at_search_edge(true),
             "f" => self.focus_find_command_line(),
             "b" if self.search_state.is_some() => self.place_cursor_at_search_edge(false),
+            "sw" => self.select_word(),
+            "sl" => self.select_line(),
+            "dw" => self.delete_word(),
             "dl" => self.delete_current_line(),
+            "gt" => self.go_to_top(),
+            "gb" => self.go_to_bottom(),
             _ => self.status = format!("Unknown ctrl command: {sequence}"),
         }
     }
@@ -959,7 +1131,7 @@ impl SlateApp {
         }
 
         if settings_next {
-            self.selected_setting = (self.selected_setting + 1).min(1);
+            self.selected_setting = (self.selected_setting + 1).min(2);
             return;
         }
 
@@ -967,6 +1139,7 @@ impl SlateApp {
             match self.selected_setting {
                 0 => self.set_command_history_limit(self.command_history_limit.saturating_sub(1)),
                 1 => self.set_line_number_mode(LineNumberMode::Absolute),
+                2 => self.set_ctrl_shift_move_mode(CtrlShiftMoveMode::Vim),
                 _ => {}
             }
             return;
@@ -982,6 +1155,7 @@ impl SlateApp {
                     };
                     self.set_line_number_mode(next_mode);
                 }
+                2 => self.set_ctrl_shift_move_mode(self.ctrl_shift_move_mode.next()),
                 _ => {}
             }
             return;
@@ -1392,6 +1566,46 @@ impl SlateApp {
                                         ui.add_space(4.0);
                                         ui.label(
                                             RichText::new("Absolute shows file line numbers. Relative treats the cursor line as 1 and counts distance above/below.")
+                                                .font(FontId::new(13.0, FontFamily::Monospace))
+                                                .color(Color32::from_rgb(136, 154, 176)),
+                                        );
+                                    });
+
+                                ui.add_space(6.0);
+                                let movement_selected = self.selected_setting == 2;
+                                egui::Frame::new()
+                                    .fill(if movement_selected { selected_fill } else { normal_fill })
+                                    .inner_margin(6.0)
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new(if movement_selected { ">" } else { " " })
+                                                    .font(FontId::new(14.0, FontFamily::Monospace))
+                                                    .color(Color32::from_rgb(136, 192, 208)),
+                                            );
+                                            ui.label(
+                                                RichText::new("Ctrl+Shift movement")
+                                                    .font(FontId::new(14.0, FontFamily::Monospace))
+                                                    .color(Color32::from_rgb(216, 222, 233)),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if ui
+                                                        .button(self.ctrl_shift_move_mode.label())
+                                                        .on_hover_text("Toggle Vim hjkl / Slate ijkl live movement")
+                                                        .clicked()
+                                                    {
+                                                        self.set_ctrl_shift_move_mode(
+                                                            self.ctrl_shift_move_mode.next(),
+                                                        );
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        ui.add_space(4.0);
+                                        ui.label(
+                                            RichText::new(self.ctrl_shift_move_mode.hint())
                                                 .font(FontId::new(13.0, FontFamily::Monospace))
                                                 .color(Color32::from_rgb(136, 154, 176)),
                                         );

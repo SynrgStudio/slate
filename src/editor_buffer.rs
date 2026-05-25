@@ -145,6 +145,14 @@ impl EditorBuffer {
         self.set_cursor(self.line_end(line_index));
     }
 
+    pub(crate) fn move_to_top(&mut self) {
+        self.set_cursor(0);
+    }
+
+    pub(crate) fn move_to_bottom(&mut self) {
+        self.set_cursor(self.text.len());
+    }
+
     pub(crate) fn move_up(&mut self) {
         let (line_index, column) = self.cursor_line_col();
         if line_index == 0 {
@@ -233,6 +241,32 @@ impl EditorBuffer {
         true
     }
 
+    pub(crate) fn select_current_line(&mut self) -> bool {
+        if self.text.is_empty() {
+            return false;
+        }
+
+        let line_index = self.line_index_for_byte(self.cursor);
+        self.set_selection(self.line_start(line_index), self.line_end(line_index));
+        true
+    }
+
+    pub(crate) fn select_word(&mut self) -> bool {
+        let Some((start, end)) = self.word_range_at_cursor() else {
+            return false;
+        };
+        self.set_selection(start, end);
+        true
+    }
+
+    pub(crate) fn delete_word(&mut self) -> bool {
+        let Some((start, end)) = self.word_range_at_cursor() else {
+            return false;
+        };
+        self.replace_selection_or_range(start, end, "");
+        true
+    }
+
     pub(crate) fn replace_selection_or_range(
         &mut self,
         start: usize,
@@ -311,6 +345,73 @@ impl EditorBuffer {
             .nth(target_column)
             .map(|(offset, _)| line_start + offset)
             .unwrap_or(line_end)
+    }
+
+    fn word_range_at_cursor(&self) -> Option<(usize, usize)> {
+        if self.text.is_empty() {
+            return None;
+        }
+
+        let cursor = self.clamp_to_char_boundary(self.cursor);
+        let word_byte = self.word_char_at_or_near(cursor)?;
+        let mut start = word_byte;
+        while start > 0 {
+            let previous = self.previous_char_boundary(start);
+            let Some(ch) = self.text[previous..start].chars().next() else {
+                break;
+            };
+            if !Self::is_word_char(ch) {
+                break;
+            }
+            start = previous;
+        }
+
+        let mut end = word_byte;
+        while end < self.text.len() {
+            let next = self.next_char_boundary(end);
+            let Some(ch) = self.text[end..next].chars().next() else {
+                break;
+            };
+            if !Self::is_word_char(ch) {
+                break;
+            }
+            end = next;
+        }
+
+        (start < end).then_some((start, end))
+    }
+
+    fn word_char_at_or_near(&self, cursor: usize) -> Option<usize> {
+        if cursor < self.text.len() {
+            let next = self.next_char_boundary(cursor);
+            if self.text[cursor..next]
+                .chars()
+                .next()
+                .is_some_and(Self::is_word_char)
+            {
+                return Some(cursor);
+            }
+        }
+
+        if cursor > 0 {
+            let previous = self.previous_char_boundary(cursor);
+            if self.text[previous..cursor]
+                .chars()
+                .next()
+                .is_some_and(Self::is_word_char)
+            {
+                return Some(previous);
+            }
+        }
+
+        self.text[cursor..]
+            .char_indices()
+            .find(|(_, ch)| Self::is_word_char(*ch))
+            .map(|(offset, _)| cursor + offset)
+    }
+
+    fn is_word_char(ch: char) -> bool {
+        ch.is_alphanumeric() || ch == '_'
     }
 
     pub(crate) fn rebuild_line_index(&mut self) {
@@ -427,5 +528,46 @@ mod tests {
         assert!(buffer.delete_current_line());
 
         assert_eq!(buffer.as_str(), "one\ntwo");
+    }
+
+    #[test]
+    fn editor_buffer_selects_word_under_cursor() {
+        let mut buffer = EditorBuffer::from_text("hello brave_world".to_string());
+        buffer.set_cursor(8);
+
+        assert!(buffer.select_word());
+
+        assert_eq!(buffer.selection(), Some((6, 17)));
+    }
+
+    #[test]
+    fn editor_buffer_selects_current_line() {
+        let mut buffer = EditorBuffer::from_text("one\ntwo\nthree".to_string());
+        buffer.set_cursor(5);
+
+        assert!(buffer.select_current_line());
+
+        assert_eq!(buffer.selection(), Some((4, 7)));
+    }
+
+    #[test]
+    fn editor_buffer_deletes_word_under_cursor() {
+        let mut buffer = EditorBuffer::from_text("hello brave world".to_string());
+        buffer.set_cursor(8);
+
+        assert!(buffer.delete_word());
+
+        assert_eq!(buffer.as_str(), "hello  world");
+        assert_eq!(buffer.cursor(), 6);
+    }
+
+    #[test]
+    fn editor_buffer_moves_to_top_and_bottom() {
+        let mut buffer = EditorBuffer::from_text("one\ntwo".to_string());
+        buffer.move_to_bottom();
+        assert_eq!(buffer.cursor(), buffer.as_str().len());
+
+        buffer.move_to_top();
+        assert_eq!(buffer.cursor(), 0);
     }
 }

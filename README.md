@@ -29,6 +29,8 @@ slate ~/notes.md
 - `:delete-line` / `:dl` delete current line
 - Ctrl-hold layer: hold `Ctrl`, type `d` then `l`, release `Ctrl` to delete line
 - Ctrl-hold layer: hold `Ctrl`, type `o` then `l`, release `Ctrl` to open last file
+- Ctrl-hold layer commands: `sw` select word, `sl` select line, `dw` delete word, `gt` top, `gb` bottom
+- Ctrl+Shift live nav: while holding `Ctrl+Shift`, move immediately using the selected settings mode: Vim `h/j/k/l` or Slate `i/j/k/l` (`i` up, `j` left, `k` down, `l` right)
 - `:settings` configure history length and absolute/relative line numbers
 - `Ctrl+Q` quit
 
