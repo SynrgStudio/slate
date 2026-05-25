@@ -2,6 +2,40 @@ use crate::{editor_buffer::EditorBuffer, search::SearchState};
 
 use eframe::egui::{self, Color32, FontFamily, FontId, Key, Stroke};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LineNumberMode {
+    Absolute,
+    Relative,
+}
+
+impl LineNumberMode {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            LineNumberMode::Absolute => "absolute",
+            LineNumberMode::Relative => "relative",
+        }
+    }
+
+    pub(crate) fn config_value(self) -> &'static str {
+        self.label()
+    }
+
+    pub(crate) fn from_config_value(value: &str) -> Option<Self> {
+        match value.trim().trim_matches('"') {
+            "absolute" => Some(LineNumberMode::Absolute),
+            "relative" => Some(LineNumberMode::Relative),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn number_for_line(self, line_index: usize, current_line_index: usize) -> usize {
+        match self {
+            LineNumberMode::Absolute => line_index + 1,
+            LineNumberMode::Relative => line_index.abs_diff(current_line_index) + 1,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct VisualRow {
     line_index: usize,
@@ -64,6 +98,7 @@ impl EditorView {
         buffer: &mut EditorBuffer,
         wrap: bool,
         search_state: Option<&SearchState>,
+        line_number_mode: LineNumberMode,
     ) -> (egui::Response, bool) {
         self.observe_buffer(buffer);
 
@@ -137,6 +172,7 @@ impl EditorView {
 
         let range = self.visible_row_range(rows.len(), rect.height(), line_height);
         let y_offset = self.scroll_y % line_height;
+        let current_line_index = buffer.cursor_line_col().0;
         for (visible_index, row_index) in range.enumerate() {
             let Some(row) = rows.get(row_index).copied() else {
                 continue;
@@ -189,7 +225,10 @@ impl EditorView {
                 egui::pos2(gutter_x, y + line_height * 0.5 + 2.0),
                 egui::Align2::RIGHT_CENTER,
                 if row.start == buffer.line_start(row.line_index) {
-                    format!("{}", row.line_index + 1)
+                    format!(
+                        "{}",
+                        line_number_mode.number_for_line(row.line_index, current_line_index)
+                    )
                 } else {
                     "·".to_string()
                 },
@@ -585,8 +624,16 @@ impl EditorView {
 
 #[cfg(test)]
 mod tests {
-    use super::EditorView;
+    use super::{EditorView, LineNumberMode};
     use crate::editor_buffer::EditorBuffer;
+
+    #[test]
+    fn line_number_mode_calculates_relative_numbers() {
+        assert_eq!(LineNumberMode::Absolute.number_for_line(9, 4), 10);
+        assert_eq!(LineNumberMode::Relative.number_for_line(4, 4), 1);
+        assert_eq!(LineNumberMode::Relative.number_for_line(3, 4), 2);
+        assert_eq!(LineNumberMode::Relative.number_for_line(5, 4), 2);
+    }
 
     #[test]
     fn editor_view_calculates_visible_line_range() {

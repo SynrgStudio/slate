@@ -1,12 +1,14 @@
 mod editor_buffer;
 mod editor_view;
+mod goto;
 mod search;
 
 use std::{fs, io::Write, path::PathBuf};
 
 use editor_buffer::EditorBuffer;
-use editor_view::EditorView;
+use editor_view::{EditorView, LineNumberMode};
 use eframe::egui::{self, Color32, FontFamily, FontId, Key, RichText, Stroke, TextEdit, Vec2};
+use goto::GotoTarget;
 use search::SearchState;
 
 fn main() -> eframe::Result {
@@ -113,12 +115,14 @@ struct SlateApp {
     scratch: bool,
     pending_action: Option<PendingAction>,
     settings_open: bool,
+    selected_setting: usize,
     command_line: String,
     command_line_focused: bool,
     focus_command_line_once: bool,
     command_history: Vec<String>,
     command_history_index: Option<usize>,
     command_history_limit: usize,
+    line_number_mode: LineNumberMode,
     search_state: Option<SearchState>,
 }
 
@@ -141,12 +145,14 @@ impl SlateApp {
             scratch,
             pending_action: None,
             settings_open: false,
+            selected_setting: 0,
             command_line: String::new(),
             command_line_focused: false,
             focus_command_line_once: false,
             command_history: Vec::new(),
             command_history_index: None,
             command_history_limit: 5,
+            line_number_mode: LineNumberMode::Absolute,
             search_state: None,
         };
 
@@ -288,10 +294,18 @@ impl SlateApp {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
-            if key.trim() == "command_history_limit" {
-                if let Ok(limit) = value.trim().parse::<usize>() {
-                    self.command_history_limit = limit.clamp(1, 50);
+            match key.trim() {
+                "command_history_limit" => {
+                    if let Ok(limit) = value.trim().parse::<usize>() {
+                        self.command_history_limit = limit.clamp(1, 50);
+                    }
                 }
+                "line_number_mode" => {
+                    if let Some(mode) = LineNumberMode::from_config_value(value) {
+                        self.line_number_mode = mode;
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -306,7 +320,11 @@ impl SlateApp {
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
         fs::write(
             path,
-            format!("command_history_limit = {}\n", self.command_history_limit),
+            format!(
+                "command_history_limit = {}\nline_number_mode = \"{}\"\n",
+                self.command_history_limit,
+                self.line_number_mode.config_value()
+            ),
         )
         .map_err(|err| err.to_string())
     }
@@ -315,6 +333,14 @@ impl SlateApp {
         self.command_history_limit = limit.clamp(1, 50);
         match self.save_settings() {
             Ok(_) => self.status = format!("History length: {}", self.command_history_limit),
+            Err(err) => self.status = format!("Settings save failed: {err}"),
+        }
+    }
+
+    fn set_line_number_mode(&mut self, mode: LineNumberMode) {
+        self.line_number_mode = mode;
+        match self.save_settings() {
+            Ok(_) => self.status = format!("Line numbers: {}", self.line_number_mode.label()),
             Err(err) => self.status = format!("Settings save failed: {err}"),
         }
     }
@@ -363,6 +389,7 @@ impl SlateApp {
             }
             Command::Settings => {
                 self.settings_open = true;
+                self.selected_setting = 0;
                 self.focus_editor_once = false;
             }
             Command::Quit => self.request_close(ctx),
@@ -423,11 +450,50 @@ impl SlateApp {
                 let query = parts.collect::<Vec<_>>().join(" ");
                 self.start_search(query);
             }
+            "goto" | "g" | "line" | "l" => {
+                let target = parts.collect::<Vec<_>>().join(" ");
+                self.goto_target(&target);
+            }
             "settings" | "set" | "prefs" | "preferences" => {
                 self.run_command(Command::Settings, ctx)
             }
             _ => self.status = format!("Unknown command: {input}"),
         }
+    }
+
+    fn goto_target(&mut self, target: &str) {
+        let Some(target) = GotoTarget::parse(target) else {
+            self.status = "Usage: :g 10, :g 10:4, :g +5, :g -5".to_string();
+            return;
+        };
+
+        let line_count = self.buffer.line_count();
+        let (line, column, status) = match target {
+            GotoTarget::Absolute { line, column } => {
+                let line = line.clamp(1, line_count);
+                let column = column.unwrap_or(1);
+                (line, column, format!("Goto line {line}, col {column}"))
+            }
+            GotoTarget::Relative { offset, column } => {
+                let current_line = self.buffer.cursor_line_col().0 + 1;
+                let line = current_line
+                    .saturating_add_signed(offset)
+                    .clamp(1, line_count);
+                let column = column.unwrap_or(1);
+                (
+                    line,
+                    column,
+                    format!("Goto {offset:+} lines → line {line}, col {column}"),
+                )
+            }
+        };
+
+        let byte = self.buffer.line_col_to_byte(line, column);
+        self.buffer.set_cursor(byte);
+        self.editor_view.request_scroll_to_cursor(&self.buffer);
+        self.search_state = None;
+        self.status = status;
+        self.focus_editor_once = true;
     }
 
     fn start_search(&mut self, query: String) {
@@ -558,6 +624,9 @@ impl SlateApp {
         let mut next_command = false;
         let mut settings_decrement = false;
         let mut settings_increment = false;
+        let mut settings_previous = false;
+        let mut settings_next = false;
+        let mut settings_activate = false;
         let mut search_next = false;
         let mut search_previous = false;
         let mut search_accept = false;
@@ -574,6 +643,10 @@ impl SlateApp {
             if self.settings_open {
                 settings_decrement |= i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft);
                 settings_increment |= i.consume_key(egui::Modifiers::NONE, Key::ArrowRight);
+                settings_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
+                settings_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
+                settings_activate |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
+                settings_activate |= i.consume_key(egui::Modifiers::NONE, Key::Space);
             }
             if i.consume_key(egui::Modifiers::CTRL, Key::P) {
                 self.palette_open = true;
@@ -689,13 +762,37 @@ impl SlateApp {
             return;
         }
 
-        if settings_decrement {
-            self.set_command_history_limit(self.command_history_limit.saturating_sub(1));
+        if settings_previous {
+            self.selected_setting = self.selected_setting.saturating_sub(1);
             return;
         }
 
-        if settings_increment {
-            self.set_command_history_limit(self.command_history_limit + 1);
+        if settings_next {
+            self.selected_setting = (self.selected_setting + 1).min(1);
+            return;
+        }
+
+        if settings_decrement {
+            match self.selected_setting {
+                0 => self.set_command_history_limit(self.command_history_limit.saturating_sub(1)),
+                1 => self.set_line_number_mode(LineNumberMode::Absolute),
+                _ => {}
+            }
+            return;
+        }
+
+        if settings_increment || settings_activate {
+            match self.selected_setting {
+                0 => self.set_command_history_limit(self.command_history_limit + 1),
+                1 => {
+                    let next_mode = match self.line_number_mode {
+                        LineNumberMode::Absolute => LineNumberMode::Relative,
+                        LineNumberMode::Relative => LineNumberMode::Absolute,
+                    };
+                    self.set_line_number_mode(next_mode);
+                }
+                _ => {}
+            }
             return;
         }
 
@@ -1024,39 +1121,95 @@ impl SlateApp {
                             .fill(Color32::from_rgb(30, 36, 48))
                             .inner_margin(8.0)
                             .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new("History length")
-                                            .font(FontId::new(14.0, FontFamily::Monospace))
-                                            .color(Color32::from_rgb(216, 222, 233)),
-                                    );
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            let response = ui.add(
-                                                egui::DragValue::new(&mut self.command_history_limit)
-                                                    .range(1..=50)
-                                                    .speed(1),
+                                let selected_fill = Color32::from_rgb(46, 56, 72);
+                                let normal_fill = Color32::from_rgb(30, 36, 48);
+
+                                let history_selected = self.selected_setting == 0;
+                                egui::Frame::new()
+                                    .fill(if history_selected { selected_fill } else { normal_fill })
+                                    .inner_margin(6.0)
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new(if history_selected { ">" } else { " " })
+                                                    .font(FontId::new(14.0, FontFamily::Monospace))
+                                                    .color(Color32::from_rgb(136, 192, 208)),
                                             );
-                                            if response.changed() {
-                                                self.set_command_history_limit(
-                                                    self.command_history_limit,
-                                                );
-                                            }
-                                        },
-                                    );
-                                });
-                                ui.add_space(4.0);
-                                ui.label(
-                                    RichText::new("Visible command history rows when Ctrl+. opens the commandline.")
-                                        .font(FontId::new(13.0, FontFamily::Monospace))
-                                        .color(Color32::from_rgb(136, 154, 176)),
-                                );
+                                            ui.label(
+                                                RichText::new("History length")
+                                                    .font(FontId::new(14.0, FontFamily::Monospace))
+                                                    .color(Color32::from_rgb(216, 222, 233)),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    let response = ui.add(
+                                                        egui::DragValue::new(&mut self.command_history_limit)
+                                                            .range(1..=50)
+                                                            .speed(1),
+                                                    );
+                                                    if response.changed() {
+                                                        self.set_command_history_limit(
+                                                            self.command_history_limit,
+                                                        );
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        ui.add_space(4.0);
+                                        ui.label(
+                                            RichText::new("Visible command history rows when Ctrl+. opens the commandline.")
+                                                .font(FontId::new(13.0, FontFamily::Monospace))
+                                                .color(Color32::from_rgb(136, 154, 176)),
+                                        );
+                                    });
+
+                                ui.add_space(6.0);
+                                let line_numbers_selected = self.selected_setting == 1;
+                                egui::Frame::new()
+                                    .fill(if line_numbers_selected { selected_fill } else { normal_fill })
+                                    .inner_margin(6.0)
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new(if line_numbers_selected { ">" } else { " " })
+                                                    .font(FontId::new(14.0, FontFamily::Monospace))
+                                                    .color(Color32::from_rgb(136, 192, 208)),
+                                            );
+                                            ui.label(
+                                                RichText::new("Line numbers")
+                                                    .font(FontId::new(14.0, FontFamily::Monospace))
+                                                    .color(Color32::from_rgb(216, 222, 233)),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    let next_mode = match self.line_number_mode {
+                                                        LineNumberMode::Absolute => LineNumberMode::Relative,
+                                                        LineNumberMode::Relative => LineNumberMode::Absolute,
+                                                    };
+                                                    if ui
+                                                        .button(self.line_number_mode.label())
+                                                        .on_hover_text("Toggle absolute/relative line numbers")
+                                                        .clicked()
+                                                    {
+                                                        self.set_line_number_mode(next_mode);
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        ui.add_space(4.0);
+                                        ui.label(
+                                            RichText::new("Absolute shows file line numbers. Relative treats the cursor line as 1 and counts distance above/below.")
+                                                .font(FontId::new(13.0, FontFamily::Monospace))
+                                                .color(Color32::from_rgb(136, 154, 176)),
+                                        );
+                                    });
                             });
 
                         ui.add_space(12.0);
                         ui.horizontal(|ui| {
-                            for (key, label) in [("←→", "adjust"), ("esc", "close")] {
+                            for (key, label) in [("↑↓", "select"), ("←→", "adjust"), ("enter", "toggle"), ("esc", "close")] {
                                 ui.label(
                                     RichText::new(format!("[{key}]"))
                                         .font(FontId::new(13.0, FontFamily::Monospace))
@@ -1174,6 +1327,7 @@ impl eframe::App for SlateApp {
                                     &mut self.buffer,
                                     self.wrap,
                                     self.search_state.as_ref(),
+                                    self.line_number_mode,
                                 );
                                 if self.focus_editor_once
                                     && !self.palette_open
@@ -1195,6 +1349,7 @@ impl eframe::App for SlateApp {
                                 &mut self.buffer,
                                 self.wrap,
                                 self.search_state.as_ref(),
+                                self.line_number_mode,
                             );
                             if self.focus_editor_once
                                 && !self.palette_open

@@ -25,6 +25,8 @@ slate ~/notes.md
 - `Ctrl+M` toggle simple Markdown preview
 - `Ctrl+F` find (`f`/`b` next/previous, `Ctrl+F`/`Ctrl+B` place cursor after/before match)
 - `Ctrl+.` command line
+- `:g 10`, `:g 10:4`, `:g +5`, `:g -5` jump to line/column
+- `:settings` configure history length and absolute/relative line numbers
 - `Ctrl+Q` quit
 
 ## Current vibe

@@ -57,9 +57,11 @@ Scope:
 
 ### T007 — Core editing improvements
 
-Status: pending
+Status: in_progress
 Scope:
 - Track and display current line/column.
+- Add absolute and relative line-number modes, configurable in Settings.
+- Add `:goto` / `:g` / `:line` / `:l` commands for absolute jumps and explicit `+/-` relative jumps.
 - Add duplicate line, move line up/down, and delete line commands.
 - Add useful Vim-inspired text operations without requiring a full Vim mode.
 
