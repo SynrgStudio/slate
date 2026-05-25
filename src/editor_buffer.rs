@@ -205,6 +205,34 @@ impl EditorBuffer {
         self.replace_selection_or_range(self.cursor, next, "");
     }
 
+    pub(crate) fn delete_current_line(&mut self) -> bool {
+        if self.text.is_empty() {
+            return false;
+        }
+
+        if self.line_count() == 1 {
+            self.clear();
+            return true;
+        }
+
+        let line_index = self.line_index_for_byte(self.cursor);
+        let (start, end) = if line_index + 1 >= self.line_count() {
+            (
+                self.line_start(line_index).saturating_sub(1),
+                self.text.len(),
+            )
+        } else {
+            (self.line_start(line_index), self.line_start(line_index + 1))
+        };
+
+        self.selection = None;
+        self.text.replace_range(start..end, "");
+        self.cursor = self.clamp_to_char_boundary(start.min(self.text.len()));
+        self.revision = self.revision.wrapping_add(1);
+        self.rebuild_line_index();
+        true
+    }
+
     pub(crate) fn replace_selection_or_range(
         &mut self,
         start: usize,
@@ -378,5 +406,26 @@ mod tests {
         assert_eq!(buffer.as_str(), "hello slate");
         assert_eq!(buffer.selection(), None);
         assert_eq!(buffer.cursor(), "hello slate".len());
+    }
+
+    #[test]
+    fn editor_buffer_deletes_current_middle_line() {
+        let mut buffer = EditorBuffer::from_text("one\ntwo\nthree".to_string());
+        buffer.set_cursor(5);
+
+        assert!(buffer.delete_current_line());
+
+        assert_eq!(buffer.as_str(), "one\nthree");
+        assert_eq!(buffer.cursor(), 4);
+    }
+
+    #[test]
+    fn editor_buffer_deletes_current_last_line_without_leaving_trailing_blank() {
+        let mut buffer = EditorBuffer::from_text("one\ntwo\nthree".to_string());
+        buffer.set_cursor(buffer.as_str().len());
+
+        assert!(buffer.delete_current_line());
+
+        assert_eq!(buffer.as_str(), "one\ntwo");
     }
 }

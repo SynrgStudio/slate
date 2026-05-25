@@ -63,6 +63,7 @@ Scope:
 - Add absolute and relative line-number modes, configurable in Settings.
 - Add `:goto` / `:g` / `:line` / `:l` commands for absolute jumps and explicit `+/-` relative jumps.
 - Add duplicate line, move line up/down, and delete line commands.
+- Add `Alt+Up` / `Alt+Down` as primary shortcuts to move the current line or selected lines.
 - Add useful Vim-inspired text operations without requiring a full Vim mode.
 
 ### T008 — Lightweight Markdown improvements
@@ -296,18 +297,20 @@ Scope:
 
 ### T033 — Ctrl-hold command layer
 
-Status: pending
+Status: in_progress
 Scope:
 - Design a low-friction way to execute short editing commands like `dw` without becoming a full modal editor.
 - Use Ctrl as a physical temporary command layer: collect key sequence while Ctrl is held, then confirm when Ctrl is released.
 - Preserve normal shortcuts by interpreting single-key sequences on Ctrl release: Ctrl+C then release copies, Ctrl+V then release pastes, Ctrl+S then release saves.
-- Support multi-key sequences while Ctrl remains held: Ctrl+C then W then release can mean change word; Ctrl+D then W then release can mean delete word; Ctrl+D then D then release can mean delete line.
+- Treat single-key Ctrl chords and multi-key Ctrl-layer commands as distinct by waiting until Ctrl release before dispatching: hold Ctrl, press `s`, release Ctrl means save; hold Ctrl, press `s`, press `w`, release Ctrl means parse the multi-key sequence `sw`.
+- Support multi-key sequences while Ctrl remains held: Ctrl+C then W then release can mean change word; Ctrl+D then W then release can mean delete word; Ctrl+D then L then release can mean delete line.
 - Prefer Ctrl-release as the primary commit signal instead of post-key timeout recognition.
 - Use timeout only as a safety/cancel mechanism for stuck keys or abandoned sequences, not as the normal recognition path.
 - Avoid awkward multi-key modifier combos that require “pulpo manotas”.
 - Show the pending command in the dedicated command line while Ctrl is held, e.g. `ctrl:c` then `ctrl:cw`, while the status bar remains visible above it.
 - Provide Escape/cancel and safe fallback so accidental command entry is harmless.
 - Avoid conflicts with essential OS/window-manager shortcuts; decide which Ctrl sequences Slate owns and which stay native.
+- First implementation supports existing single-key Ctrl commands on release (`s`, `o`, `n`, `p`, `q`, `m`, `.`, `f`) plus `dl` for delete current line.
 
 ### T034 — Repeatable edits and lightweight macros
 
@@ -432,6 +435,93 @@ Scope:
 - Add unit tests for search result offsets and line/column mapping.
 - Add a lightweight performance guard where feasible so common one-letter queries do not regress into UI freezes.
 
+### T046 — Pragmatic command backlog: useful basics without becoming Vim
+
+Status: pending
+Scope:
+- Treat this as a curated backlog, not an instruction to implement every command immediately.
+- Prefer commands that map to clear editor operations and can be reused later by command palette, command line, and optional Ctrl-hold grammar.
+- Keep normal typing as the default; avoid a permanent Vim mode.
+
+Command groups worth considering:
+
+Editing lines:
+- `:delete-line` / `:dl` — delete current line.
+- `:duplicate-line` / `:dup` — duplicate current line below.
+- `:move-line-up` / `:mlu` — move current line or selected lines up; primary shortcut should be `Alt+Up`.
+- `:move-line-down` / `:mld` — move current line or selected lines down; primary shortcut should be `Alt+Down`.
+- `:join-line` / `:join` — join current line with next line.
+- `:sort-lines` — sort selected lines or current paragraph.
+- `:trim-line` — trim trailing whitespace on current line.
+- `:trim-buffer` — trim trailing whitespace in the whole file.
+
+Editing words/selections:
+- `:delete-word` / `:dw` — delete word after cursor.
+- `:delete-prev-word` — delete word before cursor.
+- `:change-word` / `:cw` — select/delete word and enter normal typing.
+- `:uppercase` / `:upper` — uppercase selection or word.
+- `:lowercase` / `:lower` — lowercase selection or word.
+- `:titlecase` — titlecase selection or heading text.
+- `:wrap-selection` — wrap selection with quotes, parentheses, brackets, backticks, or Markdown markers.
+- `:unwrap-selection` — remove matching wrapping delimiters when safe.
+
+Navigation:
+- Already implemented: `:goto` / `:g` / `:line` / `:l` with absolute and explicit relative targets.
+- `:top` / `:bottom` — jump to start/end of file.
+- `:next-heading` / `:nh` — jump to next Markdown heading.
+- `:prev-heading` / `:ph` — jump to previous Markdown heading.
+- `:next-blank` / `:prev-blank` — jump between paragraph boundaries.
+- `:center-cursor` — scroll current cursor line to the middle of the view.
+- `:back` / `:forward` — navigation history after goto/find/follow-link jumps.
+
+Search and replacement:
+- Already implemented: `:find` / `:f` with highlighted matches and `f`/`b` navigation while active.
+- `:replace old new` — replace next/current match with confirmation later.
+- `:replace-all old new` — whole-buffer replace, with confirmation/status count.
+- `:clear-search` — clear search highlights explicitly.
+- `:find-selection` — search for current selection.
+- `:grep` / `:search-files` — future vault/project text search.
+
+Markdown and notes:
+- `:toggle-task` / `:task` — toggle `- [ ]` / `- [x]` on current line.
+- `:make-task` — turn current line into an unchecked task.
+- `:heading 1..6` — convert current line to Markdown heading level.
+- `:promote-heading` / `:demote-heading` — adjust Markdown heading level.
+- `:insert-link` — insert Markdown link around selection or at cursor.
+- `:insert-wikilink` — insert `[[...]]` link later integrated with vault resolver.
+- `:format-table` — eventually align simple Markdown tables if practical.
+
+Files and buffers:
+- Already implemented basics: `:w`, `:q`, `:wq`, `:open`, `:new`.
+- `:recent` — open recent files picker/result list.
+- `:reopen` — reopen current file from disk after confirmation.
+- `:rename-file` — rename current file and update path.
+- `:copy-path` — copy full path or vault-relative path.
+- `:buffer-next` / `:bn` and `:buffer-prev` / `:bp` — future multi-buffer navigation.
+- `:buffer-close` / `:bd` — close current buffer when buffers exist.
+
+Capture and knowledge workflow:
+- `:scratch` — open scratch buffer.
+- `:capture` — append selection/current line to scratch.
+- `:daily` — open today's note.
+- `:yesterday` / `:tomorrow` — open adjacent daily notes.
+- `:append-daily` — append selection/current line to daily note.
+- `:new-note` — create note in selected vault.
+- `:backlinks` — show backlinks for current note once indexing exists.
+
+View and UI:
+- Already implemented: `:wrap`, `:preview`, `:settings`.
+- `:line-numbers absolute|relative` — command-line toggle for the setting.
+- `:theme name` — switch theme once theme system exists.
+- `:zoom-in` / `:zoom-out` / `:zoom-reset` — adjust editor font size.
+- `:status` — show current file/editor diagnostics in a textual result buffer.
+
+Safety and workflow:
+- `:undo` / `:redo` — proper editor history once implemented.
+- `:reload-config` — reload settings from disk.
+- `:validate-config` — validate future literate/plain config.
+- `:help command` — lightweight command help/discoverability.
+
 ## Suggested implementation order
 
 1. Native editor architecture: leave `egui::TextEdit` behind for the main document.
@@ -463,11 +553,12 @@ Scope:
 27. Textual result buffers.
 28. Templates.
 29. Core editing improvements.
-30. Theme system.
-31. Buffers.
-32. Curated defaults / Doom-like ergonomics.
-33. Literate Markdown configuration polish.
-34. Markdown preview improvements.
+30. Pragmatic command backlog triage: pick the smallest useful command batch before implementing.
+31. Theme system.
+32. Buffers.
+33. Curated defaults / Doom-like ergonomics.
+34. Literate Markdown configuration polish.
+35. Markdown preview improvements.
 
 <!-- THREADSUITE:START -->
 # ACTIVE_QUEUE.md

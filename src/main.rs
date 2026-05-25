@@ -124,6 +124,8 @@ struct SlateApp {
     command_history_limit: usize,
     line_number_mode: LineNumberMode,
     search_state: Option<SearchState>,
+    ctrl_layer_active: bool,
+    ctrl_layer_sequence: String,
 }
 
 impl SlateApp {
@@ -154,6 +156,8 @@ impl SlateApp {
             command_history_limit: 5,
             line_number_mode: LineNumberMode::Absolute,
             search_state: None,
+            ctrl_layer_active: false,
+            ctrl_layer_sequence: String::new(),
         };
 
         app.load_settings();
@@ -454,10 +458,21 @@ impl SlateApp {
                 let target = parts.collect::<Vec<_>>().join(" ");
                 self.goto_target(&target);
             }
+            "delete-line" | "dl" => self.delete_current_line(),
             "settings" | "set" | "prefs" | "preferences" => {
                 self.run_command(Command::Settings, ctx)
             }
             _ => self.status = format!("Unknown command: {input}"),
+        }
+    }
+
+    fn delete_current_line(&mut self) {
+        if self.buffer.delete_current_line() {
+            self.dirty = true;
+            self.search_state = None;
+            self.editor_view.request_scroll_to_cursor(&self.buffer);
+            self.status = "Deleted line".to_string();
+            self.focus_editor_once = true;
         }
     }
 
@@ -617,7 +632,143 @@ impl SlateApp {
         }
     }
 
+    fn handle_ctrl_layer(&mut self, ctx: &egui::Context) -> bool {
+        let layer_allowed = !self.command_line_focused
+            && !self.focus_command_line_once
+            && !self.palette_open
+            && !self.settings_open
+            && self.pending_action.is_none();
+
+        if !layer_allowed {
+            self.ctrl_layer_active = false;
+            self.ctrl_layer_sequence.clear();
+            return false;
+        }
+
+        let ctrl_down = ctx.input(|input| input.modifiers.ctrl);
+        if ctrl_down && !self.ctrl_layer_active {
+            self.ctrl_layer_active = true;
+            self.ctrl_layer_sequence.clear();
+        }
+
+        if self.ctrl_layer_active && ctrl_down {
+            let keys = ctx.input(|input| input.events.clone());
+            for event in keys {
+                let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                    ..
+                } = event
+                else {
+                    continue;
+                };
+                if !modifiers.ctrl || modifiers.alt || modifiers.shift {
+                    continue;
+                }
+                if let Some(ch) = Self::ctrl_layer_key(key) {
+                    self.ctrl_layer_sequence.push(ch);
+                }
+            }
+            self.status = if self.ctrl_layer_sequence.is_empty() {
+                "Ctrl layer".to_string()
+            } else {
+                format!("Ctrl layer: {}", self.ctrl_layer_sequence)
+            };
+            return true;
+        }
+
+        if self.ctrl_layer_active && !ctrl_down {
+            let sequence = std::mem::take(&mut self.ctrl_layer_sequence);
+            self.ctrl_layer_active = false;
+            if !sequence.is_empty() {
+                self.dispatch_ctrl_layer(&sequence, ctx);
+            }
+            return true;
+        }
+
+        false
+    }
+
+    fn ctrl_layer_key(key: Key) -> Option<char> {
+        match key {
+            Key::A => Some('a'),
+            Key::B => Some('b'),
+            Key::C => Some('c'),
+            Key::D => Some('d'),
+            Key::E => Some('e'),
+            Key::F => Some('f'),
+            Key::G => Some('g'),
+            Key::H => Some('h'),
+            Key::I => Some('i'),
+            Key::J => Some('j'),
+            Key::K => Some('k'),
+            Key::L => Some('l'),
+            Key::M => Some('m'),
+            Key::N => Some('n'),
+            Key::O => Some('o'),
+            Key::P => Some('p'),
+            Key::Q => Some('q'),
+            Key::R => Some('r'),
+            Key::S => Some('s'),
+            Key::T => Some('t'),
+            Key::U => Some('u'),
+            Key::V => Some('v'),
+            Key::W => Some('w'),
+            Key::X => Some('x'),
+            Key::Y => Some('y'),
+            Key::Z => Some('z'),
+            Key::Period => Some('.'),
+            _ => None,
+        }
+    }
+
+    fn dispatch_ctrl_layer(&mut self, sequence: &str, ctx: &egui::Context) {
+        match sequence {
+            "s" => self.run_command(Command::Save, ctx),
+            "o" => self.run_command(Command::Open, ctx),
+            "n" => self.run_command(Command::New, ctx),
+            "p" => {
+                self.palette_open = true;
+                self.palette_query.clear();
+                self.selected_command = 0;
+                self.focus_editor_once = false;
+            }
+            "q" => self.run_command(Command::Quit, ctx),
+            "m" => self.run_command(Command::TogglePreview, ctx),
+            "." => self.focus_command_line(),
+            "f" if self.search_state.is_some() => self.place_cursor_at_search_edge(true),
+            "f" => self.focus_find_command_line(),
+            "b" if self.search_state.is_some() => self.place_cursor_at_search_edge(false),
+            "dl" => self.delete_current_line(),
+            _ => self.status = format!("Unknown ctrl command: {sequence}"),
+        }
+    }
+
+    fn focus_command_line(&mut self) {
+        self.palette_open = false;
+        self.command_line.clear();
+        self.command_history_index = None;
+        self.command_line_focused = true;
+        self.focus_command_line_once = true;
+        self.focus_editor_once = false;
+    }
+
+    fn focus_find_command_line(&mut self) {
+        self.palette_open = false;
+        self.command_line = "find ".to_string();
+        self.command_history_index = None;
+        self.command_line_focused = true;
+        self.focus_command_line_once = true;
+        self.focus_editor_once = false;
+    }
+
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        if self.handle_ctrl_layer(ctx) {
+            return;
+        }
+
         let mut command = None;
         let mut execute_command_line = false;
         let mut previous_command = false;
@@ -1522,12 +1673,20 @@ impl eframe::App for SlateApp {
                     }
                     self.command_line_focused = response.has_focus();
                 } else {
+                    let (text, color) = if self.ctrl_layer_active {
+                        (format!("ctrl:{}", self.ctrl_layer_sequence), footer_accent)
+                    } else {
+                        (
+                            "command  w · q · wq · open <file> · preview · wrap".to_string(),
+                            footer_dim,
+                        )
+                    };
                     painter.text(
                         egui::pos2(input_rect.left(), input_rect.center().y - 0.5),
                         egui::Align2::LEFT_CENTER,
-                        "command  w · q · wq · open <file> · preview · wrap",
+                        text,
                         footer_font.clone(),
-                        footer_dim,
+                        color,
                     );
                     self.command_line_focused = false;
                 }

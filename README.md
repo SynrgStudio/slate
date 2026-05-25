@@ -26,6 +26,8 @@ slate ~/notes.md
 - `Ctrl+F` find (`f`/`b` next/previous, `Ctrl+F`/`Ctrl+B` place cursor after/before match)
 - `Ctrl+.` command line
 - `:g 10`, `:g 10:4`, `:g +5`, `:g -5` jump to line/column
+- `:delete-line` / `:dl` delete current line
+- Ctrl-hold layer: hold `Ctrl`, type `d` then `l`, release `Ctrl` to delete line
 - `:settings` configure history length and absolute/relative line numbers
 - `Ctrl+Q` quit
 
