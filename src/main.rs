@@ -571,6 +571,7 @@ impl SlateApp {
             "select-line" | "sl" => self.select_line(),
             "delete-word" | "dw" => self.delete_word(),
             "delete-line" | "dl" => self.delete_current_line(),
+            "duplicate-line" | "dup" => self.duplicate_current_line(),
             "move-line-up" | "mlu" => self.move_current_line_up(),
             "move-line-down" | "mld" => self.move_current_line_down(),
             "move-line-to-paragraph-start" | "mlps" => self.move_current_line_to_paragraph_start(),
@@ -646,6 +647,16 @@ impl SlateApp {
             self.search_state = None;
             self.editor_view.request_scroll_to_cursor(&self.buffer);
             self.status = "Deleted line".to_string();
+            self.focus_editor_once = true;
+        }
+    }
+
+    fn duplicate_current_line(&mut self) {
+        if self.buffer.duplicate_current_line() {
+            self.dirty = true;
+            self.search_state = None;
+            self.editor_view.request_scroll_to_cursor(&self.buffer);
+            self.status = "Duplicated line".to_string();
             self.focus_editor_once = true;
         }
     }
@@ -1183,6 +1194,7 @@ impl SlateApp {
             "sl" => self.select_line(),
             "dw" => self.delete_word(),
             "dl" => self.delete_current_line(),
+            "dup" => self.duplicate_current_line(),
             "gt" => self.go_to_top(),
             "gb" => self.go_to_bottom(),
             _ => self.status = format!("Unknown ctrl command: {sequence}"),
@@ -2264,11 +2276,11 @@ impl eframe::App for SlateApp {
                         ("C-p", "command palette", "C-.", "commandline"),
                         ("C-h", "shortcut help", "C-f", "find"),
                         ("C-m", "preview", "C-q", "quit"),
-                        ("C-d l", "delete line", "C-d w", "delete word"),
-                        ("C-s w", "select word", "C-s l", "select line"),
-                        ("C-g t", "go top", "C-g b", "go bottom"),
-                        ("Alt", "move lines/select words", "C-S", self.ctrl_shift_move_mode.hint()),
-                        ("esc", "close help", "", ""),
+                        ("C-d l", "delete line", "C-d u p", "duplicate line"),
+                        ("C-d w", "delete word", "C-s w", "select word"),
+                        ("C-s l", "select line", "C-g t", "go top"),
+                        ("C-g b", "go bottom", "Alt", "move/select"),
+                        ("C-S", self.ctrl_shift_move_mode.hint(), "esc", "close help"),
                     ];
                     let col_width = help_rect.width() * 0.48;
                     for (row, (left_key, left_desc, right_key, right_desc)) in

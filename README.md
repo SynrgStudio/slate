@@ -169,6 +169,7 @@ Editing/navigation commands:
 :select-line    :sl
 :delete-word    :dw
 :delete-line    :dl
+:duplicate-line :dup
 :move-line-up   :mlu
 :move-line-down :mld
 :move-line-to-paragraph-start :mlps
@@ -196,6 +197,7 @@ Examples:
 | `Ctrl` hold → `o` → release | Open |
 | `Ctrl` hold → `o l` → release | Open last file |
 | `Ctrl` hold → `d l` → release | Delete line |
+| `Ctrl` hold → `d u p` → release | Duplicate line |
 | `Ctrl` hold → `d w` → release | Delete word |
 | `Ctrl` hold → `s w` → release | Select word |
 | `Ctrl` hold → `s l` → release | Select line |

@@ -241,6 +241,29 @@ impl EditorBuffer {
         true
     }
 
+    pub(crate) fn duplicate_current_line(&mut self) -> bool {
+        let line_index = self.line_index_for_byte(self.cursor);
+        let (_, column) = self.cursor_line_col();
+        let line = self.line(line_index).to_string();
+        let insertion = if line_index + 1 < self.line_count() {
+            format!("{line}\n")
+        } else {
+            format!("\n{line}")
+        };
+        let insert_at = if line_index + 1 < self.line_count() {
+            self.line_start(line_index + 1)
+        } else {
+            self.text.len()
+        };
+
+        self.selection = None;
+        self.text.insert_str(insert_at, &insertion);
+        self.revision = self.revision.wrapping_add(1);
+        self.rebuild_line_index();
+        self.cursor = self.line_col_to_byte(line_index + 2, column + 1);
+        true
+    }
+
     pub(crate) fn move_current_line_up(&mut self) -> bool {
         let line_index = self.line_index_for_byte(self.cursor);
         if line_index == 0 {
@@ -747,6 +770,38 @@ mod tests {
         assert!(buffer.delete_current_line());
 
         assert_eq!(buffer.as_str(), "one\ntwo");
+    }
+
+    #[test]
+    fn editor_buffer_duplicates_current_middle_line() {
+        let mut buffer = EditorBuffer::from_text("one\ntwö\nthree".to_string());
+        buffer.set_cursor("one\nt".len());
+
+        assert!(buffer.duplicate_current_line());
+
+        assert_eq!(buffer.as_str(), "one\ntwö\ntwö\nthree");
+        assert_eq!(buffer.byte_to_line_col(buffer.cursor()), (3, 2));
+    }
+
+    #[test]
+    fn editor_buffer_duplicates_current_last_line() {
+        let mut buffer = EditorBuffer::from_text("one\ntwo".to_string());
+        buffer.set_cursor(buffer.as_str().len());
+
+        assert!(buffer.duplicate_current_line());
+
+        assert_eq!(buffer.as_str(), "one\ntwo\ntwo");
+        assert_eq!(buffer.byte_to_line_col(buffer.cursor()), (3, 4));
+    }
+
+    #[test]
+    fn editor_buffer_duplicates_empty_buffer_as_empty_line() {
+        let mut buffer = EditorBuffer::new();
+
+        assert!(buffer.duplicate_current_line());
+
+        assert_eq!(buffer.as_str(), "\n");
+        assert_eq!(buffer.byte_to_line_col(buffer.cursor()), (2, 1));
     }
 
     #[test]

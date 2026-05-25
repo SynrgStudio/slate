@@ -73,7 +73,7 @@ Scope:
 - Done: track and display current line/column in the statusbar.
 - Done: move current line up/down commands and `Alt+Up` / `Alt+Down` shortcuts.
 - Done: Alt structural vertical batch for current-line movement and paragraph-boundary movement.
-- Pending: duplicate line command.
+- Done: duplicate line command.
 - Continue adding useful Vim-inspired text operations without requiring a full Vim mode.
 
 ### T008 — Lightweight Markdown improvements
@@ -559,12 +559,19 @@ Batch 2 — Horizontal word selection: done.
 - Done: Vim mode: `Alt+h` extends word selection left; `Alt+l` extends word selection right.
 - Done: preserve normal typing and avoid permanent modes.
 
-Batch 3 — Duplicate line and polish:
-- Add `EditorBuffer::duplicate_current_line()` with tests.
-- Add `:duplicate-line` / `:dup`.
-- Decide whether duplicate should get an Alt shortcut or remain command/Ctrl-layer only.
-- Update shortcut help, README, and queue docs with the final Alt structural layer.
-- Add regression tests for line movement at first/last line, paragraph boundaries, Unicode lines, selection extension, and duplicate-line behavior.
+Batch 3 — Duplicate line and polish: done.
+- Done: add `EditorBuffer::duplicate_current_line()` with tests.
+- Done: add `:duplicate-line` / `:dup`.
+- Done: keep duplicate line out of Alt; expose it through commandline and Ctrl-layer `dup` so Alt stays structural movement/selection.
+- Done: update shortcut help, README, and queue docs with the final Alt structural layer.
+- Done: add regression tests for line movement at first/last line, paragraph boundaries, Unicode lines, selection extension, and duplicate-line behavior.
+
+Future follow-up — Duplicate placement transient mode:
+- Keep simple `:dup` stable first.
+- Add a transient duplicate-placement mode later, likely as `:duplicate-place` / `:dupp` before deciding whether it should replace `:dup`.
+- Behavior idea: duplicate current line, mark the duplicate as active, move it up/down while the transient mode is active, then confirm with `Enter`/`Space` or cancel with `Esc`.
+- Reuse Slate/Vim movement mapping for placement controls, probably `Ctrl+Shift` and/or existing Alt structural line movement semantics.
+- Show status/minibuffer help such as `duplicate placement: move · Enter/Space place · Esc cancel`.
 
 ## Suggested implementation order
 
@@ -584,38 +591,39 @@ Batch 3 — Duplicate line and polish:
 
 1. T007/T046 — Alt structural editing, batch 1: move current line up/down and to paragraph start/end. Done.
 2. T007/T046 — Alt structural editing, batch 2: extend word selection left/right. Done.
-3. T007/T046 — Alt structural editing, batch 3: duplicate line and shortcut/help/docs polish.
-4. T002/T013 — Improve command discovery: fuzzy command matching, palette/command-line consistency, and recent/frequent commands.
-5. T003 — Expand persistent config for wrap/preview/theme/vault while keeping the plain config simple.
-6. T004 — Build real recent-files list and `:recent` picker.
-7. T010 — Minimal project/vault file opener with fuzzy-ish file matching.
-8. T017 — Write down Slate's knowledge-work philosophy so future features do not drift into Obsidian/Emacs sprawl.
-9. T005 — Scratch buffer and quick capture workflow.
-10. T006 — Daily notes on top of the chosen notes/vault directory.
-11. T018 — Optional vault/root folder selection.
-12. T023 — Vault index architecture: Markdown source plus rebuildable SQLite cache.
-13. T020 — Global notes search, starting simple and later backed by the index.
-14. T024 — Link resolver trigger for `[[`.
-15. T025 — Link resolver ranking/result groups.
-16. T027 — Wiki-link parser and target resolver.
-17. T026 — Content-match deep link insertion with compact/full style toggle.
-18. T028 — Follow-link navigation and cursor jump.
-19. T029 — Link display ergonomics and visual affordances.
-20. T031 — Link resolver performance and indexing lifecycle.
-21. T030 — Backlinks and most-linked notes.
-22. T021 — Progressive organization commands.
-23. T015 — Task/checklist commands.
-24. T022 — Tags and lightweight metadata.
-25. T035 — Append/capture side effects from normal editing.
-26. T036 — Textual result buffers.
-27. T014 — Templates.
-28. T009 — Theme system.
-29. T008 — Lightweight Markdown preview improvements.
-30. T011 — Buffers / multi-file workflow.
-31. T012 — Optional auto-save.
-32. T034 — Repeatable edits and lightweight macros.
-33. T037 — Curated defaults instead of infinite configurability.
-34. T038 — Literate Markdown configuration polish.
+3. T007/T046 — Alt structural editing, batch 3: duplicate line and shortcut/help/docs polish. Done.
+4. T046 — Duplicate placement transient mode: duplicate a line into a movable pending placement, confirm with Enter/Space, cancel with Esc.
+5. T002/T013 — Improve command discovery: fuzzy command matching, palette/command-line consistency, and recent/frequent commands.
+6. T003 — Expand persistent config for wrap/preview/theme/vault while keeping the plain config simple.
+7. T004 — Build real recent-files list and `:recent` picker.
+8. T010 — Minimal project/vault file opener with fuzzy-ish file matching.
+9. T017 — Write down Slate's knowledge-work philosophy so future features do not drift into Obsidian/Emacs sprawl.
+10. T005 — Scratch buffer and quick capture workflow.
+11. T006 — Daily notes on top of the chosen notes/vault directory.
+12. T018 — Optional vault/root folder selection.
+13. T023 — Vault index architecture: Markdown source plus rebuildable SQLite cache.
+14. T020 — Global notes search, starting simple and later backed by the index.
+15. T024 — Link resolver trigger for `[[`.
+16. T025 — Link resolver ranking/result groups.
+17. T027 — Wiki-link parser and target resolver.
+18. T026 — Content-match deep link insertion with compact/full style toggle.
+19. T028 — Follow-link navigation and cursor jump.
+20. T029 — Link display ergonomics and visual affordances.
+21. T031 — Link resolver performance and indexing lifecycle.
+22. T030 — Backlinks and most-linked notes.
+23. T021 — Progressive organization commands.
+24. T015 — Task/checklist commands.
+25. T022 — Tags and lightweight metadata.
+26. T035 — Append/capture side effects from normal editing.
+27. T036 — Textual result buffers.
+28. T014 — Templates.
+29. T009 — Theme system.
+30. T008 — Lightweight Markdown preview improvements.
+31. T011 — Buffers / multi-file workflow.
+32. T012 — Optional auto-save.
+33. T034 — Repeatable edits and lightweight macros.
+34. T037 — Curated defaults instead of infinite configurability.
+35. T038 — Literate Markdown configuration polish.
 
 <!-- THREADSUITE:START -->
 # ACTIVE_QUEUE.md
