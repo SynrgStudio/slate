@@ -551,13 +551,13 @@ Batch 1 — Vertical line movement: done.
 - Done: show the pending Alt sequence in the minibuffer as `alt:i`, `alt:ii`, etc.
 - Done: keep this current-line only; selected-line ranges are a future extension.
 
-Batch 2 — Horizontal word selection:
-- Add `EditorBuffer` primitives to select/extend by words to the left and right.
-- Alt structural left key selects the word under/near the cursor and leaves the cursor at the left edge; repeated taps extend selection one more word left each time.
-- Alt structural right key selects the word under/near the cursor and leaves the cursor at the right edge; repeated taps extend selection one more word right each time.
-- Slate mode: `Alt+j` extends word selection left; `Alt+l` extends word selection right.
-- Vim mode: `Alt+h` extends word selection left; `Alt+l` extends word selection right.
-- Preserve normal typing and avoid permanent modes.
+Batch 2 — Horizontal word selection: done.
+- Done: add `EditorBuffer` primitives to select/extend by words to the left and right.
+- Done: Alt structural left key selects the word under/near the cursor and leaves the cursor at the left edge; repeated taps extend selection one more word left each time.
+- Done: Alt structural right key selects the word under/near the cursor and leaves the cursor at the right edge; repeated taps extend selection one more word right each time.
+- Done: Slate mode: `Alt+j` extends word selection left; `Alt+l` extends word selection right.
+- Done: Vim mode: `Alt+h` extends word selection left; `Alt+l` extends word selection right.
+- Done: preserve normal typing and avoid permanent modes.
 
 Batch 3 — Duplicate line and polish:
 - Add `EditorBuffer::duplicate_current_line()` with tests.
@@ -583,7 +583,7 @@ Batch 3 — Duplicate line and polish:
 ### Next practical sequence
 
 1. T007/T046 — Alt structural editing, batch 1: move current line up/down and to paragraph start/end. Done.
-2. T007/T046 — Alt structural editing, batch 2: extend word selection left/right.
+2. T007/T046 — Alt structural editing, batch 2: extend word selection left/right. Done.
 3. T007/T046 — Alt structural editing, batch 3: duplicate line and shortcut/help/docs polish.
 4. T002/T013 — Improve command discovery: fuzzy command matching, palette/command-line consistency, and recent/frequent commands.
 5. T003 — Expand persistent config for wrap/preview/theme/vault while keeping the plain config simple.

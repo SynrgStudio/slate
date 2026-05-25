@@ -219,6 +219,8 @@ Current batch:
 | Move current line down | `Alt+k` / `Alt+Down` | `Alt+j` / `Alt+Down` |
 | Move line to paragraph start | repeat up key, e.g. `Alt+i i` | repeat up key, e.g. `Alt+k k` |
 | Move line to paragraph end | repeat down key, e.g. `Alt+k k` | repeat down key, e.g. `Alt+j j` |
+| Extend word selection left | `Alt+j` repeatedly | `Alt+h` repeatedly |
+| Extend word selection right | `Alt+l` repeatedly | `Alt+l` repeatedly |
 
 A paragraph is a contiguous block of non-empty lines separated by blank lines.
 

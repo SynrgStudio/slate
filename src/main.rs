@@ -618,6 +618,28 @@ impl SlateApp {
         }
     }
 
+    fn select_word_left_extend(&mut self) {
+        if self.buffer.select_word_left_extend() {
+            self.search_state = None;
+            self.editor_view.request_scroll_to_cursor(&self.buffer);
+            self.status = "Selected word left".to_string();
+            self.focus_editor_once = true;
+        } else {
+            self.status = "No word to select left".to_string();
+        }
+    }
+
+    fn select_word_right_extend(&mut self) {
+        if self.buffer.select_word_right_extend() {
+            self.search_state = None;
+            self.editor_view.request_scroll_to_cursor(&self.buffer);
+            self.status = "Selected word right".to_string();
+            self.focus_editor_once = true;
+        } else {
+            self.status = "No word to select right".to_string();
+        }
+    }
+
     fn delete_current_line(&mut self) {
         if self.buffer.delete_current_line() {
             self.dirty = true;
@@ -933,6 +955,11 @@ impl SlateApp {
             CtrlShiftMoveMode::Vim => 'j',
             CtrlShiftMoveMode::Slate => 'k',
         };
+        let left_key = match self.ctrl_shift_move_mode {
+            CtrlShiftMoveMode::Vim => 'h',
+            CtrlShiftMoveMode::Slate => 'j',
+        };
+        let right_key = 'l';
 
         const ALT_DOUBLE_TAP_SECONDS: f64 = 0.12;
 
@@ -965,6 +992,20 @@ impl SlateApp {
             } else {
                 self.move_current_line_down();
             }
+            return true;
+        }
+
+        if ch == left_key {
+            self.alt_layer_sequence.push(ch);
+            self.alt_layer_last_key = None;
+            self.select_word_left_extend();
+            return true;
+        }
+
+        if ch == right_key {
+            self.alt_layer_sequence.push(ch);
+            self.alt_layer_last_key = None;
+            self.select_word_right_extend();
             return true;
         }
 
@@ -2059,7 +2100,7 @@ impl eframe::App for SlateApp {
                 let command_height = 30.0;
                 let history_row_height = 22.0;
                 let shortcut_help_row_height = 22.0;
-                let shortcut_help_rows = if self.shortcut_help_open { 9 } else { 0 };
+                let shortcut_help_rows = if self.shortcut_help_open { 10 } else { 0 };
                 let shortcut_help_height = shortcut_help_rows as f32 * shortcut_help_row_height;
                 let command_history_active = (self.command_line_focused
                     || self.focus_command_line_once)
@@ -2226,7 +2267,8 @@ impl eframe::App for SlateApp {
                         ("C-d l", "delete line", "C-d w", "delete word"),
                         ("C-s w", "select word", "C-s l", "select line"),
                         ("C-g t", "go top", "C-g b", "go bottom"),
-                        ("C-S", self.ctrl_shift_move_mode.hint(), "esc", "close help"),
+                        ("Alt", "move lines/select words", "C-S", self.ctrl_shift_move_mode.hint()),
+                        ("esc", "close help", "", ""),
                     ];
                     let col_width = help_rect.width() * 0.48;
                     for (row, (left_key, left_desc, right_key, right_desc)) in

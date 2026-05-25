@@ -301,6 +301,72 @@ impl EditorBuffer {
         true
     }
 
+    pub(crate) fn select_word_left_extend(&mut self) -> bool {
+        if let Some((selection_start, selection_end)) = self.selection {
+            if self.cursor == selection_end {
+                let Some((removed_start, _)) = self.word_before(selection_end) else {
+                    return false;
+                };
+                let new_end = self.trim_non_word_left(removed_start);
+                if new_end <= selection_start {
+                    self.selection = None;
+                    self.cursor = selection_start;
+                } else {
+                    self.selection = Some((selection_start, new_end));
+                    self.cursor = new_end;
+                }
+                return true;
+            }
+
+            let Some((start, _)) = self.word_before(selection_start) else {
+                return false;
+            };
+            self.selection = Some((start, selection_end));
+            self.cursor = start;
+            return true;
+        }
+
+        let Some((start, end)) = self.word_at_or_before(self.cursor) else {
+            return false;
+        };
+        self.selection = Some((start, end));
+        self.cursor = start;
+        true
+    }
+
+    pub(crate) fn select_word_right_extend(&mut self) -> bool {
+        if let Some((selection_start, selection_end)) = self.selection {
+            if self.cursor == selection_start {
+                let Some((_, removed_end)) = self.word_at_or_after(selection_start) else {
+                    return false;
+                };
+                let new_start = self.trim_non_word_right(removed_end);
+                if new_start >= selection_end {
+                    self.selection = None;
+                    self.cursor = selection_end;
+                } else {
+                    self.selection = Some((new_start, selection_end));
+                    self.cursor = new_start;
+                }
+                return true;
+            }
+
+            let Some((_, end)) = self.word_after(selection_end) else {
+                return false;
+            };
+            self.selection = Some((selection_start, end));
+            self.cursor = end;
+            return true;
+        }
+
+        let Some((start, end)) = self.word_at_or_after(self.cursor) else {
+            return false;
+        };
+        self.selection = Some((start, end));
+        self.cursor = end;
+        true
+    }
+
     pub(crate) fn delete_word(&mut self) -> bool {
         let Some((start, end)) = self.word_range_at_cursor() else {
             return false;
@@ -422,6 +488,82 @@ impl EditorBuffer {
             lines.push(String::new());
         }
         lines
+    }
+
+    fn word_ranges(&self) -> Vec<(usize, usize)> {
+        let mut ranges = Vec::new();
+        let mut start = None;
+        for (byte, ch) in self.text.char_indices() {
+            if Self::is_word_char(ch) {
+                start.get_or_insert(byte);
+            } else if let Some(start) = start.take() {
+                ranges.push((start, byte));
+            }
+        }
+        if let Some(start) = start {
+            ranges.push((start, self.text.len()));
+        }
+        ranges
+    }
+
+    fn word_at_or_before(&self, byte: usize) -> Option<(usize, usize)> {
+        let byte = self.clamp_to_char_boundary(byte);
+        self.word_ranges()
+            .into_iter()
+            .take_while(|(start, _)| *start <= byte)
+            .last()
+    }
+
+    fn word_before(&self, byte: usize) -> Option<(usize, usize)> {
+        let byte = self.clamp_to_char_boundary(byte);
+        self.word_ranges()
+            .into_iter()
+            .take_while(|(_, end)| *end <= byte)
+            .last()
+    }
+
+    fn word_at_or_after(&self, byte: usize) -> Option<(usize, usize)> {
+        let byte = self.clamp_to_char_boundary(byte);
+        self.word_ranges()
+            .into_iter()
+            .find(|(start, end)| (*start <= byte && byte < *end) || *start >= byte)
+    }
+
+    fn word_after(&self, byte: usize) -> Option<(usize, usize)> {
+        let byte = self.clamp_to_char_boundary(byte);
+        self.word_ranges()
+            .into_iter()
+            .find(|(start, _)| *start >= byte)
+    }
+
+    fn trim_non_word_left(&self, byte: usize) -> usize {
+        let mut byte = self.clamp_to_char_boundary(byte);
+        while byte > 0 {
+            let previous = self.previous_char_boundary(byte);
+            let Some(ch) = self.text[previous..byte].chars().next() else {
+                break;
+            };
+            if Self::is_word_char(ch) {
+                break;
+            }
+            byte = previous;
+        }
+        byte
+    }
+
+    fn trim_non_word_right(&self, byte: usize) -> usize {
+        let mut byte = self.clamp_to_char_boundary(byte);
+        while byte < self.text.len() {
+            let next = self.next_char_boundary(byte);
+            let Some(ch) = self.text[byte..next].chars().next() else {
+                break;
+            };
+            if Self::is_word_char(ch) {
+                break;
+            }
+            byte = next;
+        }
+        byte
     }
 
     fn word_range_at_cursor(&self) -> Option<(usize, usize)> {
@@ -661,6 +803,88 @@ mod tests {
         assert!(buffer.select_word());
 
         assert_eq!(buffer.selection(), Some((6, 17)));
+    }
+
+    #[test]
+    fn editor_buffer_extends_word_selection_left() {
+        let mut buffer = EditorBuffer::from_text("hello brave world".to_string());
+        buffer.set_cursor("hello brave world".len());
+
+        assert!(buffer.select_word_left_extend());
+        assert_eq!(buffer.selection(), Some((12, 17)));
+        assert_eq!(buffer.cursor(), 12);
+
+        assert!(buffer.select_word_left_extend());
+        assert_eq!(buffer.selection(), Some((6, 17)));
+        assert_eq!(buffer.cursor(), 6);
+
+        assert!(buffer.select_word_left_extend());
+        assert_eq!(buffer.selection(), Some((0, 17)));
+        assert_eq!(buffer.cursor(), 0);
+    }
+
+    #[test]
+    fn editor_buffer_extends_word_selection_right() {
+        let mut buffer = EditorBuffer::from_text("hello brave world".to_string());
+        buffer.set_cursor(0);
+
+        assert!(buffer.select_word_right_extend());
+        assert_eq!(buffer.selection(), Some((0, 5)));
+        assert_eq!(buffer.cursor(), 5);
+
+        assert!(buffer.select_word_right_extend());
+        assert_eq!(buffer.selection(), Some((0, 11)));
+        assert_eq!(buffer.cursor(), 11);
+
+        assert!(buffer.select_word_right_extend());
+        assert_eq!(buffer.selection(), Some((0, 17)));
+        assert_eq!(buffer.cursor(), 17);
+    }
+
+    #[test]
+    fn editor_buffer_extends_word_selection_with_unicode() {
+        let mut buffer = EditorBuffer::from_text("café mañana world".to_string());
+        buffer.set_cursor(0);
+
+        assert!(buffer.select_word_right_extend());
+        assert_eq!(buffer.selection(), Some((0, "café".len())));
+
+        assert!(buffer.select_word_right_extend());
+        assert_eq!(buffer.selection(), Some((0, "café mañana".len())));
+    }
+
+    #[test]
+    fn editor_buffer_shrinks_word_selection_from_active_edge() {
+        let mut buffer = EditorBuffer::from_text("hello brave world".to_string());
+        buffer.set_cursor("hello ".len());
+
+        assert!(buffer.select_word_right_extend());
+        assert!(buffer.select_word_right_extend());
+        assert_eq!(buffer.selection(), Some((6, 17)));
+        assert_eq!(buffer.cursor(), 17);
+
+        assert!(buffer.select_word_left_extend());
+        assert_eq!(buffer.selection(), Some((6, 11)));
+        assert_eq!(buffer.cursor(), 11);
+
+        assert!(buffer.select_word_left_extend());
+        assert_eq!(buffer.selection(), None);
+        assert_eq!(buffer.cursor(), 6);
+    }
+
+    #[test]
+    fn editor_buffer_shrinks_word_selection_from_left_edge() {
+        let mut buffer = EditorBuffer::from_text("hello brave world".to_string());
+        buffer.set_cursor("hello brave".len());
+
+        assert!(buffer.select_word_left_extend());
+        assert!(buffer.select_word_left_extend());
+        assert_eq!(buffer.selection(), Some((0, 11)));
+        assert_eq!(buffer.cursor(), 0);
+
+        assert!(buffer.select_word_right_extend());
+        assert_eq!(buffer.selection(), Some((6, 11)));
+        assert_eq!(buffer.cursor(), 6);
     }
 
     #[test]
