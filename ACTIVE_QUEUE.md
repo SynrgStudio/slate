@@ -2,27 +2,34 @@
 
 ## Queue
 
+Planning snapshot:
+- Completed foundation: native editor architecture/buffer/view/input/selection/find plus Ctrl-hold command layer.
+- Current near-term lane: finish statusbar/minibuffer, find regression harness, small editing basics, command discovery, config/recent files.
+- Later lane: scratch/daily/vault/search/wiki-link/index workflows.
+
 ### T001 — Review ThreadSuite generated context
 
-Status: pending
+Status: completed
 Scope:
 - Review inferred Rust/Cargo project context and confirm or edit generated facts.
 
 ### T002 — Command palette as Slate's primary interface
 
-Status: pending
+Status: in_progress
 Scope:
-- Add fuzzy command search instead of substring-only matching.
-- Add command aliases such as `w`, `q`, `wa`, `md`, `wrap`, `:w`, `:q`, and `:wq`.
-- Add recent/frequent commands.
-- Explore command arguments such as `open ~/notes/todo.md`.
+- Done: command-line aliases for save/quit/new/open/preview/wrap/settings/find/goto/delete/select/navigation basics.
+- Done: command arguments such as `open ~/notes/todo.md`.
+- Pending: add fuzzy command search instead of substring-only matching.
+- Pending: add recent/frequent commands.
 - Keep Slate command-palette-first: commands before menus/toolbars.
 
 ### T003 — Persistent configuration
 
-Status: pending
+Status: in_progress
 Scope:
-- Persist editor preferences: theme, word wrap, preview mode, last file, selected vault/notes folder, scratch behavior, wiki-link insert style, and link resolver behavior.
+- Done: lightweight config at `~/.config/slate/config.toml`.
+- Done: persist command history limit, line-number mode, last opened file, and Ctrl+Shift movement mode.
+- Pending: persist theme, word wrap, preview mode, selected vault/notes folder, scratch behavior, wiki-link insert style, and link resolver behavior.
 - Keep configuration lightweight and human-readable.
 - Add an optional configurable vault/root notes directory for knowledge-management workflows.
 - Support toggleable wiki-link styles: compact deep link (`file.md:line:column`) and full Markdown-friendly display link (`file.md:line:column|visible text`).
@@ -30,12 +37,12 @@ Scope:
 
 ### T004 — Recent files workflow
 
-Status: pending
+Status: in_progress
 Scope:
-- Track recently opened/saved files.
-- Track the last opened file and support `open-last` / `ol` plus Ctrl-layer `ol` as an early lightweight workflow.
-- Add `Open recent` command in the command palette.
-- Optionally reopen the last file at startup.
+- Done: track the last opened file and support `open-last` / `last` / `ol` plus Ctrl-layer `ol`.
+- Pending: track a real recent opened/saved files list.
+- Pending: add `Open recent` command in the command palette/minibuffer.
+- Pending: optionally reopen the last file at startup.
 
 ### T005 — Scratch buffer and quick capture
 
@@ -60,12 +67,13 @@ Scope:
 
 Status: in_progress
 Scope:
-- Track and display current line/column.
-- Add absolute and relative line-number modes, configurable in Settings.
-- Add `:goto` / `:g` / `:line` / `:l` commands for absolute jumps and explicit `+/-` relative jumps.
-- Add duplicate line, move line up/down, and delete line commands.
-- Add `Alt+Up` / `Alt+Down` as primary shortcuts to move the current line or selected lines.
-- Add useful Vim-inspired text operations without requiring a full Vim mode.
+- Done: absolute and relative line-number modes, configurable in Settings.
+- Done: `:goto` / `:g` / `:line` / `:l` commands for absolute jumps and explicit `+/-` relative jumps.
+- Done: delete line, select line, select word, delete word, top, and bottom commands.
+- Pending: track and display current line/column in the statusbar.
+- Pending: duplicate line and move line up/down commands.
+- Pending: add `Alt+Up` / `Alt+Down` as primary shortcuts to move the current line or selected lines.
+- Continue adding useful Vim-inspired text operations without requiring a full Vim mode.
 
 ### T008 — Lightweight Markdown improvements
 
@@ -110,11 +118,12 @@ Scope:
 
 ### T013 — Terminal/Vim-like command language
 
-Status: pending
+Status: in_progress
 Scope:
-- Support command palette commands like `save`, `quit`, `save quit`, `new`, `open`, `wrap`, and `preview`.
-- Support common aliases such as `:w`, `:q`, and `:wq`.
-- Allow knowledge commands like `:daily`, `:scratch`, `:recent`, and `:theme amber`.
+- Done: command line supports `save`, `quit`, `wq`, `new`, `open`, `wrap`, `preview`, `find`, `goto`, `settings`, and early edit/navigation commands.
+- Done: common aliases such as `:w`, `:q`, `:wq`, `:x`, `:e`, `:f`, `:g`, `:dl`, `:dw`, `:sw`, `:sl`, `:gt`, `:gb`.
+- Pending: route more commands through the palette itself and add fuzzy matching.
+- Pending: add knowledge commands like `:daily`, `:scratch`, `:recent`, and `:theme amber`.
 
 ### T014 — Templates
 
@@ -135,13 +144,13 @@ Scope:
 
 ### T016 — Richer status bar and command line layout
 
-Status: pending
+Status: completed
 Scope:
-- Show file path/name, modified state, status message, line/column, mode, wrap state, word count, and shortcut hint.
-- Move status bar to the penultimate line instead of the final line.
-- Reserve the final line as a dedicated command line / minibuffer.
-- Let transient UI modes such as Ctrl-hold command layer, command entry, search, link resolver, and future swipe-like actions use the command line.
-- When the command line is active, status remains visible above it instead of being replaced.
+- Done: statusbar shows file path/name, modified state, status message, active mode, wrap state, cursor line/column, line count, word count, char count, and shortcut hint.
+- Done: statusbar sits above a dedicated command line/minibuffer.
+- Done: command history, Ctrl-layer, shortcut help, command entry, and search use the bottom/minibuffer region without overlaying the editor.
+- Done: commandline inactive hint points to command entry, help, and palette.
+- Future modes such as link resolver, recent picker, file opener, and textual result buffers should reuse this statusbar/minibuffer pattern.
 - Keep the visual style terminal-like: status line plus command line, similar to Vim/Emacs minibuffer concepts.
 
 ### T017 — Slate knowledge-work philosophy
@@ -288,33 +297,28 @@ Scope:
 
 ### T032 — Soft Vim-inspired editing grammar
 
-Status: pending
+Status: in_progress
 Scope:
-- Explore Vim's useful editing grammar without adding a permanent Vim mode.
-- Support temporary/operator-style commands such as delete word, change word, delete line, change inside quotes/parens, and jump by word/paragraph.
+- Done: first transient grammar exists through Ctrl-hold release dispatch.
+- Done: `dl`, `dw`, `sw`, `sl`, `gt`, `gb`, `ol`, and shortcut help are implemented.
+- Done: Ctrl+Shift live navigation supports configurable Vim `h/j/k/l` or Slate `i/j/k/l` movement.
+- Pending: future operator-style commands such as change word, change inside quotes/parens, and jump by word/paragraph.
 - Avoid requiring constant mode toggling; prefer transient command capture, command palette actions, or leader/chord-style interactions.
 - Keep normal typing as the default behavior.
 - Make commands discoverable and configurable before expanding too far.
 
 ### T033 — Ctrl-hold command layer
 
-Status: in_progress
+Status: completed
 Scope:
-- Design a low-friction way to execute short editing commands like `dw` without becoming a full modal editor.
-- Use Ctrl as a physical temporary command layer: collect key sequence while Ctrl is held, then confirm when Ctrl is released.
-- Preserve normal shortcuts by interpreting single-key sequences on Ctrl release: Ctrl+C then release copies, Ctrl+V then release pastes, Ctrl+S then release saves.
-- Treat single-key Ctrl chords and multi-key Ctrl-layer commands as distinct by waiting until Ctrl release before dispatching: hold Ctrl, press `s`, release Ctrl means save; hold Ctrl, press `s`, press `w`, release Ctrl means parse the multi-key sequence `sw`.
-- Support multi-key sequences while Ctrl remains held: Ctrl+C then W then release can mean change word; Ctrl+D then W then release can mean delete word; Ctrl+D then L then release can mean delete line.
-- Prefer Ctrl-release as the primary commit signal instead of post-key timeout recognition.
-- Use timeout only as a safety/cancel mechanism for stuck keys or abandoned sequences, not as the normal recognition path.
-- Avoid awkward multi-key modifier combos that require “pulpo manotas”.
-- Show the pending command in the dedicated command line while Ctrl is held, e.g. `ctrl:c` then `ctrl:cw`, while the status bar remains visible above it.
-- Provide Escape/cancel and safe fallback so accidental command entry is harmless.
-- Avoid conflicts with essential OS/window-manager shortcuts; decide which Ctrl sequences Slate owns and which stay native.
-- First implementation supports existing single-key Ctrl commands on release (`s`, `o`, `n`, `p`, `q`, `m`, `.`, `f`) plus `dl` for delete current line and `ol` for open last file.
-- Additional early Ctrl-layer commands: `h` opens shortcut help, `sw` select word, `sl` select line, `dw` delete word, `gt` go to top, `gb` go to bottom.
-- Ctrl+Shift live navigation: while both modifiers are held, the selected movement mode moves immediately without waiting for release.
-- Movement mode is configurable in settings: Vim `h/j/k/l` or Slate `i/j/k/l` (`i` up, `j` left, `k` down, `l` right).
+- Done: Ctrl is a physical temporary command layer that collects key sequences while held and dispatches on Ctrl release.
+- Done: single-key Ctrl commands remain available on release: `s`, `o`, `n`, `p`, `q`, `m`, `.`, `f`, `b` in find context.
+- Done: multi-key commands: `dl` delete line, `dw` delete word, `sw` select word, `sl` select line, `ol` open last, `gt` go top, `gb` go bottom.
+- Done: `h` opens shortcut help in the minibuffer/help area.
+- Done: pending Ctrl sequence is shown in the dedicated command line while Ctrl is held.
+- Done: Ctrl+Shift live navigation moves immediately without waiting for release.
+- Done: movement mode is configurable in settings: Vim `h/j/k/l` or Slate `i/j/k/l` (`i` up, `j` left, `k` down, `l` right).
+- Future expansion belongs in T032/T046 rather than keeping this task open.
 
 ### T034 — Repeatable edits and lightweight macros
 
@@ -441,7 +445,7 @@ Scope:
 
 ### T046 — Pragmatic command backlog: useful basics without becoming Vim
 
-Status: pending
+Status: in_progress
 Scope:
 - Treat this as a curated backlog, not an instruction to implement every command immediately.
 - Prefer commands that map to clear editor operations and can be reused later by command palette, command line, and optional Ctrl-hold grammar.
@@ -530,41 +534,53 @@ Safety and workflow:
 
 ## Suggested implementation order
 
-1. Native editor architecture: leave `egui::TextEdit` behind for the main document.
-2. EditorBuffer text model with tests.
-3. Native EditorView renderer for visible lines.
-4. Native editor input handling for minimum viable editing.
-5. Native selection, cursor jump, and scroll-to-position.
-6. Search/find on native editor primitives, using the command line as minibuffer.
-7. Find fixture and regression harness.
-8. Define/preserve Slate knowledge-work philosophy.
-9. Persistent configuration, literate Markdown config, and optional vault selection.
-10. Vault index architecture: Markdown source plus rebuildable SQLite cache.
-11. Command palette improvements and terminal/Vim-like command language.
-12. Scratch/inbox and quick capture.
-13. Daily notes.
-14. Recent files.
-15. Link resolver trigger for `[[`.
-16. Link resolver ranking/result groups.
-17. Wiki-link parser and target resolver.
-18. Content-match deep link insertion with compact/full style toggle.
-19. Follow-link navigation and cursor jump.
-20. Global vault search.
-21. Backlinks and most-linked notes.
-22. Tasks, tags, and progressive organization commands.
-23. Append/capture side effects from normal editing.
-24. Status bar plus dedicated command line layout.
-25. Soft Vim-inspired editing grammar and Ctrl-hold command layer.
-26. Repeatable edits and lightweight macros.
-27. Textual result buffers.
-28. Templates.
-29. Core editing improvements.
-30. Pragmatic command backlog triage: pick the smallest useful command batch before implementing.
-31. Theme system.
-32. Buffers.
-33. Curated defaults / Doom-like ergonomics.
-34. Literate Markdown configuration polish.
-35. Markdown preview improvements.
+### Completed foundation
+
+1. T001 — Review generated context.
+2. T039 — Native editor architecture: leave `egui::TextEdit` behind for the main document.
+3. T040 — EditorBuffer text model with tests.
+4. T041 — Native EditorView renderer for visible lines.
+5. T042 — Native editor input handling for minimum viable editing.
+6. T043 — Native selection, cursor jump, and scroll-to-position.
+7. T044 — Search/find on native editor primitives, using the command line as minibuffer.
+8. T033 — Ctrl-hold command layer and Ctrl+Shift live movement.
+9. T016 — Richer statusbar/minibuffer layout.
+
+### Next practical sequence
+
+1. T045 — Finish find fixture/regression harness and basic performance guard.
+2. T007/T046 — Complete the next tiny editing batch: duplicate line, move line up/down, `Alt+Up`, `Alt+Down`.
+3. T002/T013 — Improve command discovery: fuzzy command matching, palette/command-line consistency, and recent/frequent commands.
+4. T003 — Expand persistent config for wrap/preview/theme/vault while keeping the plain config simple.
+5. T004 — Build real recent-files list and `:recent` picker.
+6. T010 — Minimal project/vault file opener with fuzzy-ish file matching.
+7. T017 — Write down Slate's knowledge-work philosophy so future features do not drift into Obsidian/Emacs sprawl.
+8. T005 — Scratch buffer and quick capture workflow.
+9. T006 — Daily notes on top of the chosen notes/vault directory.
+10. T018 — Optional vault/root folder selection.
+11. T023 — Vault index architecture: Markdown source plus rebuildable SQLite cache.
+12. T020 — Global notes search, starting simple and later backed by the index.
+13. T024 — Link resolver trigger for `[[`.
+14. T025 — Link resolver ranking/result groups.
+15. T027 — Wiki-link parser and target resolver.
+16. T026 — Content-match deep link insertion with compact/full style toggle.
+17. T028 — Follow-link navigation and cursor jump.
+18. T029 — Link display ergonomics and visual affordances.
+19. T031 — Link resolver performance and indexing lifecycle.
+20. T030 — Backlinks and most-linked notes.
+21. T021 — Progressive organization commands.
+22. T015 — Task/checklist commands.
+23. T022 — Tags and lightweight metadata.
+24. T035 — Append/capture side effects from normal editing.
+25. T036 — Textual result buffers.
+26. T014 — Templates.
+27. T009 — Theme system.
+28. T008 — Lightweight Markdown preview improvements.
+29. T011 — Buffers / multi-file workflow.
+30. T012 — Optional auto-save.
+31. T034 — Repeatable edits and lightweight macros.
+32. T037 — Curated defaults instead of infinite configurability.
+33. T038 — Literate Markdown configuration polish.
 
 <!-- THREADSUITE:START -->
 # ACTIVE_QUEUE.md
@@ -573,7 +589,7 @@ Safety and workflow:
 
 ### T001 — Review ThreadSuite generated context
 
-Status: pending
+Status: completed
 Scope:
 - Review inferred Rust/Cargo project context and confirm or edit generated facts.
 <!-- THREADSUITE:END -->

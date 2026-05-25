@@ -1724,7 +1724,7 @@ impl eframe::App for SlateApp {
                 let command_height = 30.0;
                 let history_row_height = 22.0;
                 let shortcut_help_row_height = 22.0;
-                let shortcut_help_rows = if self.shortcut_help_open { 8 } else { 0 };
+                let shortcut_help_rows = if self.shortcut_help_open { 9 } else { 0 };
                 let shortcut_help_height = shortcut_help_rows as f32 * shortcut_help_row_height;
                 let command_history_active = (self.command_line_focused
                     || self.focus_command_line_once)
@@ -1805,7 +1805,25 @@ impl eframe::App for SlateApp {
                 let lines = self.buffer.line_count();
                 let chars = self.buffer.as_str().chars().count();
                 let words = self.buffer.as_str().split_whitespace().count();
-                let mode = if self.preview { "preview" } else { "edit" };
+                let (cursor_line, cursor_col) = self.buffer.cursor_line_col();
+                let cursor_line = cursor_line + 1;
+                let cursor_col = cursor_col + 1;
+                let base_mode = if self.preview { "preview" } else { "edit" };
+                let active_mode = if self.shortcut_help_open {
+                    "help"
+                } else if self.ctrl_layer_active {
+                    "ctrl"
+                } else if self.command_line_focused || self.focus_command_line_once {
+                    "command"
+                } else if self.search_state.is_some() {
+                    "find"
+                } else if self.settings_open {
+                    "settings"
+                } else if self.palette_open {
+                    "palette"
+                } else {
+                    base_mode
+                };
                 let wrap = if self.wrap { "wrap" } else { "nowrap" };
 
                 let (status_rect, _) = ui.allocate_exact_size(
@@ -1839,7 +1857,7 @@ impl eframe::App for SlateApp {
                 let shortcut_rect = painter.text(
                     egui::pos2(status_right, status_y),
                     egui::Align2::RIGHT_CENTER,
-                    "[Ctrl+P]",
+                    "[Ctrl+P] [Ctrl+H]",
                     footer_font.clone(),
                     footer_accent,
                 );
@@ -1847,7 +1865,9 @@ impl eframe::App for SlateApp {
                 painter.text(
                     egui::pos2(status_right, status_y),
                     egui::Align2::RIGHT_CENTER,
-                    format!("{mode} · {wrap} · {lines}l · {words}w · {chars}c"),
+                    format!(
+                        "{active_mode} · {wrap} · ln {cursor_line}, col {cursor_col} · {lines}l · {words}w · {chars}c"
+                    ),
                     footer_font.clone(),
                     footer_dim,
                 );
@@ -1864,7 +1884,8 @@ impl eframe::App for SlateApp {
                         ("C-s", "save", "C-o", "open file"),
                         ("C-o l", "open last", "C-n", "new buffer"),
                         ("C-p", "command palette", "C-.", "commandline"),
-                        ("C-f", "find", "C-m", "preview"),
+                        ("C-h", "shortcut help", "C-f", "find"),
+                        ("C-m", "preview", "C-q", "quit"),
                         ("C-d l", "delete line", "C-d w", "delete word"),
                         ("C-s w", "select word", "C-s l", "select line"),
                         ("C-g t", "go top", "C-g b", "go bottom"),
@@ -1990,7 +2011,7 @@ impl eframe::App for SlateApp {
                         input_rect,
                         TextEdit::singleline(&mut self.command_line)
                             .hint_text(
-                                RichText::new("command  w · q · wq · open <file> · preview · wrap")
+                                RichText::new("command  Ctrl+. enter · Ctrl+H help · Ctrl+P palette")
                                     .font(footer_font.clone())
                                     .color(footer_dim),
                             )
@@ -2011,7 +2032,7 @@ impl eframe::App for SlateApp {
                         ("shortcuts  [esc] close".to_string(), footer_accent)
                     } else {
                         (
-                            "command  w · q · wq · open <file> · preview · wrap · Ctrl+H help"
+                            "command  Ctrl+. enter · Ctrl+H help · Ctrl+P palette · w · q · wq"
                                 .to_string(),
                             footer_dim,
                         )
