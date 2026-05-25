@@ -146,6 +146,11 @@ impl Command {
     }
 }
 
+struct DuplicatePlacement {
+    snapshot: String,
+    was_dirty: bool,
+}
+
 struct SlateApp {
     buffer: EditorBuffer,
     editor_view: EditorView,
@@ -180,6 +185,12 @@ struct SlateApp {
     alt_layer_sequence: String,
     alt_layer_last_key: Option<char>,
     alt_layer_last_key_time: f64,
+    ctrl_alt_layer_active: bool,
+    ctrl_alt_layer_sequence: String,
+    ctrl_alt_layer_last_key: Option<char>,
+    ctrl_alt_layer_last_key_time: f64,
+    duplicate_placement: Option<DuplicatePlacement>,
+    suppress_editor_keyboard_once: bool,
 }
 
 impl SlateApp {
@@ -220,6 +231,12 @@ impl SlateApp {
             alt_layer_sequence: String::new(),
             alt_layer_last_key: None,
             alt_layer_last_key_time: 0.0,
+            ctrl_alt_layer_active: false,
+            ctrl_alt_layer_sequence: String::new(),
+            ctrl_alt_layer_last_key: None,
+            ctrl_alt_layer_last_key_time: 0.0,
+            duplicate_placement: None,
+            suppress_editor_keyboard_once: false,
         };
 
         app.load_settings();
@@ -572,6 +589,7 @@ impl SlateApp {
             "delete-word" | "dw" => self.delete_word(),
             "delete-line" | "dl" => self.delete_current_line(),
             "duplicate-line" | "dup" => self.duplicate_current_line(),
+            "duplicate-place" | "dupp" => self.start_duplicate_placement(),
             "move-line-up" | "mlu" => self.move_current_line_up(),
             "move-line-down" | "mld" => self.move_current_line_down(),
             "move-line-to-paragraph-start" | "mlps" => self.move_current_line_to_paragraph_start(),
@@ -658,6 +676,67 @@ impl SlateApp {
             self.editor_view.request_scroll_to_cursor(&self.buffer);
             self.status = "Duplicated line".to_string();
             self.focus_editor_once = true;
+        }
+    }
+
+    fn start_duplicate_placement(&mut self) {
+        let snapshot = self.buffer.as_str().to_string();
+        let was_dirty = self.dirty;
+        if self.buffer.duplicate_current_line() {
+            self.duplicate_placement = Some(DuplicatePlacement {
+                snapshot,
+                was_dirty,
+            });
+            self.dirty = true;
+            self.search_state = None;
+            self.editor_view.request_scroll_to_cursor(&self.buffer);
+            self.status = "Duplicate placement: move · Enter/Space place · Esc cancel".to_string();
+            self.focus_editor_once = true;
+        }
+    }
+
+    fn accept_duplicate_placement(&mut self) {
+        if self.duplicate_placement.take().is_some() {
+            self.dirty = true;
+            self.status = "Duplicate placed".to_string();
+            self.focus_editor_once = true;
+            self.suppress_editor_keyboard_once = true;
+        }
+    }
+
+    fn cancel_duplicate_placement(&mut self) {
+        if let Some(placement) = self.duplicate_placement.take() {
+            self.buffer.set_text(placement.snapshot);
+            self.dirty = placement.was_dirty;
+            self.search_state = None;
+            self.editor_view.request_scroll_to_cursor(&self.buffer);
+            self.status = "Duplicate placement cancelled".to_string();
+            self.focus_editor_once = true;
+            self.suppress_editor_keyboard_once = true;
+        }
+    }
+
+    fn move_duplicate_placement_up(&mut self) {
+        if self.buffer.move_current_line_up() {
+            self.dirty = true;
+            self.search_state = None;
+            self.editor_view.request_scroll_to_cursor(&self.buffer);
+            self.status = "Duplicate placement: moved up".to_string();
+            self.focus_editor_once = true;
+        } else {
+            self.status = "Duplicate already at top".to_string();
+        }
+    }
+
+    fn move_duplicate_placement_down(&mut self) {
+        if self.buffer.move_current_line_down() {
+            self.dirty = true;
+            self.search_state = None;
+            self.editor_view.request_scroll_to_cursor(&self.buffer);
+            self.status = "Duplicate placement: moved down".to_string();
+            self.focus_editor_once = true;
+        } else {
+            self.status = "Duplicate already at bottom".to_string();
         }
     }
 
@@ -880,6 +959,244 @@ impl SlateApp {
             && !self.palette_open
             && !self.settings_open
             && self.pending_action.is_none()
+    }
+
+    fn handle_duplicate_placement(&mut self, ctx: &egui::Context) -> bool {
+        if self.duplicate_placement.is_none() {
+            return false;
+        }
+
+        let mut accept = false;
+        let mut cancel = false;
+        let mut move_up = false;
+        let mut move_down = false;
+
+        ctx.input(|input| {
+            for event in &input.events {
+                let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                    ..
+                } = event
+                else {
+                    continue;
+                };
+
+                if modifiers.ctrl && modifiers.shift && !modifiers.alt {
+                    match (self.ctrl_shift_move_mode, key) {
+                        (CtrlShiftMoveMode::Vim, Key::K) | (CtrlShiftMoveMode::Slate, Key::I) => {
+                            move_up = true;
+                        }
+                        (CtrlShiftMoveMode::Vim, Key::J) | (CtrlShiftMoveMode::Slate, Key::K) => {
+                            move_down = true;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                if modifiers.alt && !modifiers.ctrl && !modifiers.shift {
+                    match (self.ctrl_shift_move_mode, key) {
+                        (_, Key::ArrowUp)
+                        | (CtrlShiftMoveMode::Vim, Key::K)
+                        | (CtrlShiftMoveMode::Slate, Key::I) => {
+                            move_up = true;
+                        }
+                        (_, Key::ArrowDown)
+                        | (CtrlShiftMoveMode::Vim, Key::J)
+                        | (CtrlShiftMoveMode::Slate, Key::K) => {
+                            move_down = true;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                if modifiers.is_none() {
+                    match key {
+                        Key::Enter | Key::Space => accept = true,
+                        Key::Escape => cancel = true,
+                        Key::ArrowUp => move_up = true,
+                        Key::ArrowDown => move_down = true,
+                        _ => {}
+                    }
+                }
+            }
+        });
+
+        if cancel {
+            self.cancel_duplicate_placement();
+            return true;
+        }
+        if accept {
+            self.accept_duplicate_placement();
+            return true;
+        }
+        if move_up {
+            self.move_duplicate_placement_up();
+            return true;
+        }
+        if move_down {
+            self.move_duplicate_placement_down();
+            return true;
+        }
+
+        self.status = "Duplicate placement: move · Enter/Space place · Esc cancel".to_string();
+        true
+    }
+
+    fn handle_shift_alt_layer(&mut self, ctx: &egui::Context) -> bool {
+        if !self.layer_allowed() {
+            self.ctrl_alt_layer_active = false;
+            self.ctrl_alt_layer_sequence.clear();
+            self.ctrl_alt_layer_last_key = None;
+            return false;
+        }
+
+        let shift_alt_down = ctx
+            .input(|input| input.modifiers.shift && input.modifiers.alt && !input.modifiers.ctrl);
+        if shift_alt_down && !self.ctrl_alt_layer_active {
+            self.ctrl_alt_layer_active = true;
+            self.ctrl_alt_layer_sequence.clear();
+            self.ctrl_alt_layer_last_key = None;
+        }
+
+        if self.ctrl_alt_layer_active && shift_alt_down {
+            let now = ctx.input(|input| input.time);
+            let keys = ctx.input(|input| input.events.clone());
+            let mut handled = false;
+            for event in keys {
+                let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                    ..
+                } = event
+                else {
+                    continue;
+                };
+                if !modifiers.shift || !modifiers.alt || modifiers.ctrl {
+                    continue;
+                }
+
+                let Some(ch) = Self::ctrl_layer_key(key) else {
+                    continue;
+                };
+                if self.dispatch_ctrl_alt_layer_key(ch, now) {
+                    handled = true;
+                }
+            }
+
+            if !handled {
+                self.status = if self.ctrl_alt_layer_sequence.is_empty() {
+                    "Shift+Alt movement layer".to_string()
+                } else {
+                    format!("Shift+Alt movement layer: {}", self.ctrl_alt_layer_sequence)
+                };
+            }
+            return true;
+        }
+
+        if self.ctrl_alt_layer_active && !shift_alt_down {
+            self.ctrl_alt_layer_active = false;
+            self.ctrl_alt_layer_sequence.clear();
+            self.ctrl_alt_layer_last_key = None;
+            return true;
+        }
+
+        false
+    }
+
+    fn dispatch_ctrl_alt_layer_key(&mut self, ch: char, now: f64) -> bool {
+        let up_key = match self.ctrl_shift_move_mode {
+            CtrlShiftMoveMode::Vim => 'k',
+            CtrlShiftMoveMode::Slate => 'i',
+        };
+        let down_key = match self.ctrl_shift_move_mode {
+            CtrlShiftMoveMode::Vim => 'j',
+            CtrlShiftMoveMode::Slate => 'k',
+        };
+        let left_key = match self.ctrl_shift_move_mode {
+            CtrlShiftMoveMode::Vim => 'h',
+            CtrlShiftMoveMode::Slate => 'j',
+        };
+        let right_key = 'l';
+        const CTRL_ALT_SEQUENCE_SECONDS: f64 = 0.12;
+
+        let within_sequence = self.ctrl_alt_layer_last_key.is_some()
+            && now - self.ctrl_alt_layer_last_key_time <= CTRL_ALT_SEQUENCE_SECONDS;
+        if !within_sequence {
+            self.ctrl_alt_layer_sequence.clear();
+        }
+
+        self.ctrl_alt_layer_sequence.push(ch);
+        self.ctrl_alt_layer_last_key = Some(ch);
+        self.ctrl_alt_layer_last_key_time = now;
+
+        if self.ctrl_alt_layer_sequence.chars().count() < 2 {
+            return true;
+        }
+
+        let sequence = std::mem::take(&mut self.ctrl_alt_layer_sequence);
+        self.ctrl_alt_layer_last_key = None;
+        let mut chars = sequence.chars();
+        let first = chars.next().unwrap_or_default();
+        let second = chars.next().unwrap_or_default();
+
+        if first == up_key && second == up_key {
+            if self.buffer.move_to_paragraph_start() {
+                self.after_cursor_jump("Paragraph start");
+            } else {
+                self.status = "No paragraph start".to_string();
+            }
+            return true;
+        }
+        if first == down_key && second == down_key {
+            if self.buffer.move_to_paragraph_end() {
+                self.after_cursor_jump("Paragraph end");
+            } else {
+                self.status = "No paragraph end".to_string();
+            }
+            return true;
+        }
+        if first == left_key && second == left_key {
+            if self.buffer.move_to_word_start_left() {
+                self.after_cursor_jump("Word start");
+            } else {
+                self.status = "No word start".to_string();
+            }
+            return true;
+        }
+        if first == right_key && second == right_key {
+            if self.buffer.move_to_word_end_right() {
+                self.after_cursor_jump("Word end");
+            } else {
+                self.status = "No word end".to_string();
+            }
+            return true;
+        }
+        if first == left_key && second == right_key {
+            self.buffer.move_to_line_end();
+            self.after_cursor_jump("Line end");
+            return true;
+        }
+        if first == right_key && second == left_key {
+            self.buffer.move_to_line_start();
+            self.after_cursor_jump("Line start");
+            return true;
+        }
+
+        false
+    }
+
+    fn after_cursor_jump(&mut self, status: &str) {
+        self.search_state = None;
+        self.editor_view.request_scroll_to_cursor(&self.buffer);
+        self.status = status.to_string();
+        self.focus_editor_once = true;
     }
 
     fn handle_alt_layer(&mut self, ctx: &egui::Context) -> bool {
@@ -1195,6 +1512,7 @@ impl SlateApp {
             "dw" => self.delete_word(),
             "dl" => self.delete_current_line(),
             "dup" => self.duplicate_current_line(),
+            "dupp" => self.start_duplicate_placement(),
             "gt" => self.go_to_top(),
             "gb" => self.go_to_bottom(),
             _ => self.status = format!("Unknown ctrl command: {sequence}"),
@@ -1233,6 +1551,14 @@ impl SlateApp {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        if self.handle_duplicate_placement(ctx) {
+            return;
+        }
+
+        if self.handle_shift_alt_layer(ctx) {
+            return;
+        }
+
         if self.handle_alt_layer(ctx) {
             return;
         }
@@ -2112,7 +2438,7 @@ impl eframe::App for SlateApp {
                 let command_height = 30.0;
                 let history_row_height = 22.0;
                 let shortcut_help_row_height = 22.0;
-                let shortcut_help_rows = if self.shortcut_help_open { 10 } else { 0 };
+                let shortcut_help_rows = if self.shortcut_help_open { 14 } else { 0 };
                 let shortcut_help_height = shortcut_help_rows as f32 * shortcut_help_row_height;
                 let command_history_active = (self.command_line_focused
                     || self.focus_command_line_once)
@@ -2131,6 +2457,13 @@ impl eframe::App for SlateApp {
                 );
 
                 self.editor_view.observe_buffer(&self.buffer);
+                let editor_keyboard_enabled =
+                    self.duplicate_placement.is_none() && !self.suppress_editor_keyboard_once;
+                let active_line_text_highlight = self
+                    .duplicate_placement
+                    .as_ref()
+                    .map(|_| self.buffer.cursor_line_col().0);
+                self.suppress_editor_keyboard_once = false;
 
                 ui.allocate_ui_with_layout(
                     editor_size,
@@ -2144,6 +2477,8 @@ impl eframe::App for SlateApp {
                                     self.wrap,
                                     self.search_state.as_ref(),
                                     self.line_number_mode,
+                                    editor_keyboard_enabled,
+                                    active_line_text_highlight,
                                 );
                                 if self.focus_editor_once
                                     && !self.palette_open
@@ -2166,6 +2501,8 @@ impl eframe::App for SlateApp {
                                 self.wrap,
                                 self.search_state.as_ref(),
                                 self.line_number_mode,
+                                editor_keyboard_enabled,
+                                active_line_text_highlight,
                             );
                             if self.focus_editor_once
                                 && !self.palette_open
@@ -2199,6 +2536,10 @@ impl eframe::App for SlateApp {
                 let base_mode = if self.preview { "preview" } else { "edit" };
                 let active_mode = if self.shortcut_help_open {
                     "help"
+                } else if self.duplicate_placement.is_some() {
+                    "dup"
+                } else if self.ctrl_alt_layer_active {
+                    "shift-alt"
                 } else if self.alt_layer_active {
                     "alt"
                 } else if self.ctrl_layer_active {
@@ -2276,11 +2617,15 @@ impl eframe::App for SlateApp {
                         ("C-p", "command palette", "C-.", "commandline"),
                         ("C-h", "shortcut help", "C-f", "find"),
                         ("C-m", "preview", "C-q", "quit"),
-                        ("C-d l", "delete line", "C-d u p", "duplicate line"),
-                        ("C-d w", "delete word", "C-s w", "select word"),
-                        ("C-s l", "select line", "C-g t", "go top"),
-                        ("C-g b", "go bottom", "Alt", "move/select"),
-                        ("C-S", self.ctrl_shift_move_mode.hint(), "esc", "close help"),
+                        ("C-d l", "delete line", "C-d w", "delete word"),
+                        ("C-s w", "select word", "C-s l", "select line"),
+                        ("C-d u p", "duplicate line", "C-d u p p", "duplicate place"),
+                        ("C-g t", "go top", "C-g b", "go bottom"),
+                        ("C-S", self.ctrl_shift_move_mode.hint(), "Caps", "ijkl arrows"),
+                        ("Alt ↑/↓", "move line", "Alt up/down", "line/paragraph"),
+                        ("Alt left/right", "word select", "dup mode", "move/place/cancel"),
+                        ("S-Alt ii/kk", "paragraph jump", "S-Alt jj/ll", "word jump"),
+                        ("S-Alt jl/lj", "line end/start", "esc", "close help"),
                     ];
                     let col_width = help_rect.width() * 0.48;
                     for (row, (left_key, left_desc, right_key, right_desc)) in
@@ -2427,7 +2772,14 @@ impl eframe::App for SlateApp {
                         Stroke::new(1.0, footer_accent),
                     );
                 } else {
-                    let (text, color) = if self.alt_layer_active {
+                    let (text, color) = if self.duplicate_placement.is_some() {
+                        (
+                            "duplicate placement  Alt movement or Ctrl+Shift movement · Enter/Space place · Esc cancel".to_string(),
+                            footer_accent,
+                        )
+                    } else if self.ctrl_alt_layer_active {
+                        (format!("shift+alt:{}", self.ctrl_alt_layer_sequence), footer_accent)
+                    } else if self.alt_layer_active {
                         (format!("alt:{}", self.alt_layer_sequence), footer_accent)
                     } else if self.ctrl_layer_active {
                         (format!("ctrl:{}", self.ctrl_layer_sequence), footer_accent)

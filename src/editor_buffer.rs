@@ -153,6 +153,67 @@ impl EditorBuffer {
         self.set_cursor(self.text.len());
     }
 
+    pub(crate) fn move_to_paragraph_start(&mut self) -> bool {
+        if self.text.is_empty() {
+            return false;
+        }
+        let line_index = self.line_index_for_byte(self.cursor);
+        if self.line(line_index).trim().is_empty() {
+            return false;
+        }
+
+        let mut target = line_index;
+        while target > 0 && !self.line(target - 1).trim().is_empty() {
+            target -= 1;
+        }
+        self.set_cursor(self.line_start(target));
+        true
+    }
+
+    pub(crate) fn move_to_paragraph_end(&mut self) -> bool {
+        if self.text.is_empty() {
+            return false;
+        }
+        let line_index = self.line_index_for_byte(self.cursor);
+        if self.line(line_index).trim().is_empty() {
+            return false;
+        }
+
+        let mut target = line_index;
+        while target + 1 < self.line_count() && !self.line(target + 1).trim().is_empty() {
+            target += 1;
+        }
+        self.set_cursor(self.line_end(target));
+        true
+    }
+
+    pub(crate) fn move_to_word_start_left(&mut self) -> bool {
+        let cursor = self.cursor;
+        let Some((start, _)) = self
+            .word_ranges()
+            .into_iter()
+            .take_while(|(start, _)| *start <= cursor)
+            .last()
+        else {
+            return false;
+        };
+        self.set_cursor(start);
+        true
+    }
+
+    pub(crate) fn move_to_word_end_right(&mut self) -> bool {
+        let cursor = self.cursor;
+        let Some((_, end)) = self
+            .word_ranges()
+            .into_iter()
+            .find(|(start, end)| (*start <= cursor && cursor < *end) || *start >= cursor)
+        else {
+            return false;
+        };
+        self.set_cursor(end);
+        true
+    }
+
     pub(crate) fn move_up(&mut self) {
         let (line_index, column) = self.cursor_line_col();
         if line_index == 0 {
@@ -971,5 +1032,31 @@ mod tests {
 
         buffer.move_to_top();
         assert_eq!(buffer.cursor(), 0);
+    }
+
+    #[test]
+    fn editor_buffer_moves_cursor_to_paragraph_boundaries() {
+        let mut buffer = EditorBuffer::from_text("one\ntwo\nthree\n\nfour".to_string());
+        buffer.set_cursor("one\ntwo\nth".len());
+
+        assert!(buffer.move_to_paragraph_start());
+        assert_eq!(buffer.cursor(), 0);
+
+        buffer.set_cursor("one\ntwo".len());
+        assert!(buffer.move_to_paragraph_end());
+        assert_eq!(buffer.cursor(), "one\ntwo\nthree".len());
+    }
+
+    #[test]
+    fn editor_buffer_moves_cursor_to_word_edges() {
+        let mut buffer = EditorBuffer::from_text("hello brave world".to_string());
+        buffer.set_cursor("hello br".len());
+
+        assert!(buffer.move_to_word_start_left());
+        assert_eq!(buffer.cursor(), "hello ".len());
+
+        buffer.set_cursor("hello brave w".len());
+        assert!(buffer.move_to_word_end_right());
+        assert_eq!(buffer.cursor(), "hello brave world".len());
     }
 }

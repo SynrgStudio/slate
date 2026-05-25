@@ -99,6 +99,8 @@ impl EditorView {
         wrap: bool,
         search_state: Option<&SearchState>,
         line_number_mode: LineNumberMode,
+        keyboard_enabled: bool,
+        active_line_text_highlight: Option<usize>,
     ) -> (egui::Response, bool) {
         self.observe_buffer(buffer);
 
@@ -149,7 +151,7 @@ impl EditorView {
             }
         }
 
-        if response.has_focus() && search_state.is_none() {
+        if keyboard_enabled && response.has_focus() && search_state.is_none() {
             changed = self.handle_keyboard(ui, buffer) || changed;
             if changed {
                 rows = self.visual_rows(&painter, buffer, &font, wrap_width, wrap);
@@ -235,12 +237,17 @@ impl EditorView {
                 FontId::new(12.0, FontFamily::Monospace),
                 Color32::from_rgb(94, 105, 126),
             );
+            let text_color = if active_line_text_highlight == Some(row.line_index) {
+                Color32::from_rgb(235, 203, 139)
+            } else {
+                Color32::from_rgb(216, 222, 233)
+            };
             painter.text(
                 egui::pos2(text_x, y + line_height * 0.5),
                 egui::Align2::LEFT_CENTER,
                 &buffer.as_str()[row.start..row.end],
                 font.clone(),
-                Color32::from_rgb(216, 222, 233),
+                text_color,
             );
         }
 

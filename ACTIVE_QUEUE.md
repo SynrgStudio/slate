@@ -566,12 +566,12 @@ Batch 3 — Duplicate line and polish: done.
 - Done: update shortcut help, README, and queue docs with the final Alt structural layer.
 - Done: add regression tests for line movement at first/last line, paragraph boundaries, Unicode lines, selection extension, and duplicate-line behavior.
 
-Future follow-up — Duplicate placement transient mode:
-- Keep simple `:dup` stable first.
-- Add a transient duplicate-placement mode later, likely as `:duplicate-place` / `:dupp` before deciding whether it should replace `:dup`.
-- Behavior idea: duplicate current line, mark the duplicate as active, move it up/down while the transient mode is active, then confirm with `Enter`/`Space` or cancel with `Esc`.
-- Reuse Slate/Vim movement mapping for placement controls, probably `Ctrl+Shift` and/or existing Alt structural line movement semantics.
-- Show status/minibuffer help such as `duplicate placement: move · Enter/Space place · Esc cancel`.
+Follow-up — Duplicate placement transient mode: done.
+- Done: keep simple `:dup` stable.
+- Done: add transient duplicate-placement mode as `:duplicate-place` / `:dupp`.
+- Done: duplicate current line, mark the duplicate as active, move it up/down while the transient mode is active, then confirm with `Enter`/`Space` or cancel with `Esc`.
+- Done: reuse Slate/Vim `Ctrl+Shift` movement mapping plus arrow movement while placement is active.
+- Done: show status/minibuffer help such as `duplicate placement: move · Enter/Space place · Esc cancel`.
 
 ## Suggested implementation order
 
@@ -592,7 +592,7 @@ Future follow-up — Duplicate placement transient mode:
 1. T007/T046 — Alt structural editing, batch 1: move current line up/down and to paragraph start/end. Done.
 2. T007/T046 — Alt structural editing, batch 2: extend word selection left/right. Done.
 3. T007/T046 — Alt structural editing, batch 3: duplicate line and shortcut/help/docs polish. Done.
-4. T046 — Duplicate placement transient mode: duplicate a line into a movable pending placement, confirm with Enter/Space, cancel with Esc.
+4. T046 — Duplicate placement transient mode: duplicate a line into a movable pending placement, confirm with Enter/Space, cancel with Esc. Done.
 5. T002/T013 — Improve command discovery: fuzzy command matching, palette/command-line consistency, and recent/frequent commands.
 6. T003 — Expand persistent config for wrap/preview/theme/vault while keeping the plain config simple.
 7. T004 — Build real recent-files list and `:recent` picker.

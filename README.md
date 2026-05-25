@@ -108,7 +108,7 @@ slate --scratch
 | Shortcut | Action |
 | --- | --- |
 | `Ctrl+P` | Command palette |
-| `Ctrl+H` | Shortcut help |
+| `Ctrl+H` | Shortcut help, including Ctrl-layer, Alt layer, Shift+Alt jumps, duplicate placement, and movement hints |
 | `Ctrl+S` | Save |
 | `Ctrl+O` | Open file |
 | `Ctrl+N` | New buffer |
@@ -170,6 +170,7 @@ Editing/navigation commands:
 :delete-word    :dw
 :delete-line    :dl
 :duplicate-line :dup
+:duplicate-place :dupp
 :move-line-up   :mlu
 :move-line-down :mld
 :move-line-to-paragraph-start :mlps
@@ -198,6 +199,7 @@ Examples:
 | `Ctrl` hold → `o l` → release | Open last file |
 | `Ctrl` hold → `d l` → release | Delete line |
 | `Ctrl` hold → `d u p` → release | Duplicate line |
+| `Ctrl` hold → `d u p p` → release | Duplicate placement mode |
 | `Ctrl` hold → `d w` → release | Delete word |
 | `Ctrl` hold → `s w` → release | Select word |
 | `Ctrl` hold → `s l` → release | Select line |
@@ -206,6 +208,25 @@ Examples:
 | `Ctrl` hold → `h` → release | Shortcut help |
 
 This gives Slate some of the speed of modal editors without requiring a permanent mode switch.
+
+---
+
+## Duplicate placement
+
+For a movable duplicate, use:
+
+```text
+:duplicate-place
+:dupp
+```
+
+Slate duplicates the current line and enters a transient placement mode:
+
+```text
+Alt movement or Ctrl+Shift movement = move duplicate
+Enter / Space                    = place
+Esc                              = cancel
+```
 
 ---
 
@@ -250,6 +271,13 @@ i up
 j left
 k down
 l right
+```
+
+Fast structural cursor jumps use the same movement mode with `Shift+Alt` double-key sequences:
+
+```text
+Slate mode: Shift+Alt+i i paragraph start, k k paragraph end, j j word start, l l word end, j l line end, l j line start
+Vim mode:   Shift+Alt+k k paragraph start, j j paragraph end, h h word start, l l word end, h l line end, l h line start
 ```
 
 The selected mode is persisted in:
