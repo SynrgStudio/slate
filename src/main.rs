@@ -61,6 +61,7 @@ enum Command {
 enum PendingAction {
     New,
     Open,
+    OpenLast,
     Quit,
 }
 
@@ -69,6 +70,7 @@ impl PendingAction {
         match self {
             PendingAction::New => "buffer has unsaved changes; start a new buffer anyway?",
             PendingAction::Open => "buffer has unsaved changes; open another file anyway?",
+            PendingAction::OpenLast => "buffer has unsaved changes; open last file anyway?",
             PendingAction::Quit => "buffer has unsaved changes; close anyway?",
         }
     }
@@ -123,6 +125,7 @@ struct SlateApp {
     command_history_index: Option<usize>,
     command_history_limit: usize,
     line_number_mode: LineNumberMode,
+    last_opened_path: Option<PathBuf>,
     search_state: Option<SearchState>,
     ctrl_layer_active: bool,
     ctrl_layer_sequence: String,
@@ -155,6 +158,7 @@ impl SlateApp {
             command_history_index: None,
             command_history_limit: 5,
             line_number_mode: LineNumberMode::Absolute,
+            last_opened_path: None,
             search_state: None,
             ctrl_layer_active: false,
             ctrl_layer_sequence: String::new(),
@@ -190,6 +194,8 @@ impl SlateApp {
                 self.path = Some(path.clone());
                 self.dirty = false;
                 self.search_state = None;
+                self.last_opened_path = Some(path.clone());
+                let _ = self.save_settings();
                 self.status = format!("Opened {}", path.display());
             }
             Err(err) => self.status = format!("Open failed: {err}"),
@@ -274,6 +280,14 @@ impl SlateApp {
         }
     }
 
+    fn open_last(&mut self) {
+        let Some(path) = self.last_opened_path.clone() else {
+            self.status = "No last file".to_string();
+            return;
+        };
+        self.open_path(path);
+    }
+
     fn save_as(&mut self) {
         if let Some(path) = rfd::FileDialog::new().save_file() {
             self.save_path(path);
@@ -309,6 +323,12 @@ impl SlateApp {
                         self.line_number_mode = mode;
                     }
                 }
+                "last_opened_path" => {
+                    let value = value.trim().trim_matches('"');
+                    if !value.is_empty() {
+                        self.last_opened_path = Some(PathBuf::from(value));
+                    }
+                }
                 _ => {}
             }
         }
@@ -325,9 +345,14 @@ impl SlateApp {
         fs::write(
             path,
             format!(
-                "command_history_limit = {}\nline_number_mode = \"{}\"\n",
+                "command_history_limit = {}\nline_number_mode = \"{}\"\nlast_opened_path = \"{}\"\n",
                 self.command_history_limit,
-                self.line_number_mode.config_value()
+                self.line_number_mode.config_value(),
+                self.last_opened_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default()
+                    .replace('"', "\\\"")
             ),
         )
         .map_err(|err| err.to_string())
@@ -446,6 +471,13 @@ impl SlateApp {
                         .and_then(|rest| dirs_next::home_dir().map(|home| home.join(rest)))
                         .unwrap_or_else(|| PathBuf::from(path));
                     self.open_path(expanded);
+                }
+            }
+            "open-last" | "last" | "ol" => {
+                if self.dirty {
+                    self.confirm(PendingAction::OpenLast);
+                } else {
+                    self.open_last();
                 }
             }
             "preview" | "md" => self.run_command(Command::TogglePreview, ctx),
@@ -613,6 +645,7 @@ impl SlateApp {
         match action {
             PendingAction::New => self.new_buffer(),
             PendingAction::Open => self.open_dialog(),
+            PendingAction::OpenLast => self.open_last(),
             PendingAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
     }
@@ -728,6 +761,13 @@ impl SlateApp {
         match sequence {
             "s" => self.run_command(Command::Save, ctx),
             "o" => self.run_command(Command::Open, ctx),
+            "ol" => {
+                if self.dirty {
+                    self.confirm(PendingAction::OpenLast);
+                } else {
+                    self.open_last();
+                }
+            }
             "n" => self.run_command(Command::New, ctx),
             "p" => {
                 self.palette_open = true;

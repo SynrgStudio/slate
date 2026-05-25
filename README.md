@@ -28,6 +28,7 @@ slate ~/notes.md
 - `:g 10`, `:g 10:4`, `:g +5`, `:g -5` jump to line/column
 - `:delete-line` / `:dl` delete current line
 - Ctrl-hold layer: hold `Ctrl`, type `d` then `l`, release `Ctrl` to delete line
+- Ctrl-hold layer: hold `Ctrl`, type `o` then `l`, release `Ctrl` to open last file
 - `:settings` configure history length and absolute/relative line numbers
 - `Ctrl+Q` quit
 

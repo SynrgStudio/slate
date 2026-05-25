@@ -33,6 +33,7 @@ Scope:
 Status: pending
 Scope:
 - Track recently opened/saved files.
+- Track the last opened file and support `open-last` / `ol` plus Ctrl-layer `ol` as an early lightweight workflow.
 - Add `Open recent` command in the command palette.
 - Optionally reopen the last file at startup.
 
@@ -310,7 +311,7 @@ Scope:
 - Show the pending command in the dedicated command line while Ctrl is held, e.g. `ctrl:c` then `ctrl:cw`, while the status bar remains visible above it.
 - Provide Escape/cancel and safe fallback so accidental command entry is harmless.
 - Avoid conflicts with essential OS/window-manager shortcuts; decide which Ctrl sequences Slate owns and which stay native.
-- First implementation supports existing single-key Ctrl commands on release (`s`, `o`, `n`, `p`, `q`, `m`, `.`, `f`) plus `dl` for delete current line.
+- First implementation supports existing single-key Ctrl commands on release (`s`, `o`, `n`, `p`, `q`, `m`, `.`, `f`) plus `dl` for delete current line and `ol` for open last file.
 
 ### T034 — Repeatable edits and lightweight macros
 
