@@ -1,6 +1,9 @@
+mod search;
+
 use std::{fs, io::Write, path::PathBuf};
 
 use eframe::egui::{self, Color32, FontFamily, FontId, Key, RichText, Stroke, TextEdit, Vec2};
+use search::SearchState;
 
 fn main() -> eframe::Result {
     let mut scratch = false;
@@ -419,6 +422,7 @@ impl EditorView {
         ui: &mut egui::Ui,
         buffer: &mut EditorBuffer,
         wrap: bool,
+        search_state: Option<&SearchState>,
     ) -> (egui::Response, bool) {
         self.observe_buffer(buffer);
 
@@ -469,7 +473,7 @@ impl EditorView {
             }
         }
 
-        if response.has_focus() {
+        if response.has_focus() && search_state.is_none() {
             changed = self.handle_keyboard(ui, buffer) || changed;
             if changed {
                 rows = self.visual_rows(&painter, buffer, &font, wrap_width, wrap);
@@ -507,6 +511,22 @@ impl EditorView {
             );
             if row.line_index % 2 == 0 {
                 painter.rect_filled(line_rect, 0.0, Color32::from_rgb(29, 35, 46));
+            }
+
+            if let Some(search_state) =
+                search_state.filter(|state| state.buffer_revision == buffer.revision)
+            {
+                self.paint_search_matches(
+                    &painter,
+                    buffer,
+                    row,
+                    search_state,
+                    text_x,
+                    y,
+                    line_height,
+                    &font,
+                    rect.right(),
+                );
             }
 
             if let Some((selection_start, selection_end)) = buffer.selection() {
@@ -782,6 +802,41 @@ impl EditorView {
         }
     }
 
+    fn paint_search_matches(
+        &self,
+        painter: &egui::Painter,
+        buffer: &EditorBuffer,
+        row: VisualRow,
+        search_state: &SearchState,
+        text_x: f32,
+        y: f32,
+        line_height: f32,
+        font: &FontId,
+        right: f32,
+    ) {
+        for (index, (match_start, match_end)) in search_state.matches.iter().copied().enumerate() {
+            let start = match_start.max(row.start).min(row.end);
+            let end = match_end.max(row.start).min(row.end);
+            if start >= end {
+                continue;
+            }
+
+            let start_x =
+                text_x + self.text_width(painter, &buffer.as_str()[row.start..start], font);
+            let end_x = text_x + self.text_width(painter, &buffer.as_str()[row.start..end], font);
+            let color = if index == search_state.selected {
+                Color32::from_rgb(235, 203, 139)
+            } else {
+                Color32::from_rgb(76, 86, 106)
+            };
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(start_x, y + 2.0),
+                egui::pos2(end_x.min(right), y + line_height - 2.0),
+            );
+            painter.rect_filled(rect, 2.0, color);
+        }
+    }
+
     fn paint_selection(
         &self,
         painter: &egui::Painter,
@@ -1030,6 +1085,7 @@ struct SlateApp {
     command_history: Vec<String>,
     command_history_index: Option<usize>,
     command_history_limit: usize,
+    search_state: Option<SearchState>,
 }
 
 impl SlateApp {
@@ -1057,6 +1113,7 @@ impl SlateApp {
             command_history: Vec::new(),
             command_history_index: None,
             command_history_limit: 5,
+            search_state: None,
         };
 
         app.load_settings();
@@ -1088,6 +1145,7 @@ impl SlateApp {
                 self.buffer.set_text(text);
                 self.path = Some(path.clone());
                 self.dirty = false;
+                self.search_state = None;
                 self.status = format!("Opened {}", path.display());
             }
             Err(err) => self.status = format!("Open failed: {err}"),
@@ -1162,6 +1220,7 @@ impl SlateApp {
         self.buffer.clear();
         self.path = None;
         self.dirty = false;
+        self.search_state = None;
         self.status = "New buffer".to_string();
     }
 
@@ -1326,10 +1385,107 @@ impl SlateApp {
             }
             "preview" | "md" => self.run_command(Command::TogglePreview, ctx),
             "wrap" => self.run_command(Command::ToggleWrap, ctx),
+            "find" | "f" => {
+                let query = parts.collect::<Vec<_>>().join(" ");
+                self.start_search(query);
+            }
             "settings" | "set" | "prefs" | "preferences" => {
                 self.run_command(Command::Settings, ctx)
             }
             _ => self.status = format!("Unknown command: {input}"),
+        }
+    }
+
+    fn start_search(&mut self, query: String) {
+        if query.is_empty() {
+            self.search_state = None;
+            self.status = "Find cancelled".to_string();
+            return;
+        }
+
+        let state = SearchState::new(query, self.buffer.as_str(), self.buffer.revision);
+        self.search_state = Some(state);
+        self.apply_selected_search_match();
+        self.focus_editor_once = true;
+    }
+
+    fn apply_selected_search_match(&mut self) {
+        let Some(state) = self.search_state.as_ref() else {
+            return;
+        };
+
+        let match_count = state.matches.len();
+        if let Some((start, end)) = state.selected_match() {
+            self.buffer.set_selection(start, end);
+            self.editor_view.request_scroll_to_cursor(&self.buffer);
+        }
+        self.status = if match_count == 0 {
+            format!("No matches for {}", state.query)
+        } else {
+            format!(
+                "Find: {} ({}/{match_count}) · f next · b prev · ctrl+f after · ctrl+b before · enter accept · esc cancel",
+                state.query,
+                state.selected + 1
+            )
+        };
+    }
+
+    fn move_search_match(&mut self, forward: bool) {
+        let Some(state) = self.search_state.as_mut() else {
+            return;
+        };
+        if state.matches.is_empty() {
+            return;
+        }
+
+        if forward {
+            state.selected = (state.selected + 1) % state.matches.len();
+        } else {
+            state.selected = if state.selected == 0 {
+                state.matches.len() - 1
+            } else {
+                state.selected - 1
+            };
+        }
+        self.apply_selected_search_match();
+        self.focus_editor_once = true;
+    }
+
+    fn accept_search(&mut self) {
+        if self.search_state.is_some() {
+            self.search_state = None;
+            self.status = "Find accepted".to_string();
+            self.focus_editor_once = true;
+        }
+    }
+
+    fn place_cursor_at_search_edge(&mut self, after_match: bool) {
+        let Some((start, end)) = self
+            .search_state
+            .as_ref()
+            .and_then(|state| state.selected_match())
+        else {
+            return;
+        };
+
+        self.buffer
+            .set_cursor(if after_match { end } else { start });
+        self.editor_view.request_scroll_to_cursor(&self.buffer);
+        self.search_state = None;
+        self.status = if after_match {
+            "Find accepted: cursor after match".to_string()
+        } else {
+            "Find accepted: cursor before match".to_string()
+        };
+        self.focus_editor_once = true;
+    }
+
+    fn cancel_search(&mut self) {
+        if self.search_state.is_some() {
+            self.search_state = None;
+            self.buffer.clear_selection();
+            self.status = "Find cancelled".to_string();
+            self.focus_editor_once = true;
         }
     }
 
@@ -1368,6 +1524,18 @@ impl SlateApp {
         let mut next_command = false;
         let mut settings_decrement = false;
         let mut settings_increment = false;
+        let mut search_next = false;
+        let mut search_previous = false;
+        let mut search_accept = false;
+        let mut search_cancel = false;
+        let mut search_cursor_after = false;
+        let mut search_cursor_before = false;
+        let search_active = self.search_state.is_some()
+            && !self.command_line_focused
+            && !self.focus_command_line_once
+            && !self.palette_open
+            && !self.settings_open
+            && self.pending_action.is_none();
         ctx.input_mut(|i| {
             if self.settings_open {
                 settings_decrement |= i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft);
@@ -1377,6 +1545,17 @@ impl SlateApp {
                 self.palette_open = true;
                 self.palette_query.clear();
                 self.selected_command = 0;
+            }
+            if search_active {
+                search_cursor_after |= i.consume_key(egui::Modifiers::CTRL, Key::F);
+                search_cursor_before |= i.consume_key(egui::Modifiers::CTRL, Key::B);
+            } else if i.consume_key(egui::Modifiers::CTRL, Key::F) {
+                self.palette_open = false;
+                self.command_line = "find ".to_string();
+                self.command_history_index = None;
+                self.command_line_focused = true;
+                self.focus_command_line_once = true;
+                self.focus_editor_once = false;
             }
             if i.consume_key(egui::Modifiers::CTRL, Key::Period) {
                 self.palette_open = false;
@@ -1391,6 +1570,11 @@ impl SlateApp {
                 execute_command_line |= i.consume_key(egui::Modifiers::NONE, Key::Tab);
                 previous_command |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
                 next_command |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
+            } else if search_active {
+                search_next |= i.consume_key(egui::Modifiers::NONE, Key::F);
+                search_previous |= i.consume_key(egui::Modifiers::NONE, Key::B);
+                search_accept |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
+                search_cancel |= i.consume_key(egui::Modifiers::NONE, Key::Escape);
             }
             if i.consume_key(egui::Modifiers::CTRL, Key::N) {
                 command = Some(Command::New);
@@ -1419,7 +1603,7 @@ impl SlateApp {
             if i.consume_key(egui::Modifiers::CTRL, Key::Q) {
                 command = Some(Command::Quit);
             }
-            if i.consume_key(egui::Modifiers::NONE, Key::Escape) {
+            if !search_cancel && i.consume_key(egui::Modifiers::NONE, Key::Escape) {
                 if self.settings_open {
                     self.settings_open = false;
                     self.focus_editor_once = true;
@@ -1440,6 +1624,36 @@ impl SlateApp {
                 }
             }
         });
+
+        if search_cursor_after {
+            self.place_cursor_at_search_edge(true);
+            return;
+        }
+
+        if search_cursor_before {
+            self.place_cursor_at_search_edge(false);
+            return;
+        }
+
+        if search_cancel {
+            self.cancel_search();
+            return;
+        }
+
+        if search_accept {
+            self.accept_search();
+            return;
+        }
+
+        if search_next {
+            self.move_search_match(true);
+            return;
+        }
+
+        if search_previous {
+            self.move_search_match(false);
+            return;
+        }
 
         if settings_decrement {
             self.set_command_history_limit(self.command_history_limit.saturating_sub(1));
@@ -1925,6 +2139,7 @@ impl eframe::App for SlateApp {
                                     &mut columns[0],
                                     &mut self.buffer,
                                     self.wrap,
+                                    self.search_state.as_ref(),
                                 );
                                 if self.focus_editor_once
                                     && !self.palette_open
@@ -1936,12 +2151,17 @@ impl eframe::App for SlateApp {
                                 }
                                 if changed {
                                     self.dirty = true;
+                                    self.search_state = None;
                                 }
                                 columns[1].vertical(|ui| self.preview_ui(ui));
                             });
                         } else {
-                            let (response, changed) =
-                                self.editor_view.render(ui, &mut self.buffer, self.wrap);
+                            let (response, changed) = self.editor_view.render(
+                                ui,
+                                &mut self.buffer,
+                                self.wrap,
+                                self.search_state.as_ref(),
+                            );
                             if self.focus_editor_once
                                 && !self.palette_open
                                 && !self.settings_open
@@ -1952,6 +2172,7 @@ impl eframe::App for SlateApp {
                             }
                             if changed {
                                 self.dirty = true;
+                                self.search_state = None;
                             }
                         }
                     },

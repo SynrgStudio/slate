@@ -23,6 +23,8 @@ slate ~/notes.md
 - `Ctrl+O` open
 - `Ctrl+N` new buffer
 - `Ctrl+M` toggle simple Markdown preview
+- `Ctrl+F` find (`f`/`b` next/previous, `Ctrl+F`/`Ctrl+B` place cursor after/before match)
+- `Ctrl+.` command line
 - `Ctrl+Q` quit
 
 ## Current vibe

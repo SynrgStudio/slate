@@ -410,20 +410,20 @@ Scope:
 
 ### T044 — Search/find on native editor primitives
 
-Status: pending
+Status: completed
 Scope:
 - Reintroduce find only after `EditorBuffer`, `EditorView`, cursor jump, selection, and scroll-to-position exist.
 - Use command line/minibuffer as the search input: Ctrl+F opens `find `; `:find query` and `:f query` are supported.
 - Keep live search as `SearchState` over `EditorBuffer`, cache by buffer revision and query, and never recompute unnecessarily per frame.
 - Start with exact case-insensitive search; later evaluate a real matcher such as `nucleo-matcher` for fzf-like ranking.
-- Render search results in the bottom expansion area without touching the document during typing.
 - Render highlights only through the native editor view and only for visible ranges.
-- Support Up/Down to move selected result, Enter to jump/select, Escape to cancel, and status text such as `match 2/10`.
-- Add regression tests using `test-fixtures/lorem-find.md`, including one-line-many-matches and single-letter queries.
+- Support `f`/`b` to move selected result, Enter to accept, Escape to cancel, and status text such as `match 2/10`.
+- Support `Ctrl+F` / `Ctrl+B` while find is active to place the cursor after/before the current match without reopening find.
+- Add regression tests for search matching behavior, including one-line-many-matches and single-letter queries.
 
 ### T045 — Find fixture and regression harness
 
-Status: pending
+Status: in_progress
 Scope:
 - Keep `test-fixtures/lorem-find.md` as a manual and automated fixture for search behavior.
 - Cover single-letter queries, repeated words on one line, case-insensitive matches, no-match query, and large-ish text behavior.
