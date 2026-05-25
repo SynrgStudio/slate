@@ -312,7 +312,7 @@ Scope:
 - Provide Escape/cancel and safe fallback so accidental command entry is harmless.
 - Avoid conflicts with essential OS/window-manager shortcuts; decide which Ctrl sequences Slate owns and which stay native.
 - First implementation supports existing single-key Ctrl commands on release (`s`, `o`, `n`, `p`, `q`, `m`, `.`, `f`) plus `dl` for delete current line and `ol` for open last file.
-- Additional early Ctrl-layer commands: `sw` select word, `sl` select line, `dw` delete word, `gt` go to top, `gb` go to bottom.
+- Additional early Ctrl-layer commands: `h` opens shortcut help, `sw` select word, `sl` select line, `dw` delete word, `gt` go to top, `gb` go to bottom.
 - Ctrl+Shift live navigation: while both modifiers are held, the selected movement mode moves immediately without waiting for release.
 - Movement mode is configurable in settings: Vim `h/j/k/l` or Slate `i/j/k/l` (`i` up, `j` left, `k` down, `l` right).
 

@@ -168,6 +168,7 @@ struct SlateApp {
     command_history: Vec<String>,
     command_history_index: Option<usize>,
     command_history_limit: usize,
+    shortcut_help_open: bool,
     line_number_mode: LineNumberMode,
     ctrl_shift_move_mode: CtrlShiftMoveMode,
     last_opened_path: Option<PathBuf>,
@@ -202,6 +203,7 @@ impl SlateApp {
             command_history: Vec::new(),
             command_history_index: None,
             command_history_limit: 5,
+            shortcut_help_open: false,
             line_number_mode: LineNumberMode::Absolute,
             ctrl_shift_move_mode: CtrlShiftMoveMode::Vim,
             last_opened_path: None,
@@ -442,6 +444,7 @@ impl SlateApp {
         self.selected_command = 0;
         self.command_line_focused = false;
         self.focus_command_line_once = false;
+        self.shortcut_help_open = false;
         self.focus_editor_once = true;
 
         match command {
@@ -492,6 +495,7 @@ impl SlateApp {
         self.command_line.clear();
         self.command_line_focused = false;
         self.focus_command_line_once = false;
+        self.shortcut_help_open = false;
         self.focus_editor_once = true;
         self.command_history_index = None;
 
@@ -945,6 +949,7 @@ impl SlateApp {
             "q" => self.run_command(Command::Quit, ctx),
             "m" => self.run_command(Command::TogglePreview, ctx),
             "." => self.focus_command_line(),
+            "h" => self.open_shortcut_help(),
             "f" if self.search_state.is_some() => self.place_cursor_at_search_edge(true),
             "f" => self.focus_find_command_line(),
             "b" if self.search_state.is_some() => self.place_cursor_at_search_edge(false),
@@ -958,7 +963,17 @@ impl SlateApp {
         }
     }
 
+    fn open_shortcut_help(&mut self) {
+        self.palette_open = false;
+        self.command_line_focused = false;
+        self.focus_command_line_once = false;
+        self.shortcut_help_open = true;
+        self.status = "Shortcut help".to_string();
+        self.focus_editor_once = true;
+    }
+
     fn focus_command_line(&mut self) {
+        self.shortcut_help_open = false;
         self.palette_open = false;
         self.command_line.clear();
         self.command_history_index = None;
@@ -968,6 +983,7 @@ impl SlateApp {
     }
 
     fn focus_find_command_line(&mut self) {
+        self.shortcut_help_open = false;
         self.palette_open = false;
         self.command_line = "find ".to_string();
         self.command_history_index = None;
@@ -1082,6 +1098,9 @@ impl SlateApp {
                     self.command_line_focused = false;
                     self.focus_command_line_once = false;
                     self.command_history_index = None;
+                    self.focus_editor_once = true;
+                } else if self.shortcut_help_open {
+                    self.shortcut_help_open = false;
                     self.focus_editor_once = true;
                 } else if self.palette_open {
                     self.palette_open = false;
@@ -1704,6 +1723,9 @@ impl eframe::App for SlateApp {
                 let status_height = 30.0;
                 let command_height = 30.0;
                 let history_row_height = 22.0;
+                let shortcut_help_row_height = 22.0;
+                let shortcut_help_rows = if self.shortcut_help_open { 8 } else { 0 };
+                let shortcut_help_height = shortcut_help_rows as f32 * shortcut_help_row_height;
                 let command_history_active = (self.command_line_focused
                     || self.focus_command_line_once)
                     && !self.command_history.is_empty();
@@ -1713,7 +1735,8 @@ impl eframe::App for SlateApp {
                     0
                 };
                 let history_height = visible_history_rows as f32 * history_row_height;
-                let footer_height = status_height + history_height + command_height;
+                let footer_height =
+                    status_height + shortcut_help_height + history_height + command_height;
                 let editor_size = Vec2::new(
                     ui.available_width(),
                     (ui.available_height() - footer_height).max(80.0),
@@ -1829,6 +1852,61 @@ impl eframe::App for SlateApp {
                     footer_dim,
                 );
 
+                if self.shortcut_help_open {
+                    let (help_rect, _) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), shortcut_help_height),
+                        egui::Sense::hover(),
+                    );
+                    let painter = ui.painter_at(help_rect);
+                    painter.rect_filled(help_rect, 0.0, Color32::from_rgb(25, 31, 40));
+
+                    let shortcuts = [
+                        ("C-s", "save", "C-o", "open file"),
+                        ("C-o l", "open last", "C-n", "new buffer"),
+                        ("C-p", "command palette", "C-.", "commandline"),
+                        ("C-f", "find", "C-m", "preview"),
+                        ("C-d l", "delete line", "C-d w", "delete word"),
+                        ("C-s w", "select word", "C-s l", "select line"),
+                        ("C-g t", "go top", "C-g b", "go bottom"),
+                        ("C-S", self.ctrl_shift_move_mode.hint(), "esc", "close help"),
+                    ];
+                    let col_width = help_rect.width() * 0.48;
+                    for (row, (left_key, left_desc, right_key, right_desc)) in
+                        shortcuts.iter().enumerate()
+                    {
+                        let y = help_rect.top()
+                            + row as f32 * shortcut_help_row_height
+                            + shortcut_help_row_height * 0.5
+                            - 0.5;
+                        for (x, key, desc) in [
+                            (help_rect.left() + 10.0, *left_key, *left_desc),
+                            (help_rect.left() + col_width + 10.0, *right_key, *right_desc),
+                        ] {
+                            let key_rect = painter.text(
+                                egui::pos2(x, y),
+                                egui::Align2::LEFT_CENTER,
+                                key,
+                                footer_font.clone(),
+                                footer_warn,
+                            );
+                            let arrow_rect = painter.text(
+                                egui::pos2(key_rect.right() + 6.0, y),
+                                egui::Align2::LEFT_CENTER,
+                                "→",
+                                footer_font.clone(),
+                                footer_dim,
+                            );
+                            painter.text(
+                                egui::pos2(arrow_rect.right() + 6.0, y),
+                                egui::Align2::LEFT_CENTER,
+                                desc,
+                                footer_font.clone(),
+                                footer_color,
+                            );
+                        }
+                    }
+                }
+
                 if visible_history_rows > 0 {
                     let (history_rect, _) = ui.allocate_exact_size(
                         Vec2::new(ui.available_width(), history_height),
@@ -1929,9 +2007,12 @@ impl eframe::App for SlateApp {
                 } else {
                     let (text, color) = if self.ctrl_layer_active {
                         (format!("ctrl:{}", self.ctrl_layer_sequence), footer_accent)
+                    } else if self.shortcut_help_open {
+                        ("shortcuts  [esc] close".to_string(), footer_accent)
                     } else {
                         (
-                            "command  w · q · wq · open <file> · preview · wrap".to_string(),
+                            "command  w · q · wq · open <file> · preview · wrap · Ctrl+H help"
+                                .to_string(),
                             footer_dim,
                         )
                     };
