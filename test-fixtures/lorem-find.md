@@ -25,6 +25,22 @@ Duis lorem neque, tincidunt sed lorem at, facilisis porta ipsum.
 la le li lo lu
 solo una ele muchas veces: l l l l l l l l l l l l l l l l l l l l
 
+## Unicode y offsets
+
+café CAFÉ café
+niño NIÑO
+emoji lorem 😀 lorem
+
+## Marcadores estables
+
+FIND_TARGET_ALPHA aparece una vez.
+Antes de la palabra exacta: needle-target aquí.
+La palabra final está al cierre: terminal-target
+
+## No match section
+
+Esta sección no contiene el marcador imposible.
+
 ## Fin
 
 última línea con loremasdasdasd
@@ -55,4 +71,3 @@ asd
 asd
 asd
 asd
-

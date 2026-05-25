@@ -54,7 +54,12 @@ pub fn find_matches(text: &str, query: &str) -> Vec<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::{SearchState, find_matches};
+    use crate::editor_buffer::EditorBuffer;
+
+    const LOREM_FIXTURE: &str = include_str!("../test-fixtures/lorem-find.md");
 
     #[test]
     fn finds_case_insensitive_matches() {
@@ -83,5 +88,62 @@ mod tests {
 
         assert_eq!(state.selected_match(), Some((3, 5)));
         assert_eq!(state.buffer_revision, 42);
+    }
+
+    #[test]
+    fn fixture_finds_lorem_case_insensitively() {
+        let lower = find_matches(LOREM_FIXTURE, "lorem");
+        let upper = find_matches(LOREM_FIXTURE, "LOREM");
+        let title = find_matches(LOREM_FIXTURE, "Lorem");
+
+        assert_eq!(lower.len(), 24);
+        assert_eq!(lower, upper);
+        assert_eq!(lower, title);
+    }
+
+    #[test]
+    fn fixture_handles_single_letter_queries() {
+        let matches = find_matches(LOREM_FIXTURE, "l");
+
+        assert!(matches.len() > 100);
+        assert_eq!(matches.first().copied(), Some((2, 3)));
+    }
+
+    #[test]
+    fn fixture_returns_no_matches_for_missing_query() {
+        assert!(find_matches(LOREM_FIXTURE, "definitely-not-in-this-fixture").is_empty());
+    }
+
+    #[test]
+    fn fixture_offsets_map_to_line_and_column() {
+        let matches = find_matches(LOREM_FIXTURE, "needle-target");
+        assert_eq!(matches.len(), 1);
+
+        let buffer = EditorBuffer::from_text(LOREM_FIXTURE.to_string());
+        assert_eq!(buffer.byte_to_line_col(matches[0].0), (37, 29));
+        assert_eq!(buffer.byte_to_line_col(matches[0].1), (37, 42));
+    }
+
+    #[test]
+    fn fixture_finds_unicode_adjacent_matches() {
+        let matches = find_matches(LOREM_FIXTURE, "lorem 😀 lorem");
+        assert_eq!(matches.len(), 1);
+
+        let buffer = EditorBuffer::from_text(LOREM_FIXTURE.to_string());
+        assert_eq!(buffer.byte_to_line_col(matches[0].0), (32, 7));
+    }
+
+    #[test]
+    fn search_performance_smoke_test_for_common_queries() {
+        let big_text = LOREM_FIXTURE.repeat(200);
+        let start = Instant::now();
+        let matches = find_matches(&big_text, "l");
+        let elapsed = start.elapsed();
+
+        assert!(!matches.is_empty());
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "single-letter search took {elapsed:?}"
+        );
     }
 }

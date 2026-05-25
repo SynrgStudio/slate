@@ -436,12 +436,12 @@ Scope:
 
 ### T045 — Find fixture and regression harness
 
-Status: in_progress
+Status: completed
 Scope:
-- Keep `test-fixtures/lorem-find.md` as a manual and automated fixture for search behavior.
-- Cover single-letter queries, repeated words on one line, case-insensitive matches, no-match query, and large-ish text behavior.
-- Add unit tests for search result offsets and line/column mapping.
-- Add a lightweight performance guard where feasible so common one-letter queries do not regress into UI freezes.
+- Done: `test-fixtures/lorem-find.md` is both a manual and automated fixture for search behavior.
+- Done: fixture covers repeated words, case-insensitive matches, no-match query, single-letter queries, Unicode-adjacent matches, stable markers, and noisy/large-ish text.
+- Done: unit tests validate fixture match counts, search result offsets, and line/column mapping through `EditorBuffer`.
+- Done: lightweight performance smoke test guards common one-letter queries against obvious regressions.
 
 ### T046 — Pragmatic command backlog: useful basics without becoming Vim
 
@@ -548,39 +548,38 @@ Safety and workflow:
 
 ### Next practical sequence
 
-1. T045 — Finish find fixture/regression harness and basic performance guard.
-2. T007/T046 — Complete the next tiny editing batch: duplicate line, move line up/down, `Alt+Up`, `Alt+Down`.
-3. T002/T013 — Improve command discovery: fuzzy command matching, palette/command-line consistency, and recent/frequent commands.
-4. T003 — Expand persistent config for wrap/preview/theme/vault while keeping the plain config simple.
-5. T004 — Build real recent-files list and `:recent` picker.
-6. T010 — Minimal project/vault file opener with fuzzy-ish file matching.
-7. T017 — Write down Slate's knowledge-work philosophy so future features do not drift into Obsidian/Emacs sprawl.
-8. T005 — Scratch buffer and quick capture workflow.
-9. T006 — Daily notes on top of the chosen notes/vault directory.
-10. T018 — Optional vault/root folder selection.
-11. T023 — Vault index architecture: Markdown source plus rebuildable SQLite cache.
-12. T020 — Global notes search, starting simple and later backed by the index.
-13. T024 — Link resolver trigger for `[[`.
-14. T025 — Link resolver ranking/result groups.
-15. T027 — Wiki-link parser and target resolver.
-16. T026 — Content-match deep link insertion with compact/full style toggle.
-17. T028 — Follow-link navigation and cursor jump.
-18. T029 — Link display ergonomics and visual affordances.
-19. T031 — Link resolver performance and indexing lifecycle.
-20. T030 — Backlinks and most-linked notes.
-21. T021 — Progressive organization commands.
-22. T015 — Task/checklist commands.
-23. T022 — Tags and lightweight metadata.
-24. T035 — Append/capture side effects from normal editing.
-25. T036 — Textual result buffers.
-26. T014 — Templates.
-27. T009 — Theme system.
-28. T008 — Lightweight Markdown preview improvements.
-29. T011 — Buffers / multi-file workflow.
-30. T012 — Optional auto-save.
-31. T034 — Repeatable edits and lightweight macros.
-32. T037 — Curated defaults instead of infinite configurability.
-33. T038 — Literate Markdown configuration polish.
+1. T007/T046 — Complete the next tiny editing batch: duplicate line, move line up/down, `Alt+Up`, `Alt+Down`.
+2. T002/T013 — Improve command discovery: fuzzy command matching, palette/command-line consistency, and recent/frequent commands.
+3. T003 — Expand persistent config for wrap/preview/theme/vault while keeping the plain config simple.
+4. T004 — Build real recent-files list and `:recent` picker.
+5. T010 — Minimal project/vault file opener with fuzzy-ish file matching.
+6. T017 — Write down Slate's knowledge-work philosophy so future features do not drift into Obsidian/Emacs sprawl.
+7. T005 — Scratch buffer and quick capture workflow.
+8. T006 — Daily notes on top of the chosen notes/vault directory.
+9. T018 — Optional vault/root folder selection.
+10. T023 — Vault index architecture: Markdown source plus rebuildable SQLite cache.
+11. T020 — Global notes search, starting simple and later backed by the index.
+12. T024 — Link resolver trigger for `[[`.
+13. T025 — Link resolver ranking/result groups.
+14. T027 — Wiki-link parser and target resolver.
+15. T026 — Content-match deep link insertion with compact/full style toggle.
+16. T028 — Follow-link navigation and cursor jump.
+17. T029 — Link display ergonomics and visual affordances.
+18. T031 — Link resolver performance and indexing lifecycle.
+19. T030 — Backlinks and most-linked notes.
+20. T021 — Progressive organization commands.
+21. T015 — Task/checklist commands.
+22. T022 — Tags and lightweight metadata.
+23. T035 — Append/capture side effects from normal editing.
+24. T036 — Textual result buffers.
+25. T014 — Templates.
+26. T009 — Theme system.
+27. T008 — Lightweight Markdown preview improvements.
+28. T011 — Buffers / multi-file workflow.
+29. T012 — Optional auto-save.
+30. T034 — Repeatable edits and lightweight macros.
+31. T037 — Curated defaults instead of infinite configurability.
+32. T038 — Literate Markdown configuration polish.
 
 <!-- THREADSUITE:START -->
 # ACTIVE_QUEUE.md

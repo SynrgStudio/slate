@@ -330,23 +330,18 @@ impl EditorView {
         let mut changed = false;
         let mut moved = false;
         let events = ui.input(|input| input.events.clone());
+        if !ui.input(|input| input.modifiers.ctrl || input.modifiers.command) {
+            if let Some(text) = text_input_from_events(&events) {
+                buffer.insert_text(&text);
+                self.request_scroll_to_cursor(buffer);
+                changed = true;
+            }
+        }
         for event in events {
-            match event {
-                egui::Event::Text(text) => {
-                    if !text.is_empty()
-                        && !ui.input(|input| input.modifiers.ctrl || input.modifiers.command)
-                    {
-                        buffer.insert_text(&text);
-                        self.request_scroll_to_cursor(buffer);
-                        changed = true;
-                    }
-                }
-                egui::Event::Paste(text) => {
-                    buffer.insert_text(&text);
-                    self.request_scroll_to_cursor(buffer);
-                    changed = true;
-                }
-                _ => {}
+            if let egui::Event::Paste(text) = event {
+                buffer.insert_text(&text);
+                self.request_scroll_to_cursor(buffer);
+                changed = true;
             }
         }
 
@@ -619,6 +614,32 @@ impl EditorView {
     #[allow(dead_code)]
     pub(crate) fn clear_scroll_target(&mut self) {
         self.target_cursor = None;
+    }
+}
+
+fn text_input_from_events(events: &[egui::Event]) -> Option<String> {
+    let texts = events
+        .iter()
+        .filter_map(|event| match event {
+            egui::Event::Text(text) if !text.is_empty() => Some(text.as_str()),
+            egui::Event::Ime(egui::ImeEvent::Commit(text)) if !text.is_empty() => {
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    match texts.as_slice() {
+        [] => None,
+        [text] => Some((*text).to_string()),
+        many => {
+            let last = many.last().copied().unwrap_or_default();
+            if last.chars().count() == 1 && last.chars().any(|ch| !ch.is_ascii()) {
+                Some(last.to_string())
+            } else {
+                Some(many.concat())
+            }
+        }
     }
 }
 
