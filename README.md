@@ -169,6 +169,10 @@ Editing/navigation commands:
 :select-line    :sl
 :delete-word    :dw
 :delete-line    :dl
+:move-line-up   :mlu
+:move-line-down :mld
+:move-line-to-paragraph-start :mlps
+:move-line-to-paragraph-end   :mlpe
 :top            :gt
 :bottom         :gb
 :open-last      :ol
@@ -200,6 +204,23 @@ Examples:
 | `Ctrl` hold → `h` → release | Shortcut help |
 
 This gives Slate some of the speed of modal editors without requiring a permanent mode switch.
+
+---
+
+## Alt structural editing
+
+`Alt` is reserved for structural text manipulation. It does not move the cursor directly; `Ctrl+Shift` already covers live cursor movement.
+
+Current batch:
+
+| Shortcut | Slate movement mode | Vim movement mode |
+| --- | --- | --- |
+| Move current line up | `Alt+i` / `Alt+Up` | `Alt+k` / `Alt+Up` |
+| Move current line down | `Alt+k` / `Alt+Down` | `Alt+j` / `Alt+Down` |
+| Move line to paragraph start | repeat up key, e.g. `Alt+i i` | repeat up key, e.g. `Alt+k k` |
+| Move line to paragraph end | repeat down key, e.g. `Alt+k k` | repeat down key, e.g. `Alt+j j` |
+
+A paragraph is a contiguous block of non-empty lines separated by blank lines.
 
 ---
 

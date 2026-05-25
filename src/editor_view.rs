@@ -330,7 +330,8 @@ impl EditorView {
         let mut changed = false;
         let mut moved = false;
         let events = ui.input(|input| input.events.clone());
-        if !ui.input(|input| input.modifiers.ctrl || input.modifiers.command) {
+        if !ui.input(|input| input.modifiers.ctrl || input.modifiers.command || input.modifiers.alt)
+        {
             if let Some(text) = text_input_from_events(&events) {
                 buffer.insert_text(&text);
                 self.request_scroll_to_cursor(buffer);

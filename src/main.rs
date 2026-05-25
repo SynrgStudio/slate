@@ -176,6 +176,10 @@ struct SlateApp {
     search_state: Option<SearchState>,
     ctrl_layer_active: bool,
     ctrl_layer_sequence: String,
+    alt_layer_active: bool,
+    alt_layer_sequence: String,
+    alt_layer_last_key: Option<char>,
+    alt_layer_last_key_time: f64,
 }
 
 impl SlateApp {
@@ -212,6 +216,10 @@ impl SlateApp {
             search_state: None,
             ctrl_layer_active: false,
             ctrl_layer_sequence: String::new(),
+            alt_layer_active: false,
+            alt_layer_sequence: String::new(),
+            alt_layer_last_key: None,
+            alt_layer_last_key_time: 0.0,
         };
 
         app.load_settings();
@@ -563,6 +571,10 @@ impl SlateApp {
             "select-line" | "sl" => self.select_line(),
             "delete-word" | "dw" => self.delete_word(),
             "delete-line" | "dl" => self.delete_current_line(),
+            "move-line-up" | "mlu" => self.move_current_line_up(),
+            "move-line-down" | "mld" => self.move_current_line_down(),
+            "move-line-to-paragraph-start" | "mlps" => self.move_current_line_to_paragraph_start(),
+            "move-line-to-paragraph-end" | "mlpe" => self.move_current_line_to_paragraph_end(),
             "top" | "go-top" | "gt" => self.go_to_top(),
             "bottom" | "go-bottom" | "gb" => self.go_to_bottom(),
             "settings" | "set" | "prefs" | "preferences" => {
@@ -614,6 +626,46 @@ impl SlateApp {
             self.status = "Deleted line".to_string();
             self.focus_editor_once = true;
         }
+    }
+
+    fn move_current_line_up(&mut self) {
+        if self.buffer.move_current_line_up() {
+            self.after_line_move("Moved line up");
+        } else {
+            self.status = "Line already at top".to_string();
+        }
+    }
+
+    fn move_current_line_down(&mut self) {
+        if self.buffer.move_current_line_down() {
+            self.after_line_move("Moved line down");
+        } else {
+            self.status = "Line already at bottom".to_string();
+        }
+    }
+
+    fn move_current_line_to_paragraph_start(&mut self) {
+        if self.buffer.move_current_line_to_paragraph_start() {
+            self.after_line_move("Moved line to paragraph start");
+        } else {
+            self.status = "Line already at paragraph start".to_string();
+        }
+    }
+
+    fn move_current_line_to_paragraph_end(&mut self) {
+        if self.buffer.move_current_line_to_paragraph_end() {
+            self.after_line_move("Moved line to paragraph end");
+        } else {
+            self.status = "Line already at paragraph end".to_string();
+        }
+    }
+
+    fn after_line_move(&mut self, status: &str) {
+        self.dirty = true;
+        self.search_state = None;
+        self.editor_view.request_scroll_to_cursor(&self.buffer);
+        self.status = status.to_string();
+        self.focus_editor_once = true;
     }
 
     fn go_to_top(&mut self) {
@@ -787,6 +839,136 @@ impl SlateApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.confirm(PendingAction::Quit);
         }
+    }
+
+    fn layer_allowed(&self) -> bool {
+        !self.command_line_focused
+            && !self.focus_command_line_once
+            && !self.palette_open
+            && !self.settings_open
+            && self.pending_action.is_none()
+    }
+
+    fn handle_alt_layer(&mut self, ctx: &egui::Context) -> bool {
+        if !self.layer_allowed() {
+            self.alt_layer_active = false;
+            self.alt_layer_sequence.clear();
+            self.alt_layer_last_key = None;
+            return false;
+        }
+
+        let alt_down = ctx.input(|input| input.modifiers.alt);
+        if alt_down && !self.alt_layer_active {
+            self.alt_layer_active = true;
+            self.alt_layer_sequence.clear();
+            self.alt_layer_last_key = None;
+        }
+
+        if self.alt_layer_active && alt_down {
+            let now = ctx.input(|input| input.time);
+            let keys = ctx.input(|input| input.events.clone());
+            let mut handled = false;
+            for event in keys {
+                let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                    ..
+                } = event
+                else {
+                    continue;
+                };
+                if !modifiers.alt || modifiers.ctrl || modifiers.shift {
+                    continue;
+                }
+
+                if key == Key::ArrowUp {
+                    self.alt_layer_sequence.push('↑');
+                    self.move_current_line_up();
+                    handled = true;
+                    continue;
+                }
+                if key == Key::ArrowDown {
+                    self.alt_layer_sequence.push('↓');
+                    self.move_current_line_down();
+                    handled = true;
+                    continue;
+                }
+
+                let Some(ch) = Self::ctrl_layer_key(key) else {
+                    continue;
+                };
+                if self.dispatch_alt_layer_key(ch, now) {
+                    handled = true;
+                }
+            }
+
+            if !handled {
+                self.status = if self.alt_layer_sequence.is_empty() {
+                    "Alt structural layer".to_string()
+                } else {
+                    format!("Alt structural layer: {}", self.alt_layer_sequence)
+                };
+            }
+            return true;
+        }
+
+        if self.alt_layer_active && !alt_down {
+            self.alt_layer_active = false;
+            self.alt_layer_sequence.clear();
+            self.alt_layer_last_key = None;
+            return true;
+        }
+
+        false
+    }
+
+    fn dispatch_alt_layer_key(&mut self, ch: char, now: f64) -> bool {
+        let up_key = match self.ctrl_shift_move_mode {
+            CtrlShiftMoveMode::Vim => 'k',
+            CtrlShiftMoveMode::Slate => 'i',
+        };
+        let down_key = match self.ctrl_shift_move_mode {
+            CtrlShiftMoveMode::Vim => 'j',
+            CtrlShiftMoveMode::Slate => 'k',
+        };
+
+        const ALT_DOUBLE_TAP_SECONDS: f64 = 0.12;
+
+        if ch == up_key {
+            let is_double_tap = self.alt_layer_last_key == Some(up_key)
+                && now - self.alt_layer_last_key_time <= ALT_DOUBLE_TAP_SECONDS;
+            self.alt_layer_sequence.push(ch);
+            self.alt_layer_last_key = Some(ch);
+            self.alt_layer_last_key_time = now;
+            if is_double_tap {
+                self.move_current_line_to_paragraph_start();
+                self.alt_layer_sequence.clear();
+                self.alt_layer_last_key = None;
+            } else {
+                self.move_current_line_up();
+            }
+            return true;
+        }
+
+        if ch == down_key {
+            let is_double_tap = self.alt_layer_last_key == Some(down_key)
+                && now - self.alt_layer_last_key_time <= ALT_DOUBLE_TAP_SECONDS;
+            self.alt_layer_sequence.push(ch);
+            self.alt_layer_last_key = Some(ch);
+            self.alt_layer_last_key_time = now;
+            if is_double_tap {
+                self.move_current_line_to_paragraph_end();
+                self.alt_layer_sequence.clear();
+                self.alt_layer_last_key = None;
+            } else {
+                self.move_current_line_down();
+            }
+            return true;
+        }
+
+        false
     }
 
     fn handle_ctrl_layer(&mut self, ctx: &egui::Context) -> bool {
@@ -998,6 +1180,10 @@ impl SlateApp {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        if self.handle_alt_layer(ctx) {
+            return;
+        }
+
         if self.handle_ctrl_layer(ctx) {
             return;
         }
@@ -1530,7 +1716,8 @@ impl SlateApp {
                 self.insert_command_line_text(text);
             }
         }
-        if ctx.input(|input| input.modifiers.ctrl || input.modifiers.command) {
+        if ctx.input(|input| input.modifiers.ctrl || input.modifiers.command || input.modifiers.alt)
+        {
             return;
         }
         if let Some((_, text)) = Self::normalized_text_input(&events) {
@@ -1959,6 +2146,8 @@ impl eframe::App for SlateApp {
                 let base_mode = if self.preview { "preview" } else { "edit" };
                 let active_mode = if self.shortcut_help_open {
                     "help"
+                } else if self.alt_layer_active {
+                    "alt"
                 } else if self.ctrl_layer_active {
                     "ctrl"
                 } else if self.command_line_focused || self.focus_command_line_once {
@@ -2184,7 +2373,9 @@ impl eframe::App for SlateApp {
                         Stroke::new(1.0, footer_accent),
                     );
                 } else {
-                    let (text, color) = if self.ctrl_layer_active {
+                    let (text, color) = if self.alt_layer_active {
+                        (format!("alt:{}", self.alt_layer_sequence), footer_accent)
+                    } else if self.ctrl_layer_active {
                         (format!("ctrl:{}", self.ctrl_layer_sequence), footer_accent)
                     } else if self.shortcut_help_open {
                         ("shortcuts  [esc] close".to_string(), footer_accent)

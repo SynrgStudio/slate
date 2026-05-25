@@ -70,9 +70,10 @@ Scope:
 - Done: absolute and relative line-number modes, configurable in Settings.
 - Done: `:goto` / `:g` / `:line` / `:l` commands for absolute jumps and explicit `+/-` relative jumps.
 - Done: delete line, select line, select word, delete word, top, and bottom commands.
-- Pending: track and display current line/column in the statusbar.
-- Pending: duplicate line and move line up/down commands.
-- Pending: add `Alt+Up` / `Alt+Down` as primary shortcuts to move the current line or selected lines.
+- Done: track and display current line/column in the statusbar.
+- Done: move current line up/down commands and `Alt+Up` / `Alt+Down` shortcuts.
+- Done: Alt structural vertical batch for current-line movement and paragraph-boundary movement.
+- Pending: duplicate line command.
 - Continue adding useful Vim-inspired text operations without requiring a full Vim mode.
 
 ### T008 — Lightweight Markdown improvements
@@ -448,16 +449,19 @@ Scope:
 Status: in_progress
 Scope:
 - Treat this as a curated backlog, not an instruction to implement every command immediately.
-- Prefer commands that map to clear editor operations and can be reused later by command palette, command line, and optional Ctrl-hold grammar.
+- Prefer commands that map to clear editor operations and can be reused later by command palette, command line, Ctrl-hold grammar, and Alt structural editing.
 - Keep normal typing as the default; avoid a permanent Vim mode.
+- Treat Ctrl+Shift as live cursor movement, Ctrl-hold as command dispatch, and Alt as a structural text/line manipulation layer.
 
 Command groups worth considering:
 
 Editing lines:
 - `:delete-line` / `:dl` — delete current line.
 - `:duplicate-line` / `:dup` — duplicate current line below.
-- `:move-line-up` / `:mlu` — move current line or selected lines up; primary shortcut should be `Alt+Up`.
-- `:move-line-down` / `:mld` — move current line or selected lines down; primary shortcut should be `Alt+Down`.
+- `:move-line-up` / `:mlu` — move current line up one line; shortcuts: `Alt+Up`, plus Alt structural up key for the selected movement mode.
+- `:move-line-down` / `:mld` — move current line down one line; shortcuts: `Alt+Down`, plus Alt structural down key for the selected movement mode.
+- `:move-line-to-paragraph-start` / `:mlps` — move current line to the start of its paragraph; shortcut: repeated Alt structural up key.
+- `:move-line-to-paragraph-end` / `:mlpe` — move current line to the end of its paragraph; shortcut: repeated Alt structural down key.
 - `:join-line` / `:join` — join current line with next line.
 - `:sort-lines` — sort selected lines or current paragraph.
 - `:trim-line` — trim trailing whitespace on current line.
@@ -467,6 +471,8 @@ Editing words/selections:
 - `:select-word` / `:sw` — select the word under/near the cursor; Ctrl-layer `sw`.
 - `:select-line` / `:sl` — select the current line; Ctrl-layer `sl`.
 - `:delete-word` / `:dw` — delete word under/near cursor; Ctrl-layer `dw`.
+- Alt structural left key extends selection by one word to the left; repeated taps extend by more words.
+- Alt structural right key extends selection by one word to the right; repeated taps extend by more words.
 - `:delete-prev-word` — delete word before cursor.
 - `:change-word` / `:cw` — select/delete word and enter normal typing.
 - `:uppercase` / `:upper` — uppercase selection or word.
@@ -532,6 +538,34 @@ Safety and workflow:
 - `:validate-config` — validate future literate/plain config.
 - `:help command` — lightweight command help/discoverability.
 
+### Three-batch Alt structural editing plan
+
+Batch 1 — Vertical line movement: done.
+- Done: add `EditorBuffer` primitives to move the current line up/down one line.
+- Done: add paragraph-boundary primitives to move the current line to the start/end of its paragraph, where a paragraph is a contiguous block of non-empty lines separated by blank lines.
+- Done: add commandline commands: `:move-line-up` / `:mlu`, `:move-line-down` / `:mld`, `:move-line-to-paragraph-start` / `:mlps`, `:move-line-to-paragraph-end` / `:mlpe`.
+- Done: add shortcuts: `Alt+Up` and `Alt+Down` for one-line movement.
+- Done: add Alt structural mode mappings:
+  - Slate mode: `Alt+i` move line up, repeated `Alt+ii` move line to paragraph start; `Alt+k` move line down, repeated `Alt+kk` move line to paragraph end.
+  - Vim mode: `Alt+k` move line up, repeated `Alt+kk` move line to paragraph start; `Alt+j` move line down, repeated `Alt+jj` move line to paragraph end.
+- Done: show the pending Alt sequence in the minibuffer as `alt:i`, `alt:ii`, etc.
+- Done: keep this current-line only; selected-line ranges are a future extension.
+
+Batch 2 — Horizontal word selection:
+- Add `EditorBuffer` primitives to select/extend by words to the left and right.
+- Alt structural left key selects the word under/near the cursor and leaves the cursor at the left edge; repeated taps extend selection one more word left each time.
+- Alt structural right key selects the word under/near the cursor and leaves the cursor at the right edge; repeated taps extend selection one more word right each time.
+- Slate mode: `Alt+j` extends word selection left; `Alt+l` extends word selection right.
+- Vim mode: `Alt+h` extends word selection left; `Alt+l` extends word selection right.
+- Preserve normal typing and avoid permanent modes.
+
+Batch 3 — Duplicate line and polish:
+- Add `EditorBuffer::duplicate_current_line()` with tests.
+- Add `:duplicate-line` / `:dup`.
+- Decide whether duplicate should get an Alt shortcut or remain command/Ctrl-layer only.
+- Update shortcut help, README, and queue docs with the final Alt structural layer.
+- Add regression tests for line movement at first/last line, paragraph boundaries, Unicode lines, selection extension, and duplicate-line behavior.
+
 ## Suggested implementation order
 
 ### Completed foundation
@@ -548,38 +582,40 @@ Safety and workflow:
 
 ### Next practical sequence
 
-1. T007/T046 — Complete the next tiny editing batch: duplicate line, move line up/down, `Alt+Up`, `Alt+Down`.
-2. T002/T013 — Improve command discovery: fuzzy command matching, palette/command-line consistency, and recent/frequent commands.
-3. T003 — Expand persistent config for wrap/preview/theme/vault while keeping the plain config simple.
-4. T004 — Build real recent-files list and `:recent` picker.
-5. T010 — Minimal project/vault file opener with fuzzy-ish file matching.
-6. T017 — Write down Slate's knowledge-work philosophy so future features do not drift into Obsidian/Emacs sprawl.
-7. T005 — Scratch buffer and quick capture workflow.
-8. T006 — Daily notes on top of the chosen notes/vault directory.
-9. T018 — Optional vault/root folder selection.
-10. T023 — Vault index architecture: Markdown source plus rebuildable SQLite cache.
-11. T020 — Global notes search, starting simple and later backed by the index.
-12. T024 — Link resolver trigger for `[[`.
-13. T025 — Link resolver ranking/result groups.
-14. T027 — Wiki-link parser and target resolver.
-15. T026 — Content-match deep link insertion with compact/full style toggle.
-16. T028 — Follow-link navigation and cursor jump.
-17. T029 — Link display ergonomics and visual affordances.
-18. T031 — Link resolver performance and indexing lifecycle.
-19. T030 — Backlinks and most-linked notes.
-20. T021 — Progressive organization commands.
-21. T015 — Task/checklist commands.
-22. T022 — Tags and lightweight metadata.
-23. T035 — Append/capture side effects from normal editing.
-24. T036 — Textual result buffers.
-25. T014 — Templates.
-26. T009 — Theme system.
-27. T008 — Lightweight Markdown preview improvements.
-28. T011 — Buffers / multi-file workflow.
-29. T012 — Optional auto-save.
-30. T034 — Repeatable edits and lightweight macros.
-31. T037 — Curated defaults instead of infinite configurability.
-32. T038 — Literate Markdown configuration polish.
+1. T007/T046 — Alt structural editing, batch 1: move current line up/down and to paragraph start/end. Done.
+2. T007/T046 — Alt structural editing, batch 2: extend word selection left/right.
+3. T007/T046 — Alt structural editing, batch 3: duplicate line and shortcut/help/docs polish.
+4. T002/T013 — Improve command discovery: fuzzy command matching, palette/command-line consistency, and recent/frequent commands.
+5. T003 — Expand persistent config for wrap/preview/theme/vault while keeping the plain config simple.
+6. T004 — Build real recent-files list and `:recent` picker.
+7. T010 — Minimal project/vault file opener with fuzzy-ish file matching.
+8. T017 — Write down Slate's knowledge-work philosophy so future features do not drift into Obsidian/Emacs sprawl.
+9. T005 — Scratch buffer and quick capture workflow.
+10. T006 — Daily notes on top of the chosen notes/vault directory.
+11. T018 — Optional vault/root folder selection.
+12. T023 — Vault index architecture: Markdown source plus rebuildable SQLite cache.
+13. T020 — Global notes search, starting simple and later backed by the index.
+14. T024 — Link resolver trigger for `[[`.
+15. T025 — Link resolver ranking/result groups.
+16. T027 — Wiki-link parser and target resolver.
+17. T026 — Content-match deep link insertion with compact/full style toggle.
+18. T028 — Follow-link navigation and cursor jump.
+19. T029 — Link display ergonomics and visual affordances.
+20. T031 — Link resolver performance and indexing lifecycle.
+21. T030 — Backlinks and most-linked notes.
+22. T021 — Progressive organization commands.
+23. T015 — Task/checklist commands.
+24. T022 — Tags and lightweight metadata.
+25. T035 — Append/capture side effects from normal editing.
+26. T036 — Textual result buffers.
+27. T014 — Templates.
+28. T009 — Theme system.
+29. T008 — Lightweight Markdown preview improvements.
+30. T011 — Buffers / multi-file workflow.
+31. T012 — Optional auto-save.
+32. T034 — Repeatable edits and lightweight macros.
+33. T037 — Curated defaults instead of infinite configurability.
+34. T038 — Literate Markdown configuration polish.
 
 <!-- THREADSUITE:START -->
 # ACTIVE_QUEUE.md

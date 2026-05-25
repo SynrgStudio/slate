@@ -241,6 +241,48 @@ impl EditorBuffer {
         true
     }
 
+    pub(crate) fn move_current_line_up(&mut self) -> bool {
+        let line_index = self.line_index_for_byte(self.cursor);
+        if line_index == 0 {
+            return false;
+        }
+        self.move_current_line_to(line_index - 1)
+    }
+
+    pub(crate) fn move_current_line_down(&mut self) -> bool {
+        let line_index = self.line_index_for_byte(self.cursor);
+        if line_index + 1 >= self.line_count() {
+            return false;
+        }
+        self.move_current_line_to(line_index + 1)
+    }
+
+    pub(crate) fn move_current_line_to_paragraph_start(&mut self) -> bool {
+        let line_index = self.line_index_for_byte(self.cursor);
+        if self.line(line_index).trim().is_empty() {
+            return false;
+        }
+
+        let mut target = line_index;
+        while target > 0 && !self.line(target - 1).trim().is_empty() {
+            target -= 1;
+        }
+        self.move_current_line_to(target)
+    }
+
+    pub(crate) fn move_current_line_to_paragraph_end(&mut self) -> bool {
+        let line_index = self.line_index_for_byte(self.cursor);
+        if self.line(line_index).trim().is_empty() {
+            return false;
+        }
+
+        let mut target = line_index;
+        while target + 1 < self.line_count() && !self.line(target + 1).trim().is_empty() {
+            target += 1;
+        }
+        self.move_current_line_to(target)
+    }
+
     pub(crate) fn select_current_line(&mut self) -> bool {
         if self.text.is_empty() {
             return false;
@@ -345,6 +387,41 @@ impl EditorBuffer {
             .nth(target_column)
             .map(|(offset, _)| line_start + offset)
             .unwrap_or(line_end)
+    }
+
+    fn move_current_line_to(&mut self, target_index: usize) -> bool {
+        if self.text.is_empty() {
+            return false;
+        }
+
+        let line_index = self.line_index_for_byte(self.cursor);
+        let target_index = target_index.min(self.line_count().saturating_sub(1));
+        if line_index == target_index {
+            return false;
+        }
+
+        let (_, column) = self.cursor_line_col();
+        let mut lines = self.lines_with_endings();
+        let line = lines.remove(line_index);
+        lines.insert(target_index, line);
+        self.text = lines.concat();
+        self.selection = None;
+        self.revision = self.revision.wrapping_add(1);
+        self.rebuild_line_index();
+        self.cursor = self.line_col_to_byte(target_index + 1, column + 1);
+        true
+    }
+
+    fn lines_with_endings(&self) -> Vec<String> {
+        let mut lines = self
+            .text
+            .split_inclusive('\n')
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        if self.text.ends_with('\n') {
+            lines.push(String::new());
+        }
+        lines
     }
 
     fn word_range_at_cursor(&self) -> Option<(usize, usize)> {
@@ -528,6 +605,52 @@ mod tests {
         assert!(buffer.delete_current_line());
 
         assert_eq!(buffer.as_str(), "one\ntwo");
+    }
+
+    #[test]
+    fn editor_buffer_moves_current_line_up_and_down() {
+        let mut buffer = EditorBuffer::from_text("one\ntwö\nthree".to_string());
+        buffer.set_cursor("one\nt".len());
+
+        assert!(buffer.move_current_line_up());
+        assert_eq!(buffer.as_str(), "twö\none\nthree");
+        assert_eq!(buffer.byte_to_line_col(buffer.cursor()), (1, 2));
+
+        assert!(buffer.move_current_line_down());
+        assert_eq!(buffer.as_str(), "one\ntwö\nthree");
+        assert_eq!(buffer.byte_to_line_col(buffer.cursor()), (2, 2));
+    }
+
+    #[test]
+    fn editor_buffer_does_not_move_past_file_edges() {
+        let mut buffer = EditorBuffer::from_text("one\ntwo".to_string());
+        buffer.set_cursor(0);
+        assert!(!buffer.move_current_line_up());
+
+        buffer.set_cursor(buffer.as_str().len());
+        assert!(!buffer.move_current_line_down());
+    }
+
+    #[test]
+    fn editor_buffer_moves_current_line_to_paragraph_boundaries() {
+        let mut buffer = EditorBuffer::from_text("one\ntwo\nthree\n\nfour".to_string());
+        buffer.set_cursor("one\ntwo\nth".len());
+
+        assert!(buffer.move_current_line_to_paragraph_start());
+        assert_eq!(buffer.as_str(), "three\none\ntwo\n\nfour");
+
+        assert!(buffer.move_current_line_to_paragraph_end());
+        assert_eq!(buffer.as_str(), "one\ntwo\nthree\n\nfour");
+    }
+
+    #[test]
+    fn editor_buffer_does_not_move_blank_line_to_paragraph_boundary() {
+        let mut buffer = EditorBuffer::from_text("one\n\ntwo".to_string());
+        buffer.set_cursor(4);
+
+        assert!(!buffer.move_current_line_to_paragraph_start());
+        assert!(!buffer.move_current_line_to_paragraph_end());
+        assert_eq!(buffer.as_str(), "one\n\ntwo");
     }
 
     #[test]
