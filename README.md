@@ -138,6 +138,8 @@ Open the command line with:
 Ctrl+.
 ```
 
+The command line is Slate's fastest primary interface. While typing the command token, Slate now shows a live terminal-style completion inline in dim text and a small fuzzy suggestion list sourced from the real command registry. Press `Tab` to accept the current completion, or `Enter` to run.
+
 Examples:
 
 ```text

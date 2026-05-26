@@ -13,15 +13,18 @@ Status: completed
 Scope:
 - Review inferred Rust/Cargo project context and confirm or edit generated facts.
 
-### T002 — Command palette as Slate's primary interface
+### T002 — Commandline-first command discovery, with palette as browser
 
 Status: in_progress
 Scope:
+- Principle: the commandline is the fastest primary interface; the command palette is for browsing lists of files, commands, settings, and other discoverable collections.
 - Done: command-line aliases for save/quit/new/open/preview/wrap/settings/find/goto/delete/select/navigation basics.
 - Done: command arguments such as `open ~/notes/todo.md`.
-- Pending: add fuzzy command search instead of substring-only matching.
+- Done: add live commandline autocomplete: while typing after `Ctrl+.`, show the best matching command completion inline in dim/low-opacity text, terminal-style.
+- Done: show a small fzf-like live suggestion list below the commandline when useful, sourced from the real command registry rather than static help text.
+- Done: add fuzzy command search instead of substring-only matching for command registry results.
 - Pending: add recent/frequent commands.
-- Keep Slate command-palette-first: commands before menus/toolbars.
+- Keep Slate commandline-first and command-palette-supported: commands before menus/toolbars.
 
 ### T003 — Persistent configuration
 
@@ -41,6 +44,7 @@ Status: in_progress
 Scope:
 - Done: track the last opened file and support `open-last` / `last` / `ol` plus Ctrl-layer `ol`.
 - Pending: track a real recent opened/saved files list.
+- Pending: add `:recent` as a commandline-first workflow that opens a live recent-file picker in the minibuffer/palette area.
 - Pending: add `Open recent` command in the command palette/minibuffer.
 - Pending: optionally reopen the last file at startup.
 
@@ -123,7 +127,8 @@ Status: in_progress
 Scope:
 - Done: command line supports `save`, `quit`, `wq`, `new`, `open`, `wrap`, `preview`, `find`, `goto`, `settings`, and early edit/navigation commands.
 - Done: common aliases such as `:w`, `:q`, `:wq`, `:x`, `:e`, `:f`, `:g`, `:dl`, `:dw`, `:sw`, `:sl`, `:gt`, `:gb`.
-- Pending: route more commands through the palette itself and add fuzzy matching.
+- Done: make the command list a live registry used by commandline autocomplete, fzf-like suggestions, palette results, aliases, and command palette entries.
+- Done: route command palette results through the shared command registry and fuzzy matching.
 - Pending: add knowledge commands like `:daily`, `:scratch`, `:recent`, and `:theme amber`.
 
 ### T014 — Templates

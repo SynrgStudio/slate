@@ -57,6 +57,178 @@ enum Command {
     Quit,
 }
 
+struct CommandSpec {
+    name: &'static str,
+    aliases: &'static [&'static str],
+    summary: &'static str,
+    hint: &'static str,
+    palette_command: Option<Command>,
+}
+
+const COMMAND_SPECS: &[CommandSpec] = &[
+    CommandSpec {
+        name: "save",
+        aliases: &["w", "write"],
+        summary: "Save current buffer",
+        hint: "Ctrl+S",
+        palette_command: Some(Command::Save),
+    },
+    CommandSpec {
+        name: "quit",
+        aliases: &["q", "exit"],
+        summary: "Quit Slate",
+        hint: "Ctrl+Q",
+        palette_command: Some(Command::Quit),
+    },
+    CommandSpec {
+        name: "wq",
+        aliases: &["x"],
+        summary: "Save and quit",
+        hint: ":wq",
+        palette_command: None,
+    },
+    CommandSpec {
+        name: "new",
+        aliases: &["enew"],
+        summary: "New buffer",
+        hint: "Ctrl+N",
+        palette_command: Some(Command::New),
+    },
+    CommandSpec {
+        name: "open",
+        aliases: &["edit", "e"],
+        summary: "Open file or path",
+        hint: "Ctrl+O",
+        palette_command: Some(Command::Open),
+    },
+    CommandSpec {
+        name: "open-last",
+        aliases: &["last", "ol"],
+        summary: "Open last file",
+        hint: "Ctrl+O L",
+        palette_command: None,
+    },
+    CommandSpec {
+        name: "preview",
+        aliases: &["md"],
+        summary: "Toggle Markdown preview",
+        hint: "Ctrl+M",
+        palette_command: Some(Command::TogglePreview),
+    },
+    CommandSpec {
+        name: "wrap",
+        aliases: &[],
+        summary: "Toggle word wrap",
+        hint: ":wrap",
+        palette_command: Some(Command::ToggleWrap),
+    },
+    CommandSpec {
+        name: "find",
+        aliases: &["f"],
+        summary: "Find text",
+        hint: "Ctrl+F",
+        palette_command: None,
+    },
+    CommandSpec {
+        name: "goto",
+        aliases: &["g", "line", "l"],
+        summary: "Go to line/column",
+        hint: ":g 10",
+        palette_command: None,
+    },
+    CommandSpec {
+        name: "select-word",
+        aliases: &["sw"],
+        summary: "Select word under cursor",
+        hint: "Ctrl S W",
+        palette_command: None,
+    },
+    CommandSpec {
+        name: "select-line",
+        aliases: &["sl"],
+        summary: "Select current line",
+        hint: "Ctrl S L",
+        palette_command: None,
+    },
+    CommandSpec {
+        name: "delete-word",
+        aliases: &["dw"],
+        summary: "Delete word under cursor",
+        hint: "Ctrl D W",
+        palette_command: None,
+    },
+    CommandSpec {
+        name: "delete-line",
+        aliases: &["dl"],
+        summary: "Delete current line",
+        hint: "Ctrl D L",
+        palette_command: None,
+    },
+    CommandSpec {
+        name: "duplicate-line",
+        aliases: &["dup"],
+        summary: "Duplicate current line",
+        hint: "Ctrl D U P",
+        palette_command: None,
+    },
+    CommandSpec {
+        name: "duplicate-place",
+        aliases: &["dupp"],
+        summary: "Duplicate line then place it",
+        hint: "Ctrl D U P P",
+        palette_command: None,
+    },
+    CommandSpec {
+        name: "move-line-up",
+        aliases: &["mlu"],
+        summary: "Move current line up",
+        hint: "Alt+Up",
+        palette_command: None,
+    },
+    CommandSpec {
+        name: "move-line-down",
+        aliases: &["mld"],
+        summary: "Move current line down",
+        hint: "Alt+Down",
+        palette_command: None,
+    },
+    CommandSpec {
+        name: "move-line-to-paragraph-start",
+        aliases: &["mlps"],
+        summary: "Move line to paragraph start",
+        hint: "Alt double-up",
+        palette_command: None,
+    },
+    CommandSpec {
+        name: "move-line-to-paragraph-end",
+        aliases: &["mlpe"],
+        summary: "Move line to paragraph end",
+        hint: "Alt double-down",
+        palette_command: None,
+    },
+    CommandSpec {
+        name: "top",
+        aliases: &["go-top", "gt"],
+        summary: "Go to top of file",
+        hint: "Ctrl G T",
+        palette_command: None,
+    },
+    CommandSpec {
+        name: "bottom",
+        aliases: &["go-bottom", "gb"],
+        summary: "Go to bottom of file",
+        hint: "Ctrl G B",
+        palette_command: None,
+    },
+    CommandSpec {
+        name: "settings",
+        aliases: &["set", "prefs", "preferences"],
+        summary: "Open settings",
+        hint: ":settings",
+        palette_command: Some(Command::Settings),
+    },
+];
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PendingAction {
     New,
@@ -116,32 +288,6 @@ impl PendingAction {
             PendingAction::Open => "buffer has unsaved changes; open another file anyway?",
             PendingAction::OpenLast => "buffer has unsaved changes; open last file anyway?",
             PendingAction::Quit => "buffer has unsaved changes; close anyway?",
-        }
-    }
-}
-
-impl Command {
-    fn label(self) -> &'static str {
-        match self {
-            Command::New => "New buffer",
-            Command::Open => "Open file",
-            Command::Save => "Save",
-            Command::TogglePreview => "Toggle Markdown preview",
-            Command::ToggleWrap => "Toggle word wrap",
-            Command::Settings => "Settings",
-            Command::Quit => "Quit",
-        }
-    }
-
-    fn hint(self) -> &'static str {
-        match self {
-            Command::New => "Ctrl+N",
-            Command::Open => "Ctrl+O",
-            Command::Save => "Ctrl+S",
-            Command::TogglePreview => "Ctrl+M",
-            Command::ToggleWrap => "",
-            Command::Settings => ":settings",
-            Command::Quit => "Ctrl+Q",
         }
     }
 }
@@ -515,6 +661,120 @@ impl SlateApp {
             }
             Command::Quit => self.request_close(ctx),
         }
+    }
+
+    fn command_line_command_prefix(&self) -> Option<&str> {
+        let input = self
+            .command_line
+            .trim_start()
+            .strip_prefix(':')
+            .unwrap_or(self.command_line.trim_start());
+        if input.is_empty() || input.contains(char::is_whitespace) {
+            return None;
+        }
+        Some(input)
+    }
+
+    fn command_line_suggestions(&self) -> Vec<&'static CommandSpec> {
+        let Some(prefix) = self.command_line_command_prefix() else {
+            return Vec::new();
+        };
+        Self::matching_command_specs(prefix, 5)
+    }
+
+    fn command_line_completion(&self) -> Option<&'static str> {
+        let prefix = self.command_line_command_prefix()?;
+        let spec = Self::matching_command_specs(prefix, 1).into_iter().next()?;
+        Self::best_command_token(spec, prefix)
+            .filter(|candidate| candidate.len() > prefix.len())
+            .map(|candidate| &candidate[prefix.len()..])
+    }
+
+    fn accept_command_line_completion(&mut self) -> bool {
+        let Some(prefix) = self.command_line_command_prefix().map(str::to_string) else {
+            return false;
+        };
+        let Some(spec) = Self::matching_command_specs(&prefix, 1).into_iter().next() else {
+            return false;
+        };
+        let Some(candidate) = Self::best_command_token(spec, &prefix) else {
+            return false;
+        };
+        if candidate.len() <= prefix.len() {
+            return false;
+        }
+        self.command_line = candidate.to_string();
+        self.command_line_cursor = self.command_line.len();
+        self.focus_command_line_once = true;
+        true
+    }
+
+    fn matching_command_specs(prefix: &str, limit: usize) -> Vec<&'static CommandSpec> {
+        let query = prefix.trim_start_matches(':').to_lowercase();
+        if query.is_empty() {
+            return COMMAND_SPECS.iter().take(limit).collect();
+        }
+
+        let mut scored = COMMAND_SPECS
+            .iter()
+            .filter_map(|spec| Self::command_spec_score(spec, &query).map(|score| (score, spec)))
+            .collect::<Vec<_>>();
+        scored.sort_by_key(|(score, spec)| (*score, spec.name.len(), spec.name));
+        scored
+            .into_iter()
+            .map(|(_, spec)| spec)
+            .take(limit)
+            .collect()
+    }
+
+    fn command_spec_score(spec: &CommandSpec, query: &str) -> Option<usize> {
+        let mut best = Self::fuzzy_score(spec.name, query);
+        for alias in spec.aliases {
+            best = best
+                .into_iter()
+                .chain(Self::fuzzy_score(alias, query))
+                .min();
+        }
+        best
+    }
+
+    fn best_command_token(spec: &CommandSpec, prefix: &str) -> Option<&'static str> {
+        let query = prefix.to_lowercase();
+        std::iter::once(spec.name)
+            .chain(spec.aliases.iter().copied())
+            .filter_map(|token| Self::fuzzy_score(token, &query).map(|score| (score, token)))
+            .min_by_key(|(score, token)| (*score, token.len()))
+            .map(|(_, token)| token)
+    }
+
+    fn fuzzy_score(candidate: &str, query: &str) -> Option<usize> {
+        if query.is_empty() {
+            return Some(0);
+        }
+        let candidate = candidate.to_lowercase();
+        if candidate == query {
+            return Some(0);
+        }
+        if candidate.starts_with(query) {
+            return Some(1 + candidate.len().saturating_sub(query.len()));
+        }
+        if candidate.contains(query) {
+            return Some(100 + candidate.find(query).unwrap_or(0));
+        }
+
+        let mut score = 200usize;
+        let mut last_match = None;
+        let mut chars = candidate.char_indices();
+        for query_ch in query.chars() {
+            let Some((index, _)) = chars.find(|(_, candidate_ch)| *candidate_ch == query_ch) else {
+                return None;
+            };
+            if let Some(last) = last_match {
+                score += index.saturating_sub(last + 1);
+            }
+            last_match = Some(index);
+        }
+        Some(score + candidate.len().saturating_sub(query.len()))
     }
 
     fn run_command_line(&mut self, ctx: &egui::Context) {
@@ -1569,6 +1829,7 @@ impl SlateApp {
 
         let mut command = None;
         let mut execute_command_line = false;
+        let mut complete_command_line = false;
         let mut previous_command = false;
         let mut next_command = false;
         let mut settings_decrement = false;
@@ -1631,7 +1892,7 @@ impl SlateApp {
             }
             if self.command_line_focused || self.focus_command_line_once {
                 execute_command_line |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
-                execute_command_line |= i.consume_key(egui::Modifiers::NONE, Key::Tab);
+                complete_command_line |= i.consume_key(egui::Modifiers::NONE, Key::Tab);
                 previous_command |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
                 next_command |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
                 command_line_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
@@ -1822,6 +2083,13 @@ impl SlateApp {
             return;
         }
 
+        if complete_command_line {
+            if !self.accept_command_line_completion() {
+                self.run_command_line(ctx);
+            }
+            return;
+        }
+
         if execute_command_line {
             self.run_command_line(ctx);
             return;
@@ -1832,20 +2100,8 @@ impl SlateApp {
         }
     }
 
-    fn filtered_commands(&self) -> Vec<Command> {
-        let all = [
-            Command::New,
-            Command::Open,
-            Command::Save,
-            Command::TogglePreview,
-            Command::ToggleWrap,
-            Command::Settings,
-            Command::Quit,
-        ];
-        let q = self.palette_query.to_lowercase();
-        all.into_iter()
-            .filter(|c| c.label().to_lowercase().contains(&q))
-            .collect()
+    fn filtered_commands(&self) -> Vec<&'static CommandSpec> {
+        Self::matching_command_specs(&self.palette_query, 12)
     }
 
     fn command_palette(&mut self, ctx: &egui::Context) {
@@ -1949,7 +2205,7 @@ impl SlateApp {
                                             .color(Color32::from_rgb(136, 192, 208)),
                                     );
                                     ui.label(
-                                        RichText::new(command.label())
+                                        RichText::new(command.name)
                                             .font(FontId::new(14.0, FontFamily::Monospace))
                                             .color(label_color),
                                     );
@@ -1957,7 +2213,7 @@ impl SlateApp {
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
                                             ui.label(
-                                                RichText::new(command.hint())
+                                                RichText::new(command.hint)
                                                     .font(FontId::new(13.0, FontFamily::Monospace))
                                                     .color(Color32::from_rgb(136, 154, 176)),
                                             );
@@ -1968,7 +2224,16 @@ impl SlateApp {
                             .response
                             .clicked();
                         if clicked {
-                            self.run_command(*command, ctx);
+                            if let Some(command) = command.palette_command {
+                                self.run_command(command, ctx);
+                            } else {
+                                self.palette_open = false;
+                                self.command_line = command.name.to_string();
+                                self.command_line_cursor = self.command_line.len();
+                                self.command_line_focused = true;
+                                self.focus_command_line_once = true;
+                                self.focus_editor_once = false;
+                            }
                             return;
                         }
                     }
@@ -1994,7 +2259,16 @@ impl SlateApp {
                     let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
                     if enter {
                         if let Some(command) = commands.get(self.selected_command).copied() {
-                            self.run_command(command, ctx);
+                            if let Some(palette_command) = command.palette_command {
+                                self.run_command(palette_command, ctx);
+                            } else {
+                                self.palette_open = false;
+                                self.command_line = command.name.to_string();
+                                self.command_line_cursor = self.command_line.len();
+                                self.command_line_focused = true;
+                                self.focus_command_line_once = true;
+                                self.focus_editor_once = false;
+                            }
                         }
                     }
                 });
@@ -2440,17 +2714,28 @@ impl eframe::App for SlateApp {
                 let shortcut_help_row_height = 22.0;
                 let shortcut_help_rows = if self.shortcut_help_open { 14 } else { 0 };
                 let shortcut_help_height = shortcut_help_rows as f32 * shortcut_help_row_height;
-                let command_history_active = (self.command_line_focused
-                    || self.focus_command_line_once)
+                let command_line_active = self.command_line_focused || self.focus_command_line_once;
+                let command_suggestions = if command_line_active {
+                    self.command_line_suggestions()
+                } else {
+                    Vec::new()
+                };
+                let visible_suggestion_rows = command_suggestions.len();
+                let command_history_active = command_line_active
+                    && command_suggestions.is_empty()
                     && !self.command_history.is_empty();
                 let visible_history_rows = if command_history_active {
                     self.command_history.len().min(self.command_history_limit)
                 } else {
                     0
                 };
+                let suggestion_height = visible_suggestion_rows as f32 * history_row_height;
                 let history_height = visible_history_rows as f32 * history_row_height;
-                let footer_height =
-                    status_height + shortcut_help_height + history_height + command_height;
+                let footer_height = status_height
+                    + shortcut_help_height
+                    + suggestion_height
+                    + history_height
+                    + command_height;
                 let editor_size = Vec2::new(
                     ui.available_width(),
                     (ui.available_height() - footer_height).max(80.0),
@@ -2664,6 +2949,57 @@ impl eframe::App for SlateApp {
                     }
                 }
 
+                if visible_suggestion_rows > 0 {
+                    let (suggestions_rect, _) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), suggestion_height),
+                        egui::Sense::hover(),
+                    );
+                    let painter = ui.painter_at(suggestions_rect);
+                    painter.rect_filled(suggestions_rect, 0.0, Color32::from_rgb(25, 31, 40));
+
+                    for (row, command) in command_suggestions.iter().enumerate() {
+                        let row_rect = egui::Rect::from_min_size(
+                            egui::pos2(
+                                suggestions_rect.left(),
+                                suggestions_rect.top() + row as f32 * history_row_height,
+                            ),
+                            Vec2::new(suggestions_rect.width(), history_row_height),
+                        );
+                        if row == 0 {
+                            painter.rect_filled(row_rect, 0.0, Color32::from_rgb(38, 47, 61));
+                        }
+
+                        painter.text(
+                            egui::pos2(row_rect.left() + 10.0, row_rect.center().y - 1.0),
+                            egui::Align2::LEFT_CENTER,
+                            if row == 0 { ">" } else { " " },
+                            footer_font.clone(),
+                            footer_accent,
+                        );
+                        painter.text(
+                            egui::pos2(row_rect.left() + 28.0, row_rect.center().y - 1.0),
+                            egui::Align2::LEFT_CENTER,
+                            command.name,
+                            footer_font.clone(),
+                            if row == 0 { footer_color } else { footer_dim },
+                        );
+                        painter.text(
+                            egui::pos2(row_rect.left() + 190.0, row_rect.center().y - 1.0),
+                            egui::Align2::LEFT_CENTER,
+                            command.summary,
+                            footer_font.clone(),
+                            footer_dim,
+                        );
+                        painter.text(
+                            egui::pos2(row_rect.right() - 10.0, row_rect.center().y - 1.0),
+                            egui::Align2::RIGHT_CENTER,
+                            command.hint,
+                            footer_font.clone(),
+                            footer_warn,
+                        );
+                    }
+                }
+
                 if visible_history_rows > 0 {
                     let (history_rect, _) = ui.allocate_exact_size(
                         Vec2::new(ui.available_width(), history_height),
@@ -2748,18 +3084,38 @@ impl eframe::App for SlateApp {
                         self.focus_command_line_once = false;
                     }
                     self.command_line_focused = true;
-                    let display_text = if self.command_line.is_empty() {
-                        "command  Ctrl+. enter · Ctrl+H help · Ctrl+P palette"
+                    if self.command_line.is_empty() {
+                        painter.text(
+                            egui::pos2(input_rect.left(), input_rect.center().y - 0.5),
+                            egui::Align2::LEFT_CENTER,
+                            "command  Ctrl+. enter · Tab complete · Ctrl+H help · Ctrl+P palette",
+                            footer_font.clone(),
+                            footer_dim,
+                        );
                     } else {
-                        &self.command_line
-                    };
-                    painter.text(
-                        egui::pos2(input_rect.left(), input_rect.center().y - 0.5),
-                        egui::Align2::LEFT_CENTER,
-                        display_text,
-                        footer_font.clone(),
-                        if self.command_line.is_empty() { footer_dim } else { footer_color },
-                    );
+                        painter.text(
+                            egui::pos2(input_rect.left(), input_rect.center().y - 0.5),
+                            egui::Align2::LEFT_CENTER,
+                            &self.command_line,
+                            footer_font.clone(),
+                            footer_color,
+                        );
+                        if self.command_line_cursor == self.command_line.len() {
+                            if let Some(completion) = self.command_line_completion() {
+                                let typed_chars = self.command_line.chars().count() as f32;
+                                painter.text(
+                                    egui::pos2(
+                                        input_rect.left() + typed_chars * 8.0,
+                                        input_rect.center().y - 0.5,
+                                    ),
+                                    egui::Align2::LEFT_CENTER,
+                                    completion,
+                                    footer_font.clone(),
+                                    Color32::from_rgb(76, 86, 106),
+                                );
+                            }
+                        }
+                    }
                     let cursor_chars = self.command_line[..self.command_line_cursor.min(self.command_line.len())]
                         .chars()
                         .count() as f32;
