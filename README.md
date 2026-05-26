@@ -138,7 +138,9 @@ Open the command line with:
 Ctrl+.
 ```
 
-The command line is Slate's fastest primary interface. While typing the command token, Slate now shows a live terminal-style completion inline in dim text and a small fuzzy suggestion list sourced from the real command registry. Press `Tab` to accept the current completion, or `Enter` to run.
+The command line is Slate's fastest primary interface. While typing the command token, Slate shows a live terminal-style completion inline in dim text and a small fuzzy suggestion list sourced from the real command registry. Press `Tab` to accept the current completion, or `Enter` to run.
+
+Slate persists command history and recent/frequent command usage in `~/.config/slate/config.toml`. Usage acts as a conservative ranking boost for commandline suggestions and the command palette. Fuzzy match quality still comes first, so this should improve discovery without making the commandline feel noisy or heavy.
 
 Examples:
 

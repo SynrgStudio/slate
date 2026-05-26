@@ -15,7 +15,7 @@ Scope:
 
 ### T002 — Commandline-first command discovery, with palette as browser
 
-Status: in_progress
+Status: completed
 Scope:
 - Principle: the commandline is the fastest primary interface; the command palette is for browsing lists of files, commands, settings, and other discoverable collections.
 - Done: command-line aliases for save/quit/new/open/preview/wrap/settings/find/goto/delete/select/navigation basics.
@@ -23,7 +23,10 @@ Scope:
 - Done: add live commandline autocomplete: while typing after `Ctrl+.`, show the best matching command completion inline in dim/low-opacity text, terminal-style.
 - Done: show a small fzf-like live suggestion list below the commandline when useful, sourced from the real command registry rather than static help text.
 - Done: add fuzzy command search instead of substring-only matching for command registry results.
-- Pending: add recent/frequent commands.
+- Done: register command usage from commandline, command palette, shortcuts, and Ctrl-layer where practical.
+- Done: persist command history plus recent/frequent command usage in the lightweight config, capped to keep it cheap.
+- Done: rank command suggestions with a conservative frequency/recency boost while keeping fuzzy quality primary.
+- Done: keep the empty commandline clean; use usage ranking when filtering and in the command palette/browser.
 - Keep Slate commandline-first and command-palette-supported: commands before menus/toolbars.
 
 ### T003 — Persistent configuration
@@ -31,7 +34,7 @@ Scope:
 Status: in_progress
 Scope:
 - Done: lightweight config at `~/.config/slate/config.toml`.
-- Done: persist command history limit, line-number mode, last opened file, recent files, and Ctrl+Shift movement mode.
+- Done: persist command history limit, command history, line-number mode, last opened file, recent files, command usage, and Ctrl+Shift movement mode.
 - Pending: persist theme, word wrap, preview mode, selected vault/notes folder, scratch behavior, wiki-link insert style, and link resolver behavior.
 - Keep configuration lightweight and human-readable.
 - Add an optional configurable vault/root notes directory for knowledge-management workflows.
@@ -130,7 +133,7 @@ Scope:
 - Done: common aliases such as `:w`, `:q`, `:wq`, `:x`, `:e`, `:f`, `:g`, `:dl`, `:dw`, `:sw`, `:sl`, `:gt`, `:gb`.
 - Done: make the command list a live registry used by commandline autocomplete, fzf-like suggestions, palette results, aliases, and command palette entries.
 - Done: route command palette results through the shared command registry and fuzzy matching.
-- Pending: add knowledge commands like `:daily`, `:scratch`, `:recent`, and `:theme amber`.
+- Pending: add knowledge commands like `:daily`, `:scratch`, and `:theme amber`.
 
 ### T014 — Templates
 
@@ -599,7 +602,7 @@ Follow-up — Duplicate placement transient mode: done.
 2. T007/T046 — Alt structural editing, batch 2: extend word selection left/right. Done.
 3. T007/T046 — Alt structural editing, batch 3: duplicate line and shortcut/help/docs polish. Done.
 4. T046 — Duplicate placement transient mode: duplicate a line into a movable pending placement, confirm with Enter/Space, cancel with Esc. Done.
-5. T002/T013 — Improve command discovery: fuzzy command matching, palette/command-line consistency, and recent/frequent commands.
+5. T002/T013 — Improve command discovery: fuzzy command matching, palette/command-line consistency, and recent/frequent commands. Done for T002; future command additions continue under T013.
 6. T003 — Expand persistent config for wrap/preview/theme/vault while keeping the plain config simple.
 7. T004 — Build real recent-files list and `:recent` picker.
 8. T010 — Minimal project/vault file opener with fuzzy-ish file matching.

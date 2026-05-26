@@ -3,11 +3,19 @@ mod editor_view;
 mod goto;
 mod search;
 
-use std::{fs, io::Write, path::PathBuf};
+use std::{
+    fs,
+    io::Write,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use editor_buffer::EditorBuffer;
 use editor_view::{EditorView, LineNumberMode};
-use eframe::egui::{self, Color32, FontFamily, FontId, Key, RichText, Stroke, TextEdit, Vec2};
+use eframe::egui::{
+    self, Color32, FontFamily, FontId, Key, RichText, Stroke, TextEdit, Vec2,
+    text::{LayoutJob, LayoutSection, TextFormat},
+};
 use goto::GotoTarget;
 use search::SearchState;
 
@@ -306,6 +314,12 @@ struct DuplicatePlacement {
     was_dirty: bool,
 }
 
+struct CommandUsage {
+    name: String,
+    count: usize,
+    last_used: i64,
+}
+
 struct SlateApp {
     buffer: EditorBuffer,
     editor_view: EditorView,
@@ -329,6 +343,7 @@ struct SlateApp {
     command_history: Vec<String>,
     command_history_index: Option<usize>,
     command_history_limit: usize,
+    command_usage: Vec<CommandUsage>,
     shortcut_help_open: bool,
     line_number_mode: LineNumberMode,
     ctrl_shift_move_mode: CtrlShiftMoveMode,
@@ -380,6 +395,7 @@ impl SlateApp {
             command_history: Vec::new(),
             command_history_index: None,
             command_history_limit: 5,
+            command_usage: Vec::new(),
             shortcut_help_open: false,
             line_number_mode: LineNumberMode::Absolute,
             ctrl_shift_move_mode: CtrlShiftMoveMode::Vim,
@@ -668,13 +684,19 @@ impl SlateApp {
                     }
                 }
                 "last_opened_path" => {
-                    let value = value.trim().trim_matches('"');
+                    let value = Self::parse_config_string(value);
                     if !value.is_empty() {
                         self.last_opened_path = Some(PathBuf::from(value));
                     }
                 }
+                "command_history" => {
+                    let value = Self::parse_config_string(value);
+                    if !value.is_empty() && self.command_history.last() != Some(&value) {
+                        self.command_history.push(value);
+                    }
+                }
                 "recent_file" => {
-                    let value = value.trim().trim_matches('"');
+                    let value = Self::parse_config_string(value);
                     if !value.is_empty() {
                         let path = PathBuf::from(value);
                         if !self.recent_files.contains(&path) {
@@ -682,9 +704,87 @@ impl SlateApp {
                         }
                     }
                 }
+                "command_usage" => {
+                    let value = Self::parse_config_string(value);
+                    let mut parts = value.split('|');
+                    let Some(name) = parts.next() else {
+                        continue;
+                    };
+                    let Some(count) = parts.next().and_then(|value| value.parse::<usize>().ok())
+                    else {
+                        continue;
+                    };
+                    let Some(last_used) = parts.next().and_then(|value| value.parse::<i64>().ok())
+                    else {
+                        continue;
+                    };
+                    let Some(name) = Self::canonical_command_name(name) else {
+                        continue;
+                    };
+                    if let Some(existing) = self
+                        .command_usage
+                        .iter_mut()
+                        .find(|usage| usage.name == name)
+                    {
+                        existing.count = existing.count.max(count);
+                        existing.last_used = existing.last_used.max(last_used);
+                    } else {
+                        self.command_usage.push(CommandUsage {
+                            name: name.to_string(),
+                            count,
+                            last_used,
+                        });
+                    }
+                }
                 _ => {}
             }
         }
+        if self.command_history.len() > self.command_history_limit {
+            let keep_from = self.command_history.len() - self.command_history_limit;
+            self.command_history.drain(0..keep_from);
+        }
+        self.recent_files.truncate(20);
+        self.command_usage.sort_by_key(|usage| {
+            (
+                std::cmp::Reverse(usage.last_used),
+                std::cmp::Reverse(usage.count),
+                usage.name.clone(),
+            )
+        });
+        self.command_usage.truncate(100);
+    }
+
+    fn parse_config_string(value: &str) -> String {
+        let value = value.trim().trim_matches('"');
+        let mut parsed = String::new();
+        let mut escaped = false;
+        for ch in value.chars() {
+            if escaped {
+                parsed.push(match ch {
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    '"' => '"',
+                    '\\' => '\\',
+                    other => other,
+                });
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else {
+                parsed.push(ch);
+            }
+        }
+        parsed
+    }
+
+    fn escape_config_string(value: &str) -> String {
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\t', "\\t")
     }
 
     fn save_settings(&self) -> Result<(), String> {
@@ -700,19 +800,39 @@ impl SlateApp {
             self.command_history_limit,
             self.line_number_mode.config_value(),
             self.ctrl_shift_move_mode.config_value(),
-            self.last_opened_path
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_default()
-                .replace('"', "\\\"")
+            Self::escape_config_string(
+                &self
+                    .last_opened_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default()
+            )
         );
+        let history_start = self
+            .command_history
+            .len()
+            .saturating_sub(self.command_history_limit);
+        for command in &self.command_history[history_start..] {
+            contents.push_str(&format!(
+                "command_history = \"{}\"\n",
+                Self::escape_config_string(command)
+            ));
+        }
         for recent in &self.recent_files {
             contents.push_str(&format!(
                 "recent_file = \"{}\"\n",
-                recent.display().to_string().replace('"', "\\\"")
+                Self::escape_config_string(&recent.display().to_string())
             ));
         }
-        fs::write(path, contents).map_err(|err| err.to_string())
+        for usage in self.command_usage.iter().take(100) {
+            contents.push_str(&format!(
+                "command_usage = \"{}|{}|{}\"\n",
+                usage.name, usage.count, usage.last_used
+            ));
+        }
+        let tmp_path = path.with_extension("toml.tmp");
+        fs::write(&tmp_path, contents).map_err(|err| err.to_string())?;
+        fs::rename(&tmp_path, &path).map_err(|err| err.to_string())
     }
 
     fn set_command_history_limit(&mut self, limit: usize) {
@@ -741,7 +861,87 @@ impl SlateApp {
         }
     }
 
+    fn command_name(command: Command) -> &'static str {
+        match command {
+            Command::New => "new",
+            Command::Open => "open",
+            Command::Save => "save",
+            Command::TogglePreview => "preview",
+            Command::ToggleWrap => "wrap",
+            Command::Settings => "settings",
+            Command::Quit => "quit",
+        }
+    }
+
+    fn now_timestamp() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or_default()
+    }
+
+    fn canonical_command_name(token: &str) -> Option<&'static str> {
+        let token = token.trim_start_matches(':');
+        COMMAND_SPECS
+            .iter()
+            .find(|spec| spec.name == token || spec.aliases.contains(&token))
+            .map(|spec| spec.name)
+    }
+
+    fn record_command_usage(&mut self, token: &str) {
+        let Some(name) = Self::canonical_command_name(token) else {
+            return;
+        };
+        let now = Self::now_timestamp();
+        if let Some(usage) = self
+            .command_usage
+            .iter_mut()
+            .find(|usage| usage.name == name)
+        {
+            usage.count = usage.count.saturating_add(1);
+            usage.last_used = now;
+        } else {
+            self.command_usage.push(CommandUsage {
+                name: name.to_string(),
+                count: 1,
+                last_used: now,
+            });
+        }
+        self.command_usage.sort_by_key(|usage| {
+            (
+                std::cmp::Reverse(usage.last_used),
+                std::cmp::Reverse(usage.count),
+                usage.name.clone(),
+            )
+        });
+        self.command_usage.truncate(100);
+        let _ = self.save_settings();
+    }
+
+    fn command_usage(&self, name: &str) -> Option<&CommandUsage> {
+        self.command_usage.iter().find(|usage| usage.name == name)
+    }
+
+    fn command_usage_boost(&self, name: &str) -> usize {
+        let Some(usage) = self.command_usage(name) else {
+            return 0;
+        };
+        let count_boost = usage.count.min(30);
+        let age_seconds = Self::now_timestamp().saturating_sub(usage.last_used);
+        let recency_boost = if age_seconds <= 60 * 60 {
+            30
+        } else if age_seconds <= 24 * 60 * 60 {
+            20
+        } else if age_seconds <= 7 * 24 * 60 * 60 {
+            10
+        } else {
+            0
+        };
+        count_boost + recency_boost
+    }
+
     fn run_command(&mut self, command: Command, ctx: &egui::Context) {
+        self.record_command_usage(Self::command_name(command));
         self.palette_open = false;
         self.recent_picker_open = false;
         self.palette_query.clear();
@@ -810,12 +1010,12 @@ impl SlateApp {
         let Some(prefix) = self.command_line_command_prefix() else {
             return Vec::new();
         };
-        Self::matching_command_specs(prefix, 5)
+        self.matching_command_specs(prefix, 5)
     }
 
     fn command_line_completion(&self) -> Option<&'static str> {
         let prefix = self.command_line_command_prefix()?;
-        let spec = Self::matching_command_specs(prefix, 1).into_iter().next()?;
+        let spec = self.matching_command_specs(prefix, 1).into_iter().next()?;
         Self::best_command_token(spec, prefix)
             .filter(|candidate| candidate.len() > prefix.len())
             .map(|candidate| &candidate[prefix.len()..])
@@ -825,7 +1025,7 @@ impl SlateApp {
         let Some(prefix) = self.command_line_command_prefix().map(str::to_string) else {
             return false;
         };
-        let Some(spec) = Self::matching_command_specs(&prefix, 1).into_iter().next() else {
+        let Some(spec) = self.matching_command_specs(&prefix, 1).into_iter().next() else {
             return false;
         };
         let Some(candidate) = Self::best_command_token(spec, &prefix) else {
@@ -840,17 +1040,26 @@ impl SlateApp {
         true
     }
 
-    fn matching_command_specs(prefix: &str, limit: usize) -> Vec<&'static CommandSpec> {
+    fn matching_command_specs(&self, prefix: &str, limit: usize) -> Vec<&'static CommandSpec> {
         let query = prefix.trim_start_matches(':').to_lowercase();
         if query.is_empty() {
-            return COMMAND_SPECS.iter().take(limit).collect();
+            let mut specs = COMMAND_SPECS.iter().collect::<Vec<_>>();
+            specs.sort_by_key(|spec| {
+                let boost = self.command_usage_boost(spec.name);
+                (std::cmp::Reverse(boost), spec.name.len(), spec.name)
+            });
+            return specs.into_iter().take(limit).collect();
         }
 
         let mut scored = COMMAND_SPECS
             .iter()
             .filter_map(|spec| Self::command_spec_score(spec, &query).map(|score| (score, spec)))
             .collect::<Vec<_>>();
-        scored.sort_by_key(|(score, spec)| (*score, spec.name.len(), spec.name));
+        scored.sort_by_key(|(score, spec)| {
+            let boost = self.command_usage_boost(spec.name);
+            let adjusted_score = (*score as isize * 100) - boost as isize;
+            (*score / 100, adjusted_score, spec.name.len(), spec.name)
+        });
         scored
             .into_iter()
             .map(|(_, spec)| spec)
@@ -926,6 +1135,11 @@ impl SlateApp {
 
         if self.command_history.last().is_none_or(|last| last != input) {
             self.command_history.push(input.to_string());
+            if self.command_history.len() > self.command_history_limit {
+                let keep_from = self.command_history.len() - self.command_history_limit;
+                self.command_history.drain(0..keep_from);
+            }
+            let _ = self.save_settings();
         }
 
         let mut parts = input.split_whitespace();
@@ -938,6 +1152,7 @@ impl SlateApp {
             "w" | "write" | "save" => self.run_command(Command::Save, ctx),
             "q" | "quit" | "exit" => self.run_command(Command::Quit, ctx),
             "wq" | "x" => {
+                self.record_command_usage("wq");
                 self.save();
                 if !self.dirty {
                     self.run_command(Command::Quit, ctx);
@@ -951,6 +1166,7 @@ impl SlateApp {
                 } else if self.dirty {
                     self.status = "Save or discard changes before opening another file".to_string();
                 } else {
+                    self.record_command_usage("open");
                     let expanded = path
                         .strip_prefix("~/")
                         .and_then(|rest| dirs_next::home_dir().map(|home| home.join(rest)))
@@ -959,6 +1175,7 @@ impl SlateApp {
                 }
             }
             "open-last" | "last" | "ol" => {
+                self.record_command_usage("open-last");
                 if self.dirty {
                     self.confirm(PendingAction::OpenLast);
                 } else {
@@ -966,31 +1183,70 @@ impl SlateApp {
                 }
             }
             "recent" | "rec" => {
+                self.record_command_usage("recent");
                 let query = parts.collect::<Vec<_>>().join(" ");
                 self.open_recent_picker_with_query(query);
             }
             "preview" | "md" => self.run_command(Command::TogglePreview, ctx),
             "wrap" => self.run_command(Command::ToggleWrap, ctx),
             "find" | "f" => {
+                self.record_command_usage("find");
                 let query = parts.collect::<Vec<_>>().join(" ");
                 self.start_search(query);
             }
             "goto" | "g" | "line" | "l" => {
+                self.record_command_usage("goto");
                 let target = parts.collect::<Vec<_>>().join(" ");
                 self.goto_target(&target);
             }
-            "select-word" | "sw" => self.select_word(),
-            "select-line" | "sl" => self.select_line(),
-            "delete-word" | "dw" => self.delete_word(),
-            "delete-line" | "dl" => self.delete_current_line(),
-            "duplicate-line" | "dup" => self.duplicate_current_line(),
-            "duplicate-place" | "dupp" => self.start_duplicate_placement(),
-            "move-line-up" | "mlu" => self.move_current_line_up(),
-            "move-line-down" | "mld" => self.move_current_line_down(),
-            "move-line-to-paragraph-start" | "mlps" => self.move_current_line_to_paragraph_start(),
-            "move-line-to-paragraph-end" | "mlpe" => self.move_current_line_to_paragraph_end(),
-            "top" | "go-top" | "gt" => self.go_to_top(),
-            "bottom" | "go-bottom" | "gb" => self.go_to_bottom(),
+            "select-word" | "sw" => {
+                self.record_command_usage("select-word");
+                self.select_word();
+            }
+            "select-line" | "sl" => {
+                self.record_command_usage("select-line");
+                self.select_line();
+            }
+            "delete-word" | "dw" => {
+                self.record_command_usage("delete-word");
+                self.delete_word();
+            }
+            "delete-line" | "dl" => {
+                self.record_command_usage("delete-line");
+                self.delete_current_line();
+            }
+            "duplicate-line" | "dup" => {
+                self.record_command_usage("duplicate-line");
+                self.duplicate_current_line();
+            }
+            "duplicate-place" | "dupp" => {
+                self.record_command_usage("duplicate-place");
+                self.start_duplicate_placement();
+            }
+            "move-line-up" | "mlu" => {
+                self.record_command_usage("move-line-up");
+                self.move_current_line_up();
+            }
+            "move-line-down" | "mld" => {
+                self.record_command_usage("move-line-down");
+                self.move_current_line_down();
+            }
+            "move-line-to-paragraph-start" | "mlps" => {
+                self.record_command_usage("move-line-to-paragraph-start");
+                self.move_current_line_to_paragraph_start();
+            }
+            "move-line-to-paragraph-end" | "mlpe" => {
+                self.record_command_usage("move-line-to-paragraph-end");
+                self.move_current_line_to_paragraph_end();
+            }
+            "top" | "go-top" | "gt" => {
+                self.record_command_usage("top");
+                self.go_to_top();
+            }
+            "bottom" | "go-bottom" | "gb" => {
+                self.record_command_usage("bottom");
+                self.go_to_bottom();
+            }
             "settings" | "set" | "prefs" | "preferences" => {
                 self.run_command(Command::Settings, ctx)
             }
@@ -1493,11 +1749,7 @@ impl SlateApp {
             }
 
             if !handled {
-                self.status = if self.ctrl_alt_layer_sequence.is_empty() {
-                    "Shift+Alt movement layer".to_string()
-                } else {
-                    format!("Shift+Alt movement layer: {}", self.ctrl_alt_layer_sequence)
-                };
+                self.status = "Shift+Alt movement layer".to_string();
             }
             return true;
         }
@@ -1657,11 +1909,7 @@ impl SlateApp {
             }
 
             if !handled {
-                self.status = if self.alt_layer_sequence.is_empty() {
-                    "Alt structural layer".to_string()
-                } else {
-                    format!("Alt structural layer: {}", self.alt_layer_sequence)
-                };
+                self.status = "Alt structural layer".to_string();
             }
             return true;
         }
@@ -1785,11 +2033,7 @@ impl SlateApp {
                     self.ctrl_layer_sequence.push(ch);
                 }
             }
-            self.status = if self.ctrl_layer_sequence.is_empty() {
-                "Ctrl layer".to_string()
-            } else {
-                format!("Ctrl layer: {}", self.ctrl_layer_sequence)
-            };
+            self.status = "Ctrl layer".to_string();
             return true;
         }
 
@@ -1889,13 +2133,17 @@ impl SlateApp {
             "s" => self.run_command(Command::Save, ctx),
             "o" => self.run_command(Command::Open, ctx),
             "ol" => {
+                self.record_command_usage("open-last");
                 if self.dirty {
                     self.confirm(PendingAction::OpenLast);
                 } else {
                     self.open_last();
                 }
             }
-            "r" => self.open_recent_picker(),
+            "r" => {
+                self.record_command_usage("recent");
+                self.open_recent_picker();
+            }
             "n" => self.run_command(Command::New, ctx),
             "p" => {
                 self.palette_open = true;
@@ -1908,16 +2156,43 @@ impl SlateApp {
             "." => self.focus_command_line(),
             "h" => self.open_shortcut_help(),
             "f" if self.search_state.is_some() => self.place_cursor_at_search_edge(true),
-            "f" => self.focus_find_command_line(),
+            "f" => {
+                self.record_command_usage("find");
+                self.focus_find_command_line();
+            }
             "b" if self.search_state.is_some() => self.place_cursor_at_search_edge(false),
-            "sw" => self.select_word(),
-            "sl" => self.select_line(),
-            "dw" => self.delete_word(),
-            "dl" => self.delete_current_line(),
-            "dup" => self.duplicate_current_line(),
-            "dupp" => self.start_duplicate_placement(),
-            "gt" => self.go_to_top(),
-            "gb" => self.go_to_bottom(),
+            "sw" => {
+                self.record_command_usage("select-word");
+                self.select_word();
+            }
+            "sl" => {
+                self.record_command_usage("select-line");
+                self.select_line();
+            }
+            "dw" => {
+                self.record_command_usage("delete-word");
+                self.delete_word();
+            }
+            "dl" => {
+                self.record_command_usage("delete-line");
+                self.delete_current_line();
+            }
+            "dup" => {
+                self.record_command_usage("duplicate-line");
+                self.duplicate_current_line();
+            }
+            "dupp" => {
+                self.record_command_usage("duplicate-place");
+                self.start_duplicate_placement();
+            }
+            "gt" => {
+                self.record_command_usage("top");
+                self.go_to_top();
+            }
+            "gb" => {
+                self.record_command_usage("bottom");
+                self.go_to_bottom();
+            }
             _ => self.status = format!("Unknown ctrl command: {sequence}"),
         }
     }
@@ -2289,7 +2564,7 @@ impl SlateApp {
     }
 
     fn filtered_commands(&self) -> Vec<&'static CommandSpec> {
-        Self::matching_command_specs(&self.palette_query, 12)
+        self.matching_command_specs(&self.palette_query, 12)
     }
 
     fn command_palette(&mut self, ctx: &egui::Context) {
@@ -2958,8 +3233,14 @@ impl eframe::App for SlateApp {
                 );
 
                 self.editor_view.observe_buffer(&self.buffer);
-                let editor_keyboard_enabled =
-                    self.duplicate_placement.is_none() && !self.suppress_editor_keyboard_once;
+                let editor_keyboard_enabled = self.duplicate_placement.is_none()
+                    && !self.suppress_editor_keyboard_once
+                    && !command_line_active
+                    && !self.palette_open
+                    && !self.settings_open
+                    && !self.recent_picker_open
+                    && !self.shortcut_help_open
+                    && self.search_state.is_none();
                 let active_line_text_highlight = self
                     .duplicate_placement
                     .as_ref()
@@ -3350,19 +3631,39 @@ impl eframe::App for SlateApp {
                 );
                 let painter = ui.painter_at(command_rect);
                 painter.rect_filled(command_rect, 0.0, Color32::from_rgb(25, 31, 40));
-                let command_y = command_rect.center().y - 2.0;
-                painter.text(
-                    egui::pos2(command_rect.left() + 10.0, command_y),
-                    egui::Align2::LEFT_CENTER,
-                    ":",
-                    footer_font.clone(),
-                    footer_accent,
-                );
-
+                let command_center_y = command_rect.center().y;
                 let input_rect = egui::Rect::from_min_max(
                     egui::pos2(command_rect.left() + 19.0, command_rect.top() + 4.0),
                     egui::pos2(command_rect.right() - 10.0, command_rect.bottom() - 4.0),
                 );
+                let paint_command_line = |segments: Vec<(String, Color32)>| {
+                    let mut text = String::new();
+                    let mut sections = Vec::new();
+                    for (segment, color) in segments {
+                        let start = text.len();
+                        text.push_str(&segment);
+                        let end = text.len();
+                        sections.push(LayoutSection {
+                            leading_space: 0.0,
+                            byte_range: start..end,
+                            format: TextFormat::simple(footer_font.clone(), color),
+                        });
+                    }
+                    let galley = painter.layout_job(LayoutJob {
+                        text,
+                        sections,
+                        break_on_newline: false,
+                        ..Default::default()
+                    });
+                    painter.galley(
+                        egui::pos2(
+                            command_rect.left() + 10.0,
+                            command_center_y - galley.size().y * 0.5,
+                        ),
+                        galley,
+                        footer_color,
+                    );
+                };
                 let command_line_active = self.command_line_focused || self.focus_command_line_once;
                 if command_line_active {
                     if self.focus_command_line_once {
@@ -3370,36 +3671,25 @@ impl eframe::App for SlateApp {
                     }
                     self.command_line_focused = true;
                     if self.command_line.is_empty() {
-                        painter.text(
-                            egui::pos2(input_rect.left(), input_rect.center().y - 0.5),
-                            egui::Align2::LEFT_CENTER,
-                            "command  Ctrl+. enter · Tab complete · Ctrl+H help · Ctrl+P palette",
-                            footer_font.clone(),
-                            footer_dim,
-                        );
+                        paint_command_line(vec![
+                            (":".to_string(), footer_accent),
+                            (
+                                "command  Ctrl+. enter · Tab complete · Ctrl+H help · Ctrl+P palette"
+                                    .to_string(),
+                                footer_dim,
+                            ),
+                        ]);
                     } else {
-                        painter.text(
-                            egui::pos2(input_rect.left(), input_rect.center().y - 0.5),
-                            egui::Align2::LEFT_CENTER,
-                            &self.command_line,
-                            footer_font.clone(),
-                            footer_color,
-                        );
+                        let mut segments = vec![
+                            (":".to_string(), footer_accent),
+                            (self.command_line.clone(), footer_color),
+                        ];
                         if self.command_line_cursor == self.command_line.len() {
                             if let Some(completion) = self.command_line_completion() {
-                                let typed_chars = self.command_line.chars().count() as f32;
-                                painter.text(
-                                    egui::pos2(
-                                        input_rect.left() + typed_chars * 8.0,
-                                        input_rect.center().y - 0.5,
-                                    ),
-                                    egui::Align2::LEFT_CENTER,
-                                    completion,
-                                    footer_font.clone(),
-                                    Color32::from_rgb(76, 86, 106),
-                                );
+                                segments.push((completion.to_string(), Color32::from_rgb(76, 86, 106)));
                             }
                         }
+                        paint_command_line(segments);
                     }
                     let cursor_chars = self.command_line[..self.command_line_cursor.min(self.command_line.len())]
                         .chars()
@@ -3438,13 +3728,7 @@ impl eframe::App for SlateApp {
                             footer_dim,
                         )
                     };
-                    painter.text(
-                        egui::pos2(input_rect.left(), input_rect.center().y - 0.5),
-                        egui::Align2::LEFT_CENTER,
-                        text,
-                        footer_font.clone(),
-                        color,
-                    );
+                    paint_command_line(vec![(":".to_string(), footer_accent), (text, color)]);
                     self.command_line_focused = false;
                 }
             });

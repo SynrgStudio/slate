@@ -326,6 +326,10 @@ impl EditorBuffer {
     }
 
     pub(crate) fn move_current_line_up(&mut self) -> bool {
+        if self.selection_line_range().is_some() {
+            return self.move_selected_lines_up();
+        }
+
         let line_index = self.line_index_for_byte(self.cursor);
         if line_index == 0 {
             return false;
@@ -334,14 +338,30 @@ impl EditorBuffer {
     }
 
     pub(crate) fn move_current_line_down(&mut self) -> bool {
+        if self.selection_line_range().is_some() {
+            return self.move_selected_lines_down();
+        }
+
         let line_index = self.line_index_for_byte(self.cursor);
-        if line_index + 1 >= self.line_count() {
+        if line_index + 1 >= self.lines_with_endings().len() {
             return false;
         }
         self.move_current_line_to(line_index + 1)
     }
 
     pub(crate) fn move_current_line_to_paragraph_start(&mut self) -> bool {
+        if let Some((start_line, end_line)) = self.selection_line_range() {
+            if self.line(start_line).trim().is_empty() {
+                return false;
+            }
+
+            let mut target = start_line;
+            while target > 0 && !self.line(target - 1).trim().is_empty() {
+                target -= 1;
+            }
+            return self.move_line_range_to(start_line, end_line, target);
+        }
+
         let line_index = self.line_index_for_byte(self.cursor);
         if self.line(line_index).trim().is_empty() {
             return false;
@@ -355,6 +375,22 @@ impl EditorBuffer {
     }
 
     pub(crate) fn move_current_line_to_paragraph_end(&mut self) -> bool {
+        if let Some((start_line, end_line)) = self.selection_line_range() {
+            if self.line(end_line).trim().is_empty() {
+                return false;
+            }
+
+            let block_len = end_line - start_line + 1;
+            let mut target_end = end_line;
+            while target_end + 1 < self.lines_with_endings().len()
+                && !self.line(target_end + 1).trim().is_empty()
+            {
+                target_end += 1;
+            }
+            let target_start = target_end.saturating_sub(block_len - 1);
+            return self.move_line_range_to(start_line, end_line, target_start);
+        }
+
         let line_index = self.line_index_for_byte(self.cursor);
         if self.line(line_index).trim().is_empty() {
             return false;
@@ -539,20 +575,111 @@ impl EditorBuffer {
             .unwrap_or(line_end)
     }
 
+    fn selection_line_range(&self) -> Option<(usize, usize)> {
+        let (start, end) = self.selection?;
+        if start == end {
+            return None;
+        }
+
+        let start_line = self.line_index_for_byte(start);
+        let mut end_line = self.line_index_for_byte(end);
+        if end > start && end_line > start_line && self.line_start(end_line) == end {
+            end_line -= 1;
+        }
+
+        let max_line = self.lines_with_endings().len().saturating_sub(1);
+        let start_line = start_line.min(max_line);
+        let end_line = end_line.min(max_line);
+        (start_line <= end_line).then_some((start_line, end_line))
+    }
+
+    fn move_selected_lines_up(&mut self) -> bool {
+        let Some((start_line, end_line)) = self.selection_line_range() else {
+            return false;
+        };
+        if start_line == 0 {
+            return false;
+        }
+        self.move_line_range_to(start_line, end_line, start_line - 1)
+    }
+
+    fn move_selected_lines_down(&mut self) -> bool {
+        let Some((start_line, end_line)) = self.selection_line_range() else {
+            return false;
+        };
+        let lines_len = self.lines_with_endings().len();
+        if end_line + 1 >= lines_len {
+            return false;
+        }
+        self.move_line_range_to(start_line, end_line, start_line + 1)
+    }
+
+    fn move_line_range_to(
+        &mut self,
+        start_line: usize,
+        end_line: usize,
+        target_start: usize,
+    ) -> bool {
+        if self.text.is_empty() || start_line > end_line {
+            return false;
+        }
+
+        let mut lines = self.lines_with_endings();
+        if start_line >= lines.len() || end_line >= lines.len() {
+            return false;
+        }
+
+        let block_len = end_line - start_line + 1;
+        let target_start = target_start.min(lines.len().saturating_sub(block_len));
+        if target_start == start_line {
+            return false;
+        }
+
+        let original_block_start_byte = self.line_start(start_line);
+        let cursor_offset = self.cursor.saturating_sub(original_block_start_byte);
+        let block = lines
+            .splice(start_line..=end_line, std::iter::empty())
+            .collect::<Vec<_>>();
+        let insert_at = target_start.min(lines.len());
+        lines.splice(insert_at..insert_at, block);
+
+        self.text = lines.concat();
+        self.selection = None;
+        self.revision = self.revision.wrapping_add(1);
+        self.rebuild_line_index();
+
+        let new_start = insert_at;
+        let new_end = insert_at + block_len - 1;
+        let selection_start = self.line_start(new_start);
+        let selection_end = if new_end + 1 < self.line_count() {
+            self.line_start(new_end + 1)
+        } else {
+            self.text.len()
+        };
+        self.selection = Some((selection_start, selection_end));
+        self.cursor =
+            self.clamp_to_char_boundary((selection_start + cursor_offset).min(selection_end));
+        true
+    }
+
     fn move_current_line_to(&mut self, target_index: usize) -> bool {
         if self.text.is_empty() {
             return false;
         }
 
         let line_index = self.line_index_for_byte(self.cursor);
-        let target_index = target_index.min(self.line_count().saturating_sub(1));
+        let mut lines = self.lines_with_endings();
+        if line_index >= lines.len() {
+            return false;
+        }
+        let target_index = target_index.min(lines.len().saturating_sub(1));
         if line_index == target_index {
             return false;
         }
 
         let (_, column) = self.cursor_line_col();
-        let mut lines = self.lines_with_endings();
         let line = lines.remove(line_index);
+        let target_index = target_index.min(lines.len());
         lines.insert(target_index, line);
         self.text = lines.concat();
         self.selection = None;
@@ -568,8 +695,10 @@ impl EditorBuffer {
             .split_inclusive('\n')
             .map(ToString::to_string)
             .collect::<Vec<_>>();
-        if self.text.ends_with('\n') {
-            lines.push(String::new());
+        if !self.text.is_empty() && !self.text.ends_with('\n') {
+            if let Some(last) = lines.last_mut() {
+                last.push('\n');
+            }
         }
         lines
     }
@@ -871,12 +1000,109 @@ mod tests {
         buffer.set_cursor("one\nt".len());
 
         assert!(buffer.move_current_line_up());
-        assert_eq!(buffer.as_str(), "twö\none\nthree");
+        assert_eq!(buffer.as_str(), "twö\none\nthree\n");
         assert_eq!(buffer.byte_to_line_col(buffer.cursor()), (1, 2));
 
         assert!(buffer.move_current_line_down());
-        assert_eq!(buffer.as_str(), "one\ntwö\nthree");
+        assert_eq!(buffer.as_str(), "one\ntwö\nthree\n");
         assert_eq!(buffer.byte_to_line_col(buffer.cursor()), (2, 2));
+    }
+
+    #[test]
+    fn editor_buffer_moves_final_line_up_without_joining_lines() {
+        let mut buffer = EditorBuffer::from_text("asd\nfgh\njkl".to_string());
+        buffer.set_cursor(buffer.as_str().len());
+
+        assert!(buffer.move_current_line_up());
+
+        assert_eq!(buffer.as_str(), "asd\njkl\nfgh\n");
+        assert_eq!(buffer.byte_to_line_col(buffer.cursor()), (2, 4));
+    }
+
+    #[test]
+    fn editor_buffer_does_not_panic_when_repeatedly_moving_line_down_at_end() {
+        let mut buffer = EditorBuffer::from_text("asd\nfgh\njkl".to_string());
+        buffer.set_cursor(buffer.as_str().len());
+
+        assert!(!buffer.move_current_line_down());
+        assert_eq!(buffer.as_str(), "asd\nfgh\njkl");
+
+        assert!(buffer.move_current_line_up());
+        assert!(buffer.move_current_line_down());
+        assert!(!buffer.move_current_line_down());
+        assert!(!buffer.move_current_line_down());
+
+        assert_eq!(buffer.as_str(), "asd\nfgh\njkl\n");
+    }
+
+    #[test]
+    fn editor_buffer_moves_selected_line_block_up() {
+        let mut buffer = EditorBuffer::from_text("asd\nfgh\njkl".to_string());
+        let start = buffer.line_start(1);
+        let end = buffer.as_str().len();
+        buffer.set_selection(start, end);
+
+        assert!(buffer.move_current_line_up());
+
+        assert_eq!(buffer.as_str(), "fgh\njkl\nasd\n");
+        assert_eq!(buffer.selection(), Some((0, "fgh\njkl\n".len())));
+    }
+
+    #[test]
+    fn editor_buffer_moves_selected_line_block_down() {
+        let mut buffer = EditorBuffer::from_text("asd\nfgh\njkl\nzzz".to_string());
+        let start = buffer.line_start(1);
+        let end = buffer.line_start(3);
+        buffer.set_selection(start, end);
+
+        assert!(buffer.move_current_line_down());
+
+        assert_eq!(buffer.as_str(), "asd\nzzz\nfgh\njkl\n");
+        assert_eq!(
+            buffer.selection(),
+            Some(("asd\nzzz\n".len(), "asd\nzzz\nfgh\njkl\n".len()))
+        );
+    }
+
+    #[test]
+    fn editor_buffer_does_not_move_selected_line_block_past_edges() {
+        let mut buffer = EditorBuffer::from_text("asd\nfgh\njkl".to_string());
+        buffer.set_selection(0, buffer.line_start(2));
+        assert!(!buffer.move_current_line_up());
+
+        let start = buffer.line_start(1);
+        let end = buffer.as_str().len();
+        buffer.set_selection(start, end);
+        assert!(!buffer.move_current_line_down());
+    }
+
+    #[test]
+    fn editor_buffer_moves_selected_line_block_to_paragraph_start() {
+        let mut buffer = EditorBuffer::from_text("asd\nfgh\njkl\nqwe\n\nzxc".to_string());
+        let start = buffer.line_start(2);
+        let end = buffer.line_start(4);
+        buffer.set_selection(start, end);
+
+        assert!(buffer.move_current_line_to_paragraph_start());
+
+        assert_eq!(buffer.as_str(), "jkl\nqwe\nasd\nfgh\n\nzxc\n");
+        assert_eq!(buffer.selection(), Some((0, "jkl\nqwe\n".len())));
+    }
+
+    #[test]
+    fn editor_buffer_moves_selected_line_block_to_paragraph_end() {
+        let mut buffer = EditorBuffer::from_text("asd\nfgh\njkl\nqwe\n\nzxc".to_string());
+        let start = buffer.line_start(0);
+        let end = buffer.line_start(2);
+        buffer.set_selection(start, end);
+
+        assert!(buffer.move_current_line_to_paragraph_end());
+
+        assert_eq!(buffer.as_str(), "jkl\nqwe\nasd\nfgh\n\nzxc\n");
+        assert_eq!(
+            buffer.selection(),
+            Some(("jkl\nqwe\n".len(), "jkl\nqwe\nasd\nfgh\n".len()))
+        );
     }
 
     #[test]
@@ -895,10 +1121,10 @@ mod tests {
         buffer.set_cursor("one\ntwo\nth".len());
 
         assert!(buffer.move_current_line_to_paragraph_start());
-        assert_eq!(buffer.as_str(), "three\none\ntwo\n\nfour");
+        assert_eq!(buffer.as_str(), "three\none\ntwo\n\nfour\n");
 
         assert!(buffer.move_current_line_to_paragraph_end());
-        assert_eq!(buffer.as_str(), "one\ntwo\nthree\n\nfour");
+        assert_eq!(buffer.as_str(), "one\ntwo\nthree\n\nfour\n");
     }
 
     #[test]
