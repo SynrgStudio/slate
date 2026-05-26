@@ -110,6 +110,7 @@ slate --scratch
 | `Ctrl+P` | Command palette |
 | `Ctrl+H` | Modal shortcut and command reference, including Ctrl-layer, Alt layer, Shift+Alt jumps, duplicate placement, and all registered commands |
 | `Ctrl+S` | Save |
+| `Ctrl+Alt+S` | Save As |
 | `Ctrl+O` | Open file |
 | `Ctrl+N` | New buffer |
 | `Ctrl+M` | Toggle Markdown preview |
@@ -149,8 +150,10 @@ Examples:
 :q
 :wq
 :x
+:open              # Slate-owned file modal
 :open ~/notes/todo.md
 :e ~/notes/todo.md
+:save-as           # Slate-owned save-as modal
 :new
 :preview
 :preview on
@@ -163,10 +166,6 @@ Examples:
 :settings
 :recent
 :recent notes
-:files
-:file
-:open-file
-:of
 ```
 
 Goto:
@@ -377,7 +376,8 @@ Slate's roadmap is intentionally staged. The idea is to build stable editor foun
 - `Alt+Up` / `Alt+Down` for moving lines
 - Better command discovery and fuzzy command matching
 - Real recent-files list and `:recent`
-- Project file picker modal via `:files` / `:file` / `:open-file` / `:of`, with fuzzy filtering plus size/modified metadata
+- Slate-owned Open and Save As modals; no native Linux/Desktop file dialogs
+- Open modal includes fuzzy filtering, folder navigation, and size/modified metadata
 - Persist more editor preferences such as theme and vault location
 - Minimal project/vault file opener
 

@@ -109,7 +109,8 @@ Scope:
 - Add a command-palette-first file opener for a directory/project.
 - Search files by name without adding a heavy sidebar.
 - Keep the UI minimal: no menubar, no toolbar.
-- Done: `:files` / `:file` / `:open-file` / `:of` opens a dedicated modal picker with focused fuzzy input, large result list, keyboard navigation, and project-root scan.
+- Superseded by T047: the regular Slate-owned `Open` modal now covers project/repo file opening with focused fuzzy input, large result list, keyboard navigation, and project-root start.
+- Removed the redundant `:files` / `:file` / `:open-file` / `:of` command path and `Ctrl+Alt+O` shortcut because `Ctrl+O` already opens the same project-root modal.
 - Done: skips heavyweight/generated directories such as `.git`, `target`, `node_modules`, and `.threadwell`.
 - Done: file results show lightweight metadata columns for size and relative modified time.
 
@@ -470,14 +471,17 @@ Scope:
 
 ### T047 — Slate-owned file dialogs for open/save/save-as
 
-Status: pending
+Status: completed
 Scope:
-- Replace native Linux/desktop dialogs from `rfd` with Slate-owned egui modals so file workflows match the terminal-like UI.
-- Reuse the T010 project file picker for `Open`: `Ctrl+O`, Ctrl-layer `o`, and bare `:open` should open Slate's modal; `:open path` / `:e path` should keep opening directly.
-- Add a Slate `Save As` modal with a focused path input, clear title, `Enter` to save, and `Esc` to cancel.
-- Keep `Save` direct when the buffer already has a path; open the Slate `Save As` modal only for scratch/untitled buffers.
-- Preserve unsaved-change confirmation flows before opening/replacing buffers.
-- After replacement, remove the `rfd` dependency from `Cargo.toml` if unused.
+- Done: replaced native Linux/desktop dialogs from `rfd` with Slate-owned egui modals so file workflows match the terminal-like UI.
+- Done: evolved the T010 project file picker for `Open`: `Ctrl+O`, Ctrl-layer `o`, and bare `:open` open Slate's modal; `:open path` / `:e path` still open directly.
+- Done: every Slate-owned filesystem modal supports consistent arrow navigation: `↑↓` selects entries, `→` enters the selected directory when selection is a folder, and `←` goes back to the parent directory.
+- Done: Open/SaveAs filesystem modals show both directories and files, with clear folder/file affordances, while preserving fuzzy filtering and metadata where useful.
+- Done: added a Slate `Save As` modal with a focused path input, clear title, `Enter` to save, and `Esc` to cancel.
+- Done: added `Ctrl+Alt+S` as the Save As shortcut while preserving `Ctrl+Shift+S` for the OS/window manager.
+- Done: `Save` remains direct when the buffer already has a path; scratch/untitled buffers open the Slate `Save As` modal.
+- Done: preserved unsaved-change confirmation flows before opening/replacing buffers.
+- Done: removed the `rfd` dependency from `Cargo.toml`.
 
 Command groups worth considering:
 
@@ -623,7 +627,7 @@ Follow-up — Duplicate placement transient mode: done.
 6. T003 — Expand persistent config for wrap/preview/theme/vault while keeping the plain config simple.
 7. T004 — Build real recent-files list and `:recent` picker.
 8. T010 — Minimal project/vault file opener with fuzzy-ish file matching plus lightweight size/modified metadata. Done.
-9. T047 — Replace native Open/Save/SaveAs dialogs with Slate-owned modals.
+9. T047 — Replace native Open/Save/SaveAs dialogs with Slate-owned modals. Done.
 10. T017 — Write down Slate's knowledge-work philosophy so future features do not drift into Obsidian/Emacs sprawl.
 11. T005 — Scratch buffer and quick capture workflow.
 12. T006 — Daily notes on top of the chosen notes/vault directory.

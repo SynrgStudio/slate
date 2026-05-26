@@ -6,7 +6,7 @@ mod search;
 use std::{
     fs,
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -59,6 +59,7 @@ enum Command {
     New,
     Open,
     Save,
+    SaveAs,
     TogglePreview,
     ToggleWrap,
     Settings,
@@ -130,11 +131,11 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         palette_command: None,
     },
     CommandSpec {
-        name: "files",
-        aliases: &["file", "open-file", "of"],
-        summary: "Open project file picker",
-        hint: ":files",
-        palette_command: None,
+        name: "save-as",
+        aliases: &["saveas", "write-as"],
+        summary: "Save current buffer with a new path",
+        hint: "Ctrl+Alt+S",
+        palette_command: Some(Command::SaveAs),
     },
     CommandSpec {
         name: "preview",
@@ -380,6 +381,12 @@ struct DuplicatePlacement {
     was_dirty: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FilePickerMode {
+    Open,
+    Browse,
+}
+
 struct CommandUsage {
     name: String,
     count: usize,
@@ -420,10 +427,17 @@ struct SlateApp {
     selected_recent_file: usize,
     pending_recent_path: Option<PathBuf>,
     file_picker_open: bool,
+    file_picker_mode: FilePickerMode,
+    file_picker_dir: PathBuf,
     file_query: String,
     project_files: Vec<PathBuf>,
     selected_project_file: usize,
     pending_project_file_path: Option<PathBuf>,
+    save_as_open: bool,
+    save_as_dir: PathBuf,
+    save_as_filename: String,
+    save_as_entries: Vec<PathBuf>,
+    selected_save_as_entry: usize,
     search_state: Option<SearchState>,
     ctrl_layer_active: bool,
     ctrl_layer_sequence: String,
@@ -477,10 +491,17 @@ impl SlateApp {
             selected_recent_file: 0,
             pending_recent_path: None,
             file_picker_open: false,
+            file_picker_mode: FilePickerMode::Browse,
+            file_picker_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             file_query: String::new(),
             project_files: Vec::new(),
             selected_project_file: 0,
             pending_project_file_path: None,
+            save_as_open: false,
+            save_as_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            save_as_filename: String::new(),
+            save_as_entries: Vec::new(),
+            selected_save_as_entry: 0,
             search_state: None,
             ctrl_layer_active: false,
             ctrl_layer_sequence: String::new(),
@@ -609,9 +630,7 @@ impl SlateApp {
     }
 
     fn open_dialog(&mut self) {
-        if let Some(path) = rfd::FileDialog::new().pick_file() {
-            self.open_path(path);
-        }
+        self.open_file_picker_for_open();
     }
 
     fn open_last(&mut self) {
@@ -723,6 +742,7 @@ impl SlateApp {
         self.path
             .as_ref()
             .and_then(|path| path.parent().map(PathBuf::from))
+            .or_else(dirs_next::home_dir)
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."))
     }
@@ -798,93 +818,87 @@ impl SlateApp {
         (size, modified)
     }
 
-    fn scan_project_files(root: &std::path::Path) -> Vec<PathBuf> {
-        fn visit(dir: &std::path::Path, files: &mut Vec<PathBuf>, depth: usize) {
-            if depth > 12 || files.len() >= 5000 {
-                return;
-            }
-            let Ok(entries) = fs::read_dir(dir) else {
-                return;
-            };
-            let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
-            entries.sort_by_key(|entry| entry.path());
-            for entry in entries {
-                if files.len() >= 5000 {
-                    return;
-                }
-                let path = entry.path();
+    fn scan_directory_entries(dir: &Path) -> Vec<PathBuf> {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut entries = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
                 let name = path
                     .file_name()
                     .and_then(|name| name.to_str())
                     .unwrap_or("");
                 if path.is_dir() {
-                    if !SlateApp::should_skip_file_dir(name) {
-                        visit(&path, files, depth + 1);
-                    }
-                } else if path.is_file() {
-                    files.push(path);
+                    !Self::should_skip_file_dir(name)
+                } else {
+                    path.is_file()
                 }
-            }
-        }
-
-        let mut files = Vec::new();
-        visit(root, &mut files, 0);
-        files
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|path| (!path.is_dir(), path.file_name().map(|name| name.to_owned())));
+        entries
     }
 
-    fn open_file_picker(&mut self) {
+    fn open_file_picker_for_open(&mut self) {
+        self.open_file_picker_at(self.project_root(), FilePickerMode::Open);
+    }
+
+    fn open_file_picker_at(&mut self, dir: PathBuf, mode: FilePickerMode) {
         self.shortcut_help_open = false;
         self.palette_open = false;
         self.recent_picker_open = false;
+        self.save_as_open = false;
         self.command_line_focused = false;
         self.focus_command_line_once = false;
         self.command_history_index = None;
-        self.file_picker_open = false;
-        self.file_query.clear();
-        let root = self.project_root();
-        self.project_files = Self::scan_project_files(&root);
-        if self.project_files.is_empty() {
-            self.status = format!("No files under {}", root.display());
-            self.focus_editor_once = true;
-            return;
-        }
         self.file_picker_open = true;
+        self.file_picker_mode = mode;
+        self.file_picker_dir = dir;
+        self.file_query.clear();
+        self.project_files = Self::scan_directory_entries(&self.file_picker_dir);
         self.selected_project_file = self.project_file_indices().first().copied().unwrap_or(0);
-        self.status = format!("Files: {}", root.display());
+        self.status = format!("Files: {}", self.file_picker_dir.display());
         self.focus_editor_once = false;
     }
 
     fn project_file_indices(&self) -> Vec<usize> {
         let query = self.file_query.trim().to_lowercase();
-        if query.is_empty() {
-            return (0..self.project_files.len()).collect();
-        }
-        let root = self.project_root();
-        let mut scored = self
-            .project_files
-            .iter()
-            .enumerate()
-            .filter_map(|(index, path)| {
-                let relative = path
-                    .strip_prefix(&root)
-                    .unwrap_or(path)
-                    .display()
-                    .to_string();
-                let name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("");
-                let relative_score = Self::fuzzy_score(&relative, &query);
-                let name_score = Self::fuzzy_score(name, &query).map(|score| score / 2);
-                relative_score
-                    .into_iter()
-                    .chain(name_score)
-                    .min()
-                    .map(|score| (score, index))
-            })
-            .collect::<Vec<_>>();
-        scored.sort_by_key(|(score, index)| (*score, *index));
-        scored.into_iter().map(|(_, index)| index).collect()
+        let mut indices = if query.is_empty() {
+            (0..self.project_files.len()).collect::<Vec<_>>()
+        } else {
+            let mut scored = self
+                .project_files
+                .iter()
+                .enumerate()
+                .filter_map(|(index, path)| {
+                    let relative = path
+                        .strip_prefix(&self.file_picker_dir)
+                        .unwrap_or(path)
+                        .display()
+                        .to_string();
+                    let name = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("");
+                    let relative_score = Self::fuzzy_score(&relative, &query);
+                    let name_score = Self::fuzzy_score(name, &query).map(|score| score / 2);
+                    relative_score
+                        .into_iter()
+                        .chain(name_score)
+                        .min()
+                        .map(|score| (score, index))
+                })
+                .collect::<Vec<_>>();
+            scored.sort_by_key(|(score, index)| (*score, *index));
+            scored
+                .into_iter()
+                .map(|(_, index)| index)
+                .collect::<Vec<_>>()
+        };
+        indices.sort_by_key(|index| !self.project_files[*index].is_dir());
+        indices
     }
 
     fn move_project_file_selection(&mut self, delta: isize) {
@@ -903,6 +917,54 @@ impl SlateApp {
         self.selected_project_file = indices[next_position];
     }
 
+    fn centered_window_start(
+        selected_position: usize,
+        visible_rows: usize,
+        total_rows: usize,
+    ) -> usize {
+        if total_rows <= visible_rows {
+            return 0;
+        }
+        selected_position
+            .saturating_sub(visible_rows / 2)
+            .min(total_rows.saturating_sub(visible_rows))
+    }
+
+    fn refresh_file_picker_entries(&mut self) {
+        self.project_files = Self::scan_directory_entries(&self.file_picker_dir);
+        self.selected_project_file = self.project_file_indices().first().copied().unwrap_or(0);
+        self.status = format!("Files: {}", self.file_picker_dir.display());
+    }
+
+    fn file_picker_enter_selected_dir(&mut self) {
+        let Some(path) = self.project_files.get(self.selected_project_file).cloned() else {
+            return;
+        };
+        if path.is_dir() {
+            self.file_picker_dir = path;
+            self.file_query.clear();
+            self.refresh_file_picker_entries();
+        }
+    }
+
+    fn file_picker_go_parent(&mut self) {
+        let Some(child) = self.file_picker_dir.file_name().map(|name| name.to_owned()) else {
+            return;
+        };
+        if let Some(parent) = self.file_picker_dir.parent().map(PathBuf::from) {
+            self.file_picker_dir = parent;
+            self.file_query.clear();
+            self.refresh_file_picker_entries();
+            if let Some(index) = self
+                .project_files
+                .iter()
+                .position(|path| path.file_name() == Some(child.as_os_str()))
+            {
+                self.selected_project_file = index;
+            }
+        }
+    }
+
     fn open_selected_project_file(&mut self) {
         if !self
             .project_file_indices()
@@ -915,7 +977,13 @@ impl SlateApp {
             self.status = "No file selected".to_string();
             return;
         };
-        if self.dirty {
+        if path.is_dir() {
+            self.file_picker_dir = path;
+            self.file_query.clear();
+            self.refresh_file_picker_entries();
+            return;
+        }
+        if self.dirty && self.file_picker_mode == FilePickerMode::Open {
             self.pending_project_file_path = Some(path);
             self.confirm(PendingAction::OpenProjectFile);
         } else {
@@ -926,9 +994,147 @@ impl SlateApp {
     }
 
     fn save_as(&mut self) {
-        if let Some(path) = rfd::FileDialog::new().save_file() {
-            self.save_path(path);
+        self.open_save_as_modal();
+    }
+
+    fn open_save_as_modal(&mut self) {
+        self.shortcut_help_open = false;
+        self.palette_open = false;
+        self.recent_picker_open = false;
+        self.file_picker_open = false;
+        self.command_line_focused = false;
+        self.focus_command_line_once = false;
+        self.command_history_index = None;
+        self.save_as_dir = self
+            .path
+            .as_ref()
+            .and_then(|path| path.parent().map(PathBuf::from))
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        self.save_as_filename = self
+            .path
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or("untitled.md")
+            .to_string();
+        self.save_as_entries = Self::scan_directory_entries(&self.save_as_dir);
+        self.selected_save_as_entry = self.save_as_entry_indices().first().copied().unwrap_or(0);
+        self.save_as_open = true;
+        self.focus_editor_once = false;
+        self.status = format!("Save as: {}", self.save_as_dir.display());
+    }
+
+    fn save_as_entry_indices(&self) -> Vec<usize> {
+        let query = self.save_as_filename.trim().to_lowercase();
+        let mut indices = if query.is_empty() {
+            (0..self.save_as_entries.len()).collect::<Vec<_>>()
+        } else {
+            let mut scored = self
+                .save_as_entries
+                .iter()
+                .enumerate()
+                .filter_map(|(index, path)| {
+                    let name = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("");
+                    Self::fuzzy_score(name, &query).map(|score| (score, index))
+                })
+                .collect::<Vec<_>>();
+            scored.sort_by_key(|(score, index)| (*score, *index));
+            scored
+                .into_iter()
+                .map(|(_, index)| index)
+                .collect::<Vec<_>>()
+        };
+        indices.sort_by_key(|index| !self.save_as_entries[*index].is_dir());
+        indices
+    }
+
+    fn refresh_save_as_entries(&mut self) {
+        self.save_as_entries = Self::scan_directory_entries(&self.save_as_dir);
+        self.selected_save_as_entry = self.save_as_entry_indices().first().copied().unwrap_or(0);
+        self.status = format!("Save as: {}", self.save_as_dir.display());
+    }
+
+    fn move_save_as_selection(&mut self, delta: isize) {
+        let indices = self.save_as_entry_indices();
+        if indices.is_empty() {
+            self.selected_save_as_entry = 0;
+            return;
         }
+        let current_position = indices
+            .iter()
+            .position(|index| *index == self.selected_save_as_entry)
+            .unwrap_or(0);
+        let next_position = current_position
+            .saturating_add_signed(delta)
+            .min(indices.len().saturating_sub(1));
+        self.selected_save_as_entry = indices[next_position];
+    }
+
+    fn save_as_enter_selected_dir(&mut self) {
+        let Some(path) = self
+            .save_as_entries
+            .get(self.selected_save_as_entry)
+            .cloned()
+        else {
+            return;
+        };
+        if path.is_dir() {
+            self.save_as_dir = path;
+            self.save_as_filename.clear();
+            self.refresh_save_as_entries();
+        }
+    }
+
+    fn save_as_go_parent(&mut self) {
+        let Some(child) = self.save_as_dir.file_name().map(|name| name.to_owned()) else {
+            return;
+        };
+        if let Some(parent) = self.save_as_dir.parent().map(PathBuf::from) {
+            self.save_as_dir = parent;
+            self.save_as_filename.clear();
+            self.refresh_save_as_entries();
+            if let Some(index) = self
+                .save_as_entries
+                .iter()
+                .position(|path| path.file_name() == Some(child.as_os_str()))
+            {
+                self.selected_save_as_entry = index;
+            }
+        }
+    }
+
+    fn confirm_save_as(&mut self) {
+        let filename = self.save_as_filename.trim();
+        let path = if filename.is_empty() {
+            let Some(selected) = self
+                .save_as_entries
+                .get(self.selected_save_as_entry)
+                .cloned()
+            else {
+                self.status = "Save as needs a file name".to_string();
+                return;
+            };
+            if selected.is_dir() {
+                self.save_as_dir = selected;
+                self.refresh_save_as_entries();
+                return;
+            }
+            selected
+        } else {
+            let input = PathBuf::from(filename);
+            if input.is_absolute() {
+                input
+            } else {
+                self.save_as_dir.join(input)
+            }
+        };
+        self.save_as_open = false;
+        self.save_path(path);
+        self.focus_editor_once = true;
     }
 
     fn settings_path() -> Option<PathBuf> {
@@ -1198,6 +1404,7 @@ impl SlateApp {
             Command::New => "new",
             Command::Open => "open",
             Command::Save => "save",
+            Command::SaveAs => "save-as",
             Command::TogglePreview => "preview",
             Command::ToggleWrap => "wrap",
             Command::Settings => "settings",
@@ -1283,6 +1490,7 @@ impl SlateApp {
         self.palette_open = false;
         self.recent_picker_open = false;
         self.file_picker_open = false;
+        self.save_as_open = false;
         self.palette_query.clear();
         self.selected_command = 0;
         self.command_line_focused = false;
@@ -1306,6 +1514,7 @@ impl SlateApp {
                 }
             }
             Command::Save => self.save(),
+            Command::SaveAs => self.open_save_as_modal(),
             Command::TogglePreview => self.set_preview_mode(!self.preview),
             Command::ToggleWrap => self.set_wrap_mode(!self.wrap),
             Command::WrapOn => self.set_wrap_mode(true),
@@ -1479,6 +1688,7 @@ impl SlateApp {
 
         match command {
             "w" | "write" | "save" => self.run_command(Command::Save, ctx),
+            "save-as" | "saveas" | "write-as" => self.run_command(Command::SaveAs, ctx),
             "q" | "quit" | "exit" => self.run_command(Command::Quit, ctx),
             "wq" | "x" => {
                 self.record_command_usage("wq");
@@ -1515,10 +1725,6 @@ impl SlateApp {
                 self.record_command_usage("recent");
                 let query = parts.collect::<Vec<_>>().join(" ");
                 self.open_recent_picker_with_query(query);
-            }
-            "files" | "file" | "open-file" | "of" => {
-                self.record_command_usage("files");
-                self.open_file_picker();
             }
             "preview" | "md" => {
                 let arg = parts.next();
@@ -2005,6 +2211,7 @@ impl SlateApp {
             && !self.settings_open
             && !self.recent_picker_open
             && !self.file_picker_open
+            && !self.save_as_open
             && self.pending_action.is_none()
     }
 
@@ -2250,7 +2457,8 @@ impl SlateApp {
             return false;
         }
 
-        let alt_down = ctx.input(|input| input.modifiers.alt);
+        let alt_down = ctx
+            .input(|input| input.modifiers.alt && !input.modifiers.ctrl && !input.modifiers.shift);
         if alt_down && !self.alt_layer_active {
             self.alt_layer_active = true;
             self.alt_layer_sequence.clear();
@@ -2392,7 +2600,7 @@ impl SlateApp {
             return false;
         }
 
-        let ctrl_down = ctx.input(|input| input.modifiers.ctrl);
+        let ctrl_down = ctx.input(|input| input.modifiers.ctrl && !input.modifiers.alt);
         if ctrl_down && !self.ctrl_layer_active {
             self.ctrl_layer_active = true;
             self.ctrl_layer_sequence.clear();
@@ -2600,6 +2808,7 @@ impl SlateApp {
         self.palette_open = false;
         self.recent_picker_open = false;
         self.file_picker_open = false;
+        self.save_as_open = false;
         self.command_line.clear();
         self.command_line_cursor = 0;
         self.command_history_index = None;
@@ -2655,7 +2864,15 @@ impl SlateApp {
         let mut file_previous = false;
         let mut file_next = false;
         let mut file_open = false;
+        let mut file_enter_dir = false;
+        let mut file_parent = false;
         let mut file_backspace = false;
+        let mut save_as_previous = false;
+        let mut save_as_next = false;
+        let mut save_as_enter = false;
+        let mut save_as_enter_dir = false;
+        let mut save_as_parent = false;
+        let mut save_as_backspace = false;
         let mut search_next = false;
         let mut search_previous = false;
         let mut search_accept = false;
@@ -2675,6 +2892,7 @@ impl SlateApp {
             && !self.settings_open
             && !self.recent_picker_open
             && !self.file_picker_open
+            && !self.save_as_open
             && self.pending_action.is_none();
         ctx.input_mut(|i| {
             if self.settings_open {
@@ -2695,12 +2913,23 @@ impl SlateApp {
             if self.file_picker_open {
                 file_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
                 file_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
+                file_enter_dir |= i.consume_key(egui::Modifiers::NONE, Key::ArrowRight);
+                file_parent |= i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft);
                 file_open |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
                 file_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
+            }
+            if self.save_as_open {
+                save_as_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
+                save_as_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
+                save_as_enter_dir |= i.consume_key(egui::Modifiers::NONE, Key::ArrowRight);
+                save_as_parent |= i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft);
+                save_as_enter |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
+                save_as_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
             }
             if i.consume_key(egui::Modifiers::CTRL, Key::P) {
                 self.recent_picker_open = false;
                 self.file_picker_open = false;
+                self.save_as_open = false;
                 self.palette_open = true;
                 self.palette_query.clear();
                 self.selected_command = 0;
@@ -2721,6 +2950,7 @@ impl SlateApp {
                 self.palette_open = false;
                 self.recent_picker_open = false;
                 self.file_picker_open = false;
+                self.save_as_open = false;
                 self.command_line.clear();
                 self.command_line_cursor = 0;
                 self.command_history_index = None;
@@ -2763,7 +2993,21 @@ impl SlateApp {
                     } if modifiers.ctrl && !modifiers.alt && !modifiers.shift
                 )
             });
-            if save_pressed {
+            let save_as_pressed = i.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: Key::S,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                        ..
+                    } if modifiers.ctrl && modifiers.alt && !modifiers.shift
+                )
+            });
+            if save_as_pressed {
+                command = Some(Command::SaveAs);
+            } else if save_pressed {
                 command = Some(Command::Save);
             }
             if i.consume_key(egui::Modifiers::CTRL, Key::M) {
@@ -2793,6 +3037,9 @@ impl SlateApp {
                 } else if self.file_picker_open {
                     self.file_picker_open = false;
                     self.pending_project_file_path = None;
+                    self.focus_editor_once = true;
+                } else if self.save_as_open {
+                    self.save_as_open = false;
                     self.focus_editor_once = true;
                 } else if self.palette_open {
                     self.palette_open = false;
@@ -2844,6 +3091,42 @@ impl SlateApp {
             self.handle_file_picker_text_input(ctx);
         }
 
+        if self.save_as_open {
+            self.handle_save_as_text_input(ctx);
+        }
+
+        if save_as_backspace {
+            self.save_as_filename.pop();
+            self.selected_save_as_entry =
+                self.save_as_entry_indices().first().copied().unwrap_or(0);
+            return;
+        }
+
+        if save_as_previous {
+            self.move_save_as_selection(-1);
+            return;
+        }
+
+        if save_as_next {
+            self.move_save_as_selection(1);
+            return;
+        }
+
+        if save_as_enter_dir {
+            self.save_as_enter_selected_dir();
+            return;
+        }
+
+        if save_as_parent {
+            self.save_as_go_parent();
+            return;
+        }
+
+        if save_as_enter {
+            self.confirm_save_as();
+            return;
+        }
+
         if file_backspace {
             self.file_query.pop();
             self.selected_project_file = self.project_file_indices().first().copied().unwrap_or(0);
@@ -2857,6 +3140,16 @@ impl SlateApp {
 
         if file_next {
             self.move_project_file_selection(1);
+            return;
+        }
+
+        if file_enter_dir {
+            self.file_picker_enter_selected_dir();
+            return;
+        }
+
+        if file_parent {
+            self.file_picker_go_parent();
             return;
         }
 
@@ -3294,6 +3587,22 @@ impl SlateApp {
         self.selected_project_file = self.project_file_indices().first().copied().unwrap_or(0);
     }
 
+    fn handle_save_as_text_input(&mut self, ctx: &egui::Context) {
+        let events = ctx.input(|input| input.events.clone());
+        if ctx.input(|input| input.modifiers.ctrl || input.modifiers.command || input.modifiers.alt)
+        {
+            return;
+        }
+        let Some((_, text)) = Self::normalized_text_input(&events) else {
+            return;
+        };
+        if text.chars().any(|ch| ch.is_control()) {
+            return;
+        }
+        self.save_as_filename.push_str(&text);
+        self.selected_save_as_entry = self.save_as_entry_indices().first().copied().unwrap_or(0);
+    }
+
     fn handle_command_line_text_input(&mut self, ctx: &egui::Context) {
         let events = ctx.input(|input| input.events.clone());
         for event in &events {
@@ -3691,14 +4000,14 @@ impl SlateApp {
             return;
         }
 
-        let root = self.project_root();
+        let root = self.file_picker_dir.clone();
         let matches = self.project_file_indices();
-        let visible_rows = 16usize.min(matches.len());
+        let visible_rows = 16usize;
         let selected_position = matches
             .iter()
             .position(|index| *index == self.selected_project_file)
             .unwrap_or(0);
-        let start = selected_position.min(matches.len().saturating_sub(visible_rows));
+        let start = Self::centered_window_start(selected_position, visible_rows, matches.len());
         let end = (start + visible_rows).min(matches.len());
 
         egui::Area::new("file_picker_dialog".into())
@@ -3727,7 +4036,12 @@ impl SlateApp {
                         let warn = Color32::from_rgb(235, 203, 139);
 
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("files").font(title_font).color(accent));
+                            let title = if self.file_picker_mode == FilePickerMode::Open {
+                                "open"
+                            } else {
+                                "files"
+                            };
+                            ui.label(RichText::new(title).font(title_font).color(accent));
                             ui.label(
                                 RichText::new(format!(
                                     "{} files · {}",
@@ -3762,7 +4076,7 @@ impl SlateApp {
                             egui::StrokeKind::Outside,
                         );
                         let query = if self.file_query.is_empty() {
-                            "type to fuzzy-find files".to_string()
+                            "type to fuzzy-find files and folders".to_string()
                         } else {
                             self.file_query.clone()
                         };
@@ -3873,7 +4187,11 @@ impl SlateApp {
                                 .unwrap_or(path)
                                 .display()
                                 .to_string();
-                            let (size_label, modified_label) = Self::file_metadata_labels(path);
+                            let (size_label, modified_label) = if path.is_dir() {
+                                ("dir".to_string(), "".to_string())
+                            } else {
+                                Self::file_metadata_labels(path)
+                            };
                             let y = row_rect.center().y - 0.5;
                             painter.text(
                                 egui::pos2(row_rect.left() + 8.0, y),
@@ -3885,7 +4203,11 @@ impl SlateApp {
                             painter.text(
                                 egui::pos2(row_rect.left() + 28.0, y),
                                 egui::Align2::LEFT_CENTER,
-                                Self::text_for_width(name, 190.0, 13.0),
+                                Self::text_for_width(
+                                    &format!("{}{}", if path.is_dir() { "▸ " } else { "  " }, name),
+                                    190.0,
+                                    13.0,
+                                ),
                                 font.clone(),
                                 if selected { text } else { accent },
                             );
@@ -3930,7 +4252,267 @@ impl SlateApp {
                             for (key, label) in [
                                 ("↑↓", "select"),
                                 ("type", "filter"),
+                                ("→", "enter dir"),
+                                ("←", "parent"),
                                 ("enter", "open"),
+                                ("esc", "close"),
+                            ] {
+                                ui.label(
+                                    RichText::new(format!("[{key}]"))
+                                        .font(font.clone())
+                                        .color(warn),
+                                );
+                                ui.label(RichText::new(label).font(font.clone()).color(dim));
+                                ui.add_space(10.0);
+                            }
+                        });
+                    });
+            });
+    }
+
+    fn save_as_dialog(&mut self, ctx: &egui::Context) {
+        if !self.save_as_open {
+            return;
+        }
+
+        let matches = self.save_as_entry_indices();
+        let visible_rows = 12usize;
+        let selected_position = matches
+            .iter()
+            .position(|index| *index == self.selected_save_as_entry)
+            .unwrap_or(0);
+        let start = Self::centered_window_start(selected_position, visible_rows, matches.len());
+        let end = (start + visible_rows).min(matches.len());
+
+        egui::Area::new("save_as_dialog".into())
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, -20.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(25, 31, 40))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
+                    .corner_radius(0.0)
+                    .inner_margin(14.0)
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 10],
+                        blur: 24,
+                        spread: 0,
+                        color: Color32::from_black_alpha(150),
+                    })
+                    .show(ui, |ui| {
+                        ui.set_width(820.0);
+                        let font = FontId::new(13.0, FontFamily::Monospace);
+                        let title_font = FontId::new(16.0, FontFamily::Monospace);
+                        let accent = Color32::from_rgb(136, 192, 208);
+                        let text = Color32::from_rgb(216, 222, 233);
+                        let dim = Color32::from_rgb(136, 154, 176);
+                        let faint = Color32::from_rgb(94, 105, 126);
+                        let warn = Color32::from_rgb(235, 203, 139);
+
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("save as").font(title_font).color(accent));
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} · {} entries",
+                                    self.save_as_dir.display(),
+                                    self.save_as_entries.len()
+                                ))
+                                .font(font.clone())
+                                .color(faint),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new("[esc] close").font(font.clone()).color(warn),
+                                    );
+                                },
+                            );
+                        });
+                        ui.add_space(10.0);
+
+                        let input_height = 30.0;
+                        let (input_rect, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), input_height),
+                            egui::Sense::hover(),
+                        );
+                        let painter = ui.painter_at(input_rect);
+                        painter.rect_filled(input_rect, 0.0, Color32::from_rgb(30, 36, 48));
+                        painter.rect_stroke(
+                            input_rect,
+                            0.0,
+                            Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
+                            egui::StrokeKind::Outside,
+                        );
+                        let filename = if self.save_as_filename.is_empty() {
+                            "type file name".to_string()
+                        } else {
+                            self.save_as_filename.clone()
+                        };
+                        let filename_color = if self.save_as_filename.is_empty() {
+                            faint
+                        } else {
+                            text
+                        };
+                        painter.text(
+                            egui::pos2(input_rect.left() + 10.0, input_rect.center().y - 0.5),
+                            egui::Align2::LEFT_CENTER,
+                            "save as: ",
+                            font.clone(),
+                            accent,
+                        );
+                        let filename_rect = painter.text(
+                            egui::pos2(input_rect.left() + 90.0, input_rect.center().y - 0.5),
+                            egui::Align2::LEFT_CENTER,
+                            filename,
+                            font.clone(),
+                            filename_color,
+                        );
+                        let cursor_x = if self.save_as_filename.is_empty() {
+                            input_rect.left() + 90.0
+                        } else {
+                            filename_rect.right() + 2.0
+                        };
+                        painter.line_segment(
+                            [
+                                egui::pos2(cursor_x, input_rect.top() + 7.0),
+                                egui::pos2(cursor_x, input_rect.bottom() - 7.0),
+                            ],
+                            Stroke::new(1.0, accent),
+                        );
+
+                        ui.add_space(8.0);
+                        let row_height = 24.0;
+                        let list_height = (visible_rows.max(1) as f32 + 1.0) * row_height;
+                        let (list_rect, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), list_height),
+                            egui::Sense::hover(),
+                        );
+                        let painter = ui.painter_at(list_rect).with_clip_rect(list_rect);
+                        painter.rect_filled(list_rect, 0.0, Color32::from_rgb(22, 28, 37));
+                        painter.rect_stroke(
+                            list_rect,
+                            0.0,
+                            Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
+                            egui::StrokeKind::Outside,
+                        );
+                        let header_y = list_rect.top() + row_height * 0.5;
+                        painter.text(
+                            egui::pos2(list_rect.left() + 32.0, header_y),
+                            egui::Align2::LEFT_CENTER,
+                            "name",
+                            font.clone(),
+                            faint,
+                        );
+                        painter.text(
+                            egui::pos2(list_rect.left() + 300.0, header_y),
+                            egui::Align2::LEFT_CENTER,
+                            "size",
+                            font.clone(),
+                            faint,
+                        );
+                        painter.text(
+                            egui::pos2(list_rect.left() + 390.0, header_y),
+                            egui::Align2::LEFT_CENTER,
+                            "modified",
+                            font.clone(),
+                            faint,
+                        );
+
+                        if matches.is_empty() {
+                            painter.text(
+                                list_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "no matching entries",
+                                font.clone(),
+                                faint,
+                            );
+                        }
+
+                        for (row, index) in matches[start..end].iter().copied().enumerate() {
+                            let row_top = list_rect.top() + (row as f32 + 1.0) * row_height;
+                            let row_rect = egui::Rect::from_min_size(
+                                egui::pos2(list_rect.left() + 4.0, row_top),
+                                Vec2::new(list_rect.width() - 8.0, row_height),
+                            );
+                            let selected = index == self.selected_save_as_entry;
+                            if selected {
+                                painter.rect_filled(row_rect, 0.0, Color32::from_rgb(38, 47, 61));
+                            }
+                            let path = &self.save_as_entries[index];
+                            let name = path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("unknown");
+                            let (size_label, modified_label) = if path.is_dir() {
+                                ("dir".to_string(), "".to_string())
+                            } else {
+                                Self::file_metadata_labels(path)
+                            };
+                            let y = row_rect.center().y - 0.5;
+                            painter.text(
+                                egui::pos2(row_rect.left() + 8.0, y),
+                                egui::Align2::LEFT_CENTER,
+                                if selected { ">" } else { " " },
+                                font.clone(),
+                                accent,
+                            );
+                            painter.text(
+                                egui::pos2(row_rect.left() + 28.0, y),
+                                egui::Align2::LEFT_CENTER,
+                                Self::text_for_width(
+                                    &format!("{}{}", if path.is_dir() { "▸ " } else { "  " }, name),
+                                    250.0,
+                                    13.0,
+                                ),
+                                font.clone(),
+                                if selected { text } else { accent },
+                            );
+                            painter.text(
+                                egui::pos2(row_rect.left() + 300.0, y),
+                                egui::Align2::LEFT_CENTER,
+                                size_label,
+                                font.clone(),
+                                if selected { dim } else { faint },
+                            );
+                            painter.text(
+                                egui::pos2(row_rect.left() + 390.0, y),
+                                egui::Align2::LEFT_CENTER,
+                                modified_label,
+                                font.clone(),
+                                if selected { dim } else { faint },
+                            );
+
+                            let response = ui.interact(
+                                row_rect,
+                                ui.id().with(("save_as_entry", index)),
+                                egui::Sense::click(),
+                            );
+                            if response.clicked() {
+                                self.selected_save_as_entry = index;
+                                if path.is_file() {
+                                    self.save_as_filename = name.to_string();
+                                }
+                            }
+                            if response.double_clicked() {
+                                self.selected_save_as_entry = index;
+                                if path.is_dir() {
+                                    self.save_as_enter_selected_dir();
+                                } else {
+                                    self.save_as_filename = name.to_string();
+                                    self.confirm_save_as();
+                                }
+                            }
+                        }
+
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            for (key, label) in [
+                                ("↑↓", "select"),
+                                ("type", "name/filter"),
+                                ("→", "enter dir"),
+                                ("←", "parent"),
+                                ("enter", "save"),
                                 ("esc", "close"),
                             ] {
                                 ui.label(
@@ -3960,6 +4542,7 @@ impl SlateApp {
                     ("Ctrl+H", "open this help"),
                     ("Esc", "close modal / cancel active mode"),
                     ("Ctrl+S", "save"),
+                    ("Ctrl+Alt+S", "save as"),
                     ("Ctrl+O", "open file"),
                     ("Ctrl+M", "toggle Markdown preview"),
                     ("Ctrl+Q", "quit"),
@@ -4407,6 +4990,7 @@ impl eframe::App for SlateApp {
                     && !self.settings_open
                     && !self.recent_picker_open
                     && !self.file_picker_open
+                    && !self.save_as_open
                     && !self.shortcut_help_open
                     && self.search_state.is_none();
                 let active_line_text_highlight = self
@@ -4435,6 +5019,7 @@ impl eframe::App for SlateApp {
                                     && !self.settings_open
                                     && !self.recent_picker_open
                                     && !self.file_picker_open
+                                    && !self.save_as_open
                                     && !self.command_line_focused
                                 {
                                     response.request_focus();
@@ -4461,6 +5046,7 @@ impl eframe::App for SlateApp {
                                 && !self.settings_open
                                 && !self.recent_picker_open
                                 && !self.file_picker_open
+                                && !self.save_as_open
                                 && !self.command_line_focused
                             {
                                 response.request_focus();
@@ -4504,6 +5090,8 @@ impl eframe::App for SlateApp {
                     "recent"
                 } else if self.file_picker_open {
                     "files"
+                } else if self.save_as_open {
+                    "save as"
                 } else if self.search_state.is_some() {
                     "find"
                 } else if self.settings_open {
@@ -4833,7 +5421,9 @@ impl eframe::App for SlateApp {
                             footer_accent,
                         )
                     } else if self.file_picker_open {
-                        ("files  type to filter · ↑↓ select · Enter open · Esc close".to_string(), footer_accent)
+                        ("files  type filter · ↑↓ select · → enter folder · ← parent · Enter open · Esc close".to_string(), footer_accent)
+                    } else if self.save_as_open {
+                        ("save as  type file name · ↑↓ select · → enter folder · ← parent · Enter save · Esc close".to_string(), footer_accent)
                     } else {
                         (
                             "command  Ctrl+. enter · Ctrl+H help · Ctrl+P palette · w · q · wq"
@@ -4850,6 +5440,7 @@ impl eframe::App for SlateApp {
         self.settings_dialog(&ctx);
         self.shortcut_help_dialog(&ctx);
         self.file_picker_dialog(&ctx);
+        self.save_as_dialog(&ctx);
     }
 }
 
