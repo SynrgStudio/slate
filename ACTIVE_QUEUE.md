@@ -45,6 +45,7 @@ Scope:
 - Done: track the last opened file and support `open-last` / `last` / `ol` plus Ctrl-layer `ol`.
 - Done: track a real recent opened/saved files list and persist it in config.
 - Done: add `:recent` as a commandline-first workflow that opens a live recent-file picker in the minibuffer/palette area.
+- Done: support `:recent <query>` and live typing/backspace filtering inside the recent picker.
 - Done: add recent command discovery through the live command registry and command palette/minibuffer.
 - Pending: optionally reopen the last file at startup.
 

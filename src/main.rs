@@ -335,6 +335,7 @@ struct SlateApp {
     last_opened_path: Option<PathBuf>,
     recent_files: Vec<PathBuf>,
     recent_picker_open: bool,
+    recent_query: String,
     selected_recent_file: usize,
     pending_recent_path: Option<PathBuf>,
     search_state: Option<SearchState>,
@@ -385,6 +386,7 @@ impl SlateApp {
             last_opened_path: None,
             recent_files: Vec::new(),
             recent_picker_open: false,
+            recent_query: String::new(),
             selected_recent_file: 0,
             pending_recent_path: None,
             search_state: None,
@@ -536,24 +538,81 @@ impl SlateApp {
     }
 
     fn open_recent_picker(&mut self) {
+        self.open_recent_picker_with_query(String::new());
+    }
+
+    fn open_recent_picker_with_query(&mut self, query: String) {
         self.shortcut_help_open = false;
         self.palette_open = false;
         self.recent_picker_open = false;
         self.command_line_focused = false;
         self.focus_command_line_once = false;
         self.command_history_index = None;
+        self.recent_query = query;
         if self.recent_files.is_empty() {
             self.status = "No recent files".to_string();
             self.focus_editor_once = true;
             return;
         }
         self.recent_picker_open = true;
-        self.selected_recent_file = self.selected_recent_file.min(self.recent_files.len() - 1);
+        self.selected_recent_file = self.recent_file_indices().first().copied().unwrap_or(0);
         self.status = "Recent files".to_string();
         self.focus_editor_once = false;
     }
 
+    fn recent_file_indices(&self) -> Vec<usize> {
+        let query = self.recent_query.trim().to_lowercase();
+        if query.is_empty() {
+            return (0..self.recent_files.len()).collect();
+        }
+
+        let mut scored = self
+            .recent_files
+            .iter()
+            .enumerate()
+            .filter_map(|(index, path)| {
+                let display = path.display().to_string();
+                let file_name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("");
+                let display_score = Self::fuzzy_score(&display, &query);
+                let name_score = Self::fuzzy_score(file_name, &query).map(|score| score / 2);
+                display_score
+                    .into_iter()
+                    .chain(name_score)
+                    .min()
+                    .map(|score| (score, index))
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by_key(|(score, index)| (*score, *index));
+        scored.into_iter().map(|(_, index)| index).collect()
+    }
+
+    fn move_recent_selection(&mut self, delta: isize) {
+        let indices = self.recent_file_indices();
+        if indices.is_empty() {
+            self.selected_recent_file = 0;
+            return;
+        }
+        let current_position = indices
+            .iter()
+            .position(|index| *index == self.selected_recent_file)
+            .unwrap_or(0);
+        let next_position = current_position
+            .saturating_add_signed(delta)
+            .min(indices.len().saturating_sub(1));
+        self.selected_recent_file = indices[next_position];
+    }
+
     fn open_selected_recent_file(&mut self) {
+        if !self
+            .recent_file_indices()
+            .contains(&self.selected_recent_file)
+        {
+            self.status = "No matching recent file".to_string();
+            return;
+        }
         let Some(path) = self.recent_files.get(self.selected_recent_file).cloned() else {
             self.status = "No recent file selected".to_string();
             return;
@@ -906,7 +965,10 @@ impl SlateApp {
                     self.open_last();
                 }
             }
-            "recent" | "rec" => self.open_recent_picker(),
+            "recent" | "rec" => {
+                let query = parts.collect::<Vec<_>>().join(" ");
+                self.open_recent_picker_with_query(query);
+            }
             "preview" | "md" => self.run_command(Command::TogglePreview, ctx),
             "wrap" => self.run_command(Command::ToggleWrap, ctx),
             "find" | "f" => {
@@ -1923,6 +1985,7 @@ impl SlateApp {
         let mut recent_previous = false;
         let mut recent_next = false;
         let mut recent_open = false;
+        let mut recent_backspace = false;
         let mut search_next = false;
         let mut search_previous = false;
         let mut search_accept = false;
@@ -1956,6 +2019,7 @@ impl SlateApp {
                 recent_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
                 recent_open |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
                 recent_open |= i.consume_key(egui::Modifiers::NONE, Key::Space);
+                recent_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
             }
             if i.consume_key(egui::Modifiers::CTRL, Key::P) {
                 self.recent_picker_open = false;
@@ -2089,14 +2153,23 @@ impl SlateApp {
             return;
         }
 
+        if self.recent_picker_open {
+            self.handle_recent_picker_text_input(ctx);
+        }
+
+        if recent_backspace {
+            self.recent_query.pop();
+            self.selected_recent_file = self.recent_file_indices().first().copied().unwrap_or(0);
+            return;
+        }
+
         if recent_previous {
-            self.selected_recent_file = self.selected_recent_file.saturating_sub(1);
+            self.move_recent_selection(-1);
             return;
         }
 
         if recent_next {
-            self.selected_recent_file =
-                (self.selected_recent_file + 1).min(self.recent_files.len().saturating_sub(1));
+            self.move_recent_selection(1);
             return;
         }
 
@@ -2477,6 +2550,22 @@ impl SlateApp {
             });
     }
 
+    fn handle_recent_picker_text_input(&mut self, ctx: &egui::Context) {
+        let events = ctx.input(|input| input.events.clone());
+        if ctx.input(|input| input.modifiers.ctrl || input.modifiers.command || input.modifiers.alt)
+        {
+            return;
+        }
+        let Some((_, text)) = Self::normalized_text_input(&events) else {
+            return;
+        };
+        if text.chars().any(|ch| ch.is_control()) {
+            return;
+        }
+        self.recent_query.push_str(&text);
+        self.selected_recent_file = self.recent_file_indices().first().copied().unwrap_or(0);
+    }
+
     fn handle_command_line_text_input(&mut self, ctx: &egui::Context) {
         let events = ctx.input(|input| input.events.clone());
         for event in &events {
@@ -2836,8 +2925,13 @@ impl eframe::App for SlateApp {
                     Vec::new()
                 };
                 let visible_suggestion_rows = command_suggestions.len();
+                let recent_file_indices = if self.recent_picker_open {
+                    self.recent_file_indices()
+                } else {
+                    Vec::new()
+                };
                 let visible_recent_rows = if self.recent_picker_open {
-                    self.recent_files.len().min(8)
+                    recent_file_indices.len().min(8)
                 } else {
                     0
                 };
@@ -3083,11 +3177,14 @@ impl eframe::App for SlateApp {
                     let painter = ui.painter_at(recent_rect);
                     painter.rect_filled(recent_rect, 0.0, Color32::from_rgb(25, 31, 40));
 
-                    let start = self
-                        .selected_recent_file
-                        .min(self.recent_files.len().saturating_sub(visible_recent_rows));
-                    let end = (start + visible_recent_rows).min(self.recent_files.len());
-                    for (row, index) in (start..end).enumerate() {
+                    let selected_position = recent_file_indices
+                        .iter()
+                        .position(|index| *index == self.selected_recent_file)
+                        .unwrap_or(0);
+                    let start = selected_position
+                        .min(recent_file_indices.len().saturating_sub(visible_recent_rows));
+                    let end = (start + visible_recent_rows).min(recent_file_indices.len());
+                    for (row, index) in recent_file_indices[start..end].iter().copied().enumerate() {
                         let row_rect = egui::Rect::from_min_size(
                             egui::pos2(
                                 recent_rect.left(),
@@ -3330,7 +3427,10 @@ impl eframe::App for SlateApp {
                     } else if self.shortcut_help_open {
                         ("shortcuts  [esc] close".to_string(), footer_accent)
                     } else if self.recent_picker_open {
-                        ("recent files  ↑↓ select · Enter open · Esc close".to_string(), footer_accent)
+                        (
+                            format!("recent files {} ↑↓ select · type filter · Enter open · Esc close", if self.recent_query.is_empty() { "".to_string() } else { format!("/{} ", self.recent_query) }),
+                            footer_accent,
+                        )
                     } else {
                         (
                             "command  Ctrl+. enter · Ctrl+H help · Ctrl+P palette · w · q · wq"

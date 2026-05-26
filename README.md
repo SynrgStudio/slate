@@ -154,6 +154,7 @@ Examples:
 :wrap
 :settings
 :recent
+:recent notes
 ```
 
 Goto:
