@@ -109,6 +109,13 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         palette_command: None,
     },
     CommandSpec {
+        name: "recent",
+        aliases: &["rec"],
+        summary: "Open recent files picker",
+        hint: ":recent",
+        palette_command: None,
+    },
+    CommandSpec {
         name: "preview",
         aliases: &["md"],
         summary: "Toggle Markdown preview",
@@ -234,6 +241,7 @@ enum PendingAction {
     New,
     Open,
     OpenLast,
+    OpenRecent,
     Quit,
 }
 
@@ -287,6 +295,7 @@ impl PendingAction {
             PendingAction::New => "buffer has unsaved changes; start a new buffer anyway?",
             PendingAction::Open => "buffer has unsaved changes; open another file anyway?",
             PendingAction::OpenLast => "buffer has unsaved changes; open last file anyway?",
+            PendingAction::OpenRecent => "buffer has unsaved changes; open recent file anyway?",
             PendingAction::Quit => "buffer has unsaved changes; close anyway?",
         }
     }
@@ -324,6 +333,10 @@ struct SlateApp {
     line_number_mode: LineNumberMode,
     ctrl_shift_move_mode: CtrlShiftMoveMode,
     last_opened_path: Option<PathBuf>,
+    recent_files: Vec<PathBuf>,
+    recent_picker_open: bool,
+    selected_recent_file: usize,
+    pending_recent_path: Option<PathBuf>,
     search_state: Option<SearchState>,
     ctrl_layer_active: bool,
     ctrl_layer_sequence: String,
@@ -370,6 +383,10 @@ impl SlateApp {
             line_number_mode: LineNumberMode::Absolute,
             ctrl_shift_move_mode: CtrlShiftMoveMode::Vim,
             last_opened_path: None,
+            recent_files: Vec::new(),
+            recent_picker_open: false,
+            selected_recent_file: 0,
+            pending_recent_path: None,
             search_state: None,
             ctrl_layer_active: false,
             ctrl_layer_sequence: String::new(),
@@ -415,7 +432,7 @@ impl SlateApp {
                 self.path = Some(path.clone());
                 self.dirty = false;
                 self.search_state = None;
-                self.last_opened_path = Some(path.clone());
+                self.remember_recent_file(path.clone());
                 let _ = self.save_settings();
                 self.status = format!("Opened {}", path.display());
             }
@@ -481,6 +498,8 @@ impl SlateApp {
             Ok(_) => {
                 self.path = Some(path.clone());
                 self.dirty = false;
+                self.remember_recent_file(path.clone());
+                let _ = self.save_settings();
                 self.status = format!("Saved {}", path.display());
             }
             Err(err) => self.status = format!("Save failed: {err}"),
@@ -507,6 +526,46 @@ impl SlateApp {
             return;
         };
         self.open_path(path);
+    }
+
+    fn remember_recent_file(&mut self, path: PathBuf) {
+        self.last_opened_path = Some(path.clone());
+        self.recent_files.retain(|recent| recent != &path);
+        self.recent_files.insert(0, path);
+        self.recent_files.truncate(20);
+    }
+
+    fn open_recent_picker(&mut self) {
+        self.shortcut_help_open = false;
+        self.palette_open = false;
+        self.recent_picker_open = false;
+        self.command_line_focused = false;
+        self.focus_command_line_once = false;
+        self.command_history_index = None;
+        if self.recent_files.is_empty() {
+            self.status = "No recent files".to_string();
+            self.focus_editor_once = true;
+            return;
+        }
+        self.recent_picker_open = true;
+        self.selected_recent_file = self.selected_recent_file.min(self.recent_files.len() - 1);
+        self.status = "Recent files".to_string();
+        self.focus_editor_once = false;
+    }
+
+    fn open_selected_recent_file(&mut self) {
+        let Some(path) = self.recent_files.get(self.selected_recent_file).cloned() else {
+            self.status = "No recent file selected".to_string();
+            return;
+        };
+        if self.dirty {
+            self.pending_recent_path = Some(path);
+            self.confirm(PendingAction::OpenRecent);
+        } else {
+            self.recent_picker_open = false;
+            self.open_path(path);
+            self.focus_editor_once = true;
+        }
     }
 
     fn save_as(&mut self) {
@@ -555,6 +614,15 @@ impl SlateApp {
                         self.last_opened_path = Some(PathBuf::from(value));
                     }
                 }
+                "recent_file" => {
+                    let value = value.trim().trim_matches('"');
+                    if !value.is_empty() {
+                        let path = PathBuf::from(value);
+                        if !self.recent_files.contains(&path) {
+                            self.recent_files.push(path);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -568,21 +636,24 @@ impl SlateApp {
             .parent()
             .ok_or_else(|| "invalid config path".to_string())?;
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-        fs::write(
-            path,
-            format!(
-                "command_history_limit = {}\nline_number_mode = \"{}\"\nctrl_shift_move_mode = \"{}\"\nlast_opened_path = \"{}\"\n",
-                self.command_history_limit,
-                self.line_number_mode.config_value(),
-                self.ctrl_shift_move_mode.config_value(),
-                self.last_opened_path
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_default()
-                    .replace('"', "\\\"")
-            ),
-        )
-        .map_err(|err| err.to_string())
+        let mut contents = format!(
+            "command_history_limit = {}\nline_number_mode = \"{}\"\nctrl_shift_move_mode = \"{}\"\nlast_opened_path = \"{}\"\n",
+            self.command_history_limit,
+            self.line_number_mode.config_value(),
+            self.ctrl_shift_move_mode.config_value(),
+            self.last_opened_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default()
+                .replace('"', "\\\"")
+        );
+        for recent in &self.recent_files {
+            contents.push_str(&format!(
+                "recent_file = \"{}\"\n",
+                recent.display().to_string().replace('"', "\\\"")
+            ));
+        }
+        fs::write(path, contents).map_err(|err| err.to_string())
     }
 
     fn set_command_history_limit(&mut self, limit: usize) {
@@ -613,6 +684,7 @@ impl SlateApp {
 
     fn run_command(&mut self, command: Command, ctx: &egui::Context) {
         self.palette_open = false;
+        self.recent_picker_open = false;
         self.palette_query.clear();
         self.selected_command = 0;
         self.command_line_focused = false;
@@ -834,6 +906,7 @@ impl SlateApp {
                     self.open_last();
                 }
             }
+            "recent" | "rec" => self.open_recent_picker(),
             "preview" | "md" => self.run_command(Command::TogglePreview, ctx),
             "wrap" => self.run_command(Command::ToggleWrap, ctx),
             "find" | "f" => {
@@ -1194,6 +1267,12 @@ impl SlateApp {
             PendingAction::New => self.new_buffer(),
             PendingAction::Open => self.open_dialog(),
             PendingAction::OpenLast => self.open_last(),
+            PendingAction::OpenRecent => {
+                if let Some(path) = self.pending_recent_path.take() {
+                    self.recent_picker_open = false;
+                    self.open_path(path);
+                }
+            }
             PendingAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
     }
@@ -1218,6 +1297,7 @@ impl SlateApp {
             && !self.focus_command_line_once
             && !self.palette_open
             && !self.settings_open
+            && !self.recent_picker_open
             && self.pending_action.is_none()
     }
 
@@ -1753,6 +1833,7 @@ impl SlateApp {
                     self.open_last();
                 }
             }
+            "r" => self.open_recent_picker(),
             "n" => self.run_command(Command::New, ctx),
             "p" => {
                 self.palette_open = true;
@@ -1791,6 +1872,7 @@ impl SlateApp {
     fn focus_command_line(&mut self) {
         self.shortcut_help_open = false;
         self.palette_open = false;
+        self.recent_picker_open = false;
         self.command_line.clear();
         self.command_line_cursor = 0;
         self.command_history_index = None;
@@ -1802,6 +1884,7 @@ impl SlateApp {
     fn focus_find_command_line(&mut self) {
         self.shortcut_help_open = false;
         self.palette_open = false;
+        self.recent_picker_open = false;
         self.command_line = "find ".to_string();
         self.command_line_cursor = self.command_line.len();
         self.command_history_index = None;
@@ -1837,6 +1920,9 @@ impl SlateApp {
         let mut settings_previous = false;
         let mut settings_next = false;
         let mut settings_activate = false;
+        let mut recent_previous = false;
+        let mut recent_next = false;
+        let mut recent_open = false;
         let mut search_next = false;
         let mut search_previous = false;
         let mut search_accept = false;
@@ -1854,6 +1940,7 @@ impl SlateApp {
             && !self.focus_command_line_once
             && !self.palette_open
             && !self.settings_open
+            && !self.recent_picker_open
             && self.pending_action.is_none();
         ctx.input_mut(|i| {
             if self.settings_open {
@@ -1864,7 +1951,14 @@ impl SlateApp {
                 settings_activate |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
                 settings_activate |= i.consume_key(egui::Modifiers::NONE, Key::Space);
             }
+            if self.recent_picker_open {
+                recent_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
+                recent_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
+                recent_open |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
+                recent_open |= i.consume_key(egui::Modifiers::NONE, Key::Space);
+            }
             if i.consume_key(egui::Modifiers::CTRL, Key::P) {
+                self.recent_picker_open = false;
                 self.palette_open = true;
                 self.palette_query.clear();
                 self.selected_command = 0;
@@ -1883,6 +1977,7 @@ impl SlateApp {
             }
             if i.consume_key(egui::Modifiers::CTRL, Key::Period) {
                 self.palette_open = false;
+                self.recent_picker_open = false;
                 self.command_line.clear();
                 self.command_line_cursor = 0;
                 self.command_history_index = None;
@@ -1948,6 +2043,10 @@ impl SlateApp {
                 } else if self.shortcut_help_open {
                     self.shortcut_help_open = false;
                     self.focus_editor_once = true;
+                } else if self.recent_picker_open {
+                    self.recent_picker_open = false;
+                    self.pending_recent_path = None;
+                    self.focus_editor_once = true;
                 } else if self.palette_open {
                     self.palette_open = false;
                     self.focus_editor_once = true;
@@ -1987,6 +2086,22 @@ impl SlateApp {
 
         if search_previous {
             self.move_search_match(false);
+            return;
+        }
+
+        if recent_previous {
+            self.selected_recent_file = self.selected_recent_file.saturating_sub(1);
+            return;
+        }
+
+        if recent_next {
+            self.selected_recent_file =
+                (self.selected_recent_file + 1).min(self.recent_files.len().saturating_sub(1));
+            return;
+        }
+
+        if recent_open {
+            self.open_selected_recent_file();
             return;
         }
 
@@ -2721,6 +2836,11 @@ impl eframe::App for SlateApp {
                     Vec::new()
                 };
                 let visible_suggestion_rows = command_suggestions.len();
+                let visible_recent_rows = if self.recent_picker_open {
+                    self.recent_files.len().min(8)
+                } else {
+                    0
+                };
                 let command_history_active = command_line_active
                     && command_suggestions.is_empty()
                     && !self.command_history.is_empty();
@@ -2730,9 +2850,11 @@ impl eframe::App for SlateApp {
                     0
                 };
                 let suggestion_height = visible_suggestion_rows as f32 * history_row_height;
+                let recent_height = visible_recent_rows as f32 * history_row_height;
                 let history_height = visible_history_rows as f32 * history_row_height;
                 let footer_height = status_height
                     + shortcut_help_height
+                    + recent_height
                     + suggestion_height
                     + history_height
                     + command_height;
@@ -2768,6 +2890,7 @@ impl eframe::App for SlateApp {
                                 if self.focus_editor_once
                                     && !self.palette_open
                                     && !self.settings_open
+                                    && !self.recent_picker_open
                                     && !self.command_line_focused
                                 {
                                     response.request_focus();
@@ -2792,6 +2915,7 @@ impl eframe::App for SlateApp {
                             if self.focus_editor_once
                                 && !self.palette_open
                                 && !self.settings_open
+                                && !self.recent_picker_open
                                 && !self.command_line_focused
                             {
                                 response.request_focus();
@@ -2831,6 +2955,8 @@ impl eframe::App for SlateApp {
                     "ctrl"
                 } else if self.command_line_focused || self.focus_command_line_once {
                     "command"
+                } else if self.recent_picker_open {
+                    "recent"
                 } else if self.search_state.is_some() {
                     "find"
                 } else if self.settings_open {
@@ -2898,7 +3024,7 @@ impl eframe::App for SlateApp {
 
                     let shortcuts = [
                         ("C-s", "save", "C-o", "open file"),
-                        ("C-o l", "open last", "C-n", "new buffer"),
+                        ("C-o l", "open last", "C-r", "recent files"),
                         ("C-p", "command palette", "C-.", "commandline"),
                         ("C-h", "shortcut help", "C-f", "find"),
                         ("C-m", "preview", "C-q", "quit"),
@@ -2945,6 +3071,68 @@ impl eframe::App for SlateApp {
                                 footer_font.clone(),
                                 footer_color,
                             );
+                        }
+                    }
+                }
+
+                if visible_recent_rows > 0 {
+                    let (recent_rect, _) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), recent_height),
+                        egui::Sense::hover(),
+                    );
+                    let painter = ui.painter_at(recent_rect);
+                    painter.rect_filled(recent_rect, 0.0, Color32::from_rgb(25, 31, 40));
+
+                    let start = self
+                        .selected_recent_file
+                        .min(self.recent_files.len().saturating_sub(visible_recent_rows));
+                    let end = (start + visible_recent_rows).min(self.recent_files.len());
+                    for (row, index) in (start..end).enumerate() {
+                        let row_rect = egui::Rect::from_min_size(
+                            egui::pos2(
+                                recent_rect.left(),
+                                recent_rect.top() + row as f32 * history_row_height,
+                            ),
+                            Vec2::new(recent_rect.width(), history_row_height),
+                        );
+                        let selected = index == self.selected_recent_file;
+                        if selected {
+                            painter.rect_filled(row_rect, 0.0, Color32::from_rgb(38, 47, 61));
+                        }
+                        let path = &self.recent_files[index];
+                        let name = path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("unknown");
+                        painter.text(
+                            egui::pos2(row_rect.left() + 10.0, row_rect.center().y - 1.0),
+                            egui::Align2::LEFT_CENTER,
+                            if selected { ">" } else { " " },
+                            footer_font.clone(),
+                            footer_accent,
+                        );
+                        painter.text(
+                            egui::pos2(row_rect.left() + 28.0, row_rect.center().y - 1.0),
+                            egui::Align2::LEFT_CENTER,
+                            name,
+                            footer_font.clone(),
+                            if selected { footer_color } else { footer_dim },
+                        );
+                        painter.text(
+                            egui::pos2(row_rect.left() + 190.0, row_rect.center().y - 1.0),
+                            egui::Align2::LEFT_CENTER,
+                            path.display().to_string(),
+                            footer_font.clone(),
+                            footer_dim,
+                        );
+                        let response = ui.interact(
+                            row_rect,
+                            ui.id().with(("recent_file", index)),
+                            egui::Sense::click(),
+                        );
+                        if response.clicked() {
+                            self.selected_recent_file = index;
+                            self.open_selected_recent_file();
                         }
                     }
                 }
@@ -3141,6 +3329,8 @@ impl eframe::App for SlateApp {
                         (format!("ctrl:{}", self.ctrl_layer_sequence), footer_accent)
                     } else if self.shortcut_help_open {
                         ("shortcuts  [esc] close".to_string(), footer_accent)
+                    } else if self.recent_picker_open {
+                        ("recent files  ↑↓ select · Enter open · Esc close".to_string(), footer_accent)
                     } else {
                         (
                             "command  Ctrl+. enter · Ctrl+H help · Ctrl+P palette · w · q · wq"

@@ -153,6 +153,7 @@ Examples:
 :preview
 :wrap
 :settings
+:recent
 ```
 
 Goto:
@@ -180,6 +181,7 @@ Editing/navigation commands:
 :top            :gt
 :bottom         :gb
 :open-last      :ol
+:recent         :rec
 ```
 
 ---

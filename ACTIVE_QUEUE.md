@@ -31,7 +31,7 @@ Scope:
 Status: in_progress
 Scope:
 - Done: lightweight config at `~/.config/slate/config.toml`.
-- Done: persist command history limit, line-number mode, last opened file, and Ctrl+Shift movement mode.
+- Done: persist command history limit, line-number mode, last opened file, recent files, and Ctrl+Shift movement mode.
 - Pending: persist theme, word wrap, preview mode, selected vault/notes folder, scratch behavior, wiki-link insert style, and link resolver behavior.
 - Keep configuration lightweight and human-readable.
 - Add an optional configurable vault/root notes directory for knowledge-management workflows.
@@ -43,9 +43,9 @@ Scope:
 Status: in_progress
 Scope:
 - Done: track the last opened file and support `open-last` / `last` / `ol` plus Ctrl-layer `ol`.
-- Pending: track a real recent opened/saved files list.
-- Pending: add `:recent` as a commandline-first workflow that opens a live recent-file picker in the minibuffer/palette area.
-- Pending: add `Open recent` command in the command palette/minibuffer.
+- Done: track a real recent opened/saved files list and persist it in config.
+- Done: add `:recent` as a commandline-first workflow that opens a live recent-file picker in the minibuffer/palette area.
+- Done: add recent command discovery through the live command registry and command palette/minibuffer.
 - Pending: optionally reopen the last file at startup.
 
 ### T005 — Scratch buffer and quick capture
