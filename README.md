@@ -27,7 +27,7 @@ Slate currently provides a minimal native GUI editor with a terminal-inspired in
 - richer statusbar with file state, active mode, cursor position, line/word/char counts
 - Ctrl-hold command layer for short editing commands
 - configurable Ctrl+Shift live movement using either Vim-style `h/j/k/l` or Slate-style `i/j/k/l`
-- shortcut help inside the minibuffer
+- modal shortcut and command reference
 
 Slate keeps the UI intentionally sparse: no menubar, no toolbar, no permanent sidebars.
 
@@ -108,7 +108,7 @@ slate --scratch
 | Shortcut | Action |
 | --- | --- |
 | `Ctrl+P` | Command palette |
-| `Ctrl+H` | Shortcut help, including Ctrl-layer, Alt layer, Shift+Alt jumps, duplicate placement, and movement hints |
+| `Ctrl+H` | Modal shortcut and command reference, including Ctrl-layer, Alt layer, Shift+Alt jumps, duplicate placement, and all registered commands |
 | `Ctrl+S` | Save |
 | `Ctrl+O` | Open file |
 | `Ctrl+N` | New buffer |
@@ -153,7 +153,13 @@ Examples:
 :e ~/notes/todo.md
 :new
 :preview
+:preview on
+:preview off
 :wrap
+:wrap on
+:wrap off
+:line-numbers relative
+:line-numbers absolute
 :settings
 :recent
 :recent notes
@@ -367,7 +373,7 @@ Slate's roadmap is intentionally staged. The idea is to build stable editor foun
 - `Alt+Up` / `Alt+Down` for moving lines
 - Better command discovery and fuzzy command matching
 - Real recent-files list and `:recent`
-- Persist more editor preferences such as wrap and preview mode
+- Persist more editor preferences such as theme and vault location
 - Minimal project/vault file opener
 
 ### Knowledge-work layer

@@ -34,8 +34,10 @@ Scope:
 Status: in_progress
 Scope:
 - Done: lightweight config at `~/.config/slate/config.toml`.
-- Done: persist command history limit, command history, line-number mode, last opened file, recent files, command usage, and Ctrl+Shift movement mode.
-- Pending: persist theme, word wrap, preview mode, selected vault/notes folder, scratch behavior, wiki-link insert style, and link resolver behavior.
+- Done: persist command history limit, command history, line-number mode, word wrap, preview mode, last opened file, recent files, command usage, and Ctrl+Shift movement mode.
+- Done: expose persisted wrap/preview controls in Settings and commandline (`:wrap on|off`, `:preview on|off`).
+- Done: expose line-number mode through commandline (`:line-numbers absolute|relative`, `:ln absolute|relative`).
+- Pending: persist theme, selected vault/notes folder, scratch behavior, wiki-link insert style, and link resolver behavior.
 - Keep configuration lightweight and human-readable.
 - Add an optional configurable vault/root notes directory for knowledge-management workflows.
 - Support toggleable wiki-link styles: compact deep link (`file.md:line:column`) and full Markdown-friendly display link (`file.md:line:column|visible text`).
@@ -158,7 +160,8 @@ Status: completed
 Scope:
 - Done: statusbar shows file path/name, modified state, status message, active mode, wrap state, cursor line/column, line count, word count, char count, and shortcut hint.
 - Done: statusbar sits above a dedicated command line/minibuffer.
-- Done: command history, Ctrl-layer, shortcut help, command entry, and search use the bottom/minibuffer region without overlaying the editor.
+- Done: command history, Ctrl-layer, command entry, and search use the bottom/minibuffer region without overlaying the editor.
+- Done: Ctrl+H shortcut help moved from the crowded minibuffer list into its own modal with shortcuts plus registered commands.
 - Done: commandline inactive hint points to command entry, help, and palette.
 - Future modes such as link resolver, recent picker, file opener, and textual result buffers should reuse this statusbar/minibuffer pattern.
 - Keep the visual style terminal-like: status line plus command line, similar to Vim/Emacs minibuffer concepts.
@@ -324,7 +327,7 @@ Scope:
 - Done: Ctrl is a physical temporary command layer that collects key sequences while held and dispatches on Ctrl release.
 - Done: single-key Ctrl commands remain available on release: `s`, `o`, `n`, `p`, `q`, `m`, `.`, `f`, `b` in find context.
 - Done: multi-key commands: `dl` delete line, `dw` delete word, `sw` select word, `sl` select line, `ol` open last, `gt` go top, `gb` go bottom.
-- Done: `h` opens shortcut help in the minibuffer/help area.
+- Done: `h` opens a dedicated shortcut/command help modal.
 - Done: pending Ctrl sequence is shown in the dedicated command line while Ctrl is held.
 - Done: Ctrl+Shift live navigation moves immediately without waiting for release.
 - Done: movement mode is configurable in settings: Vim `h/j/k/l` or Slate `i/j/k/l` (`i` up, `j` left, `k` down, `l` right).
