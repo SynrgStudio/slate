@@ -104,11 +104,14 @@ Scope:
 
 ### T010 — Minimal file explorer / project file opening
 
-Status: pending
+Status: completed
 Scope:
 - Add a command-palette-first file opener for a directory/project.
 - Search files by name without adding a heavy sidebar.
 - Keep the UI minimal: no menubar, no toolbar.
+- Done: `:files` / `:file` / `:open-file` / `:of` opens a dedicated modal picker with focused fuzzy input, large result list, keyboard navigation, and project-root scan.
+- Done: skips heavyweight/generated directories such as `.git`, `target`, `node_modules`, and `.threadwell`.
+- Done: file results show lightweight metadata columns for size and relative modified time.
 
 ### T011 — Buffers / multi-file workflow
 
@@ -465,6 +468,17 @@ Scope:
 - Keep normal typing as the default; avoid a permanent Vim mode.
 - Treat Ctrl+Shift as live cursor movement, Ctrl-hold as command dispatch, and Alt as a structural text/line manipulation layer.
 
+### T047 — Slate-owned file dialogs for open/save/save-as
+
+Status: pending
+Scope:
+- Replace native Linux/desktop dialogs from `rfd` with Slate-owned egui modals so file workflows match the terminal-like UI.
+- Reuse the T010 project file picker for `Open`: `Ctrl+O`, Ctrl-layer `o`, and bare `:open` should open Slate's modal; `:open path` / `:e path` should keep opening directly.
+- Add a Slate `Save As` modal with a focused path input, clear title, `Enter` to save, and `Esc` to cancel.
+- Keep `Save` direct when the buffer already has a path; open the Slate `Save As` modal only for scratch/untitled buffers.
+- Preserve unsaved-change confirmation flows before opening/replacing buffers.
+- After replacement, remove the `rfd` dependency from `Cargo.toml` if unused.
+
 Command groups worth considering:
 
 Editing lines:
@@ -608,34 +622,35 @@ Follow-up — Duplicate placement transient mode: done.
 5. T002/T013 — Improve command discovery: fuzzy command matching, palette/command-line consistency, and recent/frequent commands. Done for T002; future command additions continue under T013.
 6. T003 — Expand persistent config for wrap/preview/theme/vault while keeping the plain config simple.
 7. T004 — Build real recent-files list and `:recent` picker.
-8. T010 — Minimal project/vault file opener with fuzzy-ish file matching.
-9. T017 — Write down Slate's knowledge-work philosophy so future features do not drift into Obsidian/Emacs sprawl.
-10. T005 — Scratch buffer and quick capture workflow.
-11. T006 — Daily notes on top of the chosen notes/vault directory.
-12. T018 — Optional vault/root folder selection.
-13. T023 — Vault index architecture: Markdown source plus rebuildable SQLite cache.
-14. T020 — Global notes search, starting simple and later backed by the index.
-15. T024 — Link resolver trigger for `[[`.
-16. T025 — Link resolver ranking/result groups.
-17. T027 — Wiki-link parser and target resolver.
-18. T026 — Content-match deep link insertion with compact/full style toggle.
-19. T028 — Follow-link navigation and cursor jump.
-20. T029 — Link display ergonomics and visual affordances.
-21. T031 — Link resolver performance and indexing lifecycle.
-22. T030 — Backlinks and most-linked notes.
-23. T021 — Progressive organization commands.
-24. T015 — Task/checklist commands.
-25. T022 — Tags and lightweight metadata.
-26. T035 — Append/capture side effects from normal editing.
-27. T036 — Textual result buffers.
-28. T014 — Templates.
-29. T009 — Theme system.
-30. T008 — Lightweight Markdown preview improvements.
-31. T011 — Buffers / multi-file workflow.
-32. T012 — Optional auto-save.
-33. T034 — Repeatable edits and lightweight macros.
-34. T037 — Curated defaults instead of infinite configurability.
-35. T038 — Literate Markdown configuration polish.
+8. T010 — Minimal project/vault file opener with fuzzy-ish file matching plus lightweight size/modified metadata. Done.
+9. T047 — Replace native Open/Save/SaveAs dialogs with Slate-owned modals.
+10. T017 — Write down Slate's knowledge-work philosophy so future features do not drift into Obsidian/Emacs sprawl.
+11. T005 — Scratch buffer and quick capture workflow.
+12. T006 — Daily notes on top of the chosen notes/vault directory.
+13. T018 — Optional vault/root folder selection.
+14. T023 — Vault index architecture: Markdown source plus rebuildable SQLite cache.
+15. T020 — Global notes search, starting simple and later backed by the index.
+16. T024 — Link resolver trigger for `[[`.
+17. T025 — Link resolver ranking/result groups.
+18. T027 — Wiki-link parser and target resolver.
+19. T026 — Content-match deep link insertion with compact/full style toggle.
+20. T028 — Follow-link navigation and cursor jump.
+21. T029 — Link display ergonomics and visual affordances.
+22. T031 — Link resolver performance and indexing lifecycle.
+23. T030 — Backlinks and most-linked notes.
+24. T021 — Progressive organization commands.
+25. T015 — Task/checklist commands.
+26. T022 — Tags and lightweight metadata.
+27. T035 — Append/capture side effects from normal editing.
+28. T036 — Textual result buffers.
+29. T014 — Templates.
+30. T009 — Theme system.
+31. T008 — Lightweight Markdown preview improvements.
+32. T011 — Buffers / multi-file workflow.
+33. T012 — Optional auto-save.
+34. T034 — Repeatable edits and lightweight macros.
+35. T037 — Curated defaults instead of infinite configurability.
+36. T038 — Literate Markdown configuration polish.
 
 <!-- THREADSUITE:START -->
 # ACTIVE_QUEUE.md

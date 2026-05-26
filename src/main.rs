@@ -130,6 +130,13 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         palette_command: None,
     },
     CommandSpec {
+        name: "files",
+        aliases: &["file", "open-file", "of"],
+        summary: "Open project file picker",
+        hint: ":files",
+        palette_command: None,
+    },
+    CommandSpec {
         name: "preview",
         aliases: &["md"],
         summary: "Toggle Markdown preview",
@@ -305,6 +312,7 @@ enum PendingAction {
     Open,
     OpenLast,
     OpenRecent,
+    OpenProjectFile,
     Quit,
 }
 
@@ -359,6 +367,9 @@ impl PendingAction {
             PendingAction::Open => "buffer has unsaved changes; open another file anyway?",
             PendingAction::OpenLast => "buffer has unsaved changes; open last file anyway?",
             PendingAction::OpenRecent => "buffer has unsaved changes; open recent file anyway?",
+            PendingAction::OpenProjectFile => {
+                "buffer has unsaved changes; open selected file anyway?"
+            }
             PendingAction::Quit => "buffer has unsaved changes; close anyway?",
         }
     }
@@ -408,6 +419,11 @@ struct SlateApp {
     recent_query: String,
     selected_recent_file: usize,
     pending_recent_path: Option<PathBuf>,
+    file_picker_open: bool,
+    file_query: String,
+    project_files: Vec<PathBuf>,
+    selected_project_file: usize,
+    pending_project_file_path: Option<PathBuf>,
     search_state: Option<SearchState>,
     ctrl_layer_active: bool,
     ctrl_layer_sequence: String,
@@ -460,6 +476,11 @@ impl SlateApp {
             recent_query: String::new(),
             selected_recent_file: 0,
             pending_recent_path: None,
+            file_picker_open: false,
+            file_query: String::new(),
+            project_files: Vec::new(),
+            selected_project_file: 0,
+            pending_project_file_path: None,
             search_state: None,
             ctrl_layer_active: false,
             ctrl_layer_sequence: String::new(),
@@ -693,6 +714,212 @@ impl SlateApp {
             self.confirm(PendingAction::OpenRecent);
         } else {
             self.recent_picker_open = false;
+            self.open_path(path);
+            self.focus_editor_once = true;
+        }
+    }
+
+    fn project_root(&self) -> PathBuf {
+        self.path
+            .as_ref()
+            .and_then(|path| path.parent().map(PathBuf::from))
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    fn should_skip_file_dir(name: &str) -> bool {
+        matches!(
+            name,
+            ".git"
+                | "target"
+                | "node_modules"
+                | ".threadwell"
+                | ".idea"
+                | ".vscode"
+                | "dist"
+                | "build"
+        )
+    }
+
+    fn format_file_size(bytes: u64) -> String {
+        const KB: f64 = 1024.0;
+        const MB: f64 = KB * 1024.0;
+        const GB: f64 = MB * 1024.0;
+        let bytes = bytes as f64;
+        if bytes >= GB {
+            format!("{:.1}G", bytes / GB)
+        } else if bytes >= MB {
+            format!("{:.1}M", bytes / MB)
+        } else if bytes >= KB {
+            format!("{:.1}K", bytes / KB)
+        } else {
+            format!("{}B", bytes as u64)
+        }
+    }
+
+    fn format_modified_time(modified: SystemTime) -> String {
+        let Ok(elapsed) = SystemTime::now().duration_since(modified) else {
+            return "now".to_string();
+        };
+        let seconds = elapsed.as_secs();
+        let minute = 60;
+        let hour = minute * 60;
+        let day = hour * 24;
+        let week = day * 7;
+        let month = day * 30;
+        let year = day * 365;
+
+        if seconds < minute {
+            "now".to_string()
+        } else if seconds < hour {
+            format!("{}m ago", seconds / minute)
+        } else if seconds < day {
+            format!("{}h ago", seconds / hour)
+        } else if seconds < week {
+            format!("{}d ago", seconds / day)
+        } else if seconds < month {
+            format!("{}w ago", seconds / week)
+        } else if seconds < year {
+            format!("{}mo ago", seconds / month)
+        } else {
+            format!("{}y ago", seconds / year)
+        }
+    }
+
+    fn file_metadata_labels(path: &std::path::Path) -> (String, String) {
+        let Ok(metadata) = fs::metadata(path) else {
+            return ("?".to_string(), "?".to_string());
+        };
+        let size = Self::format_file_size(metadata.len());
+        let modified = metadata
+            .modified()
+            .map(Self::format_modified_time)
+            .unwrap_or_else(|_| "?".to_string());
+        (size, modified)
+    }
+
+    fn scan_project_files(root: &std::path::Path) -> Vec<PathBuf> {
+        fn visit(dir: &std::path::Path, files: &mut Vec<PathBuf>, depth: usize) {
+            if depth > 12 || files.len() >= 5000 {
+                return;
+            }
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
+            };
+            let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
+            entries.sort_by_key(|entry| entry.path());
+            for entry in entries {
+                if files.len() >= 5000 {
+                    return;
+                }
+                let path = entry.path();
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("");
+                if path.is_dir() {
+                    if !SlateApp::should_skip_file_dir(name) {
+                        visit(&path, files, depth + 1);
+                    }
+                } else if path.is_file() {
+                    files.push(path);
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        visit(root, &mut files, 0);
+        files
+    }
+
+    fn open_file_picker(&mut self) {
+        self.shortcut_help_open = false;
+        self.palette_open = false;
+        self.recent_picker_open = false;
+        self.command_line_focused = false;
+        self.focus_command_line_once = false;
+        self.command_history_index = None;
+        self.file_picker_open = false;
+        self.file_query.clear();
+        let root = self.project_root();
+        self.project_files = Self::scan_project_files(&root);
+        if self.project_files.is_empty() {
+            self.status = format!("No files under {}", root.display());
+            self.focus_editor_once = true;
+            return;
+        }
+        self.file_picker_open = true;
+        self.selected_project_file = self.project_file_indices().first().copied().unwrap_or(0);
+        self.status = format!("Files: {}", root.display());
+        self.focus_editor_once = false;
+    }
+
+    fn project_file_indices(&self) -> Vec<usize> {
+        let query = self.file_query.trim().to_lowercase();
+        if query.is_empty() {
+            return (0..self.project_files.len()).collect();
+        }
+        let root = self.project_root();
+        let mut scored = self
+            .project_files
+            .iter()
+            .enumerate()
+            .filter_map(|(index, path)| {
+                let relative = path
+                    .strip_prefix(&root)
+                    .unwrap_or(path)
+                    .display()
+                    .to_string();
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("");
+                let relative_score = Self::fuzzy_score(&relative, &query);
+                let name_score = Self::fuzzy_score(name, &query).map(|score| score / 2);
+                relative_score
+                    .into_iter()
+                    .chain(name_score)
+                    .min()
+                    .map(|score| (score, index))
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by_key(|(score, index)| (*score, *index));
+        scored.into_iter().map(|(_, index)| index).collect()
+    }
+
+    fn move_project_file_selection(&mut self, delta: isize) {
+        let indices = self.project_file_indices();
+        if indices.is_empty() {
+            self.selected_project_file = 0;
+            return;
+        }
+        let current_position = indices
+            .iter()
+            .position(|index| *index == self.selected_project_file)
+            .unwrap_or(0);
+        let next_position = current_position
+            .saturating_add_signed(delta)
+            .min(indices.len().saturating_sub(1));
+        self.selected_project_file = indices[next_position];
+    }
+
+    fn open_selected_project_file(&mut self) {
+        if !self
+            .project_file_indices()
+            .contains(&self.selected_project_file)
+        {
+            self.status = "No matching file".to_string();
+            return;
+        }
+        let Some(path) = self.project_files.get(self.selected_project_file).cloned() else {
+            self.status = "No file selected".to_string();
+            return;
+        };
+        if self.dirty {
+            self.pending_project_file_path = Some(path);
+            self.confirm(PendingAction::OpenProjectFile);
+        } else {
+            self.file_picker_open = false;
             self.open_path(path);
             self.focus_editor_once = true;
         }
@@ -1055,6 +1282,7 @@ impl SlateApp {
         self.record_command_usage(Self::command_name(command));
         self.palette_open = false;
         self.recent_picker_open = false;
+        self.file_picker_open = false;
         self.palette_query.clear();
         self.selected_command = 0;
         self.command_line_focused = false;
@@ -1287,6 +1515,10 @@ impl SlateApp {
                 self.record_command_usage("recent");
                 let query = parts.collect::<Vec<_>>().join(" ");
                 self.open_recent_picker_with_query(query);
+            }
+            "files" | "file" | "open-file" | "of" => {
+                self.record_command_usage("files");
+                self.open_file_picker();
             }
             "preview" | "md" => {
                 let arg = parts.next();
@@ -1741,6 +1973,12 @@ impl SlateApp {
                     self.open_path(path);
                 }
             }
+            PendingAction::OpenProjectFile => {
+                if let Some(path) = self.pending_project_file_path.take() {
+                    self.file_picker_open = false;
+                    self.open_path(path);
+                }
+            }
             PendingAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
     }
@@ -1766,6 +2004,7 @@ impl SlateApp {
             && !self.palette_open
             && !self.settings_open
             && !self.recent_picker_open
+            && !self.file_picker_open
             && self.pending_action.is_none()
     }
 
@@ -2360,6 +2599,7 @@ impl SlateApp {
         self.shortcut_help_open = false;
         self.palette_open = false;
         self.recent_picker_open = false;
+        self.file_picker_open = false;
         self.command_line.clear();
         self.command_line_cursor = 0;
         self.command_history_index = None;
@@ -2372,6 +2612,7 @@ impl SlateApp {
         self.shortcut_help_open = false;
         self.palette_open = false;
         self.recent_picker_open = false;
+        self.file_picker_open = false;
         self.command_line = "find ".to_string();
         self.command_line_cursor = self.command_line.len();
         self.command_history_index = None;
@@ -2411,6 +2652,10 @@ impl SlateApp {
         let mut recent_next = false;
         let mut recent_open = false;
         let mut recent_backspace = false;
+        let mut file_previous = false;
+        let mut file_next = false;
+        let mut file_open = false;
+        let mut file_backspace = false;
         let mut search_next = false;
         let mut search_previous = false;
         let mut search_accept = false;
@@ -2429,6 +2674,7 @@ impl SlateApp {
             && !self.palette_open
             && !self.settings_open
             && !self.recent_picker_open
+            && !self.file_picker_open
             && self.pending_action.is_none();
         ctx.input_mut(|i| {
             if self.settings_open {
@@ -2446,8 +2692,15 @@ impl SlateApp {
                 recent_open |= i.consume_key(egui::Modifiers::NONE, Key::Space);
                 recent_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
             }
+            if self.file_picker_open {
+                file_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
+                file_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
+                file_open |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
+                file_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
+            }
             if i.consume_key(egui::Modifiers::CTRL, Key::P) {
                 self.recent_picker_open = false;
+                self.file_picker_open = false;
                 self.palette_open = true;
                 self.palette_query.clear();
                 self.selected_command = 0;
@@ -2467,6 +2720,7 @@ impl SlateApp {
             if i.consume_key(egui::Modifiers::CTRL, Key::Period) {
                 self.palette_open = false;
                 self.recent_picker_open = false;
+                self.file_picker_open = false;
                 self.command_line.clear();
                 self.command_line_cursor = 0;
                 self.command_history_index = None;
@@ -2536,6 +2790,10 @@ impl SlateApp {
                     self.recent_picker_open = false;
                     self.pending_recent_path = None;
                     self.focus_editor_once = true;
+                } else if self.file_picker_open {
+                    self.file_picker_open = false;
+                    self.pending_project_file_path = None;
+                    self.focus_editor_once = true;
                 } else if self.palette_open {
                     self.palette_open = false;
                     self.focus_editor_once = true;
@@ -2580,6 +2838,31 @@ impl SlateApp {
 
         if self.recent_picker_open {
             self.handle_recent_picker_text_input(ctx);
+        }
+
+        if self.file_picker_open {
+            self.handle_file_picker_text_input(ctx);
+        }
+
+        if file_backspace {
+            self.file_query.pop();
+            self.selected_project_file = self.project_file_indices().first().copied().unwrap_or(0);
+            return;
+        }
+
+        if file_previous {
+            self.move_project_file_selection(-1);
+            return;
+        }
+
+        if file_next {
+            self.move_project_file_selection(1);
+            return;
+        }
+
+        if file_open {
+            self.open_selected_project_file();
+            return;
         }
 
         if recent_backspace {
@@ -2995,6 +3278,22 @@ impl SlateApp {
         self.selected_recent_file = self.recent_file_indices().first().copied().unwrap_or(0);
     }
 
+    fn handle_file_picker_text_input(&mut self, ctx: &egui::Context) {
+        let events = ctx.input(|input| input.events.clone());
+        if ctx.input(|input| input.modifiers.ctrl || input.modifiers.command || input.modifiers.alt)
+        {
+            return;
+        }
+        let Some((_, text)) = Self::normalized_text_input(&events) else {
+            return;
+        };
+        if text.chars().any(|ch| ch.is_control()) {
+            return;
+        }
+        self.file_query.push_str(&text);
+        self.selected_project_file = self.project_file_indices().first().copied().unwrap_or(0);
+    }
+
     fn handle_command_line_text_input(&mut self, ctx: &egui::Context) {
         let events = ctx.input(|input| input.events.clone());
         for event in &events {
@@ -3385,6 +3684,266 @@ impl SlateApp {
             "absolute / relative goto" => "goto abs/rel",
             _ => desc,
         }
+    }
+
+    fn file_picker_dialog(&mut self, ctx: &egui::Context) {
+        if !self.file_picker_open {
+            return;
+        }
+
+        let root = self.project_root();
+        let matches = self.project_file_indices();
+        let visible_rows = 16usize.min(matches.len());
+        let selected_position = matches
+            .iter()
+            .position(|index| *index == self.selected_project_file)
+            .unwrap_or(0);
+        let start = selected_position.min(matches.len().saturating_sub(visible_rows));
+        let end = (start + visible_rows).min(matches.len());
+
+        egui::Area::new("file_picker_dialog".into())
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, -20.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(25, 31, 40))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
+                    .corner_radius(0.0)
+                    .inner_margin(14.0)
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 10],
+                        blur: 24,
+                        spread: 0,
+                        color: Color32::from_black_alpha(150),
+                    })
+                    .show(ui, |ui| {
+                        ui.set_width(820.0);
+                        let font = FontId::new(13.0, FontFamily::Monospace);
+                        let title_font = FontId::new(16.0, FontFamily::Monospace);
+                        let accent = Color32::from_rgb(136, 192, 208);
+                        let text = Color32::from_rgb(216, 222, 233);
+                        let dim = Color32::from_rgb(136, 154, 176);
+                        let faint = Color32::from_rgb(94, 105, 126);
+                        let warn = Color32::from_rgb(235, 203, 139);
+
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("files").font(title_font).color(accent));
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} files · {}",
+                                    self.project_files.len(),
+                                    root.display()
+                                ))
+                                .font(font.clone())
+                                .color(faint),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new("[esc] close").font(font.clone()).color(warn),
+                                    );
+                                },
+                            );
+                        });
+                        ui.add_space(10.0);
+
+                        let input_height = 30.0;
+                        let (input_rect, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), input_height),
+                            egui::Sense::hover(),
+                        );
+                        let painter = ui.painter_at(input_rect);
+                        painter.rect_filled(input_rect, 0.0, Color32::from_rgb(30, 36, 48));
+                        painter.rect_stroke(
+                            input_rect,
+                            0.0,
+                            Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
+                            egui::StrokeKind::Outside,
+                        );
+                        let query = if self.file_query.is_empty() {
+                            "type to fuzzy-find files".to_string()
+                        } else {
+                            self.file_query.clone()
+                        };
+                        let query_color = if self.file_query.is_empty() {
+                            faint
+                        } else {
+                            text
+                        };
+                        painter.text(
+                            egui::pos2(input_rect.left() + 10.0, input_rect.center().y - 0.5),
+                            egui::Align2::LEFT_CENTER,
+                            "files: ",
+                            font.clone(),
+                            accent,
+                        );
+                        let query_rect = painter.text(
+                            egui::pos2(input_rect.left() + 66.0, input_rect.center().y - 0.5),
+                            egui::Align2::LEFT_CENTER,
+                            query,
+                            font.clone(),
+                            query_color,
+                        );
+                        let cursor_x = if self.file_query.is_empty() {
+                            input_rect.left() + 66.0
+                        } else {
+                            query_rect.right() + 2.0
+                        };
+                        painter.line_segment(
+                            [
+                                egui::pos2(cursor_x, input_rect.top() + 7.0),
+                                egui::pos2(cursor_x, input_rect.bottom() - 7.0),
+                            ],
+                            Stroke::new(1.0, accent),
+                        );
+
+                        ui.add_space(8.0);
+                        let row_height = 24.0;
+                        let list_height = (visible_rows.max(1) as f32 + 1.0) * row_height;
+                        let (list_rect, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), list_height),
+                            egui::Sense::hover(),
+                        );
+                        let painter = ui.painter_at(list_rect).with_clip_rect(list_rect);
+                        painter.rect_filled(list_rect, 0.0, Color32::from_rgb(22, 28, 37));
+                        painter.rect_stroke(
+                            list_rect,
+                            0.0,
+                            Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
+                            egui::StrokeKind::Outside,
+                        );
+                        let header_y = list_rect.top() + row_height * 0.5;
+                        painter.text(
+                            egui::pos2(list_rect.left() + 32.0, header_y),
+                            egui::Align2::LEFT_CENTER,
+                            "name",
+                            font.clone(),
+                            faint,
+                        );
+                        painter.text(
+                            egui::pos2(list_rect.left() + 240.0, header_y),
+                            egui::Align2::LEFT_CENTER,
+                            "path",
+                            font.clone(),
+                            faint,
+                        );
+                        painter.text(
+                            egui::pos2(list_rect.right() - 180.0, header_y),
+                            egui::Align2::LEFT_CENTER,
+                            "size",
+                            font.clone(),
+                            faint,
+                        );
+                        painter.text(
+                            egui::pos2(list_rect.right() - 92.0, header_y),
+                            egui::Align2::LEFT_CENTER,
+                            "modified",
+                            font.clone(),
+                            faint,
+                        );
+
+                        if matches.is_empty() {
+                            painter.text(
+                                list_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "no matching files",
+                                font.clone(),
+                                faint,
+                            );
+                        }
+
+                        for (row, index) in matches[start..end].iter().copied().enumerate() {
+                            let row_top = list_rect.top() + (row as f32 + 1.0) * row_height;
+                            let row_rect = egui::Rect::from_min_size(
+                                egui::pos2(list_rect.left() + 4.0, row_top),
+                                Vec2::new(list_rect.width() - 8.0, row_height),
+                            );
+                            let selected = index == self.selected_project_file;
+                            if selected {
+                                painter.rect_filled(row_rect, 0.0, Color32::from_rgb(38, 47, 61));
+                            }
+                            let path = &self.project_files[index];
+                            let name = path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("unknown");
+                            let relative = path
+                                .strip_prefix(&root)
+                                .unwrap_or(path)
+                                .display()
+                                .to_string();
+                            let (size_label, modified_label) = Self::file_metadata_labels(path);
+                            let y = row_rect.center().y - 0.5;
+                            painter.text(
+                                egui::pos2(row_rect.left() + 8.0, y),
+                                egui::Align2::LEFT_CENTER,
+                                if selected { ">" } else { " " },
+                                font.clone(),
+                                accent,
+                            );
+                            painter.text(
+                                egui::pos2(row_rect.left() + 28.0, y),
+                                egui::Align2::LEFT_CENTER,
+                                Self::text_for_width(name, 190.0, 13.0),
+                                font.clone(),
+                                if selected { text } else { accent },
+                            );
+                            painter.text(
+                                egui::pos2(row_rect.left() + 236.0, y),
+                                egui::Align2::LEFT_CENTER,
+                                Self::text_for_width(&relative, list_rect.width() - 430.0, 13.0),
+                                font.clone(),
+                                if selected { dim } else { faint },
+                            );
+                            painter.text(
+                                egui::pos2(row_rect.right() - 176.0, y),
+                                egui::Align2::LEFT_CENTER,
+                                size_label,
+                                font.clone(),
+                                if selected { dim } else { faint },
+                            );
+                            painter.text(
+                                egui::pos2(row_rect.right() - 88.0, y),
+                                egui::Align2::LEFT_CENTER,
+                                modified_label,
+                                font.clone(),
+                                if selected { dim } else { faint },
+                            );
+
+                            let response = ui.interact(
+                                row_rect,
+                                ui.id().with(("project_file", index)),
+                                egui::Sense::click(),
+                            );
+                            if response.clicked() {
+                                self.selected_project_file = index;
+                            }
+                            if response.double_clicked() {
+                                self.selected_project_file = index;
+                                self.open_selected_project_file();
+                            }
+                        }
+
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            for (key, label) in [
+                                ("↑↓", "select"),
+                                ("type", "filter"),
+                                ("enter", "open"),
+                                ("esc", "close"),
+                            ] {
+                                ui.label(
+                                    RichText::new(format!("[{key}]"))
+                                        .font(font.clone())
+                                        .color(warn),
+                                );
+                                ui.label(RichText::new(label).font(font.clone()).color(dim));
+                                ui.add_space(10.0);
+                            }
+                        });
+                    });
+            });
     }
 
     fn shortcut_help_dialog(&mut self, ctx: &egui::Context) {
@@ -3847,6 +4406,7 @@ impl eframe::App for SlateApp {
                     && !self.palette_open
                     && !self.settings_open
                     && !self.recent_picker_open
+                    && !self.file_picker_open
                     && !self.shortcut_help_open
                     && self.search_state.is_none();
                 let active_line_text_highlight = self
@@ -3874,6 +4434,7 @@ impl eframe::App for SlateApp {
                                     && !self.palette_open
                                     && !self.settings_open
                                     && !self.recent_picker_open
+                                    && !self.file_picker_open
                                     && !self.command_line_focused
                                 {
                                     response.request_focus();
@@ -3899,6 +4460,7 @@ impl eframe::App for SlateApp {
                                 && !self.palette_open
                                 && !self.settings_open
                                 && !self.recent_picker_open
+                                && !self.file_picker_open
                                 && !self.command_line_focused
                             {
                                 response.request_focus();
@@ -3940,6 +4502,8 @@ impl eframe::App for SlateApp {
                     "command"
                 } else if self.recent_picker_open {
                     "recent"
+                } else if self.file_picker_open {
+                    "files"
                 } else if self.search_state.is_some() {
                     "find"
                 } else if self.settings_open {
@@ -4268,6 +4832,8 @@ impl eframe::App for SlateApp {
                             format!("recent files {} ↑↓ select · type filter · Enter open · Esc close", if self.recent_query.is_empty() { "".to_string() } else { format!("/{} ", self.recent_query) }),
                             footer_accent,
                         )
+                    } else if self.file_picker_open {
+                        ("files  type to filter · ↑↓ select · Enter open · Esc close".to_string(), footer_accent)
                     } else {
                         (
                             "command  Ctrl+. enter · Ctrl+H help · Ctrl+P palette · w · q · wq"
@@ -4283,6 +4849,7 @@ impl eframe::App for SlateApp {
         self.command_palette(&ctx);
         self.settings_dialog(&ctx);
         self.shortcut_help_dialog(&ctx);
+        self.file_picker_dialog(&ctx);
     }
 }
 

@@ -163,6 +163,10 @@ Examples:
 :settings
 :recent
 :recent notes
+:files
+:file
+:open-file
+:of
 ```
 
 Goto:
@@ -373,6 +377,7 @@ Slate's roadmap is intentionally staged. The idea is to build stable editor foun
 - `Alt+Up` / `Alt+Down` for moving lines
 - Better command discovery and fuzzy command matching
 - Real recent-files list and `:recent`
+- Project file picker modal via `:files` / `:file` / `:open-file` / `:of`, with fuzzy filtering plus size/modified metadata
 - Persist more editor preferences such as theme and vault location
 - Minimal project/vault file opener
 
