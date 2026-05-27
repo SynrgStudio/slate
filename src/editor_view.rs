@@ -61,6 +61,7 @@ pub(crate) struct EditorView {
     scroll_y: f32,
     target_cursor: Option<usize>,
     link_click_byte: Option<usize>,
+    link_assist_trigger_start: Option<usize>,
 }
 
 impl EditorView {
@@ -69,6 +70,7 @@ impl EditorView {
             scroll_y: 0.0,
             target_cursor: None,
             link_click_byte: None,
+            link_assist_trigger_start: None,
         }
     }
 
@@ -232,6 +234,19 @@ impl EditorView {
                 render_markdown,
                 &font,
             );
+
+            if active_line_text_highlight == Some(row.line_index) {
+                let highlight_rect = egui::Rect::from_min_max(
+                    egui::pos2(text_x - 8.0, y + 1.0),
+                    egui::pos2(rect.right() - 6.0, y + line_height - 1.0),
+                );
+                painter.rect_stroke(
+                    highlight_rect,
+                    0.0,
+                    Stroke::new(1.0, Color32::from_rgb(235, 203, 139)),
+                    egui::StrokeKind::Inside,
+                );
+            }
 
             if let Some(search_state) =
                 search_state.filter(|state| state.buffer_revision == buffer.revision)
@@ -404,7 +419,9 @@ impl EditorView {
                 changed = Self::cycle_current_line_checkbox(buffer) || changed;
             }
             if input.consume_key(egui::Modifiers::NONE, Key::Enter) {
-                if !self.insert_predictive_list_newline(buffer) {
+                if !Self::insert_space_after_markdown_link_label(buffer)
+                    && !self.insert_predictive_list_newline(buffer)
+                {
                     buffer.insert_newline();
                 }
                 self.request_scroll_to_cursor(buffer);
@@ -595,6 +612,48 @@ impl EditorView {
         true
     }
 
+    pub(crate) fn insert_space_after_markdown_link_label(buffer: &mut EditorBuffer) -> bool {
+        if buffer.selection().is_some() {
+            return false;
+        }
+
+        let cursor = buffer.cursor();
+        let line_index = buffer.line_index_for_byte(cursor);
+        let line_start = buffer.line_start(line_index);
+        let line = buffer.line(line_index);
+
+        let mut search_from = 0;
+        while let Some(open_relative) = line[search_from..].find('[') {
+            let marker_start = search_from + open_relative;
+            let text_start = marker_start + 1;
+            let Some(close_text_relative) = line[text_start..].find(']') else {
+                break;
+            };
+            let text_end = text_start + close_text_relative;
+            if line.as_bytes().get(text_end + 1) != Some(&b'(') {
+                search_from = text_end.saturating_add(1);
+                continue;
+            }
+            let target_start = text_end + 2;
+            let Some(close_target_relative) = line[target_start..].find(')') else {
+                break;
+            };
+            let target_end = target_start + close_target_relative;
+            let marker_end = target_end + 1;
+            if target_start < target_end
+                && cursor >= line_start + text_start
+                && cursor <= line_start + text_end
+            {
+                let insert_at = line_start + marker_end;
+                buffer.replace_selection_or_range(insert_at, insert_at, " ");
+                return true;
+            }
+            search_from = marker_end;
+        }
+
+        false
+    }
+
     pub(crate) fn insert_predictive_list_newline(&mut self, buffer: &mut EditorBuffer) -> bool {
         if buffer.selection().is_some() {
             return false;
@@ -653,7 +712,16 @@ impl EditorView {
                 }
             }
         }
+        let inserted_at = buffer.cursor();
         buffer.insert_text(text);
+        if buffer.selection().is_none() && buffer.cursor() >= 2 {
+            let cursor = buffer.cursor();
+            if buffer.as_str().get(cursor.saturating_sub(2)..cursor) == Some("[[") {
+                self.link_assist_trigger_start = Some(cursor - 2);
+            } else if text == "[[" {
+                self.link_assist_trigger_start = Some(inserted_at);
+            }
+        }
     }
 
     pub(crate) fn normalize_paste_text(text: &str) -> String {
@@ -1260,34 +1328,42 @@ impl EditorView {
                 continue;
             }
 
-            for (start, end, color) in [
+            let target_fragment_start = buffer.as_str()[target_start..target_end]
+                .find('#')
+                .map(|offset| target_start + offset);
+            let target_path_end = target_fragment_start.unwrap_or(target_end);
+            let target_fragment_end = target_fragment_start
+                .map(|_| target_end)
+                .unwrap_or(target_end);
+            let link_dim = Color32::from_rgb(94, 105, 126);
+            let link_text = Color32::from_rgb(136, 192, 208);
+            let link_target = Color32::from_rgb(163, 190, 140);
+            let link_heading = Color32::from_rgb(235, 203, 139);
+            let mut segments = vec![
                 (byte, marker_start.min(row.end), text_color),
                 (
                     marker_start.max(row.start),
                     text_start.min(row.end),
-                    Color32::from_rgb(94, 105, 126),
+                    link_dim,
                 ),
-                (
-                    text_start.max(row.start),
-                    text_end.min(row.end),
-                    Color32::from_rgb(136, 192, 208),
-                ),
-                (
-                    text_end.max(row.start),
-                    target_start.min(row.end),
-                    Color32::from_rgb(94, 105, 126),
-                ),
+                (text_start.max(row.start), text_end.min(row.end), link_text),
+                (text_end.max(row.start), target_start.min(row.end), link_dim),
                 (
                     target_start.max(row.start),
-                    target_end.min(row.end),
-                    Color32::from_rgb(163, 190, 140),
+                    target_path_end.min(row.end),
+                    link_target,
                 ),
-                (
-                    target_end.max(row.start),
-                    marker_end.min(row.end),
-                    Color32::from_rgb(94, 105, 126),
-                ),
-            ] {
+            ];
+            if let Some(fragment_start) = target_fragment_start {
+                segments.push((
+                    fragment_start.max(row.start),
+                    target_fragment_end.min(row.end),
+                    link_heading,
+                ));
+            }
+            segments.push((target_end.max(row.start), marker_end.min(row.end), link_dim));
+
+            for (start, end, color) in segments {
                 if start < end {
                     let x =
                         text_x + self.text_width(painter, &buffer.as_str()[row.start..start], font);
@@ -1560,6 +1636,10 @@ impl EditorView {
         self.link_click_byte.take()
     }
 
+    pub(crate) fn take_link_assist_trigger_start(&mut self) -> Option<usize> {
+        self.link_assist_trigger_start.take()
+    }
+
     #[allow(dead_code)]
     pub(crate) fn clear_scroll_target(&mut self) {
         self.target_cursor = None;
@@ -1640,6 +1720,30 @@ mod tests {
 
         assert!(view.insert_predictive_list_newline(&mut buffer));
         assert_eq!(buffer.as_str(), "- hola\n");
+    }
+
+    #[test]
+    fn enter_inside_markdown_link_label_moves_after_link_with_space() {
+        let mut buffer = EditorBuffer::from_text("[algo](./note.md)".to_string());
+        buffer.set_cursor("[algo".len());
+
+        assert!(EditorView::insert_space_after_markdown_link_label(
+            &mut buffer
+        ));
+        assert_eq!(buffer.as_str(), "[algo](./note.md) ");
+        assert_eq!(buffer.cursor(), buffer.as_str().len());
+    }
+
+    #[test]
+    fn enter_inside_empty_markdown_link_label_moves_after_link_with_space() {
+        let mut buffer = EditorBuffer::from_text("[](https://example.com)".to_string());
+        buffer.set_cursor(1);
+
+        assert!(EditorView::insert_space_after_markdown_link_label(
+            &mut buffer
+        ));
+        assert_eq!(buffer.as_str(), "[](https://example.com) ");
+        assert_eq!(buffer.cursor(), buffer.as_str().len());
     }
 
     #[test]

@@ -34,7 +34,7 @@ Scope:
 Status: in_progress
 Scope:
 - Done: lightweight config at `~/.config/slate/config.toml`.
-- Done: persist command history limit, command history, line-number mode, word wrap, preview mode, last opened file, recent files, command usage, and Ctrl+Shift movement mode.
+- Done: persist command history limit, command history, line-number mode, word wrap, preview mode, last opened file, recent files, per-file cursor positions, command usage, and Ctrl+Shift movement mode.
 - Done: expose persisted wrap/preview controls in Settings and commandline (`:wrap on|off`, `:preview on|off`).
 - Done: expose line-number mode through commandline (`:line-numbers absolute|relative`, `:ln absolute|relative`).
 - Pending: persist theme, scratch behavior, wiki-link insert style, and link resolver behavior.
@@ -464,15 +464,17 @@ Scope:
 
 ### T048 — Assisted Markdown link insertion
 
-Status: pending
+Status: completed
 Scope:
-- Add an assisted Markdown link flow triggered by typing `[[`, while preserving normal manual `[text](target)` editing.
-- Show a small cursor-adjacent picker with `Archivo` and `Web`, navigable with `↑↓`, `Enter`, and `Esc`.
-- For `Archivo`, reuse Slate-owned file selection to pick a local target and insert standard Markdown `[](relative/path.md)`.
-- For `Web`, show a focused mini input for the URL and insert standard Markdown `[](https://...)` on `Enter`.
-- After insertion, place the cursor inside the `[]` label so the user can immediately type the link text.
-- Resolve file targets relative to the current buffer when possible; fall back to project/current directory when the buffer has no path.
-- Keep the final document plain Markdown; `[[` is only the assist trigger, not a persistent custom link syntax.
+- Done: add an assisted Markdown link flow triggered by typing `[[`, while preserving normal manual `[text](target)` editing.
+- Done: show a small picker with `Archivo` and `Web`, navigable with `↑↓`, `Enter`, and `Esc`.
+- Done: for `Archivo`, reuse Slate-owned file selection to pick a local target and insert standard Markdown `[](relative/path.md)`.
+- Done: when selected file is Markdown and has headings, show a second heading picker; first option always links the whole file, while selected headings insert `[](relative/path.md#heading)`.
+- Done: local Markdown links with heading fragments open the file and jump to the matching heading.
+- Done: for `Web`, show a focused mini input for the URL and insert standard Markdown `[](https://...)` on `Enter`.
+- Done: after insertion, place the cursor inside the `[]` label so the user can immediately type the link text.
+- Done: resolve file targets relative to the current buffer when possible; fall back to project/current directory when the buffer has no path.
+- Done: keep the final document plain Markdown; `[[` is only the assist trigger, not a persistent custom link syntax.
 
 Command groups worth considering:
 

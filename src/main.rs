@@ -457,6 +457,13 @@ struct DuplicatePlacement {
 enum FilePickerMode {
     Open,
     Browse,
+    InsertMarkdownLink,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LinkAssistChoice {
+    File,
+    Web,
 }
 
 #[derive(Clone)]
@@ -471,6 +478,19 @@ struct CommandUsage {
     name: String,
     count: usize,
     last_used: i64,
+}
+
+struct FileCursorPosition {
+    path: PathBuf,
+    line_index: usize,
+    column: usize,
+}
+
+struct LinkHeadingOption {
+    level: usize,
+    text: String,
+    anchor: String,
+    line_index: usize,
 }
 
 struct SlateApp {
@@ -504,7 +524,9 @@ struct SlateApp {
     reopen_last_file_on_startup: bool,
     markdown_live_rendering: bool,
     last_opened_path: Option<PathBuf>,
+    last_open_dir: Option<PathBuf>,
     recent_files: Vec<PathBuf>,
+    file_cursor_positions: Vec<FileCursorPosition>,
     recent_picker_open: bool,
     recent_query: String,
     selected_recent_file: usize,
@@ -519,6 +541,22 @@ struct SlateApp {
     project_files: Vec<PathBuf>,
     selected_project_file: usize,
     pending_project_file_path: Option<PathBuf>,
+    pending_open_heading_fragment: Option<String>,
+    link_assist_open: bool,
+    link_assist_choice: LinkAssistChoice,
+    link_assist_trigger_start: Option<usize>,
+    link_assist_web_open: bool,
+    link_assist_web_url: String,
+    link_heading_picker_open: bool,
+    link_heading_base_target: String,
+    link_heading_options: Vec<LinkHeadingOption>,
+    selected_link_heading: usize,
+    link_preview_open: bool,
+    link_preview_buffer: EditorBuffer,
+    link_preview_view: EditorView,
+    link_preview_path: Option<PathBuf>,
+    link_preview_heading_fragment: Option<String>,
+    link_preview_heading_text: Option<String>,
     save_as_open: bool,
     save_as_dir: PathBuf,
     save_as_filename: String,
@@ -584,7 +622,9 @@ impl SlateApp {
             reopen_last_file_on_startup: false,
             markdown_live_rendering: true,
             last_opened_path: None,
+            last_open_dir: None,
             recent_files: Vec::new(),
+            file_cursor_positions: Vec::new(),
             recent_picker_open: false,
             recent_query: String::new(),
             selected_recent_file: 0,
@@ -599,6 +639,22 @@ impl SlateApp {
             project_files: Vec::new(),
             selected_project_file: 0,
             pending_project_file_path: None,
+            pending_open_heading_fragment: None,
+            link_assist_open: false,
+            link_assist_choice: LinkAssistChoice::File,
+            link_assist_trigger_start: None,
+            link_assist_web_open: false,
+            link_assist_web_url: String::new(),
+            link_heading_picker_open: false,
+            link_heading_base_target: String::new(),
+            link_heading_options: Vec::new(),
+            selected_link_heading: 0,
+            link_preview_open: false,
+            link_preview_buffer: EditorBuffer::new(),
+            link_preview_view: EditorView::new(),
+            link_preview_path: None,
+            link_preview_heading_fragment: None,
+            link_preview_heading_text: None,
             save_as_open: false,
             save_as_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             save_as_filename: String::new(),
@@ -657,10 +713,13 @@ impl SlateApp {
     }
 
     fn open_path(&mut self, path: PathBuf) {
+        self.remember_current_cursor_position();
         match fs::read_to_string(&path) {
             Ok(text) => {
                 self.buffer.set_text(text);
                 self.path = Some(path.clone());
+                self.last_open_dir = path.parent().map(PathBuf::from);
+                self.restore_cursor_position_for_path(&path);
                 self.dirty = false;
                 self.search_state = None;
                 self.remember_recent_file(path.clone());
@@ -669,6 +728,40 @@ impl SlateApp {
             }
             Err(err) => self.status = format!("Open failed: {err}"),
         }
+    }
+
+    fn remember_current_cursor_position(&mut self) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        let (line_index, column) = self.buffer.cursor_line_col();
+        self.file_cursor_positions
+            .retain(|entry| entry.path != path);
+        self.file_cursor_positions.insert(
+            0,
+            FileCursorPosition {
+                path,
+                line_index,
+                column,
+            },
+        );
+        self.file_cursor_positions.truncate(100);
+    }
+
+    fn restore_cursor_position_for_path(&mut self, path: &Path) {
+        let Some(entry) = self
+            .file_cursor_positions
+            .iter()
+            .find(|entry| entry.path == path)
+        else {
+            self.editor_view.request_scroll_to_cursor(&self.buffer);
+            return;
+        };
+        let byte = self
+            .buffer
+            .line_col_to_byte(entry.line_index + 1, entry.column + 1);
+        self.buffer.set_cursor(byte);
+        self.editor_view.request_scroll_to_cursor(&self.buffer);
     }
 
     fn markdown_link_target_at_byte(&self, byte: usize) -> Option<&str> {
@@ -691,33 +784,350 @@ impl SlateApp {
 
     fn open_markdown_link_target(&mut self, target: &str) {
         let target = target.trim();
-        if target.starts_with("http://") || target.starts_with("https://") {
-            match ProcessCommand::new("xdg-open").arg(target).spawn() {
-                Ok(_) => self.status = format!("Opened link {target}"),
-                Err(err) => self.status = format!("Open link failed: {err}"),
-            }
+        if Self::is_http_url(target) {
+            self.open_web_link(target, target);
             return;
         }
 
-        let path_part = target
+        let (path_part, heading_fragment) = target
             .split_once('#')
-            .map(|(path, _)| path)
-            .unwrap_or(target);
+            .map(|(path, fragment)| (path, Some(fragment)))
+            .unwrap_or((target, None));
+        if Self::looks_like_bare_web_target(target) {
+            let path = self.resolve_markdown_link_path(path_part);
+            if !path.exists() {
+                let browser_target = format!("https://{target}");
+                self.open_web_link(&browser_target, target);
+                return;
+            }
+        }
         if path_part.trim().is_empty() {
             self.status = "Link has no local file target".to_string();
             return;
         }
+        let path = self.resolve_markdown_link_path(path_part);
         if self.dirty {
-            self.status = "Save or discard changes before opening a Markdown link".to_string();
+            self.pending_project_file_path = Some(path.clone());
+            self.pending_open_heading_fragment = heading_fragment.map(str::to_string);
+            self.confirm(PendingAction::OpenProjectFile);
             return;
         }
 
-        let path = self.resolve_markdown_link_path(path_part);
         if path.exists() {
-            self.open_path(path);
+            self.open_link_preview(path, heading_fragment.map(str::to_string));
         } else {
             self.status = format!("Link target not found: {}", path.display());
         }
+    }
+
+    fn open_link_preview(&mut self, path: PathBuf, heading_fragment: Option<String>) {
+        match fs::read_to_string(&path) {
+            Ok(text) => {
+                self.link_preview_buffer.set_text(text);
+                let heading_text = if let Some(fragment) = heading_fragment.as_deref() {
+                    Self::jump_buffer_to_markdown_heading_fragment(
+                        &mut self.link_preview_buffer,
+                        &mut self.link_preview_view,
+                        fragment,
+                    )
+                } else {
+                    None
+                };
+                if heading_fragment.is_none() {
+                    self.link_preview_view
+                        .request_scroll_to_cursor(&self.link_preview_buffer);
+                }
+                self.link_preview_path = Some(path.clone());
+                self.link_preview_heading_fragment = heading_fragment;
+                self.link_preview_heading_text = heading_text;
+                self.link_preview_open = true;
+                self.focus_editor_once = false;
+                self.status = format!("Preview link {}", path.display());
+            }
+            Err(err) => self.status = format!("Open link preview failed: {err}"),
+        }
+    }
+
+    fn commit_link_preview(&mut self) {
+        let Some(path) = self.link_preview_path.clone() else {
+            self.close_link_preview();
+            return;
+        };
+        let heading_fragment = self.link_preview_heading_fragment.clone();
+        self.close_link_preview();
+        if self.dirty {
+            self.pending_project_file_path = Some(path);
+            self.pending_open_heading_fragment = heading_fragment;
+            self.confirm(PendingAction::OpenProjectFile);
+            return;
+        }
+        self.open_path(path);
+        if let Some(fragment) = heading_fragment {
+            self.jump_to_markdown_heading_fragment(&fragment);
+        }
+    }
+
+    fn close_link_preview(&mut self) {
+        self.link_preview_open = false;
+        self.link_preview_path = None;
+        self.link_preview_heading_fragment = None;
+        self.link_preview_heading_text = None;
+        self.link_preview_buffer.clear();
+        self.focus_editor_once = true;
+    }
+
+    fn jump_to_markdown_heading_fragment(&mut self, fragment: &str) {
+        if let Some(heading_text) = Self::jump_buffer_to_markdown_heading_fragment(
+            &mut self.buffer,
+            &mut self.editor_view,
+            fragment,
+        ) {
+            self.status = format!("Opened heading {heading_text}");
+        } else {
+            self.status = format!("Heading not found: #{fragment}");
+        }
+    }
+
+    fn jump_buffer_to_markdown_heading_fragment(
+        buffer: &mut EditorBuffer,
+        view: &mut EditorView,
+        fragment: &str,
+    ) -> Option<String> {
+        let fragment = fragment.trim();
+        if fragment.is_empty() {
+            return None;
+        }
+        for line_index in 0..buffer.line_count() {
+            let Some(heading) = parse_heading_line(buffer.line(line_index)) else {
+                continue;
+            };
+            let heading_text = heading.text.trim().to_string();
+            if Self::markdown_heading_anchor(&heading_text) == fragment {
+                buffer.set_cursor(buffer.line_start(line_index));
+                view.request_scroll_to_cursor(buffer);
+                return Some(heading_text);
+            }
+        }
+        None
+    }
+
+    fn open_web_link(&mut self, browser_target: &str, display_target: &str) {
+        match ProcessCommand::new("xdg-open").arg(browser_target).spawn() {
+            Ok(_) => self.status = format!("Opened link {display_target}"),
+            Err(err) => self.status = format!("Open link failed: {err}"),
+        }
+    }
+
+    fn is_http_url(target: &str) -> bool {
+        target.starts_with("http://") || target.starts_with("https://")
+    }
+
+    fn looks_like_bare_web_target(target: &str) -> bool {
+        if target.is_empty()
+            || target.starts_with("./")
+            || target.starts_with("../")
+            || target.starts_with('/')
+            || target.starts_with('~')
+            || target.chars().any(char::is_whitespace)
+            || target.contains("://")
+        {
+            return false;
+        }
+
+        let host = target
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or_default()
+            .trim_start_matches("www.");
+        let Some(tld) = host.rsplit('.').next() else {
+            return false;
+        };
+        host.contains('.')
+            && tld.len() >= 2
+            && tld.chars().all(|ch| ch.is_ascii_alphabetic())
+            && host.split('.').all(|label| {
+                !label.is_empty()
+                    && label
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+            })
+    }
+
+    fn open_link_assist(&mut self, trigger_start: usize) {
+        self.link_assist_open = true;
+        self.link_assist_choice = LinkAssistChoice::File;
+        self.link_assist_trigger_start = Some(trigger_start);
+        self.link_assist_web_open = false;
+        self.link_assist_web_url.clear();
+        self.focus_editor_once = false;
+        self.status = "Insert link: choose Archivo or Web".to_string();
+    }
+
+    fn cancel_link_assist(&mut self) {
+        self.link_assist_open = false;
+        self.link_assist_web_open = false;
+        self.link_heading_picker_open = false;
+        self.link_assist_web_url.clear();
+        self.link_heading_base_target.clear();
+        self.link_heading_options.clear();
+        self.selected_link_heading = 0;
+        self.link_assist_trigger_start = None;
+        self.focus_editor_once = true;
+    }
+
+    fn confirm_link_assist_choice(&mut self) {
+        match self.link_assist_choice {
+            LinkAssistChoice::File => {
+                self.link_assist_open = false;
+                let dir = self
+                    .path
+                    .as_ref()
+                    .and_then(|path| path.parent().map(Path::to_path_buf))
+                    .unwrap_or_else(|| self.project_root());
+                self.open_file_picker_at(dir, FilePickerMode::InsertMarkdownLink);
+            }
+            LinkAssistChoice::Web => {
+                self.link_assist_open = false;
+                self.link_assist_web_open = true;
+                self.link_assist_web_url.clear();
+                self.focus_editor_once = false;
+            }
+        }
+    }
+
+    fn open_link_heading_picker_or_insert(&mut self, path: &Path, base_target: String) {
+        let is_markdown = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| matches!(extension.to_lowercase().as_str(), "md" | "markdown"))
+            .unwrap_or(false);
+        if !is_markdown {
+            self.insert_assisted_markdown_link(&base_target);
+            return;
+        }
+
+        let headings = fs::read_to_string(path)
+            .map(|contents| Self::markdown_heading_options(&contents))
+            .unwrap_or_default();
+        if headings.is_empty() {
+            self.insert_assisted_markdown_link(&base_target);
+            return;
+        }
+
+        self.link_heading_picker_open = true;
+        self.link_heading_base_target = base_target;
+        self.link_heading_options = headings;
+        self.selected_link_heading = 0;
+        self.focus_editor_once = false;
+        self.status = "Insert link: choose heading or whole file".to_string();
+    }
+
+    fn markdown_heading_options(contents: &str) -> Vec<LinkHeadingOption> {
+        contents
+            .lines()
+            .enumerate()
+            .filter_map(|(line_index, line)| {
+                let heading = parse_heading_line(line)?;
+                let text = heading.text.trim();
+                if text.is_empty() {
+                    return None;
+                }
+                Some(LinkHeadingOption {
+                    level: heading.level,
+                    text: text.to_string(),
+                    anchor: Self::markdown_heading_anchor(text),
+                    line_index,
+                })
+            })
+            .collect()
+    }
+
+    fn markdown_heading_anchor(text: &str) -> String {
+        let mut anchor = String::new();
+        let mut last_was_dash = false;
+        for ch in text.trim().to_lowercase().chars() {
+            if ch.is_ascii_alphanumeric() {
+                anchor.push(ch);
+                last_was_dash = false;
+            } else if ch.is_whitespace() || ch == '-' {
+                if !last_was_dash && !anchor.is_empty() {
+                    anchor.push('-');
+                    last_was_dash = true;
+                }
+            }
+        }
+        anchor.trim_matches('-').to_string()
+    }
+
+    fn confirm_link_heading_picker(&mut self) {
+        let target = if self.selected_link_heading == 0 {
+            self.link_heading_base_target.clone()
+        } else {
+            let Some(heading) = self
+                .link_heading_options
+                .get(self.selected_link_heading - 1)
+            else {
+                return;
+            };
+            format!("{}#{}", self.link_heading_base_target, heading.anchor)
+        };
+        self.link_heading_picker_open = false;
+        self.link_heading_base_target.clear();
+        self.link_heading_options.clear();
+        self.selected_link_heading = 0;
+        self.insert_assisted_markdown_link(&target);
+    }
+
+    fn move_link_heading_selection(&mut self, delta: isize) {
+        let total = self.link_heading_options.len() + 1;
+        if total == 0 {
+            self.selected_link_heading = 0;
+            return;
+        }
+        self.selected_link_heading = self
+            .selected_link_heading
+            .saturating_add_signed(delta)
+            .min(total.saturating_sub(1));
+    }
+
+    fn insert_assisted_markdown_link(&mut self, target: &str) {
+        let Some(trigger_start) = self.link_assist_trigger_start.take() else {
+            self.status = "Insert link failed: missing trigger".to_string();
+            return;
+        };
+        let trigger_end = (trigger_start + 2).min(self.buffer.as_str().len());
+        let insertion = format!("]({target})");
+        self.buffer.replace_selection_or_range(
+            trigger_start,
+            trigger_end,
+            &format!("[{}", insertion),
+        );
+        self.buffer.set_cursor(trigger_start + 1);
+        self.dirty = true;
+        self.search_state = None;
+        self.editor_view.request_scroll_to_cursor(&self.buffer);
+        self.focus_editor_once = true;
+        self.status = "Inserted Markdown link; type the label".to_string();
+    }
+
+    fn markdown_link_target_for_file(&self, path: &Path) -> String {
+        let base = self
+            .path
+            .as_ref()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let raw = path
+            .strip_prefix(&base)
+            .map(|relative| {
+                let relative = relative.display().to_string();
+                if relative.starts_with("../") || relative.starts_with("./") {
+                    relative
+                } else {
+                    format!("./{relative}")
+                }
+            })
+            .unwrap_or_else(|_| path.display().to_string());
+        raw.replace('\\', "/")
     }
 
     fn resolve_markdown_link_path(&self, target: &str) -> PathBuf {
@@ -738,6 +1148,7 @@ impl SlateApp {
     }
 
     fn save(&mut self) {
+        self.remember_current_cursor_position();
         if let Some(path) = self.path.clone() {
             self.save_path(path);
         } else {
@@ -1037,6 +1448,7 @@ impl SlateApp {
         match fs::write(&path, self.buffer.as_str()) {
             Ok(_) => {
                 self.path = Some(path.clone());
+                self.last_open_dir = path.parent().map(PathBuf::from);
                 self.dirty = false;
                 self.remember_recent_file(path.clone());
                 let _ = self.save_settings();
@@ -1047,10 +1459,12 @@ impl SlateApp {
     }
 
     fn new_buffer(&mut self) {
+        self.remember_current_cursor_position();
         self.buffer.clear();
         self.path = None;
         self.dirty = false;
         self.search_state = None;
+        self.focus_editor_once = true;
         self.status = "New buffer".to_string();
     }
 
@@ -1297,8 +1711,19 @@ impl SlateApp {
         self.path
             .as_ref()
             .and_then(|path| path.parent().map(PathBuf::from))
-            .or_else(dirs_next::home_dir)
+            .or_else(|| self.last_open_dir.clone())
+            .or_else(|| {
+                self.last_opened_path
+                    .as_ref()
+                    .and_then(|path| path.parent().map(PathBuf::from))
+            })
+            .or_else(|| {
+                self.recent_files
+                    .first()
+                    .and_then(|path| path.parent().map(PathBuf::from))
+            })
             .or_else(|| std::env::current_dir().ok())
+            .or_else(dirs_next::home_dir)
             .unwrap_or_else(|| PathBuf::from("."))
     }
 
@@ -1538,13 +1963,21 @@ impl SlateApp {
             self.refresh_file_picker_entries();
             return;
         }
-        if self.dirty && self.file_picker_mode == FilePickerMode::Open {
-            self.pending_project_file_path = Some(path);
-            self.confirm(PendingAction::OpenProjectFile);
-        } else {
-            self.file_picker_open = false;
-            self.open_path(path);
-            self.focus_editor_once = true;
+        match self.file_picker_mode {
+            FilePickerMode::InsertMarkdownLink => {
+                let target = self.markdown_link_target_for_file(&path);
+                self.file_picker_open = false;
+                self.open_link_heading_picker_or_insert(&path, target);
+            }
+            FilePickerMode::Open if self.dirty => {
+                self.pending_project_file_path = Some(path);
+                self.confirm(PendingAction::OpenProjectFile);
+            }
+            FilePickerMode::Open | FilePickerMode::Browse => {
+                self.file_picker_open = false;
+                self.open_path(path);
+                self.focus_editor_once = true;
+            }
         }
     }
 
@@ -1564,6 +1997,7 @@ impl SlateApp {
             .path
             .as_ref()
             .and_then(|path| path.parent().map(PathBuf::from))
+            .or_else(|| self.last_open_dir.clone())
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
         self.save_as_filename = self
@@ -1752,6 +2186,12 @@ impl SlateApp {
                         self.last_opened_path = Some(PathBuf::from(value));
                     }
                 }
+                "last_open_dir" => {
+                    let value = Self::parse_config_string(value);
+                    if !value.is_empty() {
+                        self.last_open_dir = Some(PathBuf::from(value));
+                    }
+                }
                 "command_history" => {
                     let value = Self::parse_config_string(value);
                     if !value.is_empty() && self.command_history.last() != Some(&value) {
@@ -1764,6 +2204,24 @@ impl SlateApp {
                         let path = PathBuf::from(value);
                         if !self.recent_files.contains(&path) {
                             self.recent_files.push(path);
+                        }
+                    }
+                }
+                "file_cursor" => {
+                    let value = Self::parse_config_string(value);
+                    if let Some((path, line_index, column)) =
+                        Self::parse_file_cursor_position(&value)
+                    {
+                        if !self
+                            .file_cursor_positions
+                            .iter()
+                            .any(|entry| entry.path == path)
+                        {
+                            self.file_cursor_positions.push(FileCursorPosition {
+                                path,
+                                line_index,
+                                column,
+                            });
                         }
                     }
                 }
@@ -1807,6 +2265,7 @@ impl SlateApp {
             self.command_history.drain(0..keep_from);
         }
         self.recent_files.truncate(20);
+        self.file_cursor_positions.truncate(100);
         self.command_usage.sort_by_key(|usage| {
             (
                 std::cmp::Reverse(usage.last_used),
@@ -1823,6 +2282,14 @@ impl SlateApp {
             "false" | "no" | "off" | "0" => Some(false),
             _ => None,
         }
+    }
+
+    fn parse_file_cursor_position(value: &str) -> Option<(PathBuf, usize, usize)> {
+        let mut parts = value.rsplitn(3, '|');
+        let column = parts.next()?.parse::<usize>().ok()?;
+        let line_index = parts.next()?.parse::<usize>().ok()?;
+        let path = PathBuf::from(parts.next()?);
+        Some((path, line_index, column))
     }
 
     fn parse_config_string(value: &str) -> String {
@@ -1867,7 +2334,7 @@ impl SlateApp {
             .ok_or_else(|| "invalid config path".to_string())?;
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
         let mut contents = format!(
-            "command_history_limit = {}\nline_number_mode = \"{}\"\nword_wrap = {}\npreview_mode = {}\nctrl_shift_move_mode = \"{}\"\nreopen_last_file_on_startup = {}\nmarkdown_live_rendering = {}\nlast_opened_path = \"{}\"\n",
+            "command_history_limit = {}\nline_number_mode = \"{}\"\nword_wrap = {}\npreview_mode = {}\nctrl_shift_move_mode = \"{}\"\nreopen_last_file_on_startup = {}\nmarkdown_live_rendering = {}\nlast_opened_path = \"{}\"\nlast_open_dir = \"{}\"\n",
             self.command_history_limit,
             self.line_number_mode.config_value(),
             self.wrap,
@@ -1878,6 +2345,13 @@ impl SlateApp {
             Self::escape_config_string(
                 &self
                     .last_opened_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default()
+            ),
+            Self::escape_config_string(
+                &self
+                    .last_open_dir
                     .as_ref()
                     .map(|path| path.display().to_string())
                     .unwrap_or_default()
@@ -1897,6 +2371,33 @@ impl SlateApp {
             contents.push_str(&format!(
                 "recent_file = \"{}\"\n",
                 Self::escape_config_string(&recent.display().to_string())
+            ));
+        }
+        let current_cursor = self.path.as_ref().map(|path| {
+            let (line_index, column) = self.buffer.cursor_line_col();
+            (path, line_index, column)
+        });
+        if let Some((path, line_index, column)) = current_cursor {
+            contents.push_str(&format!(
+                "file_cursor = \"{}|{}|{}\"\n",
+                Self::escape_config_string(&path.display().to_string()),
+                line_index,
+                column
+            ));
+        }
+        for entry in self.file_cursor_positions.iter().take(100) {
+            if current_cursor
+                .as_ref()
+                .map(|(path, _, _)| *path == &entry.path)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            contents.push_str(&format!(
+                "file_cursor = \"{}|{}|{}\"\n",
+                Self::escape_config_string(&entry.path.display().to_string()),
+                entry.line_index,
+                entry.column
             ));
         }
         for usage in self.command_usage.iter().take(100) {
@@ -2815,7 +3316,11 @@ impl SlateApp {
             PendingAction::OpenProjectFile => {
                 if let Some(path) = self.pending_project_file_path.take() {
                     self.file_picker_open = false;
+                    let heading_fragment = self.pending_open_heading_fragment.take();
                     self.open_path(path);
+                    if let Some(fragment) = heading_fragment {
+                        self.jump_to_markdown_heading_fragment(&fragment);
+                    }
                 }
             }
             PendingAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
@@ -2845,6 +3350,8 @@ impl SlateApp {
             && !self.recent_picker_open
             && !self.doc_tasks_open
             && !self.file_picker_open
+            && !self.link_heading_picker_open
+            && !self.link_preview_open
             && !self.save_as_open
             && !self.scratch_modal_open
             && !self.scratch_entries_open
@@ -3232,6 +3739,10 @@ impl SlateApp {
             && !self.recent_picker_open
             && !self.doc_tasks_open
             && !self.file_picker_open
+            && !self.link_assist_open
+            && !self.link_assist_web_open
+            && !self.link_heading_picker_open
+            && !self.link_preview_open
             && !self.save_as_open
             && !self.scratch_modal_open
             && !self.scratch_entries_open
@@ -3608,6 +4119,19 @@ impl SlateApp {
         let mut save_as_enter_dir = false;
         let mut save_as_parent = false;
         let mut save_as_backspace = false;
+        let mut link_assist_previous = false;
+        let mut link_assist_next = false;
+        let mut link_assist_confirm = false;
+        let mut link_assist_cancel = false;
+        let mut link_web_confirm = false;
+        let mut link_web_backspace = false;
+        let mut link_web_cancel = false;
+        let mut link_heading_previous = false;
+        let mut link_heading_next = false;
+        let mut link_heading_confirm = false;
+        let mut link_heading_cancel = false;
+        let mut link_preview_confirm = false;
+        let mut link_preview_cancel = false;
         let mut scratch_archive = false;
         let mut scratch_open_entries = false;
         let mut scratch_entries_previous = false;
@@ -3634,6 +4158,8 @@ impl SlateApp {
             && !self.recent_picker_open
             && !self.doc_tasks_open
             && !self.file_picker_open
+            && !self.link_heading_picker_open
+            && !self.link_preview_open
             && !self.save_as_open
             && !self.scratch_modal_open
             && !self.scratch_entries_open
@@ -3707,6 +4233,29 @@ impl SlateApp {
                 file_open |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
                 file_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
             }
+            if self.link_assist_open {
+                link_assist_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
+                link_assist_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
+                link_assist_confirm |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
+                link_assist_confirm |= i.consume_key(egui::Modifiers::NONE, Key::Space);
+                link_assist_cancel |= i.consume_key(egui::Modifiers::NONE, Key::Escape);
+            }
+            if self.link_assist_web_open {
+                link_web_confirm |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
+                link_web_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
+                link_web_cancel |= i.consume_key(egui::Modifiers::NONE, Key::Escape);
+            }
+            if self.link_heading_picker_open {
+                link_heading_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
+                link_heading_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
+                link_heading_confirm |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
+                link_heading_confirm |= i.consume_key(egui::Modifiers::NONE, Key::Space);
+                link_heading_cancel |= i.consume_key(egui::Modifiers::NONE, Key::Escape);
+            }
+            if self.link_preview_open {
+                link_preview_confirm |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
+                link_preview_cancel |= i.consume_key(egui::Modifiers::NONE, Key::Escape);
+            }
             if self.save_as_open {
                 save_as_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
                 save_as_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
@@ -3743,6 +4292,8 @@ impl SlateApp {
                 self.recent_picker_open = false;
                 self.doc_tasks_open = false;
                 self.file_picker_open = false;
+                self.link_heading_picker_open = false;
+                self.link_preview_open = false;
                 self.save_as_open = false;
                 self.scratch_modal_open = false;
                 self.scratch_entries_open = false;
@@ -3768,6 +4319,8 @@ impl SlateApp {
                 self.recent_picker_open = false;
                 self.doc_tasks_open = false;
                 self.file_picker_open = false;
+                self.link_heading_picker_open = false;
+                self.link_preview_open = false;
                 self.save_as_open = false;
                 self.scratch_modal_open = false;
                 self.scratch_entries_open = false;
@@ -3883,7 +4436,15 @@ impl SlateApp {
                 } else if self.file_picker_open {
                     self.file_picker_open = false;
                     self.pending_project_file_path = None;
+                    self.pending_open_heading_fragment = None;
+                    if self.file_picker_mode == FilePickerMode::InsertMarkdownLink {
+                        self.cancel_link_assist();
+                    }
                     self.focus_editor_once = true;
+                } else if self.link_heading_picker_open {
+                    self.cancel_link_assist();
+                } else if self.link_preview_open {
+                    self.close_link_preview();
                 } else if self.save_as_open {
                     self.save_as_open = false;
                     self.focus_editor_once = true;
@@ -3982,8 +4543,71 @@ impl SlateApp {
             self.handle_file_picker_text_input(ctx);
         }
 
+        if self.link_assist_web_open {
+            self.handle_link_assist_web_text_input(ctx);
+        }
+
         if self.save_as_open {
             self.handle_save_as_text_input(ctx);
+        }
+
+        if link_assist_cancel || link_web_cancel || link_heading_cancel {
+            self.cancel_link_assist();
+            return;
+        }
+
+        if link_preview_cancel {
+            self.close_link_preview();
+            return;
+        }
+
+        if link_preview_confirm {
+            self.commit_link_preview();
+            return;
+        }
+
+        if link_heading_previous {
+            self.move_link_heading_selection(-1);
+            return;
+        }
+
+        if link_heading_next {
+            self.move_link_heading_selection(1);
+            return;
+        }
+
+        if link_heading_confirm {
+            self.confirm_link_heading_picker();
+            return;
+        }
+
+        if link_assist_previous || link_assist_next {
+            self.link_assist_choice = match self.link_assist_choice {
+                LinkAssistChoice::File => LinkAssistChoice::Web,
+                LinkAssistChoice::Web => LinkAssistChoice::File,
+            };
+            return;
+        }
+
+        if link_assist_confirm {
+            self.confirm_link_assist_choice();
+            return;
+        }
+
+        if link_web_backspace {
+            self.link_assist_web_url.pop();
+            return;
+        }
+
+        if link_web_confirm {
+            let url = self.link_assist_web_url.trim().to_string();
+            if url.is_empty() {
+                self.status = "Insert link: URL is empty".to_string();
+            } else {
+                self.link_assist_web_open = false;
+                self.insert_assisted_markdown_link(&url);
+            }
+            return;
         }
 
         if save_as_backspace {
@@ -4572,6 +5196,21 @@ impl SlateApp {
         self.selected_project_file = self.project_file_indices().first().copied().unwrap_or(0);
     }
 
+    fn handle_link_assist_web_text_input(&mut self, ctx: &egui::Context) {
+        let events = ctx.input(|input| input.events.clone());
+        if ctx.input(|input| input.modifiers.ctrl || input.modifiers.command || input.modifiers.alt)
+        {
+            return;
+        }
+        let Some((_, text)) = Self::normalized_text_input(&events) else {
+            return;
+        };
+        if text.chars().any(|ch| ch.is_control()) {
+            return;
+        }
+        self.link_assist_web_url.push_str(&text);
+    }
+
     fn handle_save_as_text_input(&mut self, ctx: &egui::Context) {
         let events = ctx.input(|input| input.events.clone());
         if ctx.input(|input| input.modifiers.ctrl || input.modifiers.command || input.modifiers.alt)
@@ -5066,6 +5705,274 @@ impl SlateApp {
         }
     }
 
+    fn link_assist_dialog(&mut self, ctx: &egui::Context) {
+        if !self.link_assist_open && !self.link_assist_web_open && !self.link_heading_picker_open {
+            return;
+        }
+
+        egui::Area::new("link_assist_dialog".into())
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, -80.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(25, 31, 40))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
+                    .corner_radius(0.0)
+                    .inner_margin(12.0)
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 8],
+                        blur: 18,
+                        spread: 0,
+                        color: Color32::from_black_alpha(140),
+                    })
+                    .show(ui, |ui| {
+                        ui.set_width(360.0);
+                        let font = FontId::new(13.0, FontFamily::Monospace);
+                        let title_font = FontId::new(15.0, FontFamily::Monospace);
+                        let accent = Color32::from_rgb(136, 192, 208);
+                        let text = Color32::from_rgb(216, 222, 233);
+                        let dim = Color32::from_rgb(136, 154, 176);
+                        let warn = Color32::from_rgb(235, 203, 139);
+
+                        if self.link_heading_picker_open {
+                            ui.set_width(520.0);
+                            ui.label(
+                                RichText::new("insert link heading")
+                                    .font(title_font)
+                                    .color(accent),
+                            );
+                            ui.label(
+                                RichText::new("Enter on first option links the whole file")
+                                    .font(font.clone())
+                                    .color(dim),
+                            );
+                            ui.add_space(8.0);
+
+                            let total = self.link_heading_options.len() + 1;
+                            let visible_rows = 12usize;
+                            let start = Self::centered_window_start(
+                                self.selected_link_heading,
+                                visible_rows,
+                                total,
+                            );
+                            let end = (start + visible_rows).min(total);
+                            for index in start..end {
+                                let selected = index == self.selected_link_heading;
+                                let label = if index == 0 {
+                                    "No usar headers · linkear archivo entero".to_string()
+                                } else {
+                                    let heading = &self.link_heading_options[index - 1];
+                                    format!(
+                                        "{}{}  · line {}",
+                                        "  ".repeat(heading.level.saturating_sub(1)),
+                                        heading.text,
+                                        heading.line_index + 1
+                                    )
+                                };
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} {}",
+                                        if selected { ">" } else { " " },
+                                        label
+                                    ))
+                                    .font(font.clone())
+                                    .color(if selected {
+                                        accent
+                                    } else {
+                                        text
+                                    }),
+                                );
+                            }
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                for (key, label) in
+                                    [("↑↓", "choose"), ("enter", "insert"), ("esc", "cancel")]
+                                {
+                                    ui.label(
+                                        RichText::new(format!("[{key}]"))
+                                            .font(font.clone())
+                                            .color(warn),
+                                    );
+                                    ui.label(RichText::new(label).font(font.clone()).color(dim));
+                                    ui.add_space(8.0);
+                                }
+                            });
+                            return;
+                        }
+
+                        if self.link_assist_web_open {
+                            ui.label(
+                                RichText::new("insert web link")
+                                    .font(title_font)
+                                    .color(accent),
+                            );
+                            ui.add_space(8.0);
+                            let display = if self.link_assist_web_url.is_empty() {
+                                "https://...".to_string()
+                            } else {
+                                self.link_assist_web_url.clone()
+                            };
+                            ui.label(
+                                RichText::new(format!("url: {display}"))
+                                    .font(font.clone())
+                                    .color(if self.link_assist_web_url.is_empty() {
+                                        dim
+                                    } else {
+                                        text
+                                    }),
+                            );
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                for (key, label) in [("enter", "insert"), ("esc", "cancel")] {
+                                    ui.label(
+                                        RichText::new(format!("[{key}]"))
+                                            .font(font.clone())
+                                            .color(warn),
+                                    );
+                                    ui.label(RichText::new(label).font(font.clone()).color(dim));
+                                    ui.add_space(8.0);
+                                }
+                            });
+                            return;
+                        }
+
+                        ui.label(RichText::new("insert link").font(title_font).color(accent));
+                        ui.add_space(8.0);
+                        for choice in [LinkAssistChoice::File, LinkAssistChoice::Web] {
+                            let selected = choice == self.link_assist_choice;
+                            let label = match choice {
+                                LinkAssistChoice::File => "Archivo",
+                                LinkAssistChoice::Web => "Web",
+                            };
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} {label}",
+                                    if selected { ">" } else { " " }
+                                ))
+                                .font(font.clone())
+                                .color(if selected {
+                                    accent
+                                } else {
+                                    text
+                                }),
+                            );
+                        }
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            for (key, label) in
+                                [("↑↓", "choose"), ("enter", "accept"), ("esc", "cancel")]
+                            {
+                                ui.label(
+                                    RichText::new(format!("[{key}]"))
+                                        .font(font.clone())
+                                        .color(warn),
+                                );
+                                ui.label(RichText::new(label).font(font.clone()).color(dim));
+                                ui.add_space(8.0);
+                            }
+                        });
+                    });
+            });
+    }
+
+    fn link_preview_dialog(&mut self, ctx: &egui::Context) {
+        if !self.link_preview_open {
+            return;
+        }
+
+        egui::Area::new("link_preview_dialog".into())
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let screen = ctx.content_rect();
+                let size = Vec2::new(screen.width() * 0.86, screen.height() * 0.82);
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(22, 28, 37))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
+                    .corner_radius(0.0)
+                    .inner_margin(12.0)
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 12],
+                        blur: 28,
+                        spread: 0,
+                        color: Color32::from_black_alpha(170),
+                    })
+                    .show(ui, |ui| {
+                        ui.set_min_size(size);
+                        ui.set_max_size(size);
+                        let font = FontId::new(13.0, FontFamily::Monospace);
+                        let title_font = FontId::new(15.0, FontFamily::Monospace);
+                        let accent = Color32::from_rgb(136, 192, 208);
+                        let dim = Color32::from_rgb(136, 154, 176);
+                        let warn = Color32::from_rgb(235, 203, 139);
+                        let title = self
+                            .link_preview_path
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "link preview".to_string());
+
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("link preview").font(title_font).color(accent));
+                            ui.label(RichText::new(title).font(font.clone()).color(dim));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new("[enter] open  [esc] close")
+                                            .font(font.clone())
+                                            .color(warn),
+                                    );
+                                },
+                            );
+                        });
+                        if let Some(fragment) = self.link_preview_heading_fragment.as_deref() {
+                            let target = self
+                                .link_preview_heading_text
+                                .as_deref()
+                                .unwrap_or(fragment);
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new("→ target heading")
+                                        .font(font.clone())
+                                        .color(warn),
+                                );
+                                ui.label(
+                                    RichText::new(format!("#{fragment}"))
+                                        .font(font.clone())
+                                        .color(Color32::from_rgb(235, 203, 139)),
+                                );
+                                ui.label(
+                                    RichText::new(format!("· {target}"))
+                                        .font(font.clone())
+                                        .color(accent),
+                                );
+                            });
+                        }
+                        ui.add_space(8.0);
+                        let editor_height = (ui.available_height() - 4.0).max(80.0);
+                        ui.allocate_ui(Vec2::new(ui.available_width(), editor_height), |ui| {
+                            self.link_preview_view
+                                .observe_buffer(&self.link_preview_buffer);
+                            let target_line = self
+                                .link_preview_heading_fragment
+                                .as_ref()
+                                .map(|_| self.link_preview_buffer.cursor_line_col().0);
+                            let _ = self.link_preview_view.render(
+                                ui,
+                                &mut self.link_preview_buffer,
+                                self.wrap,
+                                None,
+                                self.line_number_mode,
+                                false,
+                                target_line,
+                                self.markdown_live_rendering,
+                            );
+                        });
+                    });
+            });
+    }
+
     fn file_picker_dialog(&mut self, ctx: &egui::Context) {
         if !self.file_picker_open {
             return;
@@ -5107,10 +6014,10 @@ impl SlateApp {
                         let warn = Color32::from_rgb(235, 203, 139);
 
                         ui.horizontal(|ui| {
-                            let title = if self.file_picker_mode == FilePickerMode::Open {
-                                "open"
-                            } else {
-                                "files"
+                            let title = match self.file_picker_mode {
+                                FilePickerMode::Open => "open",
+                                FilePickerMode::Browse => "files",
+                                FilePickerMode::InsertMarkdownLink => "insert link file",
                             };
                             ui.label(RichText::new(title).font(title_font).color(accent));
                             ui.label(
@@ -6444,44 +7351,32 @@ impl SlateApp {
         let mut sections = Vec::new();
         let mut byte = 0;
         for span in spans {
-            for (start, end, color, underline) in [
+            let fragment_start = line[span.target_start..span.target_end]
+                .find('#')
+                .map(|offset| span.target_start + offset);
+            let target_path_end = fragment_start.unwrap_or(span.target_end);
+            let link_dim = Color32::from_rgb(94, 105, 126);
+            let link_text = Color32::from_rgb(136, 192, 208);
+            let link_target = Color32::from_rgb(163, 190, 140);
+            let link_heading = Color32::from_rgb(235, 203, 139);
+            let mut link_sections = vec![
                 (
                     byte,
                     span.marker_start,
                     Color32::from_rgb(216, 222, 233),
                     false,
                 ),
-                (
-                    span.marker_start,
-                    span.text_start,
-                    Color32::from_rgb(94, 105, 126),
-                    false,
-                ),
-                (
-                    span.text_start,
-                    span.text_end,
-                    Color32::from_rgb(136, 192, 208),
-                    true,
-                ),
-                (
-                    span.text_end,
-                    span.target_start,
-                    Color32::from_rgb(94, 105, 126),
-                    false,
-                ),
-                (
-                    span.target_start,
-                    span.target_end,
-                    Color32::from_rgb(163, 190, 140),
-                    false,
-                ),
-                (
-                    span.target_end,
-                    span.marker_end,
-                    Color32::from_rgb(94, 105, 126),
-                    false,
-                ),
-            ] {
+                (span.marker_start, span.text_start, link_dim, false),
+                (span.text_start, span.text_end, link_text, true),
+                (span.text_end, span.target_start, link_dim, false),
+                (span.target_start, target_path_end, link_target, false),
+            ];
+            if let Some(fragment_start) = fragment_start {
+                link_sections.push((fragment_start, span.target_end, link_heading, false));
+            }
+            link_sections.push((span.target_end, span.marker_end, link_dim, false));
+
+            for (start, end, color, underline) in link_sections {
                 if start < end {
                     let mut format = TextFormat::simple(font.clone(), color);
                     if underline {
@@ -6711,6 +7606,7 @@ impl SlateApp {
 
 impl eframe::App for SlateApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.remember_current_cursor_position();
         if self.scratch_modal_open || !self.scratch_buffer.as_str().trim().is_empty() {
             self.archive_scratch_modal();
         }
@@ -6821,6 +7717,10 @@ impl eframe::App for SlateApp {
                     && !self.recent_picker_open
                     && !self.doc_tasks_open
                     && !self.file_picker_open
+                    && !self.link_assist_open
+                    && !self.link_assist_web_open
+                    && !self.link_heading_picker_open
+                    && !self.link_preview_open
                     && !self.save_as_open
                     && !self.scratch_modal_open
                     && !self.scratch_entries_open
@@ -6855,6 +7755,8 @@ impl eframe::App for SlateApp {
                                     && !self.recent_picker_open
                                     && !self.doc_tasks_open
                                     && !self.file_picker_open
+                                    && !self.link_heading_picker_open
+                                    && !self.link_preview_open
                                     && !self.save_as_open
                                     && !self.scratch_modal_open
                                     && !self.scratch_entries_open
@@ -6870,6 +7772,9 @@ impl eframe::App for SlateApp {
                                 }
                                 if let Some(byte) = self.editor_view.take_link_click_byte() {
                                     self.open_markdown_link_at_byte(byte);
+                                }
+                                if let Some(trigger_start) = self.editor_view.take_link_assist_trigger_start() {
+                                    self.open_link_assist(trigger_start);
                                 }
                                 columns[1].vertical(|ui| self.preview_ui(ui));
                             });
@@ -6890,6 +7795,8 @@ impl eframe::App for SlateApp {
                                 && !self.recent_picker_open
                                 && !self.doc_tasks_open
                                 && !self.file_picker_open
+                                && !self.link_heading_picker_open
+                                && !self.link_preview_open
                                 && !self.save_as_open
                                 && !self.scratch_modal_open
                                 && !self.scratch_entries_open
@@ -6905,6 +7812,9 @@ impl eframe::App for SlateApp {
                             }
                             if let Some(byte) = self.editor_view.take_link_click_byte() {
                                 self.open_markdown_link_at_byte(byte);
+                            }
+                            if let Some(trigger_start) = self.editor_view.take_link_assist_trigger_start() {
+                                self.open_link_assist(trigger_start);
                             }
                         }
                     },
@@ -6942,6 +7852,10 @@ impl eframe::App for SlateApp {
                     "doc tasks"
                 } else if self.file_picker_open {
                     "files"
+                } else if self.link_heading_picker_open {
+                    "link heading"
+                } else if self.link_preview_open {
+                    "link preview"
                 } else if self.save_as_open {
                     "save as"
                 } else if self.scratch_modal_open {
@@ -7365,6 +8279,10 @@ impl eframe::App for SlateApp {
                         )
                     } else if self.file_picker_open {
                         ("files  type filter · ↑↓ select · → enter folder · ← parent · Enter open · Esc close".to_string(), footer_accent)
+                    } else if self.link_heading_picker_open {
+                        ("link heading  ↑↓ select · Enter insert · Esc cancel · first option = whole file".to_string(), footer_accent)
+                    } else if self.link_preview_open {
+                        ("link preview  Enter open as buffer · Esc close".to_string(), footer_accent)
                     } else if self.save_as_open {
                         ("save as  type file name · ↑↓ select · → enter folder · ← parent · Enter save · Esc close".to_string(), footer_accent)
                     } else if self.scratch_modal_open {
@@ -7388,6 +8306,8 @@ impl eframe::App for SlateApp {
         self.command_palette(&ctx);
         self.settings_dialog(&ctx);
         self.shortcut_help_dialog(&ctx);
+        self.link_assist_dialog(&ctx);
+        self.link_preview_dialog(&ctx);
         self.file_picker_dialog(&ctx);
         self.save_as_dialog(&ctx);
         self.scratch_modal_dialog(&ctx);
