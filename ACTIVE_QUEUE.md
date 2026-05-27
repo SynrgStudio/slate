@@ -44,14 +44,15 @@ Scope:
 
 ### T004 — Recent files workflow
 
-Status: in_progress
+Status: completed
 Scope:
 - Done: track the last opened file and support `open-last` / `last` / `ol` plus Ctrl-layer `ol`.
 - Done: track a real recent opened/saved files list and persist it in config.
 - Done: add `:recent` as a commandline-first workflow that opens a live recent-file picker in the minibuffer/palette area.
 - Done: support `:recent <query>` and live typing/backspace filtering inside the recent picker.
 - Done: add recent command discovery through the live command registry and command palette/minibuffer.
-- Pending: optionally reopen the last file at startup.
+- Decision: automatic reopen-last is not necessary by default because `Ctrl+O L` / `open-last` covers the intentional workflow.
+- Done: add user-controlled `reopen_last_file_on_startup` setting for users who want Slate to reopen with the last file from the previous session.
 
 ### T005 — Scratch buffer and quick capture
 

@@ -470,6 +470,7 @@ struct SlateApp {
     shortcut_help_open: bool,
     line_number_mode: LineNumberMode,
     ctrl_shift_move_mode: CtrlShiftMoveMode,
+    reopen_last_file_on_startup: bool,
     last_opened_path: Option<PathBuf>,
     recent_files: Vec<PathBuf>,
     recent_picker_open: bool,
@@ -545,6 +546,7 @@ impl SlateApp {
             shortcut_help_open: false,
             line_number_mode: LineNumberMode::Absolute,
             ctrl_shift_move_mode: CtrlShiftMoveMode::Vim,
+            reopen_last_file_on_startup: false,
             last_opened_path: None,
             recent_files: Vec::new(),
             recent_picker_open: false,
@@ -592,6 +594,10 @@ impl SlateApp {
 
         if let Some(path) = path {
             app.open_path(path);
+        } else if !scratch && app.reopen_last_file_on_startup {
+            if let Some(last_path) = app.last_opened_path.clone() {
+                app.open_path(last_path);
+            }
         }
 
         app
@@ -1495,6 +1501,11 @@ impl SlateApp {
                         self.ctrl_shift_move_mode = mode;
                     }
                 }
+                "reopen_last_file_on_startup" => {
+                    if let Some(enabled) = Self::parse_config_bool(value) {
+                        self.reopen_last_file_on_startup = enabled;
+                    }
+                }
                 "last_opened_path" => {
                     let value = Self::parse_config_string(value);
                     if !value.is_empty() {
@@ -1616,12 +1627,13 @@ impl SlateApp {
             .ok_or_else(|| "invalid config path".to_string())?;
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
         let mut contents = format!(
-            "command_history_limit = {}\nline_number_mode = \"{}\"\nword_wrap = {}\npreview_mode = {}\nctrl_shift_move_mode = \"{}\"\nlast_opened_path = \"{}\"\n",
+            "command_history_limit = {}\nline_number_mode = \"{}\"\nword_wrap = {}\npreview_mode = {}\nctrl_shift_move_mode = \"{}\"\nreopen_last_file_on_startup = {}\nlast_opened_path = \"{}\"\n",
             self.command_history_limit,
             self.line_number_mode.config_value(),
             self.wrap,
             self.preview,
             self.ctrl_shift_move_mode.config_value(),
+            self.reopen_last_file_on_startup,
             Self::escape_config_string(
                 &self
                     .last_opened_path
@@ -1706,6 +1718,21 @@ impl SlateApp {
                     "Preview on"
                 } else {
                     "Preview off"
+                }
+                .to_string()
+            }
+            Err(err) => self.status = format!("Settings save failed: {err}"),
+        }
+    }
+
+    fn set_reopen_last_file_on_startup(&mut self, enabled: bool) {
+        self.reopen_last_file_on_startup = enabled;
+        match self.save_settings() {
+            Ok(_) => {
+                self.status = if self.reopen_last_file_on_startup {
+                    "Reopen last file on startup on"
+                } else {
+                    "Reopen last file on startup off"
                 }
                 .to_string()
             }
@@ -3644,7 +3671,7 @@ impl SlateApp {
         }
 
         if settings_next {
-            self.selected_setting = (self.selected_setting + 1).min(4);
+            self.selected_setting = (self.selected_setting + 1).min(5);
             return;
         }
 
@@ -3655,6 +3682,7 @@ impl SlateApp {
                 2 => self.set_ctrl_shift_move_mode(CtrlShiftMoveMode::Vim),
                 3 => self.set_wrap_mode(false),
                 4 => self.set_preview_mode(false),
+                5 => self.set_reopen_last_file_on_startup(false),
                 _ => {}
             }
             return;
@@ -3673,6 +3701,7 @@ impl SlateApp {
                 2 => self.set_ctrl_shift_move_mode(self.ctrl_shift_move_mode.next()),
                 3 => self.set_wrap_mode(!self.wrap),
                 4 => self.set_preview_mode(!self.preview),
+                5 => self.set_reopen_last_file_on_startup(!self.reopen_last_file_on_startup),
                 _ => {}
             }
             return;
@@ -4431,6 +4460,46 @@ impl SlateApp {
                                         ui.add_space(4.0);
                                         ui.label(
                                             RichText::new("Persisted preview/split preference. Command: :preview on|off")
+                                                .font(FontId::new(13.0, FontFamily::Monospace))
+                                                .color(Color32::from_rgb(136, 154, 176)),
+                                        );
+                                    });
+
+                                ui.add_space(6.0);
+                                let reopen_selected = self.selected_setting == 5;
+                                egui::Frame::new()
+                                    .fill(if reopen_selected { selected_fill } else { normal_fill })
+                                    .inner_margin(6.0)
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new(if reopen_selected { ">" } else { " " })
+                                                    .font(FontId::new(14.0, FontFamily::Monospace))
+                                                    .color(Color32::from_rgb(136, 192, 208)),
+                                            );
+                                            ui.label(
+                                                RichText::new("Reopen last file on startup")
+                                                    .font(FontId::new(14.0, FontFamily::Monospace))
+                                                    .color(Color32::from_rgb(216, 222, 233)),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if ui
+                                                        .button(if self.reopen_last_file_on_startup { "on" } else { "off" })
+                                                        .on_hover_text("Open Slate with the last opened file when no file path is provided")
+                                                        .clicked()
+                                                    {
+                                                        self.set_reopen_last_file_on_startup(
+                                                            !self.reopen_last_file_on_startup,
+                                                        );
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        ui.add_space(4.0);
+                                        ui.label(
+                                            RichText::new("Off by default. Ctrl+O L / open-last remains the intentional manual workflow.")
                                                 .font(FontId::new(13.0, FontFamily::Monospace))
                                                 .color(Color32::from_rgb(136, 154, 176)),
                                         );
