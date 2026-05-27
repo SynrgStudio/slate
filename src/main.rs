@@ -1,6 +1,7 @@
 mod editor_buffer;
 mod editor_view;
 mod goto;
+mod markdown;
 mod search;
 
 use std::{
@@ -11,16 +12,16 @@ use std::{
 };
 
 use editor_buffer::EditorBuffer;
-use editor_view::{
-    CheckboxState, EditorView, LineNumberMode, is_markdown_separator, parse_blockquote_line,
-    parse_checkbox_line, parse_fenced_code_marker, parse_heading_line, parse_inline_code_spans,
-    parse_list_line,
-};
+use editor_view::{EditorView, LineNumberMode};
 use eframe::egui::{
     self, Color32, FontFamily, FontId, Key, RichText, Stroke, TextEdit, Vec2,
     text::{LayoutJob, LayoutSection, TextFormat},
 };
 use goto::GotoTarget;
+use markdown::{
+    CheckboxState, is_markdown_separator, parse_blockquote_line, parse_checkbox_line,
+    parse_fenced_code_marker, parse_heading_line, parse_inline_code_spans, parse_list_line,
+};
 use search::SearchState;
 
 fn main() -> eframe::Result {

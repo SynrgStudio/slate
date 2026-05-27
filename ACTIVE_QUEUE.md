@@ -92,7 +92,7 @@ Scope:
 - Done: `Ctrl+Enter` cycles checkbox state on the current line without moving the cursor into the checkbox.
 - Done: add Markdown render layer setting: plain source mode vs live inline Markdown rendering.
 - Done: when preview split is open, force the left/editor side to plain source text and the right side to rendered Markdown regardless of live render setting.
-- Pending: add a small shared line-based Markdown parser for editor and preview rendering; avoid a heavy Markdown AST unless there is a strong reason.
+- Done: add a small shared line-based Markdown parser module for editor and preview rendering; avoid a heavy Markdown AST unless there is a strong reason.
 - Done: support checkbox subtasks and subsubtasks with `- [ ]` / `- [/]` / `- [x]` and `-- [ ]` / `-- [/]` / `-- [x]`.
 - Done: add `:doc-tasks` / `:tasks` for current-document-only checkbox navigation; scan only the current buffer, no global task database.
 - Done: in `:doc-tasks`, `Enter` jumps to the selected task line and `Ctrl+Enter` cycles that task state in-place without leaving the picker.
