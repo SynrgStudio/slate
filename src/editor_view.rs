@@ -55,6 +55,33 @@ pub(crate) fn is_markdown_separator(line: &str) -> bool {
     line.trim() == "---"
 }
 
+pub(crate) struct ParsedBlockquoteLine<'a> {
+    pub(crate) indent: &'a str,
+    pub(crate) marker: &'a str,
+    pub(crate) depth: usize,
+    pub(crate) text: &'a str,
+}
+
+pub(crate) fn parse_blockquote_line(line: &str) -> Option<ParsedBlockquoteLine<'_>> {
+    let indent_len = line.len() - line.trim_start().len();
+    let indent = &line[..indent_len];
+    let rest = &line[indent_len..];
+    let depth = rest.chars().take_while(|ch| *ch == '>').count();
+    if depth == 0 {
+        return None;
+    }
+
+    let marker_without_space_len = depth;
+    let has_space = rest.as_bytes().get(marker_without_space_len) == Some(&b' ');
+    let marker_len = marker_without_space_len + usize::from(has_space);
+    Some(ParsedBlockquoteLine {
+        indent,
+        marker: &rest[..marker_len],
+        depth,
+        text: &rest[marker_len..],
+    })
+}
+
 pub(crate) fn parse_checkbox_line(line: &str) -> Option<ParsedCheckboxLine<'_>> {
     let indent_len = line.len() - line.trim_start().len();
     let indent = &line[..indent_len];
@@ -648,6 +675,64 @@ impl EditorView {
             return;
         }
 
+        if let Some(blockquote) = parse_blockquote_line(line) {
+            let marker_start = line_start + blockquote.indent.len();
+            let marker_end = marker_start + blockquote.marker.len();
+            let cursor_in_marker = buffer.cursor() >= marker_start && buffer.cursor() <= marker_end;
+            if !cursor_in_marker && row.start == line_start {
+                let indent_width = self.text_width(painter, blockquote.indent, font);
+                let marker_width = self.text_width(painter, blockquote.marker, font);
+                if !blockquote.indent.is_empty() {
+                    painter.text(
+                        egui::pos2(text_x, y + line_height * 0.5),
+                        egui::Align2::LEFT_CENTER,
+                        blockquote.indent,
+                        font.clone(),
+                        text_color,
+                    );
+                }
+                let previous_quote_depth = row
+                    .line_index
+                    .checked_sub(1)
+                    .and_then(|line_index| parse_blockquote_line(buffer.line(line_index)))
+                    .map(|quote| quote.depth)
+                    .unwrap_or(0);
+                let next_quote_depth = (row.line_index + 1 < buffer.line_count())
+                    .then(|| parse_blockquote_line(buffer.line(row.line_index + 1)))
+                    .flatten()
+                    .map(|quote| quote.depth)
+                    .unwrap_or(0);
+                for depth in 0..blockquote.depth {
+                    let quote_level = depth + 1;
+                    let x = text_x + indent_width + depth as f32 * 4.0 + 2.0;
+                    let top = if previous_quote_depth >= quote_level {
+                        y
+                    } else {
+                        y + 3.0
+                    };
+                    let bottom = if next_quote_depth >= quote_level {
+                        y + line_height
+                    } else {
+                        y + line_height - 3.0
+                    };
+                    painter.line_segment(
+                        [egui::pos2(x, top), egui::pos2(x, bottom)],
+                        Stroke::new(1.0, Color32::from_rgb(136, 192, 208)),
+                    );
+                }
+                if row.end > marker_end {
+                    painter.text(
+                        egui::pos2(text_x + indent_width + marker_width, y + line_height * 0.5),
+                        egui::Align2::LEFT_CENTER,
+                        &buffer.as_str()[marker_end..row.end],
+                        font.clone(),
+                        Color32::from_rgb(190, 200, 216),
+                    );
+                }
+                return;
+            }
+        }
+
         let Some(parsed) = parse_checkbox_line(line) else {
             painter.text(
                 egui::pos2(text_x, y + line_height * 0.5),
@@ -975,6 +1060,25 @@ mod tests {
         assert!(super::is_markdown_separator("  ---  "));
         assert!(!super::is_markdown_separator("----"));
         assert!(!super::is_markdown_separator("text ---"));
+    }
+
+    #[test]
+    fn parses_blockquote_lines() {
+        let quote = super::parse_blockquote_line("> quote").unwrap();
+        assert_eq!(quote.marker, "> ");
+        assert_eq!(quote.depth, 1);
+        assert_eq!(quote.text, "quote");
+
+        let nested = super::parse_blockquote_line("  >> nested").unwrap();
+        assert_eq!(nested.indent, "  ");
+        assert_eq!(nested.marker, ">> ");
+        assert_eq!(nested.depth, 2);
+        assert_eq!(nested.text, "nested");
+
+        let empty = super::parse_blockquote_line(">").unwrap();
+        assert_eq!(empty.marker, ">");
+        assert_eq!(empty.text, "");
+        assert!(super::parse_blockquote_line("text > quote").is_none());
     }
 
     #[test]

@@ -12,7 +12,8 @@ use std::{
 
 use editor_buffer::EditorBuffer;
 use editor_view::{
-    CheckboxState, EditorView, LineNumberMode, is_markdown_separator, parse_checkbox_line,
+    CheckboxState, EditorView, LineNumberMode, is_markdown_separator, parse_blockquote_line,
+    parse_checkbox_line,
 };
 use eframe::egui::{
     self, Color32, FontFamily, FontId, Key, RichText, Stroke, TextEdit, Vec2,
@@ -6300,6 +6301,20 @@ impl SlateApp {
                     ui.add_space(6.0);
                     ui.separator();
                     ui.add_space(6.0);
+                } else if let Some(blockquote) = parse_blockquote_line(line) {
+                    ui.horizontal(|ui| {
+                        ui.add_space((blockquote.depth.saturating_sub(1) as f32) * 8.0);
+                        let (bar_rect, _) =
+                            ui.allocate_exact_size(Vec2::new(3.0, 20.0), egui::Sense::hover());
+                        ui.painter()
+                            .rect_filled(bar_rect, 1.5, Color32::from_rgb(136, 192, 208));
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(blockquote.text)
+                                .size(15.0)
+                                .color(Color32::from_rgb(190, 200, 216)),
+                        );
+                    });
                 } else if let Some(checkbox) = parse_checkbox_line(line) {
                     ui.horizontal(|ui| {
                         if !checkbox.indent.is_empty() {

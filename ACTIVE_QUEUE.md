@@ -97,7 +97,7 @@ Scope:
 - Done: add `:doc-tasks` / `:tasks` for current-document-only checkbox navigation; scan only the current buffer, no global task database.
 - Done: in `:doc-tasks`, `Enter` jumps to the selected task line and `Ctrl+Enter` cycles that task state in-place without leaving the picker.
 - Done: support `---` as the only horizontal separator syntax when it is alone on a line, with editor and preview rendering.
-- Pending: support blockquotes (`> quote`) with subtle editor affordance and preview rendering.
+- Done: support blockquotes (`> quote`) with subtle editor affordance and preview rendering.
 - Pending: support fenced code blocks with subtle background/padding and optional language label; no syntax highlighting required yet.
 - Pending: support inline code rendering for backtick spans where practical.
 - Pending: polish headings and regular lists in editor/preview while preserving direct plain-text editing.
