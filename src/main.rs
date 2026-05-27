@@ -3170,7 +3170,6 @@ impl SlateApp {
                 let egui::Event::Key {
                     key,
                     pressed: true,
-                    repeat: false,
                     modifiers,
                     ..
                 } = event
