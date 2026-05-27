@@ -534,8 +534,12 @@ impl EditorView {
     }
 
     pub(crate) fn cycle_current_line_checkbox(buffer: &mut EditorBuffer) -> bool {
+        let line_index = buffer.line_index_for_byte(buffer.cursor());
+        Self::cycle_checkbox_at_line(buffer, line_index)
+    }
+
+    pub(crate) fn cycle_checkbox_at_line(buffer: &mut EditorBuffer, line_index: usize) -> bool {
         let cursor = buffer.cursor();
-        let line_index = buffer.line_index_for_byte(cursor);
         let line_start = buffer.line_start(line_index);
         let line = buffer.line(line_index);
         let Some(parsed) = parse_checkbox_line(line) else {
@@ -573,10 +577,17 @@ impl EditorView {
             if source.get(cursor.saturating_sub(2)..cursor) == Some("[]") {
                 let line_index = buffer.line_index_for_byte(cursor);
                 let line_start = buffer.line_start(line_index);
-                if source[line_start..cursor.saturating_sub(2)]
-                    .chars()
-                    .all(char::is_whitespace)
-                {
+                let before_marker = &source[line_start..cursor.saturating_sub(2)];
+                let marker_allowed = before_marker.chars().all(char::is_whitespace)
+                    || before_marker
+                        .strip_suffix("- ")
+                        .map(|before_prefix| before_prefix.chars().all(char::is_whitespace))
+                        .unwrap_or(false)
+                    || before_marker
+                        .strip_suffix("-- ")
+                        .map(|before_prefix| before_prefix.chars().all(char::is_whitespace))
+                        .unwrap_or(false);
+                if marker_allowed {
                     buffer.replace_selection_or_range(cursor - 2, cursor, "[ ] ");
                     return;
                 }
@@ -670,7 +681,8 @@ impl EditorView {
 
         let indent_width = self.text_width(painter, parsed.indent, font);
         let prefix_width = self.text_width(painter, parsed.task_prefix, font);
-        let checkbox_slot_width = self.text_width(painter, "[x] ", font);
+        let checkbox_slot = if parsed.marker == "[]" { "[] " } else { "[x] " };
+        let checkbox_slot_width = self.text_width(painter, checkbox_slot, font);
         if !parsed.indent.is_empty() {
             painter.text(
                 egui::pos2(text_x, y + line_height * 0.5),
@@ -975,6 +987,30 @@ mod tests {
 
         assert_eq!(buffer.as_str(), "[ ] ");
         assert_eq!(buffer.cursor(), 4);
+    }
+
+    #[test]
+    fn expands_compact_empty_subtask_when_space_is_typed() {
+        let mut buffer = EditorBuffer::from_text("- []".to_string());
+        buffer.set_cursor(4);
+        let mut view = EditorView::new();
+
+        view.insert_text_with_checkbox_expansion(&mut buffer, " ");
+
+        assert_eq!(buffer.as_str(), "- [ ] ");
+        assert_eq!(buffer.cursor(), 6);
+    }
+
+    #[test]
+    fn expands_compact_empty_subsubtask_when_space_is_typed() {
+        let mut buffer = EditorBuffer::from_text("-- []".to_string());
+        buffer.set_cursor(5);
+        let mut view = EditorView::new();
+
+        view.insert_text_with_checkbox_expansion(&mut buffer, " ");
+
+        assert_eq!(buffer.as_str(), "-- [ ] ");
+        assert_eq!(buffer.cursor(), 7);
     }
 
     #[test]

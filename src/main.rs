@@ -74,6 +74,7 @@ enum Command {
     WrapOff,
     PreviewOn,
     PreviewOff,
+    DocTasks,
     Quit,
 }
 
@@ -229,6 +230,13 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         summary: "Disable Markdown preview",
         hint: ":preview off",
         palette_command: Some(Command::PreviewOff),
+    },
+    CommandSpec {
+        name: "doc-tasks",
+        aliases: &["tasks"],
+        summary: "Browse current-document checkboxes",
+        hint: ":doc-tasks",
+        palette_command: Some(Command::DocTasks),
     },
     CommandSpec {
         name: "find",
@@ -438,6 +446,14 @@ enum FilePickerMode {
     Browse,
 }
 
+#[derive(Clone)]
+struct DocTask {
+    line_index: usize,
+    state: CheckboxState,
+    task_prefix: String,
+    text: String,
+}
+
 struct CommandUsage {
     name: String,
     count: usize,
@@ -480,6 +496,9 @@ struct SlateApp {
     recent_query: String,
     selected_recent_file: usize,
     pending_recent_path: Option<PathBuf>,
+    doc_tasks_open: bool,
+    doc_task_query: String,
+    selected_doc_task_line: usize,
     file_picker_open: bool,
     file_picker_mode: FilePickerMode,
     file_picker_dir: PathBuf,
@@ -557,6 +576,9 @@ impl SlateApp {
             recent_query: String::new(),
             selected_recent_file: 0,
             pending_recent_path: None,
+            doc_tasks_open: false,
+            doc_task_query: String::new(),
+            selected_doc_task_line: 0,
             file_picker_open: false,
             file_picker_mode: FilePickerMode::Browse,
             file_picker_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -1059,6 +1081,136 @@ impl SlateApp {
             self.recent_picker_open = false;
             self.open_path(path);
             self.focus_editor_once = true;
+        }
+    }
+
+    fn open_doc_tasks(&mut self) {
+        self.shortcut_help_open = false;
+        self.palette_open = false;
+        self.recent_picker_open = false;
+        self.file_picker_open = false;
+        self.save_as_open = false;
+        self.scratch_modal_open = false;
+        self.scratch_entries_open = false;
+        self.capture_modal_open = false;
+        self.command_line_focused = false;
+        self.focus_command_line_once = false;
+        self.command_history_index = None;
+        self.ctrl_layer_active = false;
+        self.ctrl_layer_sequence.clear();
+        self.doc_task_query.clear();
+        let tasks = self.doc_tasks();
+        if tasks.is_empty() {
+            self.status = "No document tasks".to_string();
+            self.focus_editor_once = true;
+            return;
+        }
+        self.selected_doc_task_line = tasks.first().map(|task| task.line_index).unwrap_or(0);
+        self.doc_tasks_open = true;
+        self.focus_editor_once = false;
+        self.status = format!("{} document tasks", tasks.len());
+    }
+
+    fn doc_tasks(&self) -> Vec<DocTask> {
+        self.buffer
+            .as_str()
+            .lines()
+            .enumerate()
+            .filter_map(|(line_index, line)| {
+                let parsed = parse_checkbox_line(line)?;
+                Some(DocTask {
+                    line_index,
+                    state: parsed.state,
+                    task_prefix: parsed.task_prefix.to_string(),
+                    text: parsed.text.to_string(),
+                })
+            })
+            .collect()
+    }
+
+    fn doc_task_indices(&self) -> Vec<usize> {
+        let query = self.doc_task_query.trim().to_lowercase();
+        let tasks = self.doc_tasks();
+        if query.is_empty() {
+            return (0..tasks.len()).collect();
+        }
+        let mut scored = tasks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, task)| {
+                let state = match task.state {
+                    CheckboxState::Empty => "empty",
+                    CheckboxState::Doing => "doing",
+                    CheckboxState::Done => "done",
+                };
+                let haystack = format!("{} {} {}", task.line_index + 1, state, task.text);
+                Self::fuzzy_score(&haystack, &query).map(|score| (score, index))
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by_key(|(score, index)| (*score, *index));
+        scored.into_iter().map(|(_, index)| index).collect()
+    }
+
+    fn move_doc_task_selection(&mut self, delta: isize) {
+        let tasks = self.doc_tasks();
+        let indices = self.doc_task_indices();
+        if indices.is_empty() {
+            self.selected_doc_task_line = 0;
+            return;
+        }
+        let current_position = indices
+            .iter()
+            .position(|index| {
+                tasks
+                    .get(*index)
+                    .map(|task| task.line_index == self.selected_doc_task_line)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(0);
+        let next_position = current_position
+            .saturating_add_signed(delta)
+            .min(indices.len().saturating_sub(1));
+        if let Some(task) = tasks.get(indices[next_position]) {
+            self.selected_doc_task_line = task.line_index;
+        }
+    }
+
+    fn jump_to_selected_doc_task(&mut self) {
+        let tasks = self.doc_tasks();
+        if !self.doc_task_indices().iter().any(|index| {
+            tasks
+                .get(*index)
+                .map(|task| task.line_index == self.selected_doc_task_line)
+                .unwrap_or(false)
+        }) {
+            self.status = "No matching document task".to_string();
+            return;
+        }
+        let line = self
+            .selected_doc_task_line
+            .min(self.buffer.line_count().saturating_sub(1));
+        self.buffer.set_cursor(self.buffer.line_end(line));
+        self.editor_view.request_scroll_to_cursor(&self.buffer);
+        self.doc_tasks_open = false;
+        self.focus_editor_once = true;
+        self.status = format!("Jumped to task on line {}", line + 1);
+    }
+
+    fn cycle_selected_doc_task(&mut self) {
+        let tasks = self.doc_tasks();
+        if !self.doc_task_indices().iter().any(|index| {
+            tasks
+                .get(*index)
+                .map(|task| task.line_index == self.selected_doc_task_line)
+                .unwrap_or(false)
+        }) {
+            self.status = "No matching document task".to_string();
+            return;
+        }
+        if EditorView::cycle_checkbox_at_line(&mut self.buffer, self.selected_doc_task_line) {
+            self.dirty = true;
+            self.search_state = None;
+            self.status = format!("Cycled task on line {}", self.selected_doc_task_line + 1);
         }
     }
 
@@ -1783,6 +1935,7 @@ impl SlateApp {
             Command::WrapOff => "wrap-off",
             Command::PreviewOn => "preview-on",
             Command::PreviewOff => "preview-off",
+            Command::DocTasks => "doc-tasks",
             Command::Quit => "quit",
         }
     }
@@ -1869,6 +2022,9 @@ impl SlateApp {
         if command != Command::Capture {
             self.capture_modal_open = false;
         }
+        if command != Command::DocTasks {
+            self.doc_tasks_open = false;
+        }
         self.palette_query.clear();
         self.selected_command = 0;
         self.command_line_focused = false;
@@ -1902,6 +2058,7 @@ impl SlateApp {
             Command::WrapOff => self.set_wrap_mode(false),
             Command::PreviewOn => self.set_preview_mode(true),
             Command::PreviewOff => self.set_preview_mode(false),
+            Command::DocTasks => self.open_doc_tasks(),
             Command::LineNumbersAbsolute => self.set_line_number_mode(LineNumberMode::Absolute),
             Command::LineNumbersRelative => self.set_line_number_mode(LineNumberMode::Relative),
             Command::Settings => {
@@ -2135,6 +2292,7 @@ impl SlateApp {
             }
             "preview-on" | "md-on" => self.run_command(Command::PreviewOn, ctx),
             "preview-off" | "md-off" => self.run_command(Command::PreviewOff, ctx),
+            "doc-tasks" | "tasks" => self.run_command(Command::DocTasks, ctx),
             "wrap" => {
                 let arg = parts.next();
                 match arg.and_then(Self::parse_config_bool) {
@@ -2603,6 +2761,7 @@ impl SlateApp {
             && !self.palette_open
             && !self.settings_open
             && !self.recent_picker_open
+            && !self.doc_tasks_open
             && !self.file_picker_open
             && !self.save_as_open
             && !self.scratch_modal_open
@@ -2989,6 +3148,7 @@ impl SlateApp {
             && !self.palette_open
             && !self.settings_open
             && !self.recent_picker_open
+            && !self.doc_tasks_open
             && !self.file_picker_open
             && !self.save_as_open
             && !self.scratch_modal_open
@@ -3270,6 +3430,11 @@ impl SlateApp {
         let mut recent_next = false;
         let mut recent_open = false;
         let mut recent_backspace = false;
+        let mut doc_task_previous = false;
+        let mut doc_task_next = false;
+        let mut doc_task_open = false;
+        let mut doc_task_cycle = false;
+        let mut doc_task_backspace = false;
         let mut file_previous = false;
         let mut file_next = false;
         let mut file_open = false;
@@ -3306,6 +3471,7 @@ impl SlateApp {
             && !self.palette_open
             && !self.settings_open
             && !self.recent_picker_open
+            && !self.doc_tasks_open
             && !self.file_picker_open
             && !self.save_as_open
             && !self.scratch_modal_open
@@ -3327,6 +3493,50 @@ impl SlateApp {
                 recent_open |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
                 recent_open |= i.consume_key(egui::Modifiers::NONE, Key::Space);
                 recent_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
+            }
+            if self.doc_tasks_open {
+                doc_task_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
+                doc_task_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
+                let ctrl_held = i.modifiers.ctrl || i.modifiers.command;
+                doc_task_cycle |= i.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key {
+                            key: Key::Enter,
+                            pressed: true,
+                            repeat: false,
+                            modifiers,
+                            ..
+                        } if ctrl_held || modifiers.ctrl || modifiers.command
+                    )
+                });
+                doc_task_open |= !doc_task_cycle
+                    && i.events.iter().any(|event| {
+                        matches!(
+                            event,
+                            egui::Event::Key {
+                                key: Key::Enter,
+                                pressed: true,
+                                repeat: false,
+                                modifiers,
+                                ..
+                            } if !ctrl_held && !modifiers.ctrl && !modifiers.command && !modifiers.alt && !modifiers.shift
+                        )
+                    });
+                if doc_task_cycle || doc_task_open {
+                    i.events.retain(|event| {
+                        !matches!(
+                            event,
+                            egui::Event::Key {
+                                key: Key::Enter,
+                                pressed: true,
+                                repeat: false,
+                                ..
+                            }
+                        )
+                    });
+                }
+                doc_task_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
             }
             if self.file_picker_open {
                 file_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
@@ -3370,6 +3580,7 @@ impl SlateApp {
             }
             if i.consume_key(egui::Modifiers::CTRL, Key::P) {
                 self.recent_picker_open = false;
+                self.doc_tasks_open = false;
                 self.file_picker_open = false;
                 self.save_as_open = false;
                 self.scratch_modal_open = false;
@@ -3394,6 +3605,7 @@ impl SlateApp {
             if i.consume_key(egui::Modifiers::CTRL, Key::Period) {
                 self.palette_open = false;
                 self.recent_picker_open = false;
+                self.doc_tasks_open = false;
                 self.file_picker_open = false;
                 self.save_as_open = false;
                 self.scratch_modal_open = false;
@@ -3504,6 +3716,9 @@ impl SlateApp {
                     self.recent_picker_open = false;
                     self.pending_recent_path = None;
                     self.focus_editor_once = true;
+                } else if self.doc_tasks_open {
+                    self.doc_tasks_open = false;
+                    self.focus_editor_once = true;
                 } else if self.file_picker_open {
                     self.file_picker_open = false;
                     self.pending_project_file_path = None;
@@ -3598,6 +3813,10 @@ impl SlateApp {
             self.handle_recent_picker_text_input(ctx);
         }
 
+        if self.doc_tasks_open {
+            self.handle_doc_tasks_text_input(ctx);
+        }
+
         if self.file_picker_open {
             self.handle_file_picker_text_input(ctx);
         }
@@ -3687,6 +3906,38 @@ impl SlateApp {
 
         if recent_open {
             self.open_selected_recent_file();
+            return;
+        }
+
+        if doc_task_backspace {
+            self.doc_task_query.pop();
+            let tasks = self.doc_tasks();
+            self.selected_doc_task_line = self
+                .doc_task_indices()
+                .first()
+                .and_then(|index| tasks.get(*index))
+                .map(|task| task.line_index)
+                .unwrap_or(0);
+            return;
+        }
+
+        if doc_task_previous {
+            self.move_doc_task_selection(-1);
+            return;
+        }
+
+        if doc_task_next {
+            self.move_doc_task_selection(1);
+            return;
+        }
+
+        if doc_task_cycle {
+            self.cycle_selected_doc_task();
+            return;
+        }
+
+        if doc_task_open {
+            self.jump_to_selected_doc_task();
             return;
         }
 
@@ -4120,6 +4371,28 @@ impl SlateApp {
         }
         self.recent_query.push_str(&text);
         self.selected_recent_file = self.recent_file_indices().first().copied().unwrap_or(0);
+    }
+
+    fn handle_doc_tasks_text_input(&mut self, ctx: &egui::Context) {
+        let events = ctx.input(|input| input.events.clone());
+        if ctx.input(|input| input.modifiers.ctrl || input.modifiers.command || input.modifiers.alt)
+        {
+            return;
+        }
+        let Some((_, text)) = Self::normalized_text_input(&events) else {
+            return;
+        };
+        if text.chars().any(|ch| ch.is_control()) {
+            return;
+        }
+        self.doc_task_query.push_str(&text);
+        let tasks = self.doc_tasks();
+        self.selected_doc_task_line = self
+            .doc_task_indices()
+            .first()
+            .and_then(|index| tasks.get(*index))
+            .map(|task| task.line_index)
+            .unwrap_or(0);
     }
 
     fn handle_file_picker_text_input(&mut self, ctx: &egui::Context) {
@@ -6122,6 +6395,21 @@ impl eframe::App for SlateApp {
                 } else {
                     0
                 };
+                let doc_tasks = if self.doc_tasks_open {
+                    self.doc_tasks()
+                } else {
+                    Vec::new()
+                };
+                let doc_task_indices = if self.doc_tasks_open {
+                    self.doc_task_indices()
+                } else {
+                    Vec::new()
+                };
+                let visible_doc_task_rows = if self.doc_tasks_open {
+                    doc_task_indices.len().min(8)
+                } else {
+                    0
+                };
                 let command_history_active = command_line_active
                     && command_suggestions.is_empty()
                     && !self.command_history.is_empty();
@@ -6132,9 +6420,11 @@ impl eframe::App for SlateApp {
                 };
                 let suggestion_height = visible_suggestion_rows as f32 * history_row_height;
                 let recent_height = visible_recent_rows as f32 * history_row_height;
+                let doc_tasks_height = visible_doc_task_rows as f32 * history_row_height;
                 let history_height = visible_history_rows as f32 * history_row_height;
                 let footer_height = status_height
                     + recent_height
+                    + doc_tasks_height
                     + suggestion_height
                     + history_height
                     + command_height;
@@ -6150,6 +6440,7 @@ impl eframe::App for SlateApp {
                     && !self.palette_open
                     && !self.settings_open
                     && !self.recent_picker_open
+                    && !self.doc_tasks_open
                     && !self.file_picker_open
                     && !self.save_as_open
                     && !self.scratch_modal_open
@@ -6183,6 +6474,7 @@ impl eframe::App for SlateApp {
                                     && !self.palette_open
                                     && !self.settings_open
                                     && !self.recent_picker_open
+                                    && !self.doc_tasks_open
                                     && !self.file_picker_open
                                     && !self.save_as_open
                                     && !self.scratch_modal_open
@@ -6214,6 +6506,7 @@ impl eframe::App for SlateApp {
                                 && !self.palette_open
                                 && !self.settings_open
                                 && !self.recent_picker_open
+                                && !self.doc_tasks_open
                                 && !self.file_picker_open
                                 && !self.save_as_open
                                 && !self.scratch_modal_open
@@ -6260,6 +6553,8 @@ impl eframe::App for SlateApp {
                     "command"
                 } else if self.recent_picker_open {
                     "recent"
+                } else if self.doc_tasks_open {
+                    "doc tasks"
                 } else if self.file_picker_open {
                     "files"
                 } else if self.save_as_open {
@@ -6388,6 +6683,90 @@ impl eframe::App for SlateApp {
                         if response.clicked() {
                             self.selected_recent_file = index;
                             self.open_selected_recent_file();
+                        }
+                    }
+                }
+
+                if visible_doc_task_rows > 0 {
+                    let (doc_tasks_rect, _) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), doc_tasks_height),
+                        egui::Sense::hover(),
+                    );
+                    let painter = ui.painter_at(doc_tasks_rect);
+                    painter.rect_filled(doc_tasks_rect, 0.0, Color32::from_rgb(25, 31, 40));
+
+                    let selected_position = doc_task_indices
+                        .iter()
+                        .position(|index| {
+                            doc_tasks
+                                .get(*index)
+                                .map(|task| task.line_index == self.selected_doc_task_line)
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(0);
+                    let start = selected_position
+                        .min(doc_task_indices.len().saturating_sub(visible_doc_task_rows));
+                    let end = (start + visible_doc_task_rows).min(doc_task_indices.len());
+                    for (row, index) in doc_task_indices[start..end].iter().copied().enumerate() {
+                        let Some(task) = doc_tasks.get(index) else {
+                            continue;
+                        };
+                        let row_rect = egui::Rect::from_min_size(
+                            egui::pos2(
+                                doc_tasks_rect.left(),
+                                doc_tasks_rect.top() + row as f32 * history_row_height,
+                            ),
+                            Vec2::new(doc_tasks_rect.width(), history_row_height),
+                        );
+                        let selected = task.line_index == self.selected_doc_task_line;
+                        if selected {
+                            painter.rect_filled(row_rect, 0.0, Color32::from_rgb(38, 47, 61));
+                        }
+                        let marker = match task.state {
+                            CheckboxState::Empty => "[ ]",
+                            CheckboxState::Doing => "[/]",
+                            CheckboxState::Done => "[x]",
+                        };
+                        painter.text(
+                            egui::pos2(row_rect.left() + 10.0, row_rect.center().y - 1.0),
+                            egui::Align2::LEFT_CENTER,
+                            if selected { ">" } else { " " },
+                            footer_font.clone(),
+                            footer_accent,
+                        );
+                        painter.text(
+                            egui::pos2(row_rect.left() + 28.0, row_rect.center().y - 1.0),
+                            egui::Align2::LEFT_CENTER,
+                            marker,
+                            footer_font.clone(),
+                            match task.state {
+                                CheckboxState::Empty => footer_dim,
+                                CheckboxState::Doing => footer_warn,
+                                CheckboxState::Done => footer_ok,
+                            },
+                        );
+                        painter.text(
+                            egui::pos2(row_rect.left() + 66.0, row_rect.center().y - 1.0),
+                            egui::Align2::LEFT_CENTER,
+                            format!("{}{}", task.task_prefix, task.text),
+                            footer_font.clone(),
+                            if selected { footer_color } else { footer_dim },
+                        );
+                        painter.text(
+                            egui::pos2(row_rect.right() - 10.0, row_rect.center().y - 1.0),
+                            egui::Align2::RIGHT_CENTER,
+                            format!("line {}", task.line_index + 1),
+                            footer_font.clone(),
+                            footer_dim,
+                        );
+                        let response = ui.interact(
+                            row_rect,
+                            ui.id().with(("doc_task", task.line_index)),
+                            egui::Sense::click(),
+                        );
+                        if response.clicked() {
+                            self.selected_doc_task_line = task.line_index;
+                            self.jump_to_selected_doc_task();
                         }
                     }
                 }

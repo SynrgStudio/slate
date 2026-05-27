@@ -94,8 +94,8 @@ Scope:
 - Done: when preview split is open, force the left/editor side to plain source text and the right side to rendered Markdown regardless of live render setting.
 - Pending: add a small shared line-based Markdown parser for editor and preview rendering; avoid a heavy Markdown AST unless there is a strong reason.
 - Done: support checkbox subtasks and subsubtasks with `- [ ]` / `- [/]` / `- [x]` and `-- [ ]` / `-- [/]` / `-- [x]`.
-- Pending: add `:doc-tasks` / `:tasks` for current-document-only checkbox navigation; scan only the current buffer, no global task database.
-- Pending: in `:doc-tasks`, `Enter` jumps to the selected task line and `Ctrl+Enter` cycles that task state in-place without leaving the picker.
+- Done: add `:doc-tasks` / `:tasks` for current-document-only checkbox navigation; scan only the current buffer, no global task database.
+- Done: in `:doc-tasks`, `Enter` jumps to the selected task line and `Ctrl+Enter` cycles that task state in-place without leaving the picker.
 - Done: support `---` as the only horizontal separator syntax when it is alone on a line, with editor and preview rendering.
 - Pending: support blockquotes (`> quote`) with subtle editor affordance and preview rendering.
 - Pending: support fenced code blocks with subtle background/padding and optional language label; no syntax highlighting required yet.
