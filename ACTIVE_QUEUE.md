@@ -64,8 +64,9 @@ Scope:
 - Done: app exit archives pending scratch modal content.
 - Done: add `:scratch-entries` / `:scratch-log` / `:scl` modal for reviewing `~/.local/share/slate/scratch.md` as entries.
 - Done: from scratch modal, `Ctrl+E` opens scratch entries; in entries, `↑↓` selects and `Ctrl+D` / `Delete` deletes an entry from the archive.
+- Done: add `:capture` / `:cap` modal for sending selected text, or current line when no selection exists, to scratch with an optional title/context field focused by default.
 - Pending: support daily archive sections and quick append behavior.
-- Pending: support sending selected text/current line to scratch via `:capture` and later promote entries to full notes.
+- Pending: later promote entries/captures to full notes.
 
 ### T006 — Daily notes
 

@@ -62,6 +62,7 @@ enum Command {
     SaveAs,
     Scratch,
     ScratchEntries,
+    Capture,
     TogglePreview,
     ToggleWrap,
     Settings,
@@ -163,6 +164,13 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         summary: "Open quick scratch capture modal",
         hint: ":scratch",
         palette_command: Some(Command::Scratch),
+    },
+    CommandSpec {
+        name: "capture",
+        aliases: &["cap"],
+        summary: "Capture selection or current line to scratch",
+        hint: ":capture",
+        palette_command: Some(Command::Capture),
     },
     CommandSpec {
         name: "scratch-entries",
@@ -486,6 +494,10 @@ struct SlateApp {
     scratch_entries_open: bool,
     scratch_entries: Vec<ScratchEntry>,
     selected_scratch_entry: usize,
+    capture_modal_open: bool,
+    capture_title: String,
+    capture_text: String,
+    capture_title_focus_once: bool,
     search_state: Option<SearchState>,
     ctrl_layer_active: bool,
     ctrl_layer_sequence: String,
@@ -557,6 +569,10 @@ impl SlateApp {
             scratch_entries_open: false,
             scratch_entries: Vec::new(),
             selected_scratch_entry: 0,
+            capture_modal_open: false,
+            capture_title: String::new(),
+            capture_text: String::new(),
+            capture_title_focus_once: false,
             search_state: None,
             ctrl_layer_active: false,
             ctrl_layer_sequence: String::new(),
@@ -819,6 +835,60 @@ impl SlateApp {
             self.scratch_entries_open = true;
             self.focus_editor_once = false;
             self.status = format!("Scratch entries · {} entries", self.scratch_entries.len());
+        }
+    }
+
+    fn capture_source_text(&self) -> String {
+        if let Some((start, end)) = self.buffer.selection() {
+            return self.buffer.as_str()[start..end]
+                .trim_matches('\n')
+                .to_string();
+        }
+        let (line_index, _) = self.buffer.cursor_line_col();
+        self.buffer.line(line_index).trim_matches('\n').to_string()
+    }
+
+    fn open_capture_modal(&mut self) {
+        let text = self.capture_source_text();
+        if text.trim().is_empty() {
+            self.status = "Nothing to capture".to_string();
+            return;
+        }
+        self.shortcut_help_open = false;
+        self.palette_open = false;
+        self.recent_picker_open = false;
+        self.file_picker_open = false;
+        self.save_as_open = false;
+        self.scratch_modal_open = false;
+        self.scratch_entries_open = false;
+        self.command_line_focused = false;
+        self.focus_command_line_once = false;
+        self.capture_title.clear();
+        self.capture_text = text;
+        self.capture_modal_open = true;
+        self.capture_title_focus_once = true;
+        self.focus_editor_once = false;
+        self.status = "Capture to scratch".to_string();
+    }
+
+    fn confirm_capture_modal(&mut self) {
+        if self.capture_text.trim().is_empty() {
+            self.capture_modal_open = false;
+            self.status = "Capture cancelled".to_string();
+            self.focus_editor_once = true;
+            return;
+        }
+        let title = self.capture_title.trim();
+        let entry = if title.is_empty() {
+            self.capture_text.trim_end().to_string()
+        } else {
+            format!("**{title}**\n\n{}", self.capture_text.trim_end())
+        };
+        if self.append_text_to_scratch_archive(&entry) {
+            self.capture_modal_open = false;
+            self.capture_title.clear();
+            self.capture_text.clear();
+            self.focus_editor_once = true;
         }
     }
 
@@ -1651,6 +1721,7 @@ impl SlateApp {
             Command::SaveAs => "save-as",
             Command::Scratch => "scratch",
             Command::ScratchEntries => "scratch-entries",
+            Command::Capture => "capture",
             Command::TogglePreview => "preview",
             Command::ToggleWrap => "wrap",
             Command::Settings => "settings",
@@ -1743,6 +1814,9 @@ impl SlateApp {
         if command != Command::ScratchEntries {
             self.scratch_entries_open = false;
         }
+        if command != Command::Capture {
+            self.capture_modal_open = false;
+        }
         self.palette_query.clear();
         self.selected_command = 0;
         self.command_line_focused = false;
@@ -1769,6 +1843,7 @@ impl SlateApp {
             Command::SaveAs => self.open_save_as_modal(),
             Command::Scratch => self.open_scratch_modal(),
             Command::ScratchEntries => self.open_scratch_entries_modal(),
+            Command::Capture => self.open_capture_modal(),
             Command::TogglePreview => self.set_preview_mode(!self.preview),
             Command::ToggleWrap => self.set_wrap_mode(!self.wrap),
             Command::WrapOn => self.set_wrap_mode(true),
@@ -1954,6 +2029,7 @@ impl SlateApp {
             "scratch-entries" | "scratch-log" | "scl" => {
                 self.run_command(Command::ScratchEntries, ctx)
             }
+            "capture" | "cap" => self.run_command(Command::Capture, ctx),
             "q" | "quit" | "exit" => self.run_command(Command::Quit, ctx),
             "wq" | "x" => {
                 self.record_command_usage("wq");
@@ -2479,6 +2555,7 @@ impl SlateApp {
             && !self.save_as_open
             && !self.scratch_modal_open
             && !self.scratch_entries_open
+            && !self.capture_modal_open
             && self.pending_action.is_none()
     }
 
@@ -2864,6 +2941,7 @@ impl SlateApp {
             && !self.save_as_open
             && !self.scratch_modal_open
             && !self.scratch_entries_open
+            && !self.capture_modal_open
             && self.pending_action.is_none();
 
         if !layer_allowed {
@@ -3157,6 +3235,7 @@ impl SlateApp {
         let mut scratch_entries_previous = false;
         let mut scratch_entries_next = false;
         let mut scratch_entries_delete = false;
+        let mut capture_confirm = false;
         let mut search_next = false;
         let mut search_previous = false;
         let mut search_accept = false;
@@ -3179,6 +3258,7 @@ impl SlateApp {
             && !self.save_as_open
             && !self.scratch_modal_open
             && !self.scratch_entries_open
+            && !self.capture_modal_open
             && self.pending_action.is_none();
         ctx.input_mut(|i| {
             if self.settings_open {
@@ -3216,6 +3296,9 @@ impl SlateApp {
                 scratch_archive |= i.consume_key(egui::Modifiers::CTRL, Key::S);
                 scratch_open_entries |= i.consume_key(egui::Modifiers::CTRL, Key::E);
             }
+            if self.capture_modal_open {
+                capture_confirm |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
+            }
             if self.scratch_entries_open {
                 scratch_entries_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
                 scratch_entries_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
@@ -3239,6 +3322,7 @@ impl SlateApp {
                 self.save_as_open = false;
                 self.scratch_modal_open = false;
                 self.scratch_entries_open = false;
+                self.capture_modal_open = false;
                 self.palette_open = true;
                 self.palette_query.clear();
                 self.selected_command = 0;
@@ -3262,6 +3346,7 @@ impl SlateApp {
                 self.save_as_open = false;
                 self.scratch_modal_open = false;
                 self.scratch_entries_open = false;
+                self.capture_modal_open = false;
                 self.command_line.clear();
                 self.command_line_cursor = 0;
                 self.command_history_index = None;
@@ -3288,18 +3373,21 @@ impl SlateApp {
             }
             if !self.scratch_modal_open
                 && !self.scratch_entries_open
+                && !self.capture_modal_open
                 && i.consume_key(egui::Modifiers::CTRL, Key::N)
             {
                 command = Some(Command::New);
             }
             if !self.scratch_modal_open
                 && !self.scratch_entries_open
+                && !self.capture_modal_open
                 && i.consume_key(egui::Modifiers::CTRL, Key::O)
             {
                 command = Some(Command::Open);
             }
             let save_pressed = !self.scratch_modal_open
                 && !self.scratch_entries_open
+                && !self.capture_modal_open
                 && i.events.iter().any(|event| {
                     matches!(
                         event,
@@ -3314,6 +3402,7 @@ impl SlateApp {
                 });
             let save_as_pressed = !self.scratch_modal_open
                 && !self.scratch_entries_open
+                && !self.capture_modal_open
                 && i.events.iter().any(|event| {
                     matches!(
                         event,
@@ -3333,12 +3422,14 @@ impl SlateApp {
             }
             if !self.scratch_modal_open
                 && !self.scratch_entries_open
+                && !self.capture_modal_open
                 && i.consume_key(egui::Modifiers::CTRL, Key::M)
             {
                 command = Some(Command::TogglePreview);
             }
             if !self.scratch_modal_open
                 && !self.scratch_entries_open
+                && !self.capture_modal_open
                 && i.consume_key(egui::Modifiers::CTRL, Key::Q)
             {
                 command = Some(Command::Quit);
@@ -3372,6 +3463,11 @@ impl SlateApp {
                     self.cancel_scratch_modal();
                 } else if self.scratch_entries_open {
                     self.scratch_entries_open = false;
+                    self.focus_editor_once = true;
+                } else if self.capture_modal_open {
+                    self.capture_modal_open = false;
+                    self.capture_title.clear();
+                    self.capture_text.clear();
                     self.focus_editor_once = true;
                 } else if self.palette_open {
                     self.palette_open = false;
@@ -3408,6 +3504,11 @@ impl SlateApp {
 
         if scratch_entries_delete {
             self.delete_selected_scratch_entry();
+            return;
+        }
+
+        if capture_confirm {
+            self.confirm_capture_modal();
             return;
         }
 
@@ -3605,7 +3706,10 @@ impl SlateApp {
             }
         }
 
-        let command_suggestion_count = if self.command_line_focused || self.focus_command_line_once
+        let navigating_command_history = self.command_history_index.is_some();
+        let command_suggestion_count = if (self.command_line_focused
+            || self.focus_command_line_once)
+            && !navigating_command_history
         {
             self.command_line_suggestions().len()
         } else {
@@ -4758,6 +4862,127 @@ impl SlateApp {
             });
     }
 
+    fn capture_dialog(&mut self, ctx: &egui::Context) {
+        if !self.capture_modal_open {
+            return;
+        }
+
+        egui::Area::new("capture_dialog".into())
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, -20.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(25, 31, 40))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
+                    .corner_radius(0.0)
+                    .inner_margin(14.0)
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 10],
+                        blur: 24,
+                        spread: 0,
+                        color: Color32::from_black_alpha(150),
+                    })
+                    .show(ui, |ui| {
+                        ui.set_width(720.0);
+                        let font = FontId::new(13.0, FontFamily::Monospace);
+                        let title_font = FontId::new(16.0, FontFamily::Monospace);
+                        let accent = Color32::from_rgb(136, 192, 208);
+                        let dim = Color32::from_rgb(136, 154, 176);
+                        let faint = Color32::from_rgb(94, 105, 126);
+                        let text = Color32::from_rgb(216, 222, 233);
+                        let warn = Color32::from_rgb(235, 203, 139);
+
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("capture").font(title_font).color(accent));
+                            ui.label(
+                                RichText::new("selection/current line → scratch")
+                                    .font(font.clone())
+                                    .color(faint),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new("[esc] cancel")
+                                            .font(font.clone())
+                                            .color(warn),
+                                    );
+                                },
+                            );
+                        });
+                        ui.add_space(10.0);
+
+                        ui.label(
+                            RichText::new("title/context optional")
+                                .font(font.clone())
+                                .color(faint),
+                        );
+                        let title_input_id = ui.make_persistent_id("capture_title_input");
+                        let response = ui.add(
+                            TextEdit::singleline(&mut self.capture_title)
+                                .id_salt(title_input_id)
+                                .hint_text("press Enter empty for no title")
+                                .desired_width(f32::INFINITY)
+                                .font(font.clone())
+                                .text_color(text)
+                                .frame(egui::Frame::NONE),
+                        );
+                        if self.capture_title_focus_once {
+                            response.request_focus();
+                            ui.memory_mut(|memory| memory.request_focus(response.id));
+                            ctx.request_repaint();
+                            self.capture_title_focus_once = false;
+                        }
+
+                        ui.add_space(10.0);
+                        ui.label(RichText::new("capturing").font(font.clone()).color(faint));
+                        let preview_height = 220.0;
+                        let (preview_rect, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), preview_height),
+                            egui::Sense::hover(),
+                        );
+                        let painter = ui.painter_at(preview_rect);
+                        painter.rect_filled(preview_rect, 0.0, Color32::from_rgb(30, 36, 48));
+                        painter.rect_stroke(
+                            preview_rect,
+                            0.0,
+                            Stroke::new(1.0, Color32::from_rgb(59, 69, 89)),
+                            egui::StrokeKind::Inside,
+                        );
+                        let inner = preview_rect.shrink(10.0);
+                        let line_height = ui.fonts_mut(|fonts| fonts.row_height(&font));
+                        let clip = painter.with_clip_rect(inner);
+                        let mut y = inner.top();
+                        for line in self.capture_text.lines() {
+                            if y + line_height > inner.bottom() {
+                                break;
+                            }
+                            clip.text(
+                                egui::pos2(inner.left(), y),
+                                egui::Align2::LEFT_TOP,
+                                line,
+                                font.clone(),
+                                text,
+                            );
+                            y += line_height;
+                        }
+
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            for (key, label) in [("Enter", "archive"), ("Esc", "cancel")] {
+                                ui.label(
+                                    RichText::new(format!("[{key}]"))
+                                        .font(font.clone())
+                                        .color(warn),
+                                );
+                                ui.label(RichText::new(label).font(font.clone()).color(dim));
+                                ui.add_space(10.0);
+                            }
+                        });
+                    });
+            });
+    }
+
     fn scratch_entries_dialog(&mut self, ctx: &egui::Context) {
         if !self.scratch_entries_open {
             return;
@@ -4830,8 +5055,7 @@ impl SlateApp {
                                 self.scratch_entries.len(),
                             );
                             let end = (start + visible_rows).min(self.scratch_entries.len());
-                            let displayed_rows = end.saturating_sub(start);
-                            let list_height = row_height * displayed_rows as f32;
+                            let list_height = row_height * visible_rows as f32;
                             let total_width = ui.available_width();
                             let column_gap = 8.0;
                             let left_width = (total_width * 0.5 - column_gap).min(420.0);
@@ -5671,7 +5895,7 @@ impl eframe::App for SlateApp {
                 let history_row_height = 22.0;
 
                 let command_line_active = self.command_line_focused || self.focus_command_line_once;
-                let command_suggestions = if command_line_active {
+                let command_suggestions = if command_line_active && self.command_history_index.is_none() {
                     self.command_line_suggestions()
                 } else {
                     Vec::new()
@@ -5726,6 +5950,7 @@ impl eframe::App for SlateApp {
                     && !self.save_as_open
                     && !self.scratch_modal_open
                     && !self.scratch_entries_open
+                    && !self.capture_modal_open
                     && !self.shortcut_help_open
                     && self.search_state.is_none();
                 let active_line_text_highlight = self
@@ -5757,6 +5982,7 @@ impl eframe::App for SlateApp {
                                     && !self.save_as_open
                                     && !self.scratch_modal_open
                                     && !self.scratch_entries_open
+                                    && !self.capture_modal_open
                                     && !self.command_line_focused
                                 {
                                     response.request_focus();
@@ -5786,6 +6012,7 @@ impl eframe::App for SlateApp {
                                 && !self.save_as_open
                                 && !self.scratch_modal_open
                                 && !self.scratch_entries_open
+                                && !self.capture_modal_open
                                 && !self.command_line_focused
                             {
                                 response.request_focus();
@@ -5835,6 +6062,8 @@ impl eframe::App for SlateApp {
                     "scratch"
                 } else if self.scratch_entries_open {
                     "scratch entries"
+                } else if self.capture_modal_open {
+                    "capture"
                 } else if self.search_state.is_some() {
                     "find"
                 } else if self.settings_open {
@@ -6172,6 +6401,8 @@ impl eframe::App for SlateApp {
                         ("scratch  Ctrl+S archive · Ctrl+E entries · Esc hide · :scratch resume".to_string(), footer_accent)
                     } else if self.scratch_entries_open {
                         ("scratch entries  ↑↓ select · Ctrl+D/Delete delete · Esc close".to_string(), footer_accent)
+                    } else if self.capture_modal_open {
+                        ("capture  type optional title · Enter archive · Esc cancel".to_string(), footer_accent)
                     } else {
                         (
                             "command  Ctrl+. enter · Ctrl+H help · Ctrl+P palette · w · q · wq"
@@ -6190,6 +6421,7 @@ impl eframe::App for SlateApp {
         self.file_picker_dialog(&ctx);
         self.save_as_dialog(&ctx);
         self.scratch_modal_dialog(&ctx);
+        self.capture_dialog(&ctx);
         self.scratch_entries_dialog(&ctx);
     }
 }

@@ -112,6 +112,15 @@ In-app scratch capture:
 
 The in-app scratch modal archives with `Ctrl+S`, opens archived entries with `Ctrl+E`, hides with `Esc`, and resumes with `:scratch` if it still has pending text.
 
+Capture selection/current line:
+
+```text
+:capture
+:cap
+```
+
+The capture modal focuses the optional title field automatically. Press `Enter` empty to archive without a title, or type context first and press `Enter`.
+
 Scratch entries review:
 
 ```text
@@ -176,6 +185,7 @@ Examples:
 :e ~/notes/todo.md
 :save-as           # Slate-owned save-as modal
 :scratch           # In-app quick capture modal
+:capture           # Capture selection/current line to scratch with optional title
 :scratch-entries   # Review and clean archived scratch entries
 :new
 :preview
