@@ -502,6 +502,45 @@ impl EditorView {
                 moved = true;
             }
 
+            let ctrl_shift_home = input.consume_key(
+                egui::Modifiers {
+                    alt: false,
+                    ctrl: true,
+                    shift: true,
+                    mac_cmd: false,
+                    command: false,
+                },
+                Key::Home,
+            );
+            let ctrl_shift_end = input.consume_key(
+                egui::Modifiers {
+                    alt: false,
+                    ctrl: true,
+                    shift: true,
+                    mac_cmd: false,
+                    command: false,
+                },
+                Key::End,
+            );
+            if ctrl_shift_home || input.consume_key(egui::Modifiers::CTRL, Key::Home) {
+                let anchor = Self::selection_anchor(buffer);
+                if ctrl_shift_home {
+                    buffer.clear_selection();
+                }
+                buffer.move_to_top();
+                Self::extend_selection(buffer, anchor, ctrl_shift_home);
+                moved = true;
+            }
+            if ctrl_shift_end || input.consume_key(egui::Modifiers::CTRL, Key::End) {
+                let anchor = Self::selection_anchor(buffer);
+                if ctrl_shift_end {
+                    buffer.clear_selection();
+                }
+                buffer.move_to_bottom();
+                Self::extend_selection(buffer, anchor, ctrl_shift_end);
+                moved = true;
+            }
+
             let shift_home = input.consume_key(egui::Modifiers::SHIFT, Key::Home);
             if shift_home || input.consume_key(egui::Modifiers::NONE, Key::Home) {
                 let anchor = Self::selection_anchor(buffer);
