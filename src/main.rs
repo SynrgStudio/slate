@@ -60,9 +60,6 @@ enum Command {
     Open,
     Save,
     SaveAs,
-    VaultSet,
-    VaultOpen,
-    VaultStatus,
     Scratch,
     ScratchEntries,
     Capture,
@@ -153,27 +150,6 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         summary: "Open last file",
         hint: "Ctrl+O L",
         palette_command: None,
-    },
-    CommandSpec {
-        name: "vault-set",
-        aliases: &["vault"],
-        summary: "Select and initialize a Slate vault folder",
-        hint: ":vault-set",
-        palette_command: Some(Command::VaultSet),
-    },
-    CommandSpec {
-        name: "vault-open",
-        aliases: &["open-vault"],
-        summary: "Open the configured vault root",
-        hint: ":vault-open",
-        palette_command: Some(Command::VaultOpen),
-    },
-    CommandSpec {
-        name: "vault-status",
-        aliases: &["vault-info"],
-        summary: "Show the configured vault root",
-        hint: ":vault-status",
-        palette_command: Some(Command::VaultStatus),
     },
     CommandSpec {
         name: "recent",
@@ -458,7 +434,6 @@ struct DuplicatePlacement {
 enum FilePickerMode {
     Open,
     Browse,
-    VaultSet,
 }
 
 struct CommandUsage {
@@ -496,7 +471,6 @@ struct SlateApp {
     line_number_mode: LineNumberMode,
     ctrl_shift_move_mode: CtrlShiftMoveMode,
     last_opened_path: Option<PathBuf>,
-    vault_path: Option<PathBuf>,
     recent_files: Vec<PathBuf>,
     recent_picker_open: bool,
     recent_query: String,
@@ -509,9 +483,6 @@ struct SlateApp {
     project_files: Vec<PathBuf>,
     selected_project_file: usize,
     pending_project_file_path: Option<PathBuf>,
-    vault_folder_create_open: bool,
-    vault_folder_name: String,
-    vault_folder_name_focus_once: bool,
     save_as_open: bool,
     save_as_dir: PathBuf,
     save_as_filename: String,
@@ -575,7 +546,6 @@ impl SlateApp {
             line_number_mode: LineNumberMode::Absolute,
             ctrl_shift_move_mode: CtrlShiftMoveMode::Vim,
             last_opened_path: None,
-            vault_path: None,
             recent_files: Vec::new(),
             recent_picker_open: false,
             recent_query: String::new(),
@@ -588,9 +558,6 @@ impl SlateApp {
             project_files: Vec::new(),
             selected_project_file: 0,
             pending_project_file_path: None,
-            vault_folder_create_open: false,
-            vault_folder_name: String::new(),
-            vault_folder_name_focus_once: false,
             save_as_open: false,
             save_as_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             save_as_filename: String::new(),
@@ -668,9 +635,6 @@ impl SlateApp {
     }
 
     fn scratch_archive_path(&mut self) -> Option<PathBuf> {
-        if let Some(vault) = &self.vault_path {
-            return Some(vault.join("scratch.md"));
-        }
         let Some(mut dir) = dirs_next::data_dir() else {
             self.status = "Scratch failed: no data dir".to_string();
             return None;
@@ -1195,108 +1159,6 @@ impl SlateApp {
         self.open_file_picker_at(self.project_root(), FilePickerMode::Open);
     }
 
-    fn open_vault_set_modal(&mut self) {
-        let root = dirs_next::home_dir()
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
-        self.open_file_picker_at(root, FilePickerMode::VaultSet);
-        self.status = "Select vault folder".to_string();
-    }
-
-    fn open_vault_folder_create_modal(&mut self) {
-        if self.file_picker_mode != FilePickerMode::VaultSet {
-            return;
-        }
-        self.vault_folder_create_open = true;
-        self.vault_folder_name.clear();
-        self.vault_folder_name_focus_once = true;
-        self.status = "Create vault folder".to_string();
-    }
-
-    fn create_vault_folder_from_modal(&mut self) {
-        if self.file_picker_mode != FilePickerMode::VaultSet {
-            return;
-        }
-        let name = self.vault_folder_name.trim();
-        if name.is_empty() {
-            self.status = "Folder name required".to_string();
-            return;
-        }
-        if name == "." || name == ".." || name.contains('/') || name.contains('\\') {
-            self.status = "Folder name cannot contain path separators".to_string();
-            return;
-        }
-        let path = self.file_picker_dir.join(name);
-        if path.exists() {
-            self.status = format!("Folder already exists: {}", path.display());
-            return;
-        }
-        match fs::create_dir_all(&path) {
-            Ok(_) => {
-                self.vault_folder_create_open = false;
-                self.vault_folder_name.clear();
-                self.file_picker_dir = path;
-                self.file_query.clear();
-                self.refresh_file_picker_entries();
-                self.status = "Folder created; press Enter to use it as vault".to_string();
-            }
-            Err(err) => self.status = format!("Create folder failed: {err}"),
-        }
-    }
-
-    fn initialize_vault(&mut self, path: PathBuf) {
-        if let Err(err) = fs::create_dir_all(&path) {
-            self.status = format!("Vault setup failed: {err}");
-            return;
-        }
-        for dir in ["daily", "ideas", "projects"] {
-            if let Err(err) = fs::create_dir_all(path.join(dir)) {
-                self.status = format!("Vault setup failed: {err}");
-                return;
-            }
-        }
-        let scratch = path.join("scratch.md");
-        if !scratch.exists() {
-            if let Err(err) = fs::write(&scratch, "# Scratch\n") {
-                self.status = format!("Vault setup failed: {err}");
-                return;
-            }
-        }
-        let readme = path.join("README.md");
-        if !readme.exists() {
-            let contents = "# Slate Vault\n\nLocal-first Slate knowledge workspace.\n\n- `scratch.md` — capture inbox\n- `daily/` — daily notes\n- `ideas/` — ideas and notes\n- `projects/` — project notes\n";
-            if let Err(err) = fs::write(&readme, contents) {
-                self.status = format!("Vault setup failed: {err}");
-                return;
-            }
-        }
-        self.vault_path = Some(path.clone());
-        match self.save_settings() {
-            Ok(_) => {
-                self.file_picker_open = false;
-                self.status = format!("Vault set: {}", path.display());
-                self.focus_editor_once = true;
-            }
-            Err(err) => self.status = format!("Vault saved locally but config failed: {err}"),
-        }
-    }
-
-    fn open_vault_root(&mut self) {
-        let Some(path) = self.vault_path.clone() else {
-            self.status = "No vault configured; run :vault-set".to_string();
-            return;
-        };
-        self.open_file_picker_at(path, FilePickerMode::Open);
-    }
-
-    fn show_vault_status(&mut self) {
-        self.status = self
-            .vault_path
-            .as_ref()
-            .map(|path| format!("Vault: {}", path.display()))
-            .unwrap_or_else(|| "No vault configured; run :vault-set".to_string());
-    }
-
     fn open_file_picker_at(&mut self, dir: PathBuf, mode: FilePickerMode) {
         self.shortcut_help_open = false;
         self.palette_open = false;
@@ -1418,26 +1280,10 @@ impl SlateApp {
     }
 
     fn open_selected_project_file(&mut self) {
-        let indices = self.project_file_indices();
-        if self.file_picker_mode == FilePickerMode::VaultSet {
-            if indices.contains(&self.selected_project_file) {
-                if let Some(path) = self.project_files.get(self.selected_project_file).cloned() {
-                    if path.is_dir() {
-                        self.initialize_vault(path);
-                    } else {
-                        self.status = "Select a folder for the vault".to_string();
-                    }
-                    return;
-                }
-            }
-            if self.file_query.trim().is_empty() {
-                self.initialize_vault(self.file_picker_dir.clone());
-            } else {
-                self.status = "No matching folder; press Ctrl+N to create one".to_string();
-            }
-            return;
-        }
-        if !indices.contains(&self.selected_project_file) {
+        if !self
+            .project_file_indices()
+            .contains(&self.selected_project_file)
+        {
             self.status = "No matching file".to_string();
             return;
         }
@@ -1655,12 +1501,6 @@ impl SlateApp {
                         self.last_opened_path = Some(PathBuf::from(value));
                     }
                 }
-                "vault_path" => {
-                    let value = Self::parse_config_string(value);
-                    if !value.is_empty() {
-                        self.vault_path = Some(PathBuf::from(value));
-                    }
-                }
                 "command_history" => {
                     let value = Self::parse_config_string(value);
                     if !value.is_empty() && self.command_history.last() != Some(&value) {
@@ -1776,7 +1616,7 @@ impl SlateApp {
             .ok_or_else(|| "invalid config path".to_string())?;
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
         let mut contents = format!(
-            "command_history_limit = {}\nline_number_mode = \"{}\"\nword_wrap = {}\npreview_mode = {}\nctrl_shift_move_mode = \"{}\"\nlast_opened_path = \"{}\"\nvault_path = \"{}\"\n",
+            "command_history_limit = {}\nline_number_mode = \"{}\"\nword_wrap = {}\npreview_mode = {}\nctrl_shift_move_mode = \"{}\"\nlast_opened_path = \"{}\"\n",
             self.command_history_limit,
             self.line_number_mode.config_value(),
             self.wrap,
@@ -1785,13 +1625,6 @@ impl SlateApp {
             Self::escape_config_string(
                 &self
                     .last_opened_path
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_default()
-            ),
-            Self::escape_config_string(
-                &self
-                    .vault_path
                     .as_ref()
                     .map(|path| path.display().to_string())
                     .unwrap_or_default()
@@ -1886,9 +1719,6 @@ impl SlateApp {
             Command::Open => "open",
             Command::Save => "save",
             Command::SaveAs => "save-as",
-            Command::VaultSet => "vault-set",
-            Command::VaultOpen => "vault-open",
-            Command::VaultStatus => "vault-status",
             Command::Scratch => "scratch",
             Command::ScratchEntries => "scratch-entries",
             Command::Capture => "capture",
@@ -2011,9 +1841,6 @@ impl SlateApp {
             }
             Command::Save => self.save(),
             Command::SaveAs => self.open_save_as_modal(),
-            Command::VaultSet => self.open_vault_set_modal(),
-            Command::VaultOpen => self.open_vault_root(),
-            Command::VaultStatus => self.show_vault_status(),
             Command::Scratch => self.open_scratch_modal(),
             Command::ScratchEntries => self.open_scratch_entries_modal(),
             Command::Capture => self.open_capture_modal(),
@@ -2087,21 +1914,10 @@ impl SlateApp {
         true
     }
 
-    fn command_spec_available(&self, spec: &CommandSpec) -> bool {
-        match spec.name {
-            "vault-set" => self.vault_path.is_none(),
-            "vault-open" | "vault-status" => self.vault_path.is_some(),
-            _ => true,
-        }
-    }
-
     fn matching_command_specs(&self, prefix: &str, limit: usize) -> Vec<&'static CommandSpec> {
         let query = prefix.trim_start_matches(':').to_lowercase();
         if query.is_empty() {
-            let mut specs = COMMAND_SPECS
-                .iter()
-                .filter(|spec| self.command_spec_available(spec))
-                .collect::<Vec<_>>();
+            let mut specs = COMMAND_SPECS.iter().collect::<Vec<_>>();
             specs.sort_by_key(|spec| {
                 let boost = self.command_usage_boost(spec.name);
                 (std::cmp::Reverse(boost), spec.name.len(), spec.name)
@@ -2111,7 +1927,6 @@ impl SlateApp {
 
         let mut scored = COMMAND_SPECS
             .iter()
-            .filter(|spec| self.command_spec_available(spec))
             .filter_map(|spec| Self::command_spec_score(spec, &query).map(|score| (score, spec)))
             .collect::<Vec<_>>();
         scored.sort_by_key(|(score, spec)| {
@@ -2210,9 +2025,6 @@ impl SlateApp {
         match command {
             "w" | "write" | "save" => self.run_command(Command::Save, ctx),
             "save-as" | "saveas" | "write-as" => self.run_command(Command::SaveAs, ctx),
-            "vault-set" | "vault" => self.run_command(Command::VaultSet, ctx),
-            "vault-open" | "open-vault" => self.run_command(Command::VaultOpen, ctx),
-            "vault-status" | "vault-info" => self.run_command(Command::VaultStatus, ctx),
             "scratch" | "sc" => self.run_command(Command::Scratch, ctx),
             "scratch-entries" | "scratch-log" | "scl" => {
                 self.run_command(Command::ScratchEntries, ctx)
@@ -3412,9 +3224,6 @@ impl SlateApp {
         let mut file_enter_dir = false;
         let mut file_parent = false;
         let mut file_backspace = false;
-        let mut file_create_folder = false;
-        let mut vault_folder_confirm = false;
-        let mut vault_folder_cancel = false;
         let mut save_as_previous = false;
         let mut save_as_next = false;
         let mut save_as_enter = false;
@@ -3467,19 +3276,13 @@ impl SlateApp {
                 recent_open |= i.consume_key(egui::Modifiers::NONE, Key::Space);
                 recent_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
             }
-            if self.vault_folder_create_open {
-                vault_folder_confirm |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
-                vault_folder_cancel |= i.consume_key(egui::Modifiers::NONE, Key::Escape);
-            } else if self.file_picker_open {
+            if self.file_picker_open {
                 file_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
                 file_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
                 file_enter_dir |= i.consume_key(egui::Modifiers::NONE, Key::ArrowRight);
                 file_parent |= i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft);
                 file_open |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
                 file_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
-                if self.file_picker_mode == FilePickerMode::VaultSet {
-                    file_create_folder |= i.consume_key(egui::Modifiers::CTRL, Key::N);
-                }
             }
             if self.save_as_open {
                 save_as_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
@@ -3568,8 +3371,7 @@ impl SlateApp {
                 search_accept |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
                 search_cancel |= i.consume_key(egui::Modifiers::NONE, Key::Escape);
             }
-            if !self.file_picker_open
-                && !self.scratch_modal_open
+            if !self.scratch_modal_open
                 && !self.scratch_entries_open
                 && !self.capture_modal_open
                 && i.consume_key(egui::Modifiers::CTRL, Key::N)
@@ -3652,7 +3454,6 @@ impl SlateApp {
                     self.focus_editor_once = true;
                 } else if self.file_picker_open {
                     self.file_picker_open = false;
-                    self.vault_folder_create_open = false;
                     self.pending_project_file_path = None;
                     self.focus_editor_once = true;
                 } else if self.save_as_open {
@@ -3711,17 +3512,6 @@ impl SlateApp {
             return;
         }
 
-        if vault_folder_confirm {
-            self.create_vault_folder_from_modal();
-            return;
-        }
-
-        if vault_folder_cancel {
-            self.vault_folder_create_open = false;
-            self.vault_folder_name.clear();
-            return;
-        }
-
         if search_cursor_after {
             self.place_cursor_at_search_edge(true);
             return;
@@ -3756,7 +3546,7 @@ impl SlateApp {
             self.handle_recent_picker_text_input(ctx);
         }
 
-        if self.file_picker_open && !self.vault_folder_create_open {
+        if self.file_picker_open {
             self.handle_file_picker_text_input(ctx);
         }
 
@@ -3799,11 +3589,6 @@ impl SlateApp {
         if file_backspace {
             self.file_query.pop();
             self.selected_project_file = self.project_file_indices().first().copied().unwrap_or(0);
-            return;
-        }
-
-        if file_create_folder {
-            self.open_vault_folder_create_modal();
             return;
         }
 
@@ -4752,10 +4537,10 @@ impl SlateApp {
                         let warn = Color32::from_rgb(235, 203, 139);
 
                         ui.horizontal(|ui| {
-                            let title = match self.file_picker_mode {
-                                FilePickerMode::Open => "open",
-                                FilePickerMode::Browse => "files",
-                                FilePickerMode::VaultSet => "vault set",
+                            let title = if self.file_picker_mode == FilePickerMode::Open {
+                                "open"
+                            } else {
+                                "files"
                             };
                             ui.label(RichText::new(title).font(title_font).color(accent));
                             ui.label(
@@ -4965,23 +4750,14 @@ impl SlateApp {
 
                         ui.add_space(10.0);
                         ui.horizontal(|ui| {
-                            let enter_label = if self.file_picker_mode == FilePickerMode::VaultSet {
-                                "choose"
-                            } else {
-                                "open"
-                            };
-                            let mut hints = vec![
+                            for (key, label) in [
                                 ("↑↓", "select"),
                                 ("type", "filter"),
                                 ("→", "enter dir"),
                                 ("←", "parent"),
-                                ("enter", enter_label),
-                            ];
-                            if self.file_picker_mode == FilePickerMode::VaultSet {
-                                hints.push(("ctrl+n", "new folder"));
-                            }
-                            hints.push(("esc", "close"));
-                            for (key, label) in hints {
+                                ("enter", "open"),
+                                ("esc", "close"),
+                            ] {
                                 ui.label(
                                     RichText::new(format!("[{key}]"))
                                         .font(font.clone())
@@ -4990,84 +4766,6 @@ impl SlateApp {
                                 ui.label(RichText::new(label).font(font.clone()).color(dim));
                                 ui.add_space(10.0);
                             }
-                            if self.file_picker_mode == FilePickerMode::VaultSet
-                                && ui
-                                    .button(RichText::new("+ new folder").font(font.clone()))
-                                    .clicked()
-                            {
-                                self.open_vault_folder_create_modal();
-                            }
-                        });
-                    });
-            });
-    }
-
-    fn vault_folder_create_dialog(&mut self, ctx: &egui::Context) {
-        if !self.vault_folder_create_open {
-            return;
-        }
-
-        egui::Area::new("vault_folder_create_dialog".into())
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, -40.0])
-            .order(egui::Order::Tooltip)
-            .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(25, 31, 40))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(136, 192, 208)))
-                    .corner_radius(0.0)
-                    .inner_margin(14.0)
-                    .shadow(egui::epaint::Shadow {
-                        offset: [0, 10],
-                        blur: 24,
-                        spread: 0,
-                        color: Color32::from_black_alpha(180),
-                    })
-                    .show(ui, |ui| {
-                        ui.set_width(460.0);
-                        let font = FontId::new(13.0, FontFamily::Monospace);
-                        let title_font = FontId::new(16.0, FontFamily::Monospace);
-                        let accent = Color32::from_rgb(136, 192, 208);
-                        let text = Color32::from_rgb(216, 222, 233);
-                        let dim = Color32::from_rgb(136, 154, 176);
-                        let warn = Color32::from_rgb(235, 203, 139);
-
-                        ui.label(
-                            RichText::new("create vault folder")
-                                .font(title_font)
-                                .color(accent),
-                        );
-                        ui.add_space(6.0);
-                        ui.label(
-                            RichText::new(format!("inside {}", self.file_picker_dir.display()))
-                                .font(font.clone())
-                                .color(dim),
-                        );
-                        ui.add_space(10.0);
-                        let response = ui.add(
-                            TextEdit::singleline(&mut self.vault_folder_name)
-                                .hint_text("folder name")
-                                .desired_width(f32::INFINITY)
-                                .font(font.clone())
-                                .text_color(text)
-                                .frame(egui::Frame::NONE),
-                        );
-                        if self.vault_folder_name_focus_once {
-                            response.request_focus();
-                            ui.memory_mut(|memory| memory.request_focus(response.id));
-                            self.vault_folder_name_focus_once = false;
-                            ctx.request_repaint();
-                        }
-                        ui.add_space(10.0);
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("[enter]").font(font.clone()).color(warn));
-                            ui.label(
-                                RichText::new("create and enter folder")
-                                    .font(font.clone())
-                                    .color(dim),
-                            );
-                            ui.add_space(12.0);
-                            ui.label(RichText::new("[esc]").font(font.clone()).color(warn));
-                            ui.label(RichText::new("cancel").font(font.clone()).color(dim));
                         });
                     });
             });
@@ -6696,15 +6394,7 @@ impl eframe::App for SlateApp {
                             footer_accent,
                         )
                     } else if self.file_picker_open {
-                        if self.file_picker_mode == FilePickerMode::VaultSet {
-                            if self.vault_folder_create_open {
-                                ("vault folder  type name · Enter create and enter · Esc cancel".to_string(), footer_accent)
-                            } else {
-                                ("vault set  Ctrl+N new folder · ↑↓ select · → enter · ← parent · Enter choose · Esc close".to_string(), footer_accent)
-                            }
-                        } else {
-                            ("files  type filter · ↑↓ select · → enter folder · ← parent · Enter open · Esc close".to_string(), footer_accent)
-                        }
+                        ("files  type filter · ↑↓ select · → enter folder · ← parent · Enter open · Esc close".to_string(), footer_accent)
                     } else if self.save_as_open {
                         ("save as  type file name · ↑↓ select · → enter folder · ← parent · Enter save · Esc close".to_string(), footer_accent)
                     } else if self.scratch_modal_open {
@@ -6729,7 +6419,6 @@ impl eframe::App for SlateApp {
         self.settings_dialog(&ctx);
         self.shortcut_help_dialog(&ctx);
         self.file_picker_dialog(&ctx);
-        self.vault_folder_create_dialog(&ctx);
         self.save_as_dialog(&ctx);
         self.scratch_modal_dialog(&ctx);
         self.capture_dialog(&ctx);

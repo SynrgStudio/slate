@@ -97,23 +97,6 @@ slate
 slate ~/notes.md
 ```
 
-Vault mode:
-
-```text
-:vault-set
-:vault
-```
-
-When no vault is configured, Slate only suggests the setup command. Once configured, vault commands such as `:vault-open` and `:vault-status` become available. In `:vault-set`, press `Ctrl+N` to open a small create-folder modal, type the folder name, press `Enter` to create and enter it, then press `Enter` again to use it as the vault. `:vault-set` initializes the selected folder with:
-
-```text
-scratch.md
-daily/
-ideas/
-projects/
-README.md
-```
-
 Scratch mode:
 
 ```bash
@@ -201,9 +184,6 @@ Examples:
 :open ~/notes/todo.md
 :e ~/notes/todo.md
 :save-as           # Slate-owned save-as modal
-:vault-set         # Select/init optional Slate vault folder
-:vault-open        # Open configured vault root
-:vault-status      # Show configured vault root
 :scratch           # In-app quick capture modal
 :capture           # Capture selection/current line to scratch with optional title
 :scratch-entries   # Review and clean archived scratch entries

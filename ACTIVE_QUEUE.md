@@ -72,9 +72,8 @@ Scope:
 
 Status: pending
 Scope:
-- Deferred until T018 establishes the optional vault/root folder, so daily notes live in the same knowledge workspace as scratch, captures, links, and future search.
 - Add command to create/open today's note.
-- Use the configured vault's `daily/` directory and simple Markdown template.
+- Use a configurable notes directory and simple Markdown template.
 - Preserve the terminal-like, minimal interaction style.
 - Consider commands for `daily`, `yesterday`, `tomorrow`, and `append daily`.
 
@@ -187,21 +186,13 @@ Scope:
 
 ### T018 — Optional vault / local knowledge base
 
-Status: in_progress
+Status: pending
 Scope:
-- Do before T006 Daily Notes so scratch, captures, daily notes, links, and future search share one optional knowledge root.
-- Done: add contextual command availability so setup commands can appear before a vault exists and vault-only commands can appear after configuration.
-- Done: add `:vault-set` / `:vault` command that opens a Slate-owned folder picker for selecting a normal folder as Slate's optional knowledge workspace.
-- Done: initialize selected vault folders/files: `scratch.md`, `daily/`, `ideas/`, `projects/`, and `README.md`.
-- Done: support creating a new vault folder from the `:vault-set` modal with `Ctrl+N` / `+ new folder`, using a small name modal; Enter creates and enters the folder, then Enter again selects it as the vault.
-- Done: persist the configured vault in `~/.config/slate/config.toml`.
-- Done: add `:vault-open` / `:open-vault` and `:vault-status` / `:vault-info` commands once a vault is configured.
+- Add a `Select vault` command that picks a normal folder as Slate's optional knowledge workspace.
 - Keep Slate usable as a regular text editor even when no vault is selected.
 - Treat the configured vault as the root for scratch, daily notes, ideas, projects, wiki links, and search.
 - Use normal folders/files such as `daily/`, `scratch.md`, `ideas/`, and `projects/`.
-- Migrate/redirect future scratch and capture storage to `vault/scratch.md` when a vault exists, while preserving the current data-dir fallback when no vault is configured.
-- Add lightweight commands/status for showing and opening the current vault root.
-- Leave indexing/SQLite for T023 after the filesystem layout is stable.
+- Add commands for creating, opening, and searching notes within that root.
 
 ### T019 — Wiki links and note navigation
 
