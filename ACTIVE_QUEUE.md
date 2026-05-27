@@ -103,8 +103,9 @@ Scope:
 - Done: support inline code rendering for backtick spans where practical.
 - Done: polish headings in editor/preview while preserving direct plain-text editing.
 - Done: polish regular unordered/ordered lists in editor/preview while preserving direct plain-text editing.
-- Pending: support local Markdown links like `[text](./file.md)` with visual affordance and contextual open.
-- Pending: support `Ctrl+LeftClick` on web links to open them in the default browser and on local links to open them in Slate.
+- Done: support Markdown links like `[text](./file.md)` and `[text](https://example.com)` with editor/preview visual affordance.
+- Done: support contextual open for Markdown links via `:open-link`.
+- Done: support `Ctrl+LeftClick` on web links to open them in the default browser and on local links to open them in Slate.
 - Pending: support simple Markdown tables in preview only; no table editor or auto-alignment for now.
 
 ### T009 — Theme system
@@ -460,6 +461,18 @@ Scope:
 - Done: `Save` remains direct when the buffer already has a path; scratch/untitled buffers open the Slate `Save As` modal.
 - Done: preserved unsaved-change confirmation flows before opening/replacing buffers.
 - Done: removed the `rfd` dependency from `Cargo.toml`.
+
+### T048 — Assisted Markdown link insertion
+
+Status: pending
+Scope:
+- Add an assisted Markdown link flow triggered by typing `[[`, while preserving normal manual `[text](target)` editing.
+- Show a small cursor-adjacent picker with `Archivo` and `Web`, navigable with `↑↓`, `Enter`, and `Esc`.
+- For `Archivo`, reuse Slate-owned file selection to pick a local target and insert standard Markdown `[](relative/path.md)`.
+- For `Web`, show a focused mini input for the URL and insert standard Markdown `[](https://...)` on `Enter`.
+- After insertion, place the cursor inside the `[]` label so the user can immediately type the link text.
+- Resolve file targets relative to the current buffer when possible; fall back to project/current directory when the buffer has no path.
+- Keep the final document plain Markdown; `[[` is only the assist trigger, not a persistent custom link syntax.
 
 Command groups worth considering:
 

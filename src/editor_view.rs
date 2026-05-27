@@ -1,8 +1,9 @@
 use crate::{
     editor_buffer::EditorBuffer,
     markdown::{
-        CheckboxState, is_markdown_separator, parse_blockquote_line, parse_checkbox_line,
-        parse_fenced_code_marker, parse_heading_line, parse_inline_code_spans, parse_list_line,
+        CheckboxState, is_markdown_separator, markdown_link_target_at_byte, parse_blockquote_line,
+        parse_checkbox_line, parse_fenced_code_marker, parse_heading_line, parse_inline_code_spans,
+        parse_list_line, parse_markdown_link_spans,
     },
     search::SearchState,
 };
@@ -59,6 +60,7 @@ enum CodeLineKind<'a> {
 pub(crate) struct EditorView {
     scroll_y: f32,
     target_cursor: Option<usize>,
+    link_click_byte: Option<usize>,
 }
 
 impl EditorView {
@@ -66,6 +68,7 @@ impl EditorView {
         Self {
             scroll_y: 0.0,
             target_cursor: None,
+            link_click_byte: None,
         }
     }
 
@@ -153,8 +156,20 @@ impl EditorView {
                         end: 0,
                     });
                 let byte = self.byte_for_x(&painter, buffer, row, pos.x - text_x, &font);
-                buffer.set_cursor(byte);
-                self.request_scroll_to_cursor(buffer);
+                let ctrl_click = ui.input(|input| input.modifiers.ctrl || input.modifiers.command);
+                let clicked_link = ctrl_click
+                    && markdown_link_target_at_byte(
+                        buffer.line(row.line_index),
+                        buffer.line_start(row.line_index),
+                        byte,
+                    )
+                    .is_some();
+                if clicked_link {
+                    self.link_click_byte = Some(byte);
+                } else {
+                    buffer.set_cursor(byte);
+                    self.request_scroll_to_cursor(buffer);
+                }
             }
         }
 
@@ -1067,6 +1082,19 @@ impl EditorView {
                 }
             }
 
+            if self.paint_markdown_link_text(
+                painter,
+                buffer,
+                row,
+                text_x,
+                y,
+                line_height,
+                font,
+                text_color,
+            ) {
+                return;
+            }
+
             if self.paint_inline_code_text(
                 painter,
                 buffer,
@@ -1195,6 +1223,123 @@ impl EditorView {
                 text_color,
             );
         }
+    }
+
+    fn paint_markdown_link_text(
+        &self,
+        painter: &egui::Painter,
+        buffer: &EditorBuffer,
+        row: VisualRow,
+        text_x: f32,
+        y: f32,
+        line_height: f32,
+        font: &FontId,
+        text_color: Color32,
+    ) -> bool {
+        let line = buffer.line(row.line_index);
+        let line_start = buffer.line_start(row.line_index);
+        let spans = parse_markdown_link_spans(line);
+        if spans.is_empty()
+            || spans.iter().any(|span| {
+                buffer.cursor() >= line_start + span.marker_start
+                    && buffer.cursor() <= line_start + span.marker_end
+            })
+        {
+            return false;
+        }
+
+        let mut byte = row.start;
+        for span in spans {
+            let marker_start = line_start + span.marker_start;
+            let text_start = line_start + span.text_start;
+            let text_end = line_start + span.text_end;
+            let target_start = line_start + span.target_start;
+            let target_end = line_start + span.target_end;
+            let marker_end = line_start + span.marker_end;
+            if marker_end <= row.start || marker_start >= row.end {
+                continue;
+            }
+
+            for (start, end, color) in [
+                (byte, marker_start.min(row.end), text_color),
+                (
+                    marker_start.max(row.start),
+                    text_start.min(row.end),
+                    Color32::from_rgb(94, 105, 126),
+                ),
+                (
+                    text_start.max(row.start),
+                    text_end.min(row.end),
+                    Color32::from_rgb(136, 192, 208),
+                ),
+                (
+                    text_end.max(row.start),
+                    target_start.min(row.end),
+                    Color32::from_rgb(94, 105, 126),
+                ),
+                (
+                    target_start.max(row.start),
+                    target_end.min(row.end),
+                    Color32::from_rgb(163, 190, 140),
+                ),
+                (
+                    target_end.max(row.start),
+                    marker_end.min(row.end),
+                    Color32::from_rgb(94, 105, 126),
+                ),
+            ] {
+                if start < end {
+                    let x =
+                        text_x + self.text_width(painter, &buffer.as_str()[row.start..start], font);
+                    painter.text(
+                        egui::pos2(x, y + line_height * 0.5),
+                        egui::Align2::LEFT_CENTER,
+                        &buffer.as_str()[start..end],
+                        font.clone(),
+                        color,
+                    );
+                }
+            }
+
+            let underline_start_byte = text_start.max(row.start).min(row.end);
+            let underline_end_byte = text_end.max(row.start).min(row.end);
+            if underline_start_byte < underline_end_byte {
+                let underline_start = text_x
+                    + self.text_width(
+                        painter,
+                        &buffer.as_str()[row.start..underline_start_byte],
+                        font,
+                    );
+                let underline_end = text_x
+                    + self.text_width(
+                        painter,
+                        &buffer.as_str()[row.start..underline_end_byte],
+                        font,
+                    );
+                let underline_y = y + line_height - 3.0;
+                painter.line_segment(
+                    [
+                        egui::pos2(underline_start, underline_y),
+                        egui::pos2(underline_end, underline_y),
+                    ],
+                    Stroke::new(1.0, Color32::from_rgb(136, 192, 208)),
+                );
+            }
+            byte = marker_end.max(row.start).min(row.end);
+        }
+
+        if byte < row.end {
+            let x = text_x + self.text_width(painter, &buffer.as_str()[row.start..byte], font);
+            painter.text(
+                egui::pos2(x, y + line_height * 0.5),
+                egui::Align2::LEFT_CENTER,
+                &buffer.as_str()[byte..row.end],
+                font.clone(),
+                text_color,
+            );
+        }
+
+        true
     }
 
     fn paint_inline_code_text(
@@ -1409,6 +1554,10 @@ impl EditorView {
 
     pub(crate) fn request_scroll_to_cursor(&mut self, buffer: &EditorBuffer) {
         self.target_cursor = Some(buffer.cursor());
+    }
+
+    pub(crate) fn take_link_click_byte(&mut self) -> Option<usize> {
+        self.link_click_byte.take()
     }
 
     #[allow(dead_code)]

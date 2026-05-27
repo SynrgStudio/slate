@@ -100,6 +100,62 @@ pub(crate) fn parse_heading_line(line: &str) -> Option<ParsedHeadingLine<'_>> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MarkdownLinkSpan {
+    pub(crate) marker_start: usize,
+    pub(crate) text_start: usize,
+    pub(crate) text_end: usize,
+    pub(crate) target_start: usize,
+    pub(crate) target_end: usize,
+    pub(crate) marker_end: usize,
+}
+
+pub(crate) fn markdown_link_target_at_byte(
+    line: &str,
+    line_start: usize,
+    byte: usize,
+) -> Option<&str> {
+    parse_markdown_link_spans(line)
+        .into_iter()
+        .find(|span| byte >= line_start + span.marker_start && byte <= line_start + span.marker_end)
+        .map(|span| &line[span.target_start..span.target_end])
+}
+
+pub(crate) fn parse_markdown_link_spans(line: &str) -> Vec<MarkdownLinkSpan> {
+    let mut spans = Vec::new();
+    let mut search_from = 0;
+    while let Some(open_relative) = line[search_from..].find('[') {
+        let marker_start = search_from + open_relative;
+        let text_start = marker_start + 1;
+        let Some(close_text_relative) = line[text_start..].find(']') else {
+            break;
+        };
+        let text_end = text_start + close_text_relative;
+        if text_start == text_end || line.as_bytes().get(text_end + 1) != Some(&b'(') {
+            search_from = text_end.saturating_add(1);
+            continue;
+        }
+        let target_start = text_end + 2;
+        let Some(close_target_relative) = line[target_start..].find(')') else {
+            break;
+        };
+        let target_end = target_start + close_target_relative;
+        let marker_end = target_end + 1;
+        if target_start < target_end {
+            spans.push(MarkdownLinkSpan {
+                marker_start,
+                text_start,
+                text_end,
+                target_start,
+                target_end,
+                marker_end,
+            });
+        }
+        search_from = marker_end;
+    }
+    spans
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct InlineCodeSpan {
     pub(crate) marker_start: usize,
     pub(crate) code_start: usize,
@@ -287,6 +343,49 @@ mod tests {
 
         assert!(parse_heading_line("#Nope").is_none());
         assert!(parse_heading_line("####### Too much").is_none());
+    }
+
+    #[test]
+    fn finds_markdown_link_target_at_byte() {
+        let line = "see [note](./note.md)";
+
+        assert_eq!(
+            markdown_link_target_at_byte(line, 10, 15),
+            Some("./note.md")
+        );
+        assert_eq!(
+            markdown_link_target_at_byte(line, 10, 31),
+            Some("./note.md")
+        );
+        assert_eq!(markdown_link_target_at_byte(line, 10, 10), None);
+    }
+
+    #[test]
+    fn parses_markdown_link_spans() {
+        assert_eq!(
+            parse_markdown_link_spans("see [note](./note.md) and [web](https://example.com)"),
+            vec![
+                MarkdownLinkSpan {
+                    marker_start: 4,
+                    text_start: 5,
+                    text_end: 9,
+                    target_start: 11,
+                    target_end: 20,
+                    marker_end: 21,
+                },
+                MarkdownLinkSpan {
+                    marker_start: 26,
+                    text_start: 27,
+                    text_end: 30,
+                    target_start: 32,
+                    target_end: 51,
+                    marker_end: 52,
+                },
+            ]
+        );
+        assert!(parse_markdown_link_spans("[empty]()").is_empty());
+        assert!(parse_markdown_link_spans("[](./note.md)").is_empty());
+        assert!(parse_markdown_link_spans("[broken](./note.md").is_empty());
     }
 
     #[test]

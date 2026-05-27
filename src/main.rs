@@ -8,6 +8,7 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
+    process::Command as ProcessCommand,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -19,8 +20,9 @@ use eframe::egui::{
 };
 use goto::GotoTarget;
 use markdown::{
-    CheckboxState, is_markdown_separator, parse_blockquote_line, parse_checkbox_line,
-    parse_fenced_code_marker, parse_heading_line, parse_inline_code_spans, parse_list_line,
+    CheckboxState, is_markdown_separator, markdown_link_target_at_byte, parse_blockquote_line,
+    parse_checkbox_line, parse_fenced_code_marker, parse_heading_line, parse_inline_code_spans,
+    parse_list_line, parse_markdown_link_spans,
 };
 use search::SearchState;
 
@@ -78,6 +80,7 @@ enum Command {
     PreviewOn,
     PreviewOff,
     DocTasks,
+    OpenLink,
     Quit,
 }
 
@@ -233,6 +236,13 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         summary: "Disable Markdown preview",
         hint: ":preview off",
         palette_command: Some(Command::PreviewOff),
+    },
+    CommandSpec {
+        name: "open-link",
+        aliases: &["olink", "follow-link"],
+        summary: "Open Markdown link under cursor",
+        hint: ":open-link",
+        palette_command: Some(Command::OpenLink),
     },
     CommandSpec {
         name: "doc-tasks",
@@ -659,6 +669,72 @@ impl SlateApp {
             }
             Err(err) => self.status = format!("Open failed: {err}"),
         }
+    }
+
+    fn markdown_link_target_at_byte(&self, byte: usize) -> Option<&str> {
+        let line_index = self.buffer.line_index_for_byte(byte);
+        let line_start = self.buffer.line_start(line_index);
+        markdown_link_target_at_byte(self.buffer.line(line_index), line_start, byte)
+    }
+
+    fn open_link_under_cursor(&mut self) {
+        self.open_markdown_link_at_byte(self.buffer.cursor());
+    }
+
+    fn open_markdown_link_at_byte(&mut self, byte: usize) {
+        let Some(target) = self.markdown_link_target_at_byte(byte).map(str::to_string) else {
+            self.status = "No Markdown link under cursor".to_string();
+            return;
+        };
+        self.open_markdown_link_target(&target);
+    }
+
+    fn open_markdown_link_target(&mut self, target: &str) {
+        let target = target.trim();
+        if target.starts_with("http://") || target.starts_with("https://") {
+            match ProcessCommand::new("xdg-open").arg(target).spawn() {
+                Ok(_) => self.status = format!("Opened link {target}"),
+                Err(err) => self.status = format!("Open link failed: {err}"),
+            }
+            return;
+        }
+
+        let path_part = target
+            .split_once('#')
+            .map(|(path, _)| path)
+            .unwrap_or(target);
+        if path_part.trim().is_empty() {
+            self.status = "Link has no local file target".to_string();
+            return;
+        }
+        if self.dirty {
+            self.status = "Save or discard changes before opening a Markdown link".to_string();
+            return;
+        }
+
+        let path = self.resolve_markdown_link_path(path_part);
+        if path.exists() {
+            self.open_path(path);
+        } else {
+            self.status = format!("Link target not found: {}", path.display());
+        }
+    }
+
+    fn resolve_markdown_link_path(&self, target: &str) -> PathBuf {
+        let expanded = target
+            .strip_prefix("~/")
+            .and_then(|rest| dirs_next::home_dir().map(|home| home.join(rest)))
+            .unwrap_or_else(|| PathBuf::from(target));
+        if expanded.is_absolute() {
+            return expanded;
+        }
+
+        let base = self
+            .path
+            .as_ref()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        base.join(expanded)
     }
 
     fn save(&mut self) {
@@ -1939,6 +2015,7 @@ impl SlateApp {
             Command::PreviewOn => "preview-on",
             Command::PreviewOff => "preview-off",
             Command::DocTasks => "doc-tasks",
+            Command::OpenLink => "open-link",
             Command::Quit => "quit",
         }
     }
@@ -2062,6 +2139,7 @@ impl SlateApp {
             Command::PreviewOn => self.set_preview_mode(true),
             Command::PreviewOff => self.set_preview_mode(false),
             Command::DocTasks => self.open_doc_tasks(),
+            Command::OpenLink => self.open_link_under_cursor(),
             Command::LineNumbersAbsolute => self.set_line_number_mode(LineNumberMode::Absolute),
             Command::LineNumbersRelative => self.set_line_number_mode(LineNumberMode::Relative),
             Command::Settings => {
@@ -2296,6 +2374,7 @@ impl SlateApp {
             "preview-on" | "md-on" => self.run_command(Command::PreviewOn, ctx),
             "preview-off" | "md-off" => self.run_command(Command::PreviewOff, ctx),
             "doc-tasks" | "tasks" => self.run_command(Command::DocTasks, ctx),
+            "open-link" | "olink" | "follow-link" => self.run_command(Command::OpenLink, ctx),
             "wrap" => {
                 let arg = parts.next();
                 match arg.and_then(Self::parse_config_bool) {
@@ -6355,6 +6434,85 @@ impl SlateApp {
         }
     }
 
+    fn markdown_link_preview_label(ui: &mut egui::Ui, line: &str) -> bool {
+        let spans = parse_markdown_link_spans(line);
+        if spans.is_empty() {
+            return false;
+        }
+
+        let font = FontId::new(15.0, FontFamily::Monospace);
+        let mut sections = Vec::new();
+        let mut byte = 0;
+        for span in spans {
+            for (start, end, color, underline) in [
+                (
+                    byte,
+                    span.marker_start,
+                    Color32::from_rgb(216, 222, 233),
+                    false,
+                ),
+                (
+                    span.marker_start,
+                    span.text_start,
+                    Color32::from_rgb(94, 105, 126),
+                    false,
+                ),
+                (
+                    span.text_start,
+                    span.text_end,
+                    Color32::from_rgb(136, 192, 208),
+                    true,
+                ),
+                (
+                    span.text_end,
+                    span.target_start,
+                    Color32::from_rgb(94, 105, 126),
+                    false,
+                ),
+                (
+                    span.target_start,
+                    span.target_end,
+                    Color32::from_rgb(163, 190, 140),
+                    false,
+                ),
+                (
+                    span.target_end,
+                    span.marker_end,
+                    Color32::from_rgb(94, 105, 126),
+                    false,
+                ),
+            ] {
+                if start < end {
+                    let mut format = TextFormat::simple(font.clone(), color);
+                    if underline {
+                        format.underline = Stroke::new(1.0, color);
+                    }
+                    sections.push(LayoutSection {
+                        leading_space: 0.0,
+                        byte_range: start..end,
+                        format,
+                    });
+                }
+            }
+            byte = span.marker_end;
+        }
+        if byte < line.len() {
+            sections.push(LayoutSection {
+                leading_space: 0.0,
+                byte_range: byte..line.len(),
+                format: TextFormat::simple(font, Color32::from_rgb(216, 222, 233)),
+            });
+        }
+
+        ui.label(LayoutJob {
+            text: line.to_string(),
+            sections,
+            break_on_newline: false,
+            ..Default::default()
+        });
+        true
+    }
+
     fn inline_code_preview_label(ui: &mut egui::Ui, line: &str) -> bool {
         let spans = parse_inline_code_spans(line);
         if spans.is_empty() {
@@ -6541,7 +6699,9 @@ impl SlateApp {
                     });
                 } else if trimmed.is_empty() {
                     ui.add_space(8.0);
-                } else if !Self::inline_code_preview_label(ui, line) {
+                } else if !Self::markdown_link_preview_label(ui, line)
+                    && !Self::inline_code_preview_label(ui, line)
+                {
                     ui.label(RichText::new(line).size(15.0));
                 }
             }
@@ -6708,6 +6868,9 @@ impl eframe::App for SlateApp {
                                     self.dirty = true;
                                     self.search_state = None;
                                 }
+                                if let Some(byte) = self.editor_view.take_link_click_byte() {
+                                    self.open_markdown_link_at_byte(byte);
+                                }
                                 columns[1].vertical(|ui| self.preview_ui(ui));
                             });
                         } else {
@@ -6739,6 +6902,9 @@ impl eframe::App for SlateApp {
                             if changed {
                                 self.dirty = true;
                                 self.search_state = None;
+                            }
+                            if let Some(byte) = self.editor_view.take_link_click_byte() {
+                                self.open_markdown_link_at_byte(byte);
                             }
                         }
                     },
