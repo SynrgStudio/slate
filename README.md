@@ -8,6 +8,8 @@ The goal is simple:
 
 > A normal text editor first. A powerful personal knowledge workspace when you want it.
 
+For the project philosophy and feature decision rules, see [`PHILOSOPHY.md`](PHILOSOPHY.md).
+
 ---
 
 ## What Slate does today
@@ -101,6 +103,25 @@ Scratch mode:
 slate --scratch
 ```
 
+In-app scratch capture:
+
+```text
+:scratch
+:sc
+```
+
+The in-app scratch modal archives with `Ctrl+S`, opens archived entries with `Ctrl+E`, hides with `Esc`, and resumes with `:scratch` if it still has pending text.
+
+Scratch entries review:
+
+```text
+:scratch-entries
+:scratch-log
+:scl
+```
+
+Use `↑↓` to select an archived entry and `Ctrl+D` or `Delete` to delete it from `~/.local/share/slate/scratch.md`.
+
 ---
 
 ## Core shortcuts
@@ -154,6 +175,8 @@ Examples:
 :open ~/notes/todo.md
 :e ~/notes/todo.md
 :save-as           # Slate-owned save-as modal
+:scratch           # In-app quick capture modal
+:scratch-entries   # Review and clean archived scratch entries
 :new
 :preview
 :preview on

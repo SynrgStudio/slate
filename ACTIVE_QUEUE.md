@@ -56,13 +56,16 @@ Scope:
 
 ### T005 — Scratch buffer and quick capture
 
-Status: pending
+Status: in_progress
 Scope:
-- Improve scratch mode as a fast capture inbox.
-- Support daily archive sections and quick append behavior.
-- Consider command palette entries for `scratch`, `capture`, and `daily note`.
-- Treat scratch as the central mental inbox: capture now, organize later.
-- Support sending selected text/current line to scratch.
+- Done: preserve existing `slate --scratch` window behavior as a fast capture inbox that appends to `~/.local/share/slate/scratch.md` on exit.
+- Done: add `:scratch` / `:sc` command and command-palette entry for an in-app Slate-owned scratch modal.
+- Done: scratch modal uses Slate's native `EditorBuffer`/`EditorView`, supports multiline typing, hides with `Esc`, resumes with `:scratch`, and archives with `Ctrl+S`.
+- Done: app exit archives pending scratch modal content.
+- Done: add `:scratch-entries` / `:scratch-log` / `:scl` modal for reviewing `~/.local/share/slate/scratch.md` as entries.
+- Done: from scratch modal, `Ctrl+E` opens scratch entries; in entries, `↑↓` selects and `Ctrl+D` / `Delete` deletes an entry from the archive.
+- Pending: support daily archive sections and quick append behavior.
+- Pending: support sending selected text/current line to scratch via `:capture` and later promote entries to full notes.
 
 ### T006 — Daily notes
 
@@ -172,11 +175,13 @@ Scope:
 
 ### T017 — Slate knowledge-work philosophy
 
-Status: pending
+Status: completed
 Scope:
-- Define Slate as a personal text workspace / terminal-like knowledge editor, not an Obsidian/Logseq clone.
-- Prioritize: local files, capture first, commands before UI, progressive organization, and simple Markdown.
-- Explicitly avoid early graph views, mandatory databases, heavy sidebars, plugin complexity, sync systems, and Emacs-level configurability.
+- Done: added `PHILOSOPHY.md` as Slate's product/design charter.
+- Done: defined Slate as a personal text workspace / terminal-like knowledge editor, not an Obsidian/Logseq clone.
+- Done: prioritized local files, capture first, commands before UI, progressive organization, and simple Markdown.
+- Done: explicitly documented anti-goals: early graph views, mandatory databases, heavy sidebars, plugin complexity, sync systems, and Emacs-level configurability.
+- Done: added feature decision rules for future scratch/daily/vault/wiki-link/index work.
 
 ### T018 — Optional vault / local knowledge base
 
@@ -628,7 +633,7 @@ Follow-up — Duplicate placement transient mode: done.
 7. T004 — Build real recent-files list and `:recent` picker.
 8. T010 — Minimal project/vault file opener with fuzzy-ish file matching plus lightweight size/modified metadata. Done.
 9. T047 — Replace native Open/Save/SaveAs dialogs with Slate-owned modals. Done.
-10. T017 — Write down Slate's knowledge-work philosophy so future features do not drift into Obsidian/Emacs sprawl.
+10. T017 — Write down Slate's knowledge-work philosophy so future features do not drift into Obsidian/Emacs sprawl. Done.
 11. T005 — Scratch buffer and quick capture workflow.
 12. T006 — Daily notes on top of the chosen notes/vault directory.
 13. T018 — Optional vault/root folder selection.

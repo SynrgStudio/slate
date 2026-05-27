@@ -60,6 +60,8 @@ enum Command {
     Open,
     Save,
     SaveAs,
+    Scratch,
+    ScratchEntries,
     TogglePreview,
     ToggleWrap,
     Settings,
@@ -70,6 +72,31 @@ enum Command {
     PreviewOn,
     PreviewOff,
     Quit,
+}
+
+#[derive(Clone)]
+struct ScratchEntry {
+    heading: Option<String>,
+    body: String,
+}
+
+impl ScratchEntry {
+    fn title(&self) -> String {
+        self.heading
+            .clone()
+            .unwrap_or_else(|| "untitled scratch".to_string())
+    }
+
+    fn preview(&self) -> String {
+        self.body
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("")
+            .trim()
+            .chars()
+            .take(80)
+            .collect()
+    }
 }
 
 struct CommandSpec {
@@ -129,6 +156,20 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         summary: "Open recent files picker",
         hint: ":recent",
         palette_command: None,
+    },
+    CommandSpec {
+        name: "scratch",
+        aliases: &["sc"],
+        summary: "Open quick scratch capture modal",
+        hint: ":scratch",
+        palette_command: Some(Command::Scratch),
+    },
+    CommandSpec {
+        name: "scratch-entries",
+        aliases: &["scratch-log", "scl"],
+        summary: "Review and clean scratch archive entries",
+        hint: ":scratch-entries",
+        palette_command: Some(Command::ScratchEntries),
     },
     CommandSpec {
         name: "save-as",
@@ -413,6 +454,7 @@ struct SlateApp {
     command_line_cursor: usize,
     command_line_focused: bool,
     focus_command_line_once: bool,
+    selected_command_line_suggestion: usize,
     command_history: Vec<String>,
     command_history_index: Option<usize>,
     command_history_limit: usize,
@@ -438,6 +480,12 @@ struct SlateApp {
     save_as_filename: String,
     save_as_entries: Vec<PathBuf>,
     selected_save_as_entry: usize,
+    scratch_modal_open: bool,
+    scratch_buffer: EditorBuffer,
+    scratch_view: EditorView,
+    scratch_entries_open: bool,
+    scratch_entries: Vec<ScratchEntry>,
+    selected_scratch_entry: usize,
     search_state: Option<SearchState>,
     ctrl_layer_active: bool,
     ctrl_layer_sequence: String,
@@ -477,6 +525,7 @@ impl SlateApp {
             command_line_cursor: 0,
             command_line_focused: false,
             focus_command_line_once: false,
+            selected_command_line_suggestion: 0,
             command_history: Vec::new(),
             command_history_index: None,
             command_history_limit: 5,
@@ -502,6 +551,12 @@ impl SlateApp {
             save_as_filename: String::new(),
             save_as_entries: Vec::new(),
             selected_save_as_entry: 0,
+            scratch_modal_open: false,
+            scratch_buffer: EditorBuffer::new(),
+            scratch_view: EditorView::new(),
+            scratch_entries_open: false,
+            scratch_entries: Vec::new(),
+            selected_scratch_entry: 0,
             search_state: None,
             ctrl_layer_active: false,
             ctrl_layer_sequence: String::new(),
@@ -563,6 +618,59 @@ impl SlateApp {
         }
     }
 
+    fn scratch_archive_path(&mut self) -> Option<PathBuf> {
+        let Some(mut dir) = dirs_next::data_dir() else {
+            self.status = "Scratch failed: no data dir".to_string();
+            return None;
+        };
+        dir.push("slate");
+        Some(dir.join("scratch.md"))
+    }
+
+    fn append_text_to_scratch_archive(&mut self, text: &str) -> bool {
+        let text = text.trim_end();
+        if text.trim().is_empty() {
+            return false;
+        }
+
+        let Some(path) = self.scratch_archive_path() else {
+            self.status = "Scratch append failed: no data dir".to_string();
+            return false;
+        };
+        if let Some(dir) = path.parent() {
+            if let Err(err) = fs::create_dir_all(dir) {
+                self.status = format!("Scratch append failed: {err}");
+                return false;
+            }
+        }
+
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        let needs_header =
+            !path.exists() || fs::metadata(&path).map(|m| m.len() == 0).unwrap_or(true);
+        let entry = if needs_header {
+            format!("# Scratch\n\n## {now}\n\n{text}\n")
+        } else {
+            format!("\n\n## {now}\n\n{text}\n")
+        };
+
+        match fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(mut file) => match file.write_all(entry.as_bytes()) {
+                Ok(_) => {
+                    self.status = format!("Appended to {}", path.display());
+                    true
+                }
+                Err(err) => {
+                    self.status = format!("Scratch append failed: {err}");
+                    false
+                }
+            },
+            Err(err) => {
+                self.status = format!("Scratch append failed: {err}");
+                false
+            }
+        }
+    }
+
     fn append_to_scratch_archive(&mut self) {
         if !self.scratch
             || self.path.is_some()
@@ -572,39 +680,175 @@ impl SlateApp {
             return;
         }
 
-        let Some(mut dir) = dirs_next::data_dir() else {
-            self.status = "Scratch append failed: no data dir".to_string();
-            return;
-        };
-        dir.push("slate");
+        let text = self.buffer.as_str().to_string();
+        if self.append_text_to_scratch_archive(&text) {
+            self.dirty = false;
+        }
+    }
 
-        if let Err(err) = fs::create_dir_all(&dir) {
-            self.status = format!("Scratch append failed: {err}");
+    fn archive_scratch_modal(&mut self) {
+        if self.scratch_buffer.as_str().trim().is_empty() {
+            self.scratch_modal_open = false;
+            self.scratch_buffer.clear();
+            self.status = "Scratch cancelled".to_string();
+            self.focus_editor_once = true;
             return;
         }
+        let text = self.scratch_buffer.as_str().to_string();
+        if self.append_text_to_scratch_archive(&text) {
+            self.scratch_buffer.clear();
+            self.scratch_modal_open = false;
+            self.focus_editor_once = true;
+        }
+    }
 
-        let path = dir.join("scratch.md");
-        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-        let needs_header =
-            !path.exists() || fs::metadata(&path).map(|m| m.len() == 0).unwrap_or(true);
-        let entry = if needs_header {
-            format!(
-                "# Scratch\n\n## {now}\n\n{}\n",
-                self.buffer.as_str().trim_end()
-            )
+    fn cancel_scratch_modal(&mut self) {
+        self.scratch_modal_open = false;
+        self.focus_editor_once = true;
+        self.status = if self.scratch_buffer.as_str().trim().is_empty() {
+            self.scratch_buffer.clear();
+            "Scratch cancelled".to_string()
         } else {
-            format!("\n\n## {now}\n\n{}\n", self.buffer.as_str().trim_end())
+            "Scratch hidden; run :scratch to resume".to_string()
         };
+    }
 
-        match fs::OpenOptions::new().create(true).append(true).open(&path) {
-            Ok(mut file) => match file.write_all(entry.as_bytes()) {
-                Ok(_) => {
-                    self.dirty = false;
-                    self.status = format!("Appended to {}", path.display());
+    fn open_scratch_modal(&mut self) {
+        self.shortcut_help_open = false;
+        self.palette_open = false;
+        self.recent_picker_open = false;
+        self.file_picker_open = false;
+        self.save_as_open = false;
+        self.scratch_entries_open = false;
+        self.command_line_focused = false;
+        self.focus_command_line_once = false;
+        self.command_history_index = None;
+        self.scratch_modal_open = true;
+        self.focus_editor_once = false;
+        self.status = "Scratch capture".to_string();
+    }
+
+    fn parse_scratch_entries(text: &str) -> Vec<ScratchEntry> {
+        let mut entries = Vec::new();
+        let mut heading: Option<String> = None;
+        let mut body = String::new();
+        let mut seen_entry = false;
+
+        let flush =
+            |entries: &mut Vec<ScratchEntry>, heading: &mut Option<String>, body: &mut String| {
+                if heading.is_some() || !body.trim().is_empty() {
+                    entries.push(ScratchEntry {
+                        heading: heading.take(),
+                        body: body.trim_matches('\n').to_string(),
+                    });
+                    body.clear();
                 }
-                Err(err) => self.status = format!("Scratch append failed: {err}"),
-            },
-            Err(err) => self.status = format!("Scratch append failed: {err}"),
+            };
+
+        for line in text.lines() {
+            if line.trim() == "# Scratch"
+                && !seen_entry
+                && heading.is_none()
+                && body.trim().is_empty()
+            {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("## ") {
+                flush(&mut entries, &mut heading, &mut body);
+                heading = Some(rest.trim().to_string());
+                seen_entry = true;
+            } else {
+                body.push_str(line);
+                body.push('\n');
+            }
+        }
+        flush(&mut entries, &mut heading, &mut body);
+        entries
+    }
+
+    fn serialize_scratch_entries(entries: &[ScratchEntry]) -> String {
+        let mut text = "# Scratch\n".to_string();
+        for entry in entries {
+            text.push_str("\n## ");
+            text.push_str(entry.heading.as_deref().unwrap_or("untitled scratch"));
+            text.push_str("\n\n");
+            text.push_str(entry.body.trim_end());
+            text.push('\n');
+        }
+        text
+    }
+
+    fn load_scratch_entries(&mut self) -> bool {
+        let Some(path) = self.scratch_archive_path() else {
+            return false;
+        };
+        match fs::read_to_string(&path) {
+            Ok(text) => {
+                self.scratch_entries = Self::parse_scratch_entries(&text);
+                if self.scratch_entries.is_empty() {
+                    self.selected_scratch_entry = 0;
+                } else {
+                    self.selected_scratch_entry = self
+                        .selected_scratch_entry
+                        .min(self.scratch_entries.len().saturating_sub(1));
+                }
+                true
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                self.scratch_entries.clear();
+                self.selected_scratch_entry = 0;
+                true
+            }
+            Err(err) => {
+                self.status = format!("Scratch entries failed: {err}");
+                false
+            }
+        }
+    }
+
+    fn open_scratch_entries_modal(&mut self) {
+        self.shortcut_help_open = false;
+        self.palette_open = false;
+        self.recent_picker_open = false;
+        self.file_picker_open = false;
+        self.save_as_open = false;
+        self.scratch_modal_open = false;
+        self.command_line_focused = false;
+        self.focus_command_line_once = false;
+        if self.load_scratch_entries() {
+            self.scratch_entries_open = true;
+            self.focus_editor_once = false;
+            self.status = format!("Scratch entries · {} entries", self.scratch_entries.len());
+        }
+    }
+
+    fn delete_selected_scratch_entry(&mut self) {
+        if self.scratch_entries.is_empty() {
+            self.status = "No scratch entry to delete".to_string();
+            return;
+        }
+        let index = self
+            .selected_scratch_entry
+            .min(self.scratch_entries.len() - 1);
+        let deleted = self.scratch_entries.remove(index);
+        self.selected_scratch_entry = self
+            .selected_scratch_entry
+            .min(self.scratch_entries.len().saturating_sub(1));
+        let Some(path) = self.scratch_archive_path() else {
+            return;
+        };
+        if let Some(dir) = path.parent() {
+            if let Err(err) = fs::create_dir_all(dir) {
+                self.status = format!("Scratch delete failed: {err}");
+                return;
+            }
+        }
+        match fs::write(
+            &path,
+            Self::serialize_scratch_entries(&self.scratch_entries),
+        ) {
+            Ok(_) => self.status = format!("Deleted scratch entry {}", deleted.title()),
+            Err(err) => self.status = format!("Scratch delete failed: {err}"),
         }
     }
 
@@ -1405,6 +1649,8 @@ impl SlateApp {
             Command::Open => "open",
             Command::Save => "save",
             Command::SaveAs => "save-as",
+            Command::Scratch => "scratch",
+            Command::ScratchEntries => "scratch-entries",
             Command::TogglePreview => "preview",
             Command::ToggleWrap => "wrap",
             Command::Settings => "settings",
@@ -1491,6 +1737,12 @@ impl SlateApp {
         self.recent_picker_open = false;
         self.file_picker_open = false;
         self.save_as_open = false;
+        if command != Command::Scratch {
+            self.scratch_modal_open = false;
+        }
+        if command != Command::ScratchEntries {
+            self.scratch_entries_open = false;
+        }
         self.palette_query.clear();
         self.selected_command = 0;
         self.command_line_focused = false;
@@ -1515,6 +1767,8 @@ impl SlateApp {
             }
             Command::Save => self.save(),
             Command::SaveAs => self.open_save_as_modal(),
+            Command::Scratch => self.open_scratch_modal(),
+            Command::ScratchEntries => self.open_scratch_entries_modal(),
             Command::TogglePreview => self.set_preview_mode(!self.preview),
             Command::ToggleWrap => self.set_wrap_mode(!self.wrap),
             Command::WrapOn => self.set_wrap_mode(true),
@@ -1563,7 +1817,14 @@ impl SlateApp {
         let Some(prefix) = self.command_line_command_prefix().map(str::to_string) else {
             return false;
         };
-        let Some(spec) = self.matching_command_specs(&prefix, 1).into_iter().next() else {
+        let suggestions = self.matching_command_specs(&prefix, 5);
+        let Some(spec) = suggestions
+            .get(
+                self.selected_command_line_suggestion
+                    .min(suggestions.len().saturating_sub(1)),
+            )
+            .copied()
+        else {
             return false;
         };
         let Some(candidate) = Self::best_command_token(spec, &prefix) else {
@@ -1689,6 +1950,10 @@ impl SlateApp {
         match command {
             "w" | "write" | "save" => self.run_command(Command::Save, ctx),
             "save-as" | "saveas" | "write-as" => self.run_command(Command::SaveAs, ctx),
+            "scratch" | "sc" => self.run_command(Command::Scratch, ctx),
+            "scratch-entries" | "scratch-log" | "scl" => {
+                self.run_command(Command::ScratchEntries, ctx)
+            }
             "q" | "quit" | "exit" => self.run_command(Command::Quit, ctx),
             "wq" | "x" => {
                 self.record_command_usage("wq");
@@ -2212,6 +2477,8 @@ impl SlateApp {
             && !self.recent_picker_open
             && !self.file_picker_open
             && !self.save_as_open
+            && !self.scratch_modal_open
+            && !self.scratch_entries_open
             && self.pending_action.is_none()
     }
 
@@ -2592,6 +2859,11 @@ impl SlateApp {
             && !self.focus_command_line_once
             && !self.palette_open
             && !self.settings_open
+            && !self.recent_picker_open
+            && !self.file_picker_open
+            && !self.save_as_open
+            && !self.scratch_modal_open
+            && !self.scratch_entries_open
             && self.pending_action.is_none();
 
         if !layer_allowed {
@@ -2809,8 +3081,11 @@ impl SlateApp {
         self.recent_picker_open = false;
         self.file_picker_open = false;
         self.save_as_open = false;
+        self.scratch_modal_open = false;
+        self.scratch_entries_open = false;
         self.command_line.clear();
         self.command_line_cursor = 0;
+        self.selected_command_line_suggestion = 0;
         self.command_history_index = None;
         self.command_line_focused = true;
         self.focus_command_line_once = true;
@@ -2822,8 +3097,12 @@ impl SlateApp {
         self.palette_open = false;
         self.recent_picker_open = false;
         self.file_picker_open = false;
+        self.save_as_open = false;
+        self.scratch_modal_open = false;
+        self.scratch_entries_open = false;
         self.command_line = "find ".to_string();
         self.command_line_cursor = self.command_line.len();
+        self.selected_command_line_suggestion = 0;
         self.command_history_index = None;
         self.command_line_focused = true;
         self.focus_command_line_once = true;
@@ -2873,6 +3152,11 @@ impl SlateApp {
         let mut save_as_enter_dir = false;
         let mut save_as_parent = false;
         let mut save_as_backspace = false;
+        let mut scratch_archive = false;
+        let mut scratch_open_entries = false;
+        let mut scratch_entries_previous = false;
+        let mut scratch_entries_next = false;
+        let mut scratch_entries_delete = false;
         let mut search_next = false;
         let mut search_previous = false;
         let mut search_accept = false;
@@ -2893,6 +3177,8 @@ impl SlateApp {
             && !self.recent_picker_open
             && !self.file_picker_open
             && !self.save_as_open
+            && !self.scratch_modal_open
+            && !self.scratch_entries_open
             && self.pending_action.is_none();
         ctx.input_mut(|i| {
             if self.settings_open {
@@ -2926,10 +3212,33 @@ impl SlateApp {
                 save_as_enter |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
                 save_as_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
             }
+            if self.scratch_modal_open {
+                scratch_archive |= i.consume_key(egui::Modifiers::CTRL, Key::S);
+                scratch_open_entries |= i.consume_key(egui::Modifiers::CTRL, Key::E);
+            }
+            if self.scratch_entries_open {
+                scratch_entries_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
+                scratch_entries_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
+                scratch_entries_delete |= i.consume_key(egui::Modifiers::NONE, Key::Delete);
+                scratch_entries_delete |= i.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key {
+                            key: Key::D,
+                            pressed: true,
+                            repeat: false,
+                            modifiers,
+                            ..
+                        } if modifiers.ctrl && !modifiers.alt
+                    )
+                });
+            }
             if i.consume_key(egui::Modifiers::CTRL, Key::P) {
                 self.recent_picker_open = false;
                 self.file_picker_open = false;
                 self.save_as_open = false;
+                self.scratch_modal_open = false;
+                self.scratch_entries_open = false;
                 self.palette_open = true;
                 self.palette_query.clear();
                 self.selected_command = 0;
@@ -2951,6 +3260,8 @@ impl SlateApp {
                 self.recent_picker_open = false;
                 self.file_picker_open = false;
                 self.save_as_open = false;
+                self.scratch_modal_open = false;
+                self.scratch_entries_open = false;
                 self.command_line.clear();
                 self.command_line_cursor = 0;
                 self.command_history_index = None;
@@ -2975,45 +3286,61 @@ impl SlateApp {
                 search_accept |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
                 search_cancel |= i.consume_key(egui::Modifiers::NONE, Key::Escape);
             }
-            if i.consume_key(egui::Modifiers::CTRL, Key::N) {
+            if !self.scratch_modal_open
+                && !self.scratch_entries_open
+                && i.consume_key(egui::Modifiers::CTRL, Key::N)
+            {
                 command = Some(Command::New);
             }
-            if i.consume_key(egui::Modifiers::CTRL, Key::O) {
+            if !self.scratch_modal_open
+                && !self.scratch_entries_open
+                && i.consume_key(egui::Modifiers::CTRL, Key::O)
+            {
                 command = Some(Command::Open);
             }
-            let save_pressed = i.events.iter().any(|event| {
-                matches!(
-                    event,
-                    egui::Event::Key {
-                        key: Key::S,
-                        pressed: true,
-                        repeat: false,
-                        modifiers,
-                        ..
-                    } if modifiers.ctrl && !modifiers.alt && !modifiers.shift
-                )
-            });
-            let save_as_pressed = i.events.iter().any(|event| {
-                matches!(
-                    event,
-                    egui::Event::Key {
-                        key: Key::S,
-                        pressed: true,
-                        repeat: false,
-                        modifiers,
-                        ..
-                    } if modifiers.ctrl && modifiers.alt && !modifiers.shift
-                )
-            });
+            let save_pressed = !self.scratch_modal_open
+                && !self.scratch_entries_open
+                && i.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key {
+                            key: Key::S,
+                            pressed: true,
+                            repeat: false,
+                            modifiers,
+                            ..
+                        } if modifiers.ctrl && !modifiers.alt && !modifiers.shift
+                    )
+                });
+            let save_as_pressed = !self.scratch_modal_open
+                && !self.scratch_entries_open
+                && i.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key {
+                            key: Key::S,
+                            pressed: true,
+                            repeat: false,
+                            modifiers,
+                            ..
+                        } if modifiers.ctrl && modifiers.alt && !modifiers.shift
+                    )
+                });
             if save_as_pressed {
                 command = Some(Command::SaveAs);
             } else if save_pressed {
                 command = Some(Command::Save);
             }
-            if i.consume_key(egui::Modifiers::CTRL, Key::M) {
+            if !self.scratch_modal_open
+                && !self.scratch_entries_open
+                && i.consume_key(egui::Modifiers::CTRL, Key::M)
+            {
                 command = Some(Command::TogglePreview);
             }
-            if i.consume_key(egui::Modifiers::CTRL, Key::Q) {
+            if !self.scratch_modal_open
+                && !self.scratch_entries_open
+                && i.consume_key(egui::Modifiers::CTRL, Key::Q)
+            {
                 command = Some(Command::Quit);
             }
             if !search_cancel && i.consume_key(egui::Modifiers::NONE, Key::Escape) {
@@ -3041,6 +3368,11 @@ impl SlateApp {
                 } else if self.save_as_open {
                     self.save_as_open = false;
                     self.focus_editor_once = true;
+                } else if self.scratch_modal_open {
+                    self.cancel_scratch_modal();
+                } else if self.scratch_entries_open {
+                    self.scratch_entries_open = false;
+                    self.focus_editor_once = true;
                 } else if self.palette_open {
                     self.palette_open = false;
                     self.focus_editor_once = true;
@@ -3052,6 +3384,32 @@ impl SlateApp {
                 }
             }
         });
+
+        if scratch_archive {
+            self.archive_scratch_modal();
+            return;
+        }
+
+        if scratch_open_entries {
+            self.open_scratch_entries_modal();
+            return;
+        }
+
+        if scratch_entries_previous {
+            self.selected_scratch_entry = self.selected_scratch_entry.saturating_sub(1);
+            return;
+        }
+
+        if scratch_entries_next {
+            self.selected_scratch_entry =
+                (self.selected_scratch_entry + 1).min(self.scratch_entries.len().saturating_sub(1));
+            return;
+        }
+
+        if scratch_entries_delete {
+            self.delete_selected_scratch_entry();
+            return;
+        }
 
         if search_cursor_after {
             self.place_cursor_at_search_edge(true);
@@ -3247,19 +3605,41 @@ impl SlateApp {
             }
         }
 
-        if previous_command && !self.command_history.is_empty() {
-            let index = self
-                .command_history_index
-                .unwrap_or(self.command_history.len())
-                .saturating_sub(1);
-            self.command_history_index = Some(index);
-            self.command_line = self.command_history[index].clone();
-            self.command_line_cursor = self.command_line.len();
-            self.focus_command_line_once = true;
-            return;
+        let command_suggestion_count = if self.command_line_focused || self.focus_command_line_once
+        {
+            self.command_line_suggestions().len()
+        } else {
+            0
+        };
+
+        if previous_command {
+            if command_suggestion_count > 0 {
+                self.selected_command_line_suggestion =
+                    self.selected_command_line_suggestion.saturating_sub(1);
+                self.focus_command_line_once = true;
+                return;
+            }
+            if !self.command_history.is_empty() {
+                let index = self
+                    .command_history_index
+                    .unwrap_or(self.command_history.len())
+                    .saturating_sub(1);
+                self.command_history_index = Some(index);
+                self.command_line = self.command_history[index].clone();
+                self.command_line_cursor = self.command_line.len();
+                self.selected_command_line_suggestion = 0;
+                self.focus_command_line_once = true;
+                return;
+            }
         }
 
         if next_command {
+            if command_suggestion_count > 0 {
+                self.selected_command_line_suggestion = (self.selected_command_line_suggestion + 1)
+                    .min(command_suggestion_count.saturating_sub(1));
+                self.focus_command_line_once = true;
+                return;
+            }
             if let Some(index) = self.command_history_index {
                 if index + 1 < self.command_history.len() {
                     let index = index + 1;
@@ -3271,6 +3651,7 @@ impl SlateApp {
                     self.command_line.clear();
                     self.command_line_cursor = 0;
                 }
+                self.selected_command_line_suggestion = 0;
                 self.focus_command_line_once = true;
             }
             return;
@@ -3284,6 +3665,16 @@ impl SlateApp {
         }
 
         if execute_command_line {
+            if command_suggestion_count > 0 {
+                let suggestions = self.command_line_suggestions();
+                if let Some(spec) = suggestions.get(
+                    self.selected_command_line_suggestion
+                        .min(suggestions.len().saturating_sub(1)),
+                ) {
+                    self.command_line = spec.name.to_string();
+                    self.command_line_cursor = self.command_line.len();
+                }
+            }
             self.run_command_line(ctx);
             return;
         }
@@ -3631,6 +4022,8 @@ impl SlateApp {
         }
         self.command_line.insert_str(self.command_line_cursor, text);
         self.command_line_cursor += text.len();
+        self.selected_command_line_suggestion = 0;
+        self.command_history_index = None;
     }
 
     fn command_line_backspace(&mut self) {
@@ -3641,6 +4034,8 @@ impl SlateApp {
         self.command_line
             .replace_range(previous..self.command_line_cursor, "");
         self.command_line_cursor = previous;
+        self.selected_command_line_suggestion = 0;
+        self.command_history_index = None;
     }
 
     fn command_line_delete(&mut self) {
@@ -3650,6 +4045,8 @@ impl SlateApp {
         let next = self.next_command_line_boundary();
         self.command_line
             .replace_range(self.command_line_cursor..next, "");
+        self.selected_command_line_suggestion = 0;
+        self.command_history_index = None;
     }
 
     fn previous_command_line_boundary(&self) -> usize {
@@ -4261,6 +4658,332 @@ impl SlateApp {
                                     RichText::new(format!("[{key}]"))
                                         .font(font.clone())
                                         .color(warn),
+                                );
+                                ui.label(RichText::new(label).font(font.clone()).color(dim));
+                                ui.add_space(10.0);
+                            }
+                        });
+                    });
+            });
+    }
+
+    fn scratch_modal_dialog(&mut self, ctx: &egui::Context) {
+        if !self.scratch_modal_open {
+            return;
+        }
+
+        egui::Area::new("scratch_modal_dialog".into())
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, -20.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(25, 31, 40))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
+                    .corner_radius(0.0)
+                    .inner_margin(14.0)
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 10],
+                        blur: 24,
+                        spread: 0,
+                        color: Color32::from_black_alpha(150),
+                    })
+                    .show(ui, |ui| {
+                        ui.set_width(760.0);
+                        ui.set_height(430.0);
+                        let font = FontId::new(13.0, FontFamily::Monospace);
+                        let title_font = FontId::new(16.0, FontFamily::Monospace);
+                        let accent = Color32::from_rgb(136, 192, 208);
+                        let dim = Color32::from_rgb(136, 154, 176);
+                        let faint = Color32::from_rgb(94, 105, 126);
+                        let warn = Color32::from_rgb(235, 203, 139);
+
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("scratch").font(title_font).color(accent));
+                            ui.label(
+                                RichText::new(
+                                    "quick capture · archives to ~/.local/share/slate/scratch.md",
+                                )
+                                .font(font.clone())
+                                .color(faint),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new("[esc] hide").font(font.clone()).color(warn),
+                                    );
+                                },
+                            );
+                        });
+                        ui.add_space(10.0);
+
+                        let editor_height = 330.0;
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(ui.available_width(), editor_height),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                let (response, changed) = self.scratch_view.render(
+                                    ui,
+                                    &mut self.scratch_buffer,
+                                    self.wrap,
+                                    None,
+                                    self.line_number_mode,
+                                    true,
+                                    None,
+                                );
+                                response.request_focus();
+                                if changed {
+                                    self.status = "Scratch capture modified".to_string();
+                                }
+                            },
+                        );
+
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            for (key, label) in [
+                                ("Ctrl+S", "archive"),
+                                ("Esc", "hide"),
+                                (":scratch", "resume"),
+                            ] {
+                                ui.label(
+                                    RichText::new(format!("[{key}]"))
+                                        .font(font.clone())
+                                        .color(warn),
+                                );
+                                ui.label(RichText::new(label).font(font.clone()).color(dim));
+                                ui.add_space(10.0);
+                            }
+                        });
+                    });
+            });
+    }
+
+    fn scratch_entries_dialog(&mut self, ctx: &egui::Context) {
+        if !self.scratch_entries_open {
+            return;
+        }
+
+        egui::Area::new("scratch_entries_dialog".into())
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, -20.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(25, 31, 40))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
+                    .corner_radius(0.0)
+                    .inner_margin(14.0)
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 10],
+                        blur: 24,
+                        spread: 0,
+                        color: Color32::from_black_alpha(150),
+                    })
+                    .show(ui, |ui| {
+                        ui.set_width(820.0);
+                        ui.set_height(470.0);
+                        let font = FontId::new(13.0, FontFamily::Monospace);
+                        let title_font = FontId::new(16.0, FontFamily::Monospace);
+                        let accent = Color32::from_rgb(136, 192, 208);
+                        let dim = Color32::from_rgb(136, 154, 176);
+                        let faint = Color32::from_rgb(94, 105, 126);
+                        let text = Color32::from_rgb(216, 222, 233);
+                        let warn = Color32::from_rgb(235, 203, 139);
+                        let danger = Color32::from_rgb(191, 97, 106);
+
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("scratch entries")
+                                    .font(title_font)
+                                    .color(accent),
+                            );
+                            ui.label(
+                                RichText::new(format!("{} entries", self.scratch_entries.len()))
+                                    .font(font.clone())
+                                    .color(faint),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new("[esc] close").font(font.clone()).color(warn),
+                                    );
+                                },
+                            );
+                        });
+                        ui.add_space(10.0);
+
+                        if self.scratch_entries.is_empty() {
+                            ui.label(
+                                RichText::new("Scratch archive is empty.")
+                                    .font(font.clone())
+                                    .color(dim),
+                            );
+                        } else {
+                            let row_height = 44.0;
+                            let visible_rows = 8usize;
+                            let selected = self
+                                .selected_scratch_entry
+                                .min(self.scratch_entries.len().saturating_sub(1));
+                            let start = Self::centered_window_start(
+                                selected,
+                                visible_rows,
+                                self.scratch_entries.len(),
+                            );
+                            let end = (start + visible_rows).min(self.scratch_entries.len());
+                            let displayed_rows = end.saturating_sub(start);
+                            let list_height = row_height * displayed_rows as f32;
+                            let total_width = ui.available_width();
+                            let column_gap = 8.0;
+                            let left_width = (total_width * 0.5 - column_gap).min(420.0);
+                            let right_width = (total_width - left_width - column_gap).max(120.0);
+                            let label_height = ui.fonts_mut(|fonts| fonts.row_height(&font));
+
+                            let (label_rect, _) = ui.allocate_exact_size(
+                                Vec2::new(total_width, label_height),
+                                egui::Sense::hover(),
+                            );
+                            let label_painter = ui.painter_at(label_rect);
+                            let left_label_pos =
+                                egui::pos2(label_rect.left(), label_rect.center().y);
+                            let right_label_pos = egui::pos2(
+                                label_rect.left() + left_width + column_gap,
+                                label_rect.center().y,
+                            );
+                            label_painter.text(
+                                left_label_pos,
+                                egui::Align2::LEFT_CENTER,
+                                "entries",
+                                font.clone(),
+                                faint,
+                            );
+                            label_painter.text(
+                                right_label_pos,
+                                egui::Align2::LEFT_CENTER,
+                                "preview",
+                                font.clone(),
+                                faint,
+                            );
+                            ui.add_space(6.0);
+
+                            let (body_rect, _) = ui.allocate_exact_size(
+                                Vec2::new(total_width, list_height),
+                                egui::Sense::hover(),
+                            );
+                            let list_rect = egui::Rect::from_min_size(
+                                body_rect.left_top(),
+                                Vec2::new(left_width, list_height),
+                            );
+                            let preview_rect = egui::Rect::from_min_size(
+                                egui::pos2(list_rect.right() + column_gap, body_rect.top()),
+                                Vec2::new(right_width, list_height),
+                            );
+
+                            let list_painter = ui.painter_at(list_rect);
+                            for (visible_row, index) in (start..end).enumerate() {
+                                let entry = &self.scratch_entries[index];
+                                let selected = index == self.selected_scratch_entry;
+                                let rect = egui::Rect::from_min_size(
+                                    egui::pos2(
+                                        list_rect.left(),
+                                        list_rect.top() + visible_row as f32 * row_height,
+                                    ),
+                                    Vec2::new(list_rect.width(), row_height),
+                                );
+                                let response = ui.interact(
+                                    rect,
+                                    ui.id().with(("scratch_entry", index)),
+                                    egui::Sense::click(),
+                                );
+                                if selected {
+                                    list_painter.rect_filled(
+                                        rect,
+                                        0.0,
+                                        Color32::from_rgb(38, 47, 61),
+                                    );
+                                }
+                                list_painter.text(
+                                    egui::pos2(rect.left() + 8.0, rect.top() + 12.0),
+                                    egui::Align2::LEFT_CENTER,
+                                    if selected { ">" } else { " " },
+                                    font.clone(),
+                                    accent,
+                                );
+                                list_painter.text(
+                                    egui::pos2(rect.left() + 26.0, rect.top() + 12.0),
+                                    egui::Align2::LEFT_CENTER,
+                                    entry.title(),
+                                    font.clone(),
+                                    if selected { text } else { dim },
+                                );
+                                list_painter.text(
+                                    egui::pos2(rect.left() + 26.0, rect.top() + 31.0),
+                                    egui::Align2::LEFT_CENTER,
+                                    entry.preview(),
+                                    font.clone(),
+                                    faint,
+                                );
+                                if response.clicked() {
+                                    self.selected_scratch_entry = index;
+                                }
+                            }
+
+                            let selected_entry = self
+                                .scratch_entries
+                                .get(self.selected_scratch_entry)
+                                .or_else(|| self.scratch_entries.first());
+                            if let Some(entry) = selected_entry {
+                                let painter = ui.painter_at(preview_rect);
+                                painter.rect_filled(
+                                    preview_rect,
+                                    0.0,
+                                    Color32::from_rgb(30, 36, 48),
+                                );
+                                painter.rect_stroke(
+                                    preview_rect,
+                                    0.0,
+                                    Stroke::new(1.0, Color32::from_rgb(59, 69, 89)),
+                                    egui::StrokeKind::Inside,
+                                );
+
+                                let inner_rect = preview_rect.shrink(10.0);
+                                let preview_painter =
+                                    ui.painter_at(preview_rect).with_clip_rect(inner_rect);
+                                let line_height = ui.fonts_mut(|fonts| fonts.row_height(&font));
+                                preview_painter.text(
+                                    inner_rect.left_top(),
+                                    egui::Align2::LEFT_TOP,
+                                    entry.title(),
+                                    font.clone(),
+                                    accent,
+                                );
+                                let mut body_y = inner_rect.top() + line_height + 12.0;
+                                for line in entry.body.lines() {
+                                    if body_y + line_height > inner_rect.bottom() {
+                                        break;
+                                    }
+                                    preview_painter.text(
+                                        egui::pos2(inner_rect.left(), body_y),
+                                        egui::Align2::LEFT_TOP,
+                                        line,
+                                        font.clone(),
+                                        text,
+                                    );
+                                    body_y += line_height;
+                                }
+                            }
+                        }
+
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            for (key, label, color) in [
+                                ("↑↓", "select", warn),
+                                ("Ctrl+D", "delete entry", danger),
+                                ("Esc", "close", warn),
+                            ] {
+                                ui.label(
+                                    RichText::new(format!("[{key}]"))
+                                        .font(font.clone())
+                                        .color(color),
                                 );
                                 ui.label(RichText::new(label).font(font.clone()).color(dim));
                                 ui.add_space(10.0);
@@ -4908,6 +5631,9 @@ impl SlateApp {
 
 impl eframe::App for SlateApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.scratch_modal_open || !self.scratch_buffer.as_str().trim().is_empty() {
+            self.archive_scratch_modal();
+        }
         self.append_to_scratch_archive();
         let _ = self.save_settings();
     }
@@ -4951,6 +5677,13 @@ impl eframe::App for SlateApp {
                     Vec::new()
                 };
                 let visible_suggestion_rows = command_suggestions.len();
+                if visible_suggestion_rows > 0 {
+                    self.selected_command_line_suggestion = self
+                        .selected_command_line_suggestion
+                        .min(visible_suggestion_rows.saturating_sub(1));
+                } else {
+                    self.selected_command_line_suggestion = 0;
+                }
                 let recent_file_indices = if self.recent_picker_open {
                     self.recent_file_indices()
                 } else {
@@ -4991,6 +5724,8 @@ impl eframe::App for SlateApp {
                     && !self.recent_picker_open
                     && !self.file_picker_open
                     && !self.save_as_open
+                    && !self.scratch_modal_open
+                    && !self.scratch_entries_open
                     && !self.shortcut_help_open
                     && self.search_state.is_none();
                 let active_line_text_highlight = self
@@ -5020,6 +5755,8 @@ impl eframe::App for SlateApp {
                                     && !self.recent_picker_open
                                     && !self.file_picker_open
                                     && !self.save_as_open
+                                    && !self.scratch_modal_open
+                                    && !self.scratch_entries_open
                                     && !self.command_line_focused
                                 {
                                     response.request_focus();
@@ -5047,6 +5784,8 @@ impl eframe::App for SlateApp {
                                 && !self.recent_picker_open
                                 && !self.file_picker_open
                                 && !self.save_as_open
+                                && !self.scratch_modal_open
+                                && !self.scratch_entries_open
                                 && !self.command_line_focused
                             {
                                 response.request_focus();
@@ -5092,6 +5831,10 @@ impl eframe::App for SlateApp {
                     "files"
                 } else if self.save_as_open {
                     "save as"
+                } else if self.scratch_modal_open {
+                    "scratch"
+                } else if self.scratch_entries_open {
+                    "scratch entries"
                 } else if self.search_state.is_some() {
                     "find"
                 } else if self.settings_open {
@@ -5223,6 +5966,7 @@ impl eframe::App for SlateApp {
                     painter.rect_filled(suggestions_rect, 0.0, Color32::from_rgb(25, 31, 40));
 
                     for (row, command) in command_suggestions.iter().enumerate() {
+                        let selected = row == self.selected_command_line_suggestion;
                         let row_rect = egui::Rect::from_min_size(
                             egui::pos2(
                                 suggestions_rect.left(),
@@ -5230,14 +5974,14 @@ impl eframe::App for SlateApp {
                             ),
                             Vec2::new(suggestions_rect.width(), history_row_height),
                         );
-                        if row == 0 {
+                        if selected {
                             painter.rect_filled(row_rect, 0.0, Color32::from_rgb(38, 47, 61));
                         }
 
                         painter.text(
                             egui::pos2(row_rect.left() + 10.0, row_rect.center().y - 1.0),
                             egui::Align2::LEFT_CENTER,
-                            if row == 0 { ">" } else { " " },
+                            if selected { ">" } else { " " },
                             footer_font.clone(),
                             footer_accent,
                         );
@@ -5246,7 +5990,7 @@ impl eframe::App for SlateApp {
                             egui::Align2::LEFT_CENTER,
                             command.name,
                             footer_font.clone(),
-                            if row == 0 { footer_color } else { footer_dim },
+                            if selected { footer_color } else { footer_dim },
                         );
                         painter.text(
                             egui::pos2(row_rect.left() + 190.0, row_rect.center().y - 1.0),
@@ -5424,6 +6168,10 @@ impl eframe::App for SlateApp {
                         ("files  type filter · ↑↓ select · → enter folder · ← parent · Enter open · Esc close".to_string(), footer_accent)
                     } else if self.save_as_open {
                         ("save as  type file name · ↑↓ select · → enter folder · ← parent · Enter save · Esc close".to_string(), footer_accent)
+                    } else if self.scratch_modal_open {
+                        ("scratch  Ctrl+S archive · Ctrl+E entries · Esc hide · :scratch resume".to_string(), footer_accent)
+                    } else if self.scratch_entries_open {
+                        ("scratch entries  ↑↓ select · Ctrl+D/Delete delete · Esc close".to_string(), footer_accent)
                     } else {
                         (
                             "command  Ctrl+. enter · Ctrl+H help · Ctrl+P palette · w · q · wq"
@@ -5441,6 +6189,8 @@ impl eframe::App for SlateApp {
         self.shortcut_help_dialog(&ctx);
         self.file_picker_dialog(&ctx);
         self.save_as_dialog(&ctx);
+        self.scratch_modal_dialog(&ctx);
+        self.scratch_entries_dialog(&ctx);
     }
 }
 
