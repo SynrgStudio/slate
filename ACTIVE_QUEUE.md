@@ -83,12 +83,27 @@ Scope:
 
 ### T008 — Lightweight Markdown improvements
 
-Status: pending
+Status: in_progress
 Scope:
 - Improve preview rendering without making Slate heavy.
-- In progress: support Slate checkbox markers (`[ ] `, `[/] `, `[x] `) as Markdown checkboxes, not as Slate task-management objects; `[] ` expands to `[ ] ` while typing.
-- Support blockquotes, separators, local links, better code blocks, and simple tables where practical.
 - Keep Markdown as plain files plus lightweight conventions, not a custom database format.
+- Done: support Slate checkbox markers (`[ ] `, `[/] `, `[x] `) as Markdown checkboxes, not as Slate task-management objects; `[] ` expands to `[ ] ` while typing.
+- Done: render checkbox markers nicely in editor/preview while keeping raw text editable when the cursor enters the marker.
+- Done: `Ctrl+Enter` cycles checkbox state on the current line without moving the cursor into the checkbox.
+- Done: add Markdown render layer setting: plain source mode vs live inline Markdown rendering.
+- Done: when preview split is open, force the left/editor side to plain source text and the right side to rendered Markdown regardless of live render setting.
+- Pending: add a small shared line-based Markdown parser for editor and preview rendering; avoid a heavy Markdown AST unless there is a strong reason.
+- Done: support checkbox subtasks and subsubtasks with `- [ ]` / `- [/]` / `- [x]` and `-- [ ]` / `-- [/]` / `-- [x]`.
+- Pending: add `:doc-tasks` / `:tasks` for current-document-only checkbox navigation; scan only the current buffer, no global task database.
+- Pending: in `:doc-tasks`, `Enter` jumps to the selected task line and `Ctrl+Enter` cycles that task state in-place without leaving the picker.
+- Done: support `---` as the only horizontal separator syntax when it is alone on a line, with editor and preview rendering.
+- Pending: support blockquotes (`> quote`) with subtle editor affordance and preview rendering.
+- Pending: support fenced code blocks with subtle background/padding and optional language label; no syntax highlighting required yet.
+- Pending: support inline code rendering for backtick spans where practical.
+- Pending: polish headings and regular lists in editor/preview while preserving direct plain-text editing.
+- Pending: support local Markdown links like `[text](./file.md)` with visual affordance and contextual open.
+- Pending: support `Ctrl+LeftClick` on web links to open them in the default browser and on local links to open them in Slate.
+- Pending: support simple Markdown tables in preview only; no table editor or auto-alignment for now.
 
 ### T009 — Theme system
 

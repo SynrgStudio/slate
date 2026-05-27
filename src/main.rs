@@ -11,7 +11,9 @@ use std::{
 };
 
 use editor_buffer::EditorBuffer;
-use editor_view::{CheckboxState, EditorView, LineNumberMode, parse_checkbox_line};
+use editor_view::{
+    CheckboxState, EditorView, LineNumberMode, is_markdown_separator, parse_checkbox_line,
+};
 use eframe::egui::{
     self, Color32, FontFamily, FontId, Key, RichText, Stroke, TextEdit, Vec2,
     text::{LayoutJob, LayoutSection, TextFormat},
@@ -471,6 +473,7 @@ struct SlateApp {
     line_number_mode: LineNumberMode,
     ctrl_shift_move_mode: CtrlShiftMoveMode,
     reopen_last_file_on_startup: bool,
+    markdown_live_rendering: bool,
     last_opened_path: Option<PathBuf>,
     recent_files: Vec<PathBuf>,
     recent_picker_open: bool,
@@ -547,6 +550,7 @@ impl SlateApp {
             line_number_mode: LineNumberMode::Absolute,
             ctrl_shift_move_mode: CtrlShiftMoveMode::Vim,
             reopen_last_file_on_startup: false,
+            markdown_live_rendering: true,
             last_opened_path: None,
             recent_files: Vec::new(),
             recent_picker_open: false,
@@ -1506,6 +1510,11 @@ impl SlateApp {
                         self.reopen_last_file_on_startup = enabled;
                     }
                 }
+                "markdown_live_rendering" => {
+                    if let Some(enabled) = Self::parse_config_bool(value) {
+                        self.markdown_live_rendering = enabled;
+                    }
+                }
                 "last_opened_path" => {
                     let value = Self::parse_config_string(value);
                     if !value.is_empty() {
@@ -1627,13 +1636,14 @@ impl SlateApp {
             .ok_or_else(|| "invalid config path".to_string())?;
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
         let mut contents = format!(
-            "command_history_limit = {}\nline_number_mode = \"{}\"\nword_wrap = {}\npreview_mode = {}\nctrl_shift_move_mode = \"{}\"\nreopen_last_file_on_startup = {}\nlast_opened_path = \"{}\"\n",
+            "command_history_limit = {}\nline_number_mode = \"{}\"\nword_wrap = {}\npreview_mode = {}\nctrl_shift_move_mode = \"{}\"\nreopen_last_file_on_startup = {}\nmarkdown_live_rendering = {}\nlast_opened_path = \"{}\"\n",
             self.command_history_limit,
             self.line_number_mode.config_value(),
             self.wrap,
             self.preview,
             self.ctrl_shift_move_mode.config_value(),
             self.reopen_last_file_on_startup,
+            self.markdown_live_rendering,
             Self::escape_config_string(
                 &self
                     .last_opened_path
@@ -1733,6 +1743,21 @@ impl SlateApp {
                     "Reopen last file on startup on"
                 } else {
                     "Reopen last file on startup off"
+                }
+                .to_string()
+            }
+            Err(err) => self.status = format!("Settings save failed: {err}"),
+        }
+    }
+
+    fn set_markdown_live_rendering(&mut self, enabled: bool) {
+        self.markdown_live_rendering = enabled;
+        match self.save_settings() {
+            Ok(_) => {
+                self.status = if self.markdown_live_rendering {
+                    "Markdown live rendering on"
+                } else {
+                    "Markdown plain source mode"
                 }
                 .to_string()
             }
@@ -3671,7 +3696,7 @@ impl SlateApp {
         }
 
         if settings_next {
-            self.selected_setting = (self.selected_setting + 1).min(5);
+            self.selected_setting = (self.selected_setting + 1).min(6);
             return;
         }
 
@@ -3682,7 +3707,8 @@ impl SlateApp {
                 2 => self.set_ctrl_shift_move_mode(CtrlShiftMoveMode::Vim),
                 3 => self.set_wrap_mode(false),
                 4 => self.set_preview_mode(false),
-                5 => self.set_reopen_last_file_on_startup(false),
+                5 => self.set_markdown_live_rendering(false),
+                6 => self.set_reopen_last_file_on_startup(false),
                 _ => {}
             }
             return;
@@ -3701,7 +3727,8 @@ impl SlateApp {
                 2 => self.set_ctrl_shift_move_mode(self.ctrl_shift_move_mode.next()),
                 3 => self.set_wrap_mode(!self.wrap),
                 4 => self.set_preview_mode(!self.preview),
-                5 => self.set_reopen_last_file_on_startup(!self.reopen_last_file_on_startup),
+                5 => self.set_markdown_live_rendering(!self.markdown_live_rendering),
+                6 => self.set_reopen_last_file_on_startup(!self.reopen_last_file_on_startup),
                 _ => {}
             }
             return;
@@ -4466,7 +4493,47 @@ impl SlateApp {
                                     });
 
                                 ui.add_space(6.0);
-                                let reopen_selected = self.selected_setting == 5;
+                                let markdown_live_selected = self.selected_setting == 5;
+                                egui::Frame::new()
+                                    .fill(if markdown_live_selected { selected_fill } else { normal_fill })
+                                    .inner_margin(6.0)
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new(if markdown_live_selected { ">" } else { " " })
+                                                    .font(FontId::new(14.0, FontFamily::Monospace))
+                                                    .color(Color32::from_rgb(136, 192, 208)),
+                                            );
+                                            ui.label(
+                                                RichText::new("Markdown live rendering")
+                                                    .font(FontId::new(14.0, FontFamily::Monospace))
+                                                    .color(Color32::from_rgb(216, 222, 233)),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if ui
+                                                        .button(if self.markdown_live_rendering { "live" } else { "plain" })
+                                                        .on_hover_text("Choose plain source text or live inline Markdown affordances while editing")
+                                                        .clicked()
+                                                    {
+                                                        self.set_markdown_live_rendering(
+                                                            !self.markdown_live_rendering,
+                                                        );
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        ui.add_space(4.0);
+                                        ui.label(
+                                            RichText::new("Preview split always keeps the editor side plain and renders Markdown on the right.")
+                                                .font(FontId::new(13.0, FontFamily::Monospace))
+                                                .color(Color32::from_rgb(136, 154, 176)),
+                                        );
+                                    });
+
+                                ui.add_space(6.0);
+                                let reopen_selected = self.selected_setting == 6;
                                 egui::Frame::new()
                                     .fill(if reopen_selected { selected_fill } else { normal_fill })
                                     .inner_margin(6.0)
@@ -4903,6 +4970,7 @@ impl SlateApp {
                                     self.line_number_mode,
                                     true,
                                     None,
+                                    false,
                                 );
                                 response.request_focus();
                                 if changed {
@@ -5887,6 +5955,51 @@ impl SlateApp {
             });
     }
 
+    fn checkbox_preview_icon(ui: &mut egui::Ui, state: CheckboxState) {
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(13.0, 13.0), egui::Sense::hover());
+        let (fill, stroke) = match state {
+            CheckboxState::Empty => (
+                Color32::from_rgb(30, 36, 48),
+                Color32::from_rgb(136, 154, 176),
+            ),
+            CheckboxState::Doing => (
+                Color32::from_rgb(59, 66, 82),
+                Color32::from_rgb(235, 203, 139),
+            ),
+            CheckboxState::Done => (
+                Color32::from_rgb(49, 70, 60),
+                Color32::from_rgb(163, 190, 140),
+            ),
+        };
+        ui.painter().rect_filled(rect, 2.0, fill);
+        ui.painter().rect_stroke(
+            rect,
+            2.0,
+            Stroke::new(1.2, stroke),
+            egui::StrokeKind::Outside,
+        );
+        let glyph_rect = rect.shrink(3.2);
+        match state {
+            CheckboxState::Empty => {}
+            CheckboxState::Doing => {
+                ui.painter().line_segment(
+                    [glyph_rect.left_bottom(), glyph_rect.right_top()],
+                    Stroke::new(1.5, stroke),
+                );
+            }
+            CheckboxState::Done => {
+                ui.painter().line_segment(
+                    [glyph_rect.left_top(), glyph_rect.right_bottom()],
+                    Stroke::new(1.5, stroke),
+                );
+                ui.painter().line_segment(
+                    [glyph_rect.left_bottom(), glyph_rect.right_top()],
+                    Stroke::new(1.5, stroke),
+                );
+            }
+        }
+    }
+
     fn preview_ui(&self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -5910,12 +6023,11 @@ impl SlateApp {
                     ui.label(RichText::new(h).size(22.0).strong());
                 } else if let Some(h) = trimmed.strip_prefix("# ") {
                     ui.label(RichText::new(h).size(28.0).strong());
+                } else if is_markdown_separator(line) {
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(6.0);
                 } else if let Some(checkbox) = parse_checkbox_line(line) {
-                    let (icon, color) = match checkbox.state {
-                        CheckboxState::Empty => ("☐", Color32::from_rgb(136, 154, 176)),
-                        CheckboxState::Doing => ("◒", Color32::from_rgb(235, 203, 139)),
-                        CheckboxState::Done => ("☑", Color32::from_rgb(163, 190, 140)),
-                    };
                     ui.horizontal(|ui| {
                         if !checkbox.indent.is_empty() {
                             ui.label(
@@ -5923,7 +6035,14 @@ impl SlateApp {
                                     .font(FontId::new(15.0, FontFamily::Monospace)),
                             );
                         }
-                        ui.label(RichText::new(icon).size(15.0).color(color));
+                        if !checkbox.task_prefix.is_empty() {
+                            ui.label(
+                                RichText::new(checkbox.task_prefix)
+                                    .font(FontId::new(15.0, FontFamily::Monospace))
+                                    .color(Color32::from_rgb(136, 154, 176)),
+                            );
+                        }
+                        Self::checkbox_preview_icon(ui, checkbox.state);
                         ui.label(RichText::new(checkbox.text).size(15.0));
                     });
                 } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
@@ -6058,6 +6177,7 @@ impl eframe::App for SlateApp {
                                     self.line_number_mode,
                                     editor_keyboard_enabled,
                                     active_line_text_highlight,
+                                    false,
                                 );
                                 if self.focus_editor_once
                                     && !self.palette_open
@@ -6088,6 +6208,7 @@ impl eframe::App for SlateApp {
                                 self.line_number_mode,
                                 editor_keyboard_enabled,
                                 active_line_text_highlight,
+                                self.markdown_live_rendering,
                             );
                             if self.focus_editor_once
                                 && !self.palette_open

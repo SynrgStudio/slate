@@ -45,15 +45,27 @@ pub(crate) enum CheckboxState {
 
 pub(crate) struct ParsedCheckboxLine<'a> {
     pub(crate) indent: &'a str,
+    pub(crate) task_prefix: &'a str,
     pub(crate) marker: &'a str,
     pub(crate) state: CheckboxState,
     pub(crate) text: &'a str,
+}
+
+pub(crate) fn is_markdown_separator(line: &str) -> bool {
+    line.trim() == "---"
 }
 
 pub(crate) fn parse_checkbox_line(line: &str) -> Option<ParsedCheckboxLine<'_>> {
     let indent_len = line.len() - line.trim_start().len();
     let indent = &line[..indent_len];
     let rest = &line[indent_len..];
+    let (task_prefix, rest) = if let Some(rest) = rest.strip_prefix("-- ") {
+        ("-- ", rest)
+    } else if let Some(rest) = rest.strip_prefix("- ") {
+        ("- ", rest)
+    } else {
+        ("", rest)
+    };
     let (marker, state, text) = if let Some(text) = rest.strip_prefix("[ ] ") {
         ("[ ]", CheckboxState::Empty, text)
     } else if let Some(text) = rest.strip_prefix("[] ") {
@@ -70,6 +82,7 @@ pub(crate) fn parse_checkbox_line(line: &str) -> Option<ParsedCheckboxLine<'_>> 
 
     Some(ParsedCheckboxLine {
         indent,
+        task_prefix,
         marker,
         state,
         text,
@@ -141,6 +154,7 @@ impl EditorView {
         line_number_mode: LineNumberMode,
         keyboard_enabled: bool,
         active_line_text_highlight: Option<usize>,
+        render_markdown: bool,
     ) -> (egui::Response, bool) {
         self.observe_buffer(buffer);
 
@@ -291,6 +305,7 @@ impl EditorView {
                 line_height,
                 &font,
                 text_color,
+                render_markdown,
             );
         }
 
@@ -526,7 +541,7 @@ impl EditorView {
         let Some(parsed) = parse_checkbox_line(line) else {
             return false;
         };
-        let marker_start = line_start + parsed.indent.len();
+        let marker_start = line_start + parsed.indent.len() + parsed.task_prefix.len();
         let marker_end = marker_start + parsed.marker.len();
         let next_marker = match parsed.state {
             CheckboxState::Empty => "[/]",
@@ -593,9 +608,35 @@ impl EditorView {
         line_height: f32,
         font: &FontId,
         text_color: Color32,
+        render_markdown: bool,
     ) {
         let line_start = buffer.line_start(row.line_index);
+        if !render_markdown {
+            painter.text(
+                egui::pos2(text_x, y + line_height * 0.5),
+                egui::Align2::LEFT_CENTER,
+                &buffer.as_str()[row.start..row.end],
+                font.clone(),
+                text_color,
+            );
+            return;
+        }
         let line = buffer.line(row.line_index);
+        if is_markdown_separator(line)
+            && buffer.cursor_line_col().0 != row.line_index
+            && row.start == line_start
+        {
+            let separator_y = y + line_height * 0.5;
+            painter.line_segment(
+                [
+                    egui::pos2(text_x, separator_y),
+                    egui::pos2(painter.clip_rect().right() - 8.0, separator_y),
+                ],
+                Stroke::new(1.0, Color32::from_rgb(76, 86, 106)),
+            );
+            return;
+        }
+
         let Some(parsed) = parse_checkbox_line(line) else {
             painter.text(
                 egui::pos2(text_x, y + line_height * 0.5),
@@ -607,7 +648,7 @@ impl EditorView {
             return;
         };
 
-        let marker_start = line_start + parsed.indent.len();
+        let marker_start = line_start + parsed.indent.len() + parsed.task_prefix.len();
         let marker_text_end = marker_start + parsed.marker.len();
         let marker_end = marker_text_end + 1;
         let cursor_in_checkbox =
@@ -628,6 +669,7 @@ impl EditorView {
         }
 
         let indent_width = self.text_width(painter, parsed.indent, font);
+        let prefix_width = self.text_width(painter, parsed.task_prefix, font);
         let checkbox_slot_width = self.text_width(painter, "[x] ", font);
         if !parsed.indent.is_empty() {
             painter.text(
@@ -639,8 +681,21 @@ impl EditorView {
             );
         }
 
+        if !parsed.task_prefix.is_empty() {
+            painter.text(
+                egui::pos2(text_x + indent_width, y + line_height * 0.5),
+                egui::Align2::LEFT_CENTER,
+                parsed.task_prefix,
+                font.clone(),
+                Color32::from_rgb(136, 154, 176),
+            );
+        }
+
         let icon_rect = egui::Rect::from_min_size(
-            egui::pos2(text_x + indent_width, y + (line_height - 13.0) * 0.5),
+            egui::pos2(
+                text_x + indent_width + prefix_width,
+                y + (line_height - 13.0) * 0.5,
+            ),
             egui::vec2(13.0, 13.0),
         );
         let (fill, stroke) = match parsed.state {
@@ -689,7 +744,7 @@ impl EditorView {
         if row.end > text_start {
             painter.text(
                 egui::pos2(
-                    text_x + indent_width + checkbox_slot_width,
+                    text_x + indent_width + prefix_width + checkbox_slot_width,
                     y + line_height * 0.5,
                 ),
                 egui::Align2::LEFT_CENTER,
@@ -882,6 +937,15 @@ mod tests {
         assert_eq!(compact_empty.marker, "[]");
         assert_eq!(compact_empty.state, super::CheckboxState::Empty);
 
+        let subtask = super::parse_checkbox_line("- [ ] subtask").unwrap();
+        assert_eq!(subtask.task_prefix, "- ");
+        assert_eq!(subtask.marker, "[ ]");
+        assert_eq!(subtask.text, "subtask");
+
+        let subsubtask = super::parse_checkbox_line("-- [/] subsubtask").unwrap();
+        assert_eq!(subsubtask.task_prefix, "-- ");
+        assert_eq!(subsubtask.state, super::CheckboxState::Doing);
+
         let doing = super::parse_checkbox_line("  [/] doing").unwrap();
         assert_eq!(doing.indent, "  ");
         assert_eq!(doing.state, super::CheckboxState::Doing);
@@ -891,6 +955,14 @@ mod tests {
         assert_eq!(done.state, super::CheckboxState::Done);
         assert!(super::parse_checkbox_line("[]todo").is_none());
         assert!(super::parse_checkbox_line("text [] todo").is_none());
+    }
+
+    #[test]
+    fn parses_slate_markdown_separator() {
+        assert!(super::is_markdown_separator("---"));
+        assert!(super::is_markdown_separator("  ---  "));
+        assert!(!super::is_markdown_separator("----"));
+        assert!(!super::is_markdown_separator("text ---"));
     }
 
     #[test]
