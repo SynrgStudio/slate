@@ -3143,8 +3143,8 @@ impl SlateApp {
         false
     }
 
-    fn handle_ctrl_layer(&mut self, ctx: &egui::Context) -> bool {
-        let layer_allowed = !self.command_line_focused
+    fn editor_shortcuts_allowed(&self) -> bool {
+        !self.command_line_focused
             && !self.focus_command_line_once
             && !self.palette_open
             && !self.settings_open
@@ -3155,7 +3155,83 @@ impl SlateApp {
             && !self.scratch_modal_open
             && !self.scratch_entries_open
             && !self.capture_modal_open
-            && self.pending_action.is_none();
+            && self.pending_action.is_none()
+    }
+
+    fn handle_immediate_ctrl_edit(&mut self, ctx: &egui::Context) -> bool {
+        if !self.editor_shortcuts_allowed() {
+            return false;
+        }
+
+        let mut undo = false;
+        let mut redo = false;
+        ctx.input_mut(|input| {
+            for event in &input.events {
+                let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                    ..
+                } = event
+                else {
+                    continue;
+                };
+                if modifiers.alt || modifiers.shift || !(modifiers.ctrl || modifiers.command) {
+                    continue;
+                }
+                match key {
+                    Key::Z => undo = true,
+                    Key::Y => redo = true,
+                    _ => {}
+                }
+            }
+            if undo || redo {
+                input.events.retain(|event| {
+                    !matches!(
+                        event,
+                        egui::Event::Key {
+                            key: Key::Z | Key::Y,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } if !modifiers.alt && !modifiers.shift && (modifiers.ctrl || modifiers.command)
+                    )
+                });
+            }
+        });
+
+        if undo {
+            if self.buffer.undo() {
+                self.dirty = true;
+                self.editor_view.request_scroll_to_cursor(&self.buffer);
+                self.status = "Undo".to_string();
+            } else {
+                self.status = "Nothing to undo".to_string();
+            }
+            self.ctrl_layer_active = false;
+            self.ctrl_layer_sequence.clear();
+            return true;
+        }
+
+        if redo {
+            if self.buffer.redo() {
+                self.dirty = true;
+                self.editor_view.request_scroll_to_cursor(&self.buffer);
+                self.status = "Redo".to_string();
+            } else {
+                self.status = "Nothing to redo".to_string();
+            }
+            self.ctrl_layer_active = false;
+            self.ctrl_layer_sequence.clear();
+            return true;
+        }
+
+        false
+    }
+
+    fn handle_ctrl_layer(&mut self, ctx: &egui::Context) -> bool {
+        let layer_allowed = self.editor_shortcuts_allowed();
 
         if !layer_allowed {
             self.ctrl_layer_active = false;
@@ -3410,6 +3486,10 @@ impl SlateApp {
         }
 
         if self.handle_alt_layer(ctx) {
+            return;
+        }
+
+        if self.handle_immediate_ctrl_edit(ctx) {
             return;
         }
 

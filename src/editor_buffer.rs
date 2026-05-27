@@ -1,8 +1,17 @@
+#[derive(Clone)]
+struct BufferSnapshot {
+    text: String,
+    cursor: usize,
+    selection: Option<(usize, usize)>,
+}
+
 pub(crate) struct EditorBuffer {
     text: String,
     line_starts: Vec<usize>,
     cursor: usize,
     selection: Option<(usize, usize)>,
+    undo_stack: Vec<BufferSnapshot>,
+    redo_stack: Vec<BufferSnapshot>,
     pub(crate) revision: u64,
 }
 
@@ -17,6 +26,8 @@ impl EditorBuffer {
             line_starts: Vec::new(),
             cursor: 0,
             selection: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             revision: 0,
         };
         buffer.rebuild_line_index();
@@ -25,6 +36,54 @@ impl EditorBuffer {
 
     pub(crate) fn as_str(&self) -> &str {
         &self.text
+    }
+
+    fn snapshot(&self) -> BufferSnapshot {
+        BufferSnapshot {
+            text: self.text.clone(),
+            cursor: self.cursor,
+            selection: self.selection,
+        }
+    }
+
+    fn record_undo_snapshot(&mut self) {
+        const MAX_UNDO_SNAPSHOTS: usize = 256;
+        self.undo_stack.push(self.snapshot());
+        if self.undo_stack.len() > MAX_UNDO_SNAPSHOTS {
+            self.undo_stack.remove(0);
+        }
+        self.redo_stack.clear();
+    }
+
+    fn restore_snapshot(&mut self, snapshot: BufferSnapshot) {
+        self.text = snapshot.text;
+        self.cursor = self.clamp_to_char_boundary(snapshot.cursor);
+        self.selection = snapshot.selection.map(|(start, end)| {
+            (
+                self.clamp_to_char_boundary(start),
+                self.clamp_to_char_boundary(end),
+            )
+        });
+        self.revision = self.revision.wrapping_add(1);
+        self.rebuild_line_index();
+    }
+
+    pub(crate) fn undo(&mut self) -> bool {
+        let Some(snapshot) = self.undo_stack.pop() else {
+            return false;
+        };
+        self.redo_stack.push(self.snapshot());
+        self.restore_snapshot(snapshot);
+        true
+    }
+
+    pub(crate) fn redo(&mut self) -> bool {
+        let Some(snapshot) = self.redo_stack.pop() else {
+            return false;
+        };
+        self.undo_stack.push(self.snapshot());
+        self.restore_snapshot(snapshot);
+        true
     }
 
     #[allow(dead_code)]
@@ -36,6 +95,8 @@ impl EditorBuffer {
         self.text = text;
         self.cursor = self.cursor.min(self.text.len());
         self.selection = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
         self.revision = self.revision.wrapping_add(1);
         self.rebuild_line_index();
     }
@@ -48,6 +109,8 @@ impl EditorBuffer {
     pub(crate) fn mark_external_edit(&mut self) {
         self.cursor = self.cursor.min(self.text.len());
         self.selection = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
         self.revision = self.revision.wrapping_add(1);
         self.rebuild_line_index();
     }
@@ -280,7 +343,12 @@ impl EditorBuffer {
         }
 
         if self.line_count() == 1 {
-            self.clear();
+            self.record_undo_snapshot();
+            self.text.clear();
+            self.cursor = 0;
+            self.selection = None;
+            self.revision = self.revision.wrapping_add(1);
+            self.rebuild_line_index();
             return true;
         }
 
@@ -294,6 +362,7 @@ impl EditorBuffer {
             (self.line_start(line_index), self.line_start(line_index + 1))
         };
 
+        self.record_undo_snapshot();
         self.selection = None;
         self.text.replace_range(start..end, "");
         self.cursor = self.clamp_to_char_boundary(start.min(self.text.len()));
@@ -317,6 +386,7 @@ impl EditorBuffer {
             self.text.len()
         };
 
+        self.record_undo_snapshot();
         self.selection = None;
         self.text.insert_str(insert_at, &insertion);
         self.revision = self.revision.wrapping_add(1);
@@ -512,6 +582,13 @@ impl EditorBuffer {
             std::mem::swap(&mut start, &mut end);
         }
 
+        if self.text.get(start..end) == Some(replacement) {
+            self.cursor = start + replacement.len();
+            self.selection = None;
+            return;
+        }
+
+        self.record_undo_snapshot();
         self.text.replace_range(start..end, replacement);
         self.cursor = start + replacement.len();
         self.selection = None;
@@ -643,6 +720,7 @@ impl EditorBuffer {
         let insert_at = target_start.min(lines.len());
         lines.splice(insert_at..insert_at, block);
 
+        self.record_undo_snapshot();
         self.text = lines.concat();
         self.selection = None;
         self.revision = self.revision.wrapping_add(1);
@@ -681,6 +759,7 @@ impl EditorBuffer {
         let line = lines.remove(line_index);
         let target_index = target_index.min(lines.len());
         lines.insert(target_index, line);
+        self.record_undo_snapshot();
         self.text = lines.concat();
         self.selection = None;
         self.revision = self.revision.wrapping_add(1);
@@ -914,6 +993,40 @@ mod tests {
         assert_eq!(buffer.as_str(), "hello\nworld");
         assert_eq!(buffer.line_count(), 2);
         assert_eq!(buffer.cursor(), buffer.as_str().len());
+    }
+
+    #[test]
+    fn editor_buffer_undoes_and_redoes_text_edits() {
+        let mut buffer = EditorBuffer::new();
+
+        buffer.insert_text("hello");
+        buffer.insert_text(" world");
+        assert_eq!(buffer.as_str(), "hello world");
+
+        assert!(buffer.undo());
+        assert_eq!(buffer.as_str(), "hello");
+        assert!(buffer.undo());
+        assert_eq!(buffer.as_str(), "");
+        assert!(!buffer.undo());
+
+        assert!(buffer.redo());
+        assert_eq!(buffer.as_str(), "hello");
+        assert!(buffer.redo());
+        assert_eq!(buffer.as_str(), "hello world");
+        assert!(!buffer.redo());
+    }
+
+    #[test]
+    fn editor_buffer_undo_clears_redo_after_new_edit() {
+        let mut buffer = EditorBuffer::new();
+
+        buffer.insert_text("hello");
+        buffer.insert_text(" world");
+        assert!(buffer.undo());
+        buffer.insert_text(" slate");
+
+        assert_eq!(buffer.as_str(), "hello slate");
+        assert!(!buffer.redo());
     }
 
     #[test]
