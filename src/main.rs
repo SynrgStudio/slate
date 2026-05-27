@@ -13,7 +13,7 @@ use std::{
 use editor_buffer::EditorBuffer;
 use editor_view::{
     CheckboxState, EditorView, LineNumberMode, is_markdown_separator, parse_blockquote_line,
-    parse_checkbox_line,
+    parse_checkbox_line, parse_fenced_code_marker,
 };
 use eframe::egui::{
     self, Color32, FontFamily, FontId, Key, RichText, Stroke, TextEdit, Vec2,
@@ -6278,19 +6278,46 @@ impl SlateApp {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.set_width(ui.available_width());
             let mut in_code = false;
+            let mut code_language = String::new();
             for line in self.buffer.as_str().lines() {
                 let trimmed = line.trim_start();
-                if trimmed.starts_with("```") {
-                    in_code = !in_code;
+                if let Some(fence) = parse_fenced_code_marker(line) {
+                    if in_code {
+                        in_code = false;
+                        code_language.clear();
+                    } else {
+                        in_code = true;
+                        code_language = fence.language.to_string();
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("code")
+                                    .font(FontId::new(12.0, FontFamily::Monospace))
+                                    .color(Color32::from_rgb(136, 154, 176)),
+                            );
+                            if !code_language.is_empty() {
+                                ui.label(
+                                    RichText::new(&code_language)
+                                        .font(FontId::new(12.0, FontFamily::Monospace))
+                                        .color(Color32::from_rgb(235, 203, 139)),
+                                );
+                            }
+                        });
+                    }
                     continue;
                 }
 
                 if in_code {
-                    ui.label(
-                        RichText::new(line)
-                            .font(FontId::new(14.0, FontFamily::Monospace))
-                            .background_color(Color32::from_rgb(25, 31, 40)),
-                    );
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(25, 31, 40))
+                        .inner_margin(egui::Margin::symmetric(8, 3))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(line)
+                                    .font(FontId::new(14.0, FontFamily::Monospace))
+                                    .color(Color32::from_rgb(216, 222, 233)),
+                            );
+                        });
                 } else if let Some(h) = trimmed.strip_prefix("### ") {
                     ui.label(RichText::new(h).size(18.0).strong());
                 } else if let Some(h) = trimmed.strip_prefix("## ") {

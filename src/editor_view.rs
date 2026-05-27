@@ -62,6 +62,21 @@ pub(crate) struct ParsedBlockquoteLine<'a> {
     pub(crate) text: &'a str,
 }
 
+pub(crate) struct ParsedCodeFence<'a> {
+    pub(crate) language: &'a str,
+}
+
+pub(crate) fn parse_fenced_code_marker(line: &str) -> Option<ParsedCodeFence<'_>> {
+    let trimmed = line.trim_start();
+    let language = trimmed.strip_prefix("```")?;
+    if language.starts_with('`') || language.contains("```") {
+        return None;
+    }
+    Some(ParsedCodeFence {
+        language: language.trim(),
+    })
+}
+
 pub(crate) fn parse_blockquote_line(line: &str) -> Option<ParsedBlockquoteLine<'_>> {
     let indent_len = line.len() - line.trim_start().len();
     let indent = &line[..indent_len];
@@ -121,6 +136,12 @@ pub(crate) struct VisualRow {
     line_index: usize,
     start: usize,
     end: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CodeLineKind<'a> {
+    Fence { language: &'a str },
+    Body,
 }
 
 pub(crate) struct EditorView {
@@ -272,6 +293,17 @@ impl EditorView {
             if row.line_index % 2 == 0 {
                 painter.rect_filled(line_rect, 0.0, Color32::from_rgb(29, 35, 46));
             }
+
+            self.paint_markdown_line_background(
+                &painter,
+                buffer,
+                row,
+                text_x,
+                y,
+                line_height,
+                rect.right(),
+                render_markdown,
+            );
 
             if let Some(search_state) =
                 search_state.filter(|state| state.buffer_revision == buffer.revision)
@@ -432,6 +464,7 @@ impl EditorView {
         }
         for event in events {
             if let egui::Event::Paste(text) = event {
+                let text = Self::normalize_paste_text(&text);
                 buffer.insert_text(&text);
                 self.request_scroll_to_cursor(buffer);
                 changed = true;
@@ -662,6 +695,66 @@ impl EditorView {
         buffer.insert_text(text);
     }
 
+    pub(crate) fn normalize_paste_text(text: &str) -> String {
+        let mut normalized = text
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .replace('\u{00a0}', " ")
+            .replace(['\u{200b}', '\u{200c}', '\u{200d}', '\u{feff}'], "");
+
+        if normalized.lines().count() <= 1 {
+            return normalized.trim_end_matches([' ', '\t']).to_string();
+        }
+
+        let mut lines = normalized
+            .split('\n')
+            .map(|line| line.trim_end_matches([' ', '\t']).to_string())
+            .collect::<Vec<_>>();
+
+        while lines
+            .first()
+            .map(|line| line.trim().is_empty())
+            .unwrap_or(false)
+        {
+            lines.remove(0);
+        }
+        while lines
+            .last()
+            .map(|line| line.trim().is_empty())
+            .unwrap_or(false)
+        {
+            lines.pop();
+        }
+
+        let common_indent = lines
+            .iter()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                line.chars()
+                    .take_while(|ch| *ch == ' ' || *ch == '\t')
+                    .count()
+            })
+            .min()
+            .unwrap_or(0);
+
+        if common_indent > 0 {
+            for line in &mut lines {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let byte_index = line
+                    .char_indices()
+                    .nth(common_indent)
+                    .map(|(index, _)| index)
+                    .unwrap_or_else(|| line.len());
+                line.replace_range(..byte_index, "");
+            }
+        }
+
+        normalized = lines.join("\n");
+        normalized
+    }
+
     pub(crate) fn selection_anchor(buffer: &EditorBuffer) -> usize {
         buffer
             .selection()
@@ -673,6 +766,85 @@ impl EditorView {
         if extend {
             buffer.set_selection(anchor, buffer.cursor());
         }
+    }
+
+    fn code_line_kind<'a>(
+        &self,
+        buffer: &'a EditorBuffer,
+        line_index: usize,
+    ) -> Option<CodeLineKind<'a>> {
+        let mut in_code = false;
+        for index in 0..=line_index {
+            let line = buffer.line(index);
+            if let Some(fence) = parse_fenced_code_marker(line) {
+                if index == line_index {
+                    return Some(CodeLineKind::Fence {
+                        language: fence.language,
+                    });
+                }
+                in_code = !in_code;
+                continue;
+            }
+            if index == line_index && in_code {
+                return Some(CodeLineKind::Body);
+            }
+        }
+        None
+    }
+
+    fn code_block_range(&self, buffer: &EditorBuffer, line_index: usize) -> Option<(usize, usize)> {
+        let mut block_start = None;
+        for index in 0..buffer.line_count() {
+            if parse_fenced_code_marker(buffer.line(index)).is_none() {
+                continue;
+            }
+
+            if let Some(start) = block_start {
+                let end = index;
+                if line_index >= start && line_index <= end {
+                    return Some((start, end));
+                }
+                block_start = None;
+            } else {
+                block_start = Some(index);
+            }
+        }
+
+        block_start.and_then(|start| {
+            (line_index >= start).then(|| (start, buffer.line_count().saturating_sub(1)))
+        })
+    }
+
+    fn paint_markdown_line_background(
+        &self,
+        painter: &egui::Painter,
+        buffer: &EditorBuffer,
+        row: VisualRow,
+        text_x: f32,
+        y: f32,
+        line_height: f32,
+        right: f32,
+        render_markdown: bool,
+    ) {
+        if !render_markdown || self.code_line_kind(buffer, row.line_index).is_none() {
+            return;
+        }
+
+        let cursor_line = buffer.cursor_line_col().0;
+        let cursor_in_this_code_block =
+            self.code_block_range(buffer, row.line_index)
+                .is_some_and(|line_range| {
+                    self.code_block_range(buffer, cursor_line) == Some(line_range)
+                });
+        if cursor_in_this_code_block {
+            return;
+        }
+
+        let code_rect = egui::Rect::from_min_max(
+            egui::pos2(text_x - 4.0, y + 1.0),
+            egui::pos2(right - 8.0, y + line_height - 1.0),
+        );
+        painter.rect_filled(code_rect, 2.0, Color32::from_rgb(25, 31, 40));
     }
 
     pub(crate) fn paint_line_text(
@@ -699,6 +871,49 @@ impl EditorView {
             return;
         }
         let line = buffer.line(row.line_index);
+        if let Some(code_kind) = self.code_line_kind(buffer, row.line_index) {
+            let cursor_line = buffer.cursor_line_col().0;
+            let cursor_in_this_code_block = self
+                .code_block_range(buffer, row.line_index)
+                .is_some_and(|line_range| {
+                    self.code_block_range(buffer, cursor_line) == Some(line_range)
+                });
+            if cursor_in_this_code_block {
+                painter.text(
+                    egui::pos2(text_x, y + line_height * 0.5),
+                    egui::Align2::LEFT_CENTER,
+                    &buffer.as_str()[row.start..row.end],
+                    font.clone(),
+                    text_color,
+                );
+                return;
+            }
+
+            match code_kind {
+                CodeLineKind::Fence { .. } if row.start == line_start => {
+                    painter.text(
+                        egui::pos2(text_x, y + line_height * 0.5),
+                        egui::Align2::LEFT_CENTER,
+                        &buffer.as_str()[row.start..row.end],
+                        font.clone(),
+                        Color32::from_rgb(136, 154, 176),
+                    );
+                    return;
+                }
+                CodeLineKind::Body => {
+                    painter.text(
+                        egui::pos2(text_x, y + line_height * 0.5),
+                        egui::Align2::LEFT_CENTER,
+                        &buffer.as_str()[row.start..row.end],
+                        font.clone(),
+                        Color32::from_rgb(216, 222, 233),
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         if is_markdown_separator(line)
             && buffer.cursor_line_col().0 != row.line_index
             && row.start == line_start
@@ -1094,11 +1309,50 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_multiline_paste_text() {
+        let pasted = "\r\n    fn main() {  \r\n        println!(\"hi\");\u{00a0}\r\n    }\r\n";
+
+        assert_eq!(
+            EditorView::normalize_paste_text(pasted),
+            "fn main() {\n    println!(\"hi\");\n}"
+        );
+    }
+
+    #[test]
+    fn normalizes_single_line_paste_text_without_stripping_leading_spaces() {
+        assert_eq!(EditorView::normalize_paste_text("  hello  "), "  hello");
+    }
+
+    #[test]
     fn parses_slate_markdown_separator() {
         assert!(super::is_markdown_separator("---"));
         assert!(super::is_markdown_separator("  ---  "));
         assert!(!super::is_markdown_separator("----"));
         assert!(!super::is_markdown_separator("text ---"));
+    }
+
+    #[test]
+    fn parses_fenced_code_markers() {
+        let rust = super::parse_fenced_code_marker("```rust").unwrap();
+        assert_eq!(rust.language, "rust");
+
+        let plain = super::parse_fenced_code_marker("  ```").unwrap();
+        assert_eq!(plain.language, "");
+
+        assert!(super::parse_fenced_code_marker("text ```rust").is_none());
+        assert!(super::parse_fenced_code_marker("````rust").is_none());
+    }
+
+    #[test]
+    fn detects_fenced_code_block_ranges() {
+        let buffer = EditorBuffer::from_text("before\n```rust\ncode\n```\nafter".to_string());
+        let view = EditorView::new();
+
+        assert_eq!(view.code_block_range(&buffer, 0), None);
+        assert_eq!(view.code_block_range(&buffer, 1), Some((1, 3)));
+        assert_eq!(view.code_block_range(&buffer, 2), Some((1, 3)));
+        assert_eq!(view.code_block_range(&buffer, 3), Some((1, 3)));
+        assert_eq!(view.code_block_range(&buffer, 4), None);
     }
 
     #[test]
