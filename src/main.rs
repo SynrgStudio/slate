@@ -13,7 +13,7 @@ use std::{
 use editor_buffer::EditorBuffer;
 use editor_view::{
     CheckboxState, EditorView, LineNumberMode, is_markdown_separator, parse_blockquote_line,
-    parse_checkbox_line, parse_fenced_code_marker, parse_inline_code_spans,
+    parse_checkbox_line, parse_fenced_code_marker, parse_heading_line, parse_inline_code_spans,
 };
 use eframe::egui::{
     self, Color32, FontFamily, FontId, Key, RichText, Stroke, TextEdit, Vec2,
@@ -6463,12 +6463,24 @@ impl SlateApp {
                                     .color(Color32::from_rgb(216, 222, 233)),
                             );
                         });
-                } else if let Some(h) = trimmed.strip_prefix("### ") {
-                    ui.label(RichText::new(h).size(18.0).strong());
-                } else if let Some(h) = trimmed.strip_prefix("## ") {
-                    ui.label(RichText::new(h).size(22.0).strong());
-                } else if let Some(h) = trimmed.strip_prefix("# ") {
-                    ui.label(RichText::new(h).size(28.0).strong());
+                } else if let Some(heading) = parse_heading_line(line) {
+                    let size = match heading.level {
+                        1 => 28.0,
+                        2 => 22.0,
+                        3 => 18.0,
+                        _ => 16.0,
+                    };
+                    let color = match heading.level {
+                        1 => Color32::from_rgb(235, 203, 139),
+                        2 => Color32::from_rgb(180, 142, 173),
+                        3 => Color32::from_rgb(136, 192, 208),
+                        _ => Color32::from_rgb(216, 222, 233),
+                    };
+                    ui.add_space(if heading.level <= 2 { 4.0 } else { 2.0 });
+                    ui.label(RichText::new(heading.text).size(size).strong().color(color));
+                    if heading.level <= 2 {
+                        ui.separator();
+                    }
                 } else if is_markdown_separator(line) {
                     ui.add_space(6.0);
                     ui.separator();

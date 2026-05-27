@@ -101,7 +101,8 @@ Scope:
 - Done: support fenced code blocks with subtle background/padding and optional language label; no syntax highlighting required yet.
 - Nice-to-have: future syntax/semantic highlighting for fenced code blocks, probably via tree-sitter or syntect; not relevant for the current milestone.
 - Done: support inline code rendering for backtick spans where practical.
-- Pending: polish headings and regular lists in editor/preview while preserving direct plain-text editing.
+- Done: polish headings in editor/preview while preserving direct plain-text editing.
+- Pending: polish regular lists in editor/preview while preserving direct plain-text editing.
 - Pending: support local Markdown links like `[text](./file.md)` with visual affordance and contextual open.
 - Pending: support `Ctrl+LeftClick` on web links to open them in the default browser and on local links to open them in Slate.
 - Pending: support simple Markdown tables in preview only; no table editor or auto-alignment for now.

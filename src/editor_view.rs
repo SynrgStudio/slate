@@ -66,6 +66,29 @@ pub(crate) struct ParsedCodeFence<'a> {
     pub(crate) language: &'a str,
 }
 
+pub(crate) struct ParsedHeadingLine<'a> {
+    pub(crate) indent: &'a str,
+    pub(crate) marker: &'a str,
+    pub(crate) level: usize,
+    pub(crate) text: &'a str,
+}
+
+pub(crate) fn parse_heading_line(line: &str) -> Option<ParsedHeadingLine<'_>> {
+    let indent_len = line.len() - line.trim_start().len();
+    let indent = &line[..indent_len];
+    let rest = &line[indent_len..];
+    let level = rest.chars().take_while(|ch| *ch == '#').count();
+    if !(1..=6).contains(&level) || rest.as_bytes().get(level) != Some(&b' ') {
+        return None;
+    }
+    Some(ParsedHeadingLine {
+        indent,
+        marker: &rest[..=level],
+        level,
+        text: &rest[level + 1..],
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct InlineCodeSpan {
     pub(crate) marker_start: usize,
@@ -977,6 +1000,67 @@ impl EditorView {
             }
         }
 
+        if let Some(heading) = parse_heading_line(line) {
+            let marker_start = line_start + heading.indent.len();
+            let marker_end = marker_start + heading.marker.len();
+            let cursor_in_marker = buffer.cursor() >= marker_start && buffer.cursor() <= marker_end;
+            let heading_color = match heading.level {
+                1 => Color32::from_rgb(235, 203, 139),
+                2 => Color32::from_rgb(180, 142, 173),
+                3 => Color32::from_rgb(136, 192, 208),
+                _ => Color32::from_rgb(216, 222, 233),
+            };
+            if !cursor_in_marker && row.start == line_start {
+                let indent_width = self.text_width(painter, heading.indent, font);
+                let marker_width = self.text_width(painter, heading.marker, font);
+                if !heading.indent.is_empty() {
+                    painter.text(
+                        egui::pos2(text_x, y + line_height * 0.5),
+                        egui::Align2::LEFT_CENTER,
+                        heading.indent,
+                        font.clone(),
+                        text_color,
+                    );
+                }
+                painter.text(
+                    egui::pos2(text_x + indent_width, y + line_height * 0.5),
+                    egui::Align2::LEFT_CENTER,
+                    heading.marker,
+                    font.clone(),
+                    Color32::from_rgb(94, 105, 126),
+                );
+                if row.end > marker_end {
+                    painter.text(
+                        egui::pos2(text_x + indent_width + marker_width, y + line_height * 0.5),
+                        egui::Align2::LEFT_CENTER,
+                        &buffer.as_str()[marker_end..row.end],
+                        font.clone(),
+                        heading_color,
+                    );
+                }
+                if heading.level <= 2 {
+                    let underline_y = y + line_height - 2.0;
+                    painter.line_segment(
+                        [
+                            egui::pos2(text_x + indent_width + marker_width, underline_y),
+                            egui::pos2(painter.clip_rect().right() - 8.0, underline_y),
+                        ],
+                        Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
+                    );
+                }
+                return;
+            } else if !cursor_in_marker {
+                painter.text(
+                    egui::pos2(text_x, y + line_height * 0.5),
+                    egui::Align2::LEFT_CENTER,
+                    &buffer.as_str()[row.start..row.end],
+                    font.clone(),
+                    heading_color,
+                );
+                return;
+            }
+        }
+
         if is_markdown_separator(line)
             && buffer.cursor_line_col().0 != row.line_index
             && row.start == line_start
@@ -1484,6 +1568,23 @@ mod tests {
         assert!(super::is_markdown_separator("  ---  "));
         assert!(!super::is_markdown_separator("----"));
         assert!(!super::is_markdown_separator("text ---"));
+    }
+
+    #[test]
+    fn parses_heading_lines() {
+        let h1 = super::parse_heading_line("# Title").unwrap();
+        assert_eq!(h1.level, 1);
+        assert_eq!(h1.marker, "# ");
+        assert_eq!(h1.text, "Title");
+
+        let h3 = super::parse_heading_line("  ### Section").unwrap();
+        assert_eq!(h3.indent, "  ");
+        assert_eq!(h3.level, 3);
+        assert_eq!(h3.marker, "### ");
+        assert_eq!(h3.text, "Section");
+
+        assert!(super::parse_heading_line("#Nope").is_none());
+        assert!(super::parse_heading_line("####### Too much").is_none());
     }
 
     #[test]
