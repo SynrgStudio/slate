@@ -99,7 +99,8 @@ Scope:
 - Done: support `---` as the only horizontal separator syntax when it is alone on a line, with editor and preview rendering.
 - Done: support blockquotes (`> quote`) with subtle editor affordance and preview rendering.
 - Done: support fenced code blocks with subtle background/padding and optional language label; no syntax highlighting required yet.
-- Pending: support inline code rendering for backtick spans where practical.
+- Nice-to-have: future syntax/semantic highlighting for fenced code blocks, probably via tree-sitter or syntect; not relevant for the current milestone.
+- Done: support inline code rendering for backtick spans where practical.
 - Pending: polish headings and regular lists in editor/preview while preserving direct plain-text editing.
 - Pending: support local Markdown links like `[text](./file.md)` with visual affordance and contextual open.
 - Pending: support `Ctrl+LeftClick` on web links to open them in the default browser and on local links to open them in Slate.

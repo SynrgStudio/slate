@@ -66,6 +66,38 @@ pub(crate) struct ParsedCodeFence<'a> {
     pub(crate) language: &'a str,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct InlineCodeSpan {
+    pub(crate) marker_start: usize,
+    pub(crate) code_start: usize,
+    pub(crate) code_end: usize,
+    pub(crate) marker_end: usize,
+}
+
+pub(crate) fn parse_inline_code_spans(line: &str) -> Vec<InlineCodeSpan> {
+    let mut spans = Vec::new();
+    let mut search_from = 0;
+    while let Some(open_relative) = line[search_from..].find('`') {
+        let marker_start = search_from + open_relative;
+        let code_start = marker_start + 1;
+        let Some(close_relative) = line[code_start..].find('`') else {
+            break;
+        };
+        let code_end = code_start + close_relative;
+        let marker_end = code_end + 1;
+        if code_start < code_end {
+            spans.push(InlineCodeSpan {
+                marker_start,
+                code_start,
+                code_end,
+                marker_end,
+            });
+        }
+        search_from = marker_end;
+    }
+    spans
+}
+
 pub(crate) fn parse_fenced_code_marker(line: &str) -> Option<ParsedCodeFence<'_>> {
     let trimmed = line.trim_start();
     let language = trimmed.strip_prefix("```")?;
@@ -303,6 +335,7 @@ impl EditorView {
                 line_height,
                 rect.right(),
                 render_markdown,
+                &font,
             );
 
             if let Some(search_state) =
@@ -825,26 +858,56 @@ impl EditorView {
         line_height: f32,
         right: f32,
         render_markdown: bool,
+        font: &FontId,
     ) {
-        if !render_markdown || self.code_line_kind(buffer, row.line_index).is_none() {
+        if !render_markdown {
             return;
         }
 
-        let cursor_line = buffer.cursor_line_col().0;
-        let cursor_in_this_code_block =
-            self.code_block_range(buffer, row.line_index)
+        if self.code_line_kind(buffer, row.line_index).is_some() {
+            let cursor_line = buffer.cursor_line_col().0;
+            let cursor_in_this_code_block = self
+                .code_block_range(buffer, row.line_index)
                 .is_some_and(|line_range| {
                     self.code_block_range(buffer, cursor_line) == Some(line_range)
                 });
-        if cursor_in_this_code_block {
+            if cursor_in_this_code_block {
+                return;
+            }
+
+            let code_rect = egui::Rect::from_min_max(
+                egui::pos2(text_x - 4.0, y + 1.0),
+                egui::pos2(right - 8.0, y + line_height - 1.0),
+            );
+            painter.rect_filled(code_rect, 2.0, Color32::from_rgb(25, 31, 40));
             return;
         }
 
-        let code_rect = egui::Rect::from_min_max(
-            egui::pos2(text_x - 4.0, y + 1.0),
-            egui::pos2(right - 8.0, y + line_height - 1.0),
-        );
-        painter.rect_filled(code_rect, 2.0, Color32::from_rgb(25, 31, 40));
+        let line = buffer.line(row.line_index);
+        let line_start = buffer.line_start(row.line_index);
+        let cursor = buffer.cursor();
+        let spans = parse_inline_code_spans(line);
+        if spans.iter().any(|span| {
+            cursor >= line_start + span.marker_start && cursor <= line_start + span.marker_end
+        }) {
+            return;
+        }
+
+        for span in spans {
+            let start = (line_start + span.marker_start).max(row.start);
+            let end = (line_start + span.marker_end).min(row.end);
+            if start >= end {
+                continue;
+            }
+            let start_x =
+                text_x + self.text_width(painter, &buffer.as_str()[row.start..start], font);
+            let end_x = text_x + self.text_width(painter, &buffer.as_str()[row.start..end], font);
+            let code_rect = egui::Rect::from_min_max(
+                egui::pos2(start_x - 2.0, y + 2.0),
+                egui::pos2(end_x + 2.0, y + line_height - 2.0),
+            );
+            painter.rect_filled(code_rect, 3.0, Color32::from_rgb(31, 38, 50));
+        }
     }
 
     pub(crate) fn paint_line_text(
@@ -988,6 +1051,18 @@ impl EditorView {
         }
 
         let Some(parsed) = parse_checkbox_line(line) else {
+            if self.paint_inline_code_text(
+                painter,
+                buffer,
+                row,
+                text_x,
+                y,
+                line_height,
+                font,
+                text_color,
+            ) {
+                return;
+            }
             painter.text(
                 egui::pos2(text_x, y + line_height * 0.5),
                 egui::Align2::LEFT_CENTER,
@@ -1104,6 +1179,86 @@ impl EditorView {
                 text_color,
             );
         }
+    }
+
+    fn paint_inline_code_text(
+        &self,
+        painter: &egui::Painter,
+        buffer: &EditorBuffer,
+        row: VisualRow,
+        text_x: f32,
+        y: f32,
+        line_height: f32,
+        font: &FontId,
+        text_color: Color32,
+    ) -> bool {
+        let line = buffer.line(row.line_index);
+        let line_start = buffer.line_start(row.line_index);
+        let spans = parse_inline_code_spans(line);
+        if spans.is_empty()
+            || spans.iter().any(|span| {
+                buffer.cursor() >= line_start + span.marker_start
+                    && buffer.cursor() <= line_start + span.marker_end
+            })
+        {
+            return false;
+        }
+
+        let mut byte = row.start;
+        for span in spans {
+            let marker_start = line_start + span.marker_start;
+            let code_start = line_start + span.code_start;
+            let code_end = line_start + span.code_end;
+            let marker_end = line_start + span.marker_end;
+            if marker_end <= row.start || marker_start >= row.end {
+                continue;
+            }
+
+            for (start, end, color) in [
+                (byte, marker_start.min(row.end), text_color),
+                (
+                    marker_start.max(row.start),
+                    code_start.min(row.end),
+                    Color32::from_rgb(94, 105, 126),
+                ),
+                (
+                    code_start.max(row.start),
+                    code_end.min(row.end),
+                    Color32::from_rgb(235, 203, 139),
+                ),
+                (
+                    code_end.max(row.start),
+                    marker_end.min(row.end),
+                    Color32::from_rgb(94, 105, 126),
+                ),
+            ] {
+                if start < end {
+                    let x =
+                        text_x + self.text_width(painter, &buffer.as_str()[row.start..start], font);
+                    painter.text(
+                        egui::pos2(x, y + line_height * 0.5),
+                        egui::Align2::LEFT_CENTER,
+                        &buffer.as_str()[start..end],
+                        font.clone(),
+                        color,
+                    );
+                }
+            }
+            byte = marker_end.max(row.start).min(row.end);
+        }
+
+        if byte < row.end {
+            let x = text_x + self.text_width(painter, &buffer.as_str()[row.start..byte], font);
+            painter.text(
+                egui::pos2(x, y + line_height * 0.5),
+                egui::Align2::LEFT_CENTER,
+                &buffer.as_str()[byte..row.end],
+                font.clone(),
+                text_color,
+            );
+        }
+
+        true
     }
 
     pub(crate) fn paint_search_matches(
@@ -1329,6 +1484,30 @@ mod tests {
         assert!(super::is_markdown_separator("  ---  "));
         assert!(!super::is_markdown_separator("----"));
         assert!(!super::is_markdown_separator("text ---"));
+    }
+
+    #[test]
+    fn parses_inline_code_spans() {
+        assert_eq!(
+            super::parse_inline_code_spans("use `code` here and `more`"),
+            vec![
+                super::InlineCodeSpan {
+                    marker_start: 4,
+                    code_start: 5,
+                    code_end: 9,
+                    marker_end: 10,
+                },
+                super::InlineCodeSpan {
+                    marker_start: 20,
+                    code_start: 21,
+                    code_end: 25,
+                    marker_end: 26,
+                },
+            ]
+        );
+        assert!(super::parse_inline_code_spans("no code").is_empty());
+        assert!(super::parse_inline_code_spans("open `code").is_empty());
+        assert!(super::parse_inline_code_spans("empty `` span").is_empty());
     }
 
     #[test]

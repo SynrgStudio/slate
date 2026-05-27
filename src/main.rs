@@ -13,7 +13,7 @@ use std::{
 use editor_buffer::EditorBuffer;
 use editor_view::{
     CheckboxState, EditorView, LineNumberMode, is_markdown_separator, parse_blockquote_line,
-    parse_checkbox_line, parse_fenced_code_marker,
+    parse_checkbox_line, parse_fenced_code_marker, parse_inline_code_spans,
 };
 use eframe::egui::{
     self, Color32, FontFamily, FontId, Key, RichText, Stroke, TextEdit, Vec2,
@@ -6353,6 +6353,72 @@ impl SlateApp {
         }
     }
 
+    fn inline_code_preview_label(ui: &mut egui::Ui, line: &str) -> bool {
+        let spans = parse_inline_code_spans(line);
+        if spans.is_empty() {
+            return false;
+        }
+
+        let font = FontId::new(15.0, FontFamily::Monospace);
+        let mut sections = Vec::new();
+        let mut byte = 0;
+        for span in spans {
+            for (start, end, color, background) in [
+                (
+                    byte,
+                    span.marker_start,
+                    Color32::from_rgb(216, 222, 233),
+                    Color32::TRANSPARENT,
+                ),
+                (
+                    span.marker_start,
+                    span.code_start,
+                    Color32::from_rgb(94, 105, 126),
+                    Color32::from_rgb(31, 38, 50),
+                ),
+                (
+                    span.code_start,
+                    span.code_end,
+                    Color32::from_rgb(235, 203, 139),
+                    Color32::from_rgb(31, 38, 50),
+                ),
+                (
+                    span.code_end,
+                    span.marker_end,
+                    Color32::from_rgb(94, 105, 126),
+                    Color32::from_rgb(31, 38, 50),
+                ),
+            ] {
+                if start < end {
+                    let mut format = TextFormat::simple(font.clone(), color);
+                    format.background = background;
+                    format.expand_bg = 2.0;
+                    sections.push(LayoutSection {
+                        leading_space: 0.0,
+                        byte_range: start..end,
+                        format,
+                    });
+                }
+            }
+            byte = span.marker_end;
+        }
+        if byte < line.len() {
+            sections.push(LayoutSection {
+                leading_space: 0.0,
+                byte_range: byte..line.len(),
+                format: TextFormat::simple(font, Color32::from_rgb(216, 222, 233)),
+            });
+        }
+
+        ui.label(LayoutJob {
+            text: line.to_string(),
+            sections,
+            break_on_newline: false,
+            ..Default::default()
+        });
+        true
+    }
+
     fn preview_ui(&self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -6443,7 +6509,7 @@ impl SlateApp {
                     ui.label(format!("• {}", &trimmed[2..]));
                 } else if trimmed.is_empty() {
                     ui.add_space(8.0);
-                } else {
+                } else if !Self::inline_code_preview_label(ui, line) {
                     ui.label(RichText::new(line).size(15.0));
                 }
             }
