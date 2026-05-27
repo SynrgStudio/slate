@@ -73,6 +73,54 @@ pub(crate) struct ParsedHeadingLine<'a> {
     pub(crate) text: &'a str,
 }
 
+pub(crate) struct ParsedListLine<'a> {
+    pub(crate) indent: &'a str,
+    pub(crate) marker: &'a str,
+    pub(crate) text: &'a str,
+    pub(crate) ordered: bool,
+    pub(crate) number: Option<usize>,
+    pub(crate) separator: Option<char>,
+}
+
+pub(crate) fn parse_list_line(line: &str) -> Option<ParsedListLine<'_>> {
+    let indent_len = line.len() - line.trim_start().len();
+    let indent = &line[..indent_len];
+    let rest = &line[indent_len..];
+
+    if let Some(text) = rest.strip_prefix("- ").or_else(|| rest.strip_prefix("* ")) {
+        return Some(ParsedListLine {
+            indent,
+            marker: &rest[..2],
+            text,
+            ordered: false,
+            number: None,
+            separator: None,
+        });
+    }
+
+    let digit_len = rest.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    if digit_len == 0 || digit_len > 9 {
+        return None;
+    }
+    let marker_len = digit_len + 2;
+    let marker = rest.get(..marker_len)?;
+    let separator = rest.as_bytes().get(digit_len)?;
+    if (*separator == b'.' || *separator == b')')
+        && rest.as_bytes().get(digit_len + 1) == Some(&b' ')
+    {
+        return Some(ParsedListLine {
+            indent,
+            marker,
+            text: &rest[marker_len..],
+            ordered: true,
+            number: rest[..digit_len].parse().ok(),
+            separator: Some(*separator as char),
+        });
+    }
+
+    None
+}
+
 pub(crate) fn parse_heading_line(line: &str) -> Option<ParsedHeadingLine<'_>> {
     let indent_len = line.len() - line.trim_start().len();
     let indent = &line[..indent_len];
@@ -532,7 +580,9 @@ impl EditorView {
                 changed = Self::cycle_current_line_checkbox(buffer) || changed;
             }
             if input.consume_key(egui::Modifiers::NONE, Key::Enter) {
-                buffer.insert_newline();
+                if !self.insert_predictive_list_newline(buffer) {
+                    buffer.insert_newline();
+                }
                 self.request_scroll_to_cursor(buffer);
                 changed = true;
             }
@@ -718,6 +768,37 @@ impl EditorView {
         };
         buffer.replace_selection_or_range(marker_start, marker_end, next_marker);
         buffer.set_cursor(next_cursor);
+        true
+    }
+
+    pub(crate) fn insert_predictive_list_newline(&mut self, buffer: &mut EditorBuffer) -> bool {
+        if buffer.selection().is_some() {
+            return false;
+        }
+
+        let line_index = buffer.line_index_for_byte(buffer.cursor());
+        let line_start = buffer.line_start(line_index);
+        let line_end = buffer.line_end(line_index);
+        if buffer.cursor() != line_end {
+            return false;
+        }
+
+        let line = buffer.line(line_index);
+        let Some(list) = parse_list_line(line) else {
+            return false;
+        };
+
+        if list.text.trim().is_empty() {
+            buffer.replace_selection_or_range(line_start, line_end, "");
+            return true;
+        }
+
+        let next_marker = if let (Some(number), Some(separator)) = (list.number, list.separator) {
+            format!("{}{} ", number + 1, separator)
+        } else {
+            list.marker.to_string()
+        };
+        buffer.insert_text(&format!("\n{}{}", list.indent, next_marker));
         true
     }
 
@@ -1135,6 +1216,48 @@ impl EditorView {
         }
 
         let Some(parsed) = parse_checkbox_line(line) else {
+            if let Some(list) = parse_list_line(line) {
+                let marker_start = line_start + list.indent.len();
+                let marker_end = marker_start + list.marker.len();
+                let cursor_in_marker =
+                    buffer.cursor() >= marker_start && buffer.cursor() <= marker_end;
+                if !cursor_in_marker && row.start == line_start {
+                    let indent_width = self.text_width(painter, list.indent, font);
+                    let marker_width = self.text_width(painter, list.marker, font);
+                    if !list.indent.is_empty() {
+                        painter.text(
+                            egui::pos2(text_x, y + line_height * 0.5),
+                            egui::Align2::LEFT_CENTER,
+                            list.indent,
+                            font.clone(),
+                            text_color,
+                        );
+                    }
+                    let marker_color = if list.ordered {
+                        Color32::from_rgb(235, 203, 139)
+                    } else {
+                        Color32::from_rgb(136, 192, 208)
+                    };
+                    painter.text(
+                        egui::pos2(text_x + indent_width, y + line_height * 0.5),
+                        egui::Align2::LEFT_CENTER,
+                        list.marker,
+                        font.clone(),
+                        marker_color,
+                    );
+                    if row.end > marker_end {
+                        painter.text(
+                            egui::pos2(text_x + indent_width + marker_width, y + line_height * 0.5),
+                            egui::Align2::LEFT_CENTER,
+                            &buffer.as_str()[marker_end..row.end],
+                            font.clone(),
+                            text_color,
+                        );
+                    }
+                    return;
+                }
+            }
+
             if self.paint_inline_code_text(
                 painter,
                 buffer,
@@ -1568,6 +1691,69 @@ mod tests {
         assert!(super::is_markdown_separator("  ---  "));
         assert!(!super::is_markdown_separator("----"));
         assert!(!super::is_markdown_separator("text ---"));
+    }
+
+    #[test]
+    fn parses_list_lines() {
+        let bullet = super::parse_list_line("  - item").unwrap();
+        assert_eq!(bullet.indent, "  ");
+        assert_eq!(bullet.marker, "- ");
+        assert_eq!(bullet.text, "item");
+        assert!(!bullet.ordered);
+        assert_eq!(bullet.number, None);
+        assert_eq!(bullet.separator, None);
+
+        let star = super::parse_list_line("* item").unwrap();
+        assert_eq!(star.marker, "* ");
+        assert_eq!(star.text, "item");
+        assert!(!star.ordered);
+
+        let ordered = super::parse_list_line("12. item").unwrap();
+        assert_eq!(ordered.marker, "12. ");
+        assert_eq!(ordered.text, "item");
+        assert!(ordered.ordered);
+        assert_eq!(ordered.number, Some(12));
+        assert_eq!(ordered.separator, Some('.'));
+
+        let paren = super::parse_list_line("3) item").unwrap();
+        assert_eq!(paren.marker, "3) ");
+        assert_eq!(paren.text, "item");
+        assert!(paren.ordered);
+        assert_eq!(paren.number, Some(3));
+        assert_eq!(paren.separator, Some(')'));
+
+        assert!(super::parse_list_line("-not list").is_none());
+        assert!(super::parse_list_line("1.not list").is_none());
+    }
+
+    #[test]
+    fn predictive_list_newline_continues_unordered_lists() {
+        let mut buffer = EditorBuffer::from_text("- hola".to_string());
+        buffer.set_cursor(buffer.as_str().len());
+        let mut view = EditorView::new();
+
+        assert!(view.insert_predictive_list_newline(&mut buffer));
+        assert_eq!(buffer.as_str(), "- hola\n- ");
+    }
+
+    #[test]
+    fn predictive_list_newline_increments_ordered_lists() {
+        let mut buffer = EditorBuffer::from_text("  1) hola".to_string());
+        buffer.set_cursor(buffer.as_str().len());
+        let mut view = EditorView::new();
+
+        assert!(view.insert_predictive_list_newline(&mut buffer));
+        assert_eq!(buffer.as_str(), "  1) hola\n  2) ");
+    }
+
+    #[test]
+    fn predictive_list_newline_removes_empty_list_marker() {
+        let mut buffer = EditorBuffer::from_text("- hola\n- ".to_string());
+        buffer.set_cursor(buffer.as_str().len());
+        let mut view = EditorView::new();
+
+        assert!(view.insert_predictive_list_newline(&mut buffer));
+        assert_eq!(buffer.as_str(), "- hola\n");
     }
 
     #[test]

@@ -14,6 +14,7 @@ use editor_buffer::EditorBuffer;
 use editor_view::{
     CheckboxState, EditorView, LineNumberMode, is_markdown_separator, parse_blockquote_line,
     parse_checkbox_line, parse_fenced_code_marker, parse_heading_line, parse_inline_code_spans,
+    parse_list_line,
 };
 use eframe::egui::{
     self, Color32, FontFamily, FontId, Key, RichText, Stroke, TextEdit, Vec2,
@@ -6517,8 +6518,26 @@ impl SlateApp {
                         Self::checkbox_preview_icon(ui, checkbox.state);
                         ui.label(RichText::new(checkbox.text).size(15.0));
                     });
-                } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
-                    ui.label(format!("• {}", &trimmed[2..]));
+                } else if let Some(list) = parse_list_line(line) {
+                    ui.horizontal(|ui| {
+                        if !list.indent.is_empty() {
+                            ui.label(
+                                RichText::new(list.indent)
+                                    .font(FontId::new(15.0, FontFamily::Monospace)),
+                            );
+                        }
+                        let marker = if list.ordered { list.marker } else { "•" };
+                        ui.label(
+                            RichText::new(marker)
+                                .font(FontId::new(15.0, FontFamily::Monospace))
+                                .color(if list.ordered {
+                                    Color32::from_rgb(235, 203, 139)
+                                } else {
+                                    Color32::from_rgb(136, 192, 208)
+                                }),
+                        );
+                        ui.label(RichText::new(list.text).size(15.0));
+                    });
                 } else if trimmed.is_empty() {
                     ui.add_space(8.0);
                 } else if !Self::inline_code_preview_label(ui, line) {
