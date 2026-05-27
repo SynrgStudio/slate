@@ -36,6 +36,46 @@ impl LineNumberMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CheckboxState {
+    Empty,
+    Doing,
+    Done,
+}
+
+pub(crate) struct ParsedCheckboxLine<'a> {
+    pub(crate) indent: &'a str,
+    pub(crate) marker: &'a str,
+    pub(crate) state: CheckboxState,
+    pub(crate) text: &'a str,
+}
+
+pub(crate) fn parse_checkbox_line(line: &str) -> Option<ParsedCheckboxLine<'_>> {
+    let indent_len = line.len() - line.trim_start().len();
+    let indent = &line[..indent_len];
+    let rest = &line[indent_len..];
+    let (marker, state, text) = if let Some(text) = rest.strip_prefix("[ ] ") {
+        ("[ ]", CheckboxState::Empty, text)
+    } else if let Some(text) = rest.strip_prefix("[] ") {
+        ("[]", CheckboxState::Empty, text)
+    } else if let Some(text) = rest.strip_prefix("[/] ") {
+        ("[/]", CheckboxState::Doing, text)
+    } else if let Some(text) = rest.strip_prefix("[x] ") {
+        ("[x]", CheckboxState::Done, text)
+    } else if let Some(text) = rest.strip_prefix("[X] ") {
+        ("[X]", CheckboxState::Done, text)
+    } else {
+        return None;
+    };
+
+    Some(ParsedCheckboxLine {
+        indent,
+        marker,
+        state,
+        text,
+    })
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct VisualRow {
     line_index: usize,
@@ -242,11 +282,14 @@ impl EditorView {
             } else {
                 Color32::from_rgb(216, 222, 233)
             };
-            painter.text(
-                egui::pos2(text_x, y + line_height * 0.5),
-                egui::Align2::LEFT_CENTER,
-                &buffer.as_str()[row.start..row.end],
-                font.clone(),
+            self.paint_line_text(
+                &painter,
+                buffer,
+                row,
+                text_x,
+                y,
+                line_height,
+                &font,
                 text_color,
             );
         }
@@ -340,7 +383,7 @@ impl EditorView {
         if !ui.input(|input| input.modifiers.ctrl || input.modifiers.command || input.modifiers.alt)
         {
             if let Some(text) = text_input_from_events(&events) {
-                buffer.insert_text(&text);
+                self.insert_text_with_checkbox_expansion(buffer, &text);
                 self.request_scroll_to_cursor(buffer);
                 changed = true;
             }
@@ -354,6 +397,9 @@ impl EditorView {
         }
 
         ui.input_mut(|input| {
+            if input.consume_key(egui::Modifiers::CTRL, Key::Enter) {
+                changed = Self::cycle_current_line_checkbox(buffer) || changed;
+            }
             if input.consume_key(egui::Modifiers::NONE, Key::Enter) {
                 buffer.insert_newline();
                 self.request_scroll_to_cursor(buffer);
@@ -472,6 +518,58 @@ impl EditorView {
         changed
     }
 
+    pub(crate) fn cycle_current_line_checkbox(buffer: &mut EditorBuffer) -> bool {
+        let cursor = buffer.cursor();
+        let line_index = buffer.line_index_for_byte(cursor);
+        let line_start = buffer.line_start(line_index);
+        let line = buffer.line(line_index);
+        let Some(parsed) = parse_checkbox_line(line) else {
+            return false;
+        };
+        let marker_start = line_start + parsed.indent.len();
+        let marker_end = marker_start + parsed.marker.len();
+        let next_marker = match parsed.state {
+            CheckboxState::Empty => "[/]",
+            CheckboxState::Doing => "[x]",
+            CheckboxState::Done => "[ ]",
+        };
+        let next_cursor = if cursor <= marker_start {
+            cursor
+        } else if cursor <= marker_end {
+            marker_start + cursor.saturating_sub(marker_start).min(next_marker.len())
+        } else {
+            cursor
+                .saturating_add(next_marker.len())
+                .saturating_sub(parsed.marker.len())
+        };
+        buffer.replace_selection_or_range(marker_start, marker_end, next_marker);
+        buffer.set_cursor(next_cursor);
+        true
+    }
+
+    pub(crate) fn insert_text_with_checkbox_expansion(
+        &mut self,
+        buffer: &mut EditorBuffer,
+        text: &str,
+    ) {
+        if text == " " && buffer.selection().is_none() && buffer.cursor() >= 2 {
+            let cursor = buffer.cursor();
+            let source = buffer.as_str();
+            if source.get(cursor.saturating_sub(2)..cursor) == Some("[]") {
+                let line_index = buffer.line_index_for_byte(cursor);
+                let line_start = buffer.line_start(line_index);
+                if source[line_start..cursor.saturating_sub(2)]
+                    .chars()
+                    .all(char::is_whitespace)
+                {
+                    buffer.replace_selection_or_range(cursor - 2, cursor, "[ ] ");
+                    return;
+                }
+            }
+        }
+        buffer.insert_text(text);
+    }
+
     pub(crate) fn selection_anchor(buffer: &EditorBuffer) -> usize {
         buffer
             .selection()
@@ -482,6 +580,123 @@ impl EditorView {
     pub(crate) fn extend_selection(buffer: &mut EditorBuffer, anchor: usize, extend: bool) {
         if extend {
             buffer.set_selection(anchor, buffer.cursor());
+        }
+    }
+
+    pub(crate) fn paint_line_text(
+        &self,
+        painter: &egui::Painter,
+        buffer: &EditorBuffer,
+        row: VisualRow,
+        text_x: f32,
+        y: f32,
+        line_height: f32,
+        font: &FontId,
+        text_color: Color32,
+    ) {
+        let line_start = buffer.line_start(row.line_index);
+        let line = buffer.line(row.line_index);
+        let Some(parsed) = parse_checkbox_line(line) else {
+            painter.text(
+                egui::pos2(text_x, y + line_height * 0.5),
+                egui::Align2::LEFT_CENTER,
+                &buffer.as_str()[row.start..row.end],
+                font.clone(),
+                text_color,
+            );
+            return;
+        };
+
+        let marker_start = line_start + parsed.indent.len();
+        let marker_text_end = marker_start + parsed.marker.len();
+        let marker_end = marker_text_end + 1;
+        let cursor_in_checkbox =
+            buffer.cursor() >= marker_start && buffer.cursor() <= marker_text_end;
+        if cursor_in_checkbox
+            || row.start != line_start
+            || row.end <= marker_start
+            || row.start >= marker_end
+        {
+            painter.text(
+                egui::pos2(text_x, y + line_height * 0.5),
+                egui::Align2::LEFT_CENTER,
+                &buffer.as_str()[row.start..row.end],
+                font.clone(),
+                text_color,
+            );
+            return;
+        }
+
+        let indent_width = self.text_width(painter, parsed.indent, font);
+        let checkbox_slot_width = self.text_width(painter, "[x] ", font);
+        if !parsed.indent.is_empty() {
+            painter.text(
+                egui::pos2(text_x, y + line_height * 0.5),
+                egui::Align2::LEFT_CENTER,
+                parsed.indent,
+                font.clone(),
+                text_color,
+            );
+        }
+
+        let icon_rect = egui::Rect::from_min_size(
+            egui::pos2(text_x + indent_width, y + (line_height - 13.0) * 0.5),
+            egui::vec2(13.0, 13.0),
+        );
+        let (fill, stroke) = match parsed.state {
+            CheckboxState::Empty => (
+                Color32::from_rgb(30, 36, 48),
+                Color32::from_rgb(136, 154, 176),
+            ),
+            CheckboxState::Doing => (
+                Color32::from_rgb(59, 66, 82),
+                Color32::from_rgb(235, 203, 139),
+            ),
+            CheckboxState::Done => (
+                Color32::from_rgb(49, 70, 60),
+                Color32::from_rgb(163, 190, 140),
+            ),
+        };
+        painter.rect_filled(icon_rect, 2.0, fill);
+        painter.rect_stroke(
+            icon_rect,
+            2.0,
+            Stroke::new(1.2, stroke),
+            egui::StrokeKind::Outside,
+        );
+        let glyph_rect = icon_rect.shrink(3.2);
+        match parsed.state {
+            CheckboxState::Empty => {}
+            CheckboxState::Doing => {
+                painter.line_segment(
+                    [glyph_rect.left_bottom(), glyph_rect.right_top()],
+                    Stroke::new(1.5, stroke),
+                );
+            }
+            CheckboxState::Done => {
+                painter.line_segment(
+                    [glyph_rect.left_top(), glyph_rect.right_bottom()],
+                    Stroke::new(1.5, stroke),
+                );
+                painter.line_segment(
+                    [glyph_rect.left_bottom(), glyph_rect.right_top()],
+                    Stroke::new(1.5, stroke),
+                );
+            }
+        }
+
+        let text_start = marker_end;
+        if row.end > text_start {
+            painter.text(
+                egui::pos2(
+                    text_x + indent_width + checkbox_slot_width,
+                    y + line_height * 0.5,
+                ),
+                egui::Align2::LEFT_CENTER,
+                &buffer.as_str()[text_start..row.end],
+                font.clone(),
+                text_color,
+            );
         }
     }
 
@@ -655,6 +870,66 @@ fn text_input_from_events(events: &[egui::Event]) -> Option<String> {
 mod tests {
     use super::{EditorView, LineNumberMode};
     use crate::editor_buffer::EditorBuffer;
+
+    #[test]
+    fn parses_slate_checkbox_lines() {
+        let empty = super::parse_checkbox_line("[ ] todo").unwrap();
+        assert_eq!(empty.marker, "[ ]");
+        assert_eq!(empty.state, super::CheckboxState::Empty);
+        assert_eq!(empty.text, "todo");
+
+        let compact_empty = super::parse_checkbox_line("[] todo").unwrap();
+        assert_eq!(compact_empty.marker, "[]");
+        assert_eq!(compact_empty.state, super::CheckboxState::Empty);
+
+        let doing = super::parse_checkbox_line("  [/] doing").unwrap();
+        assert_eq!(doing.indent, "  ");
+        assert_eq!(doing.state, super::CheckboxState::Doing);
+        assert_eq!(doing.text, "doing");
+
+        let done = super::parse_checkbox_line("[x] done").unwrap();
+        assert_eq!(done.state, super::CheckboxState::Done);
+        assert!(super::parse_checkbox_line("[]todo").is_none());
+        assert!(super::parse_checkbox_line("text [] todo").is_none());
+    }
+
+    #[test]
+    fn expands_compact_empty_checkbox_when_space_is_typed() {
+        let mut buffer = EditorBuffer::from_text("[]".to_string());
+        buffer.set_cursor(2);
+        let mut view = EditorView::new();
+
+        view.insert_text_with_checkbox_expansion(&mut buffer, " ");
+
+        assert_eq!(buffer.as_str(), "[ ] ");
+        assert_eq!(buffer.cursor(), 4);
+    }
+
+    #[test]
+    fn cycles_checkbox_state_on_current_line() {
+        let mut buffer = EditorBuffer::from_text("[ ] todo".to_string());
+        buffer.set_cursor(1);
+
+        assert!(EditorView::cycle_current_line_checkbox(&mut buffer));
+        assert_eq!(buffer.as_str(), "[/] todo");
+
+        assert!(EditorView::cycle_current_line_checkbox(&mut buffer));
+        assert_eq!(buffer.as_str(), "[x] todo");
+
+        assert!(EditorView::cycle_current_line_checkbox(&mut buffer));
+        assert_eq!(buffer.as_str(), "[ ] todo");
+    }
+
+    #[test]
+    fn cycling_checkbox_preserves_cursor_in_text() {
+        let mut buffer = EditorBuffer::from_text("[ ] todo".to_string());
+        buffer.set_cursor(8);
+
+        assert!(EditorView::cycle_current_line_checkbox(&mut buffer));
+
+        assert_eq!(buffer.as_str(), "[/] todo");
+        assert_eq!(buffer.cursor(), 8);
+    }
 
     #[test]
     fn line_number_mode_calculates_relative_numbers() {

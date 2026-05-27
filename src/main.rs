@@ -11,7 +11,7 @@ use std::{
 };
 
 use editor_buffer::EditorBuffer;
-use editor_view::{EditorView, LineNumberMode};
+use editor_view::{CheckboxState, EditorView, LineNumberMode, parse_checkbox_line};
 use eframe::egui::{
     self, Color32, FontFamily, FontId, Key, RichText, Stroke, TextEdit, Vec2,
     text::{LayoutJob, LayoutSection, TextFormat},
@@ -5841,6 +5841,22 @@ impl SlateApp {
                     ui.label(RichText::new(h).size(22.0).strong());
                 } else if let Some(h) = trimmed.strip_prefix("# ") {
                     ui.label(RichText::new(h).size(28.0).strong());
+                } else if let Some(checkbox) = parse_checkbox_line(line) {
+                    let (icon, color) = match checkbox.state {
+                        CheckboxState::Empty => ("☐", Color32::from_rgb(136, 154, 176)),
+                        CheckboxState::Doing => ("◒", Color32::from_rgb(235, 203, 139)),
+                        CheckboxState::Done => ("☑", Color32::from_rgb(163, 190, 140)),
+                    };
+                    ui.horizontal(|ui| {
+                        if !checkbox.indent.is_empty() {
+                            ui.label(
+                                RichText::new(checkbox.indent)
+                                    .font(FontId::new(15.0, FontFamily::Monospace)),
+                            );
+                        }
+                        ui.label(RichText::new(icon).size(15.0).color(color));
+                        ui.label(RichText::new(checkbox.text).size(15.0));
+                    });
                 } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
                     ui.label(format!("• {}", &trimmed[2..]));
                 } else if trimmed.is_empty() {

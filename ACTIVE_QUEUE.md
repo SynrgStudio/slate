@@ -5,7 +5,7 @@
 Planning snapshot:
 - Completed foundation: native editor architecture/buffer/view/input/selection/find plus Ctrl-hold command layer.
 - Current near-term lane: finish statusbar/minibuffer, find regression harness, small editing basics, command discovery, config/recent files.
-- Later lane: scratch/daily/vault/search/wiki-link/index workflows.
+- Later lane: scratch/search/wiki-link/tag workflows.
 
 ### T001 — Review ThreadSuite generated context
 
@@ -37,9 +37,8 @@ Scope:
 - Done: persist command history limit, command history, line-number mode, word wrap, preview mode, last opened file, recent files, command usage, and Ctrl+Shift movement mode.
 - Done: expose persisted wrap/preview controls in Settings and commandline (`:wrap on|off`, `:preview on|off`).
 - Done: expose line-number mode through commandline (`:line-numbers absolute|relative`, `:ln absolute|relative`).
-- Pending: persist theme, selected vault/notes folder, scratch behavior, wiki-link insert style, and link resolver behavior.
+- Pending: persist theme, scratch behavior, wiki-link insert style, and link resolver behavior.
 - Keep configuration lightweight and human-readable.
-- Add an optional configurable vault/root notes directory for knowledge-management workflows.
 - Support toggleable wiki-link styles: compact deep link (`file.md:line:column`) and full Markdown-friendly display link (`file.md:line:column|visible text`).
 - Support a future literate Markdown config as the human-facing configuration source.
 
@@ -65,17 +64,8 @@ Scope:
 - Done: add `:scratch-entries` / `:scratch-log` / `:scl` modal for reviewing `~/.local/share/slate/scratch.md` as entries.
 - Done: from scratch modal, `Ctrl+E` opens scratch entries; in entries, `↑↓` selects and `Ctrl+D` / `Delete` deletes an entry from the archive.
 - Done: add `:capture` / `:cap` modal for sending selected text, or current line when no selection exists, to scratch with an optional title/context field focused by default.
-- Pending: support daily archive sections and quick append behavior.
+- Pending: support quick append behavior.
 - Pending: later promote entries/captures to full notes.
-
-### T006 — Daily notes
-
-Status: pending
-Scope:
-- Add command to create/open today's note.
-- Use a configurable notes directory and simple Markdown template.
-- Preserve the terminal-like, minimal interaction style.
-- Consider commands for `daily`, `yesterday`, `tomorrow`, and `append daily`.
 
 ### T007 — Core editing improvements
 
@@ -95,7 +85,8 @@ Scope:
 Status: pending
 Scope:
 - Improve preview rendering without making Slate heavy.
-- Support checklists, blockquotes, separators, local links, better code blocks, and simple tables where practical.
+- In progress: support Slate checkbox markers (`[ ] `, `[/] `, `[x] `) as Markdown checkboxes, not as Slate task-management objects; `[] ` expands to `[ ] ` while typing.
+- Support blockquotes, separators, local links, better code blocks, and simple tables where practical.
 - Keep Markdown as plain files plus lightweight conventions, not a custom database format.
 
 ### T009 — Theme system
@@ -133,7 +124,7 @@ Status: pending
 Scope:
 - Add configurable auto-save for suitable workflows.
 - Consider save-on-focus-loss or timed auto-save.
-- Keep auto-save especially useful for scratch and daily notes.
+- Keep auto-save especially useful for scratch and capture workflows.
 
 ### T013 — Terminal/Vim-like command language
 
@@ -143,24 +134,7 @@ Scope:
 - Done: common aliases such as `:w`, `:q`, `:wq`, `:x`, `:e`, `:f`, `:g`, `:dl`, `:dw`, `:sw`, `:sl`, `:gt`, `:gb`.
 - Done: make the command list a live registry used by commandline autocomplete, fzf-like suggestions, palette results, aliases, and command palette entries.
 - Done: route command palette results through the shared command registry and fuzzy matching.
-- Pending: add knowledge commands like `:daily`, `:scratch`, and `:theme amber`.
-
-### T014 — Templates
-
-Status: pending
-Scope:
-- Add templates for daily notes, meetings, projects, ideas, and journaling.
-- Add `New from template` through the command palette.
-- Keep templates as editable plain text/Markdown files where possible.
-
-### T015 — Task/checklist commands
-
-Status: pending
-Scope:
-- Detect Markdown task lines like `- [ ]` and `- [x]`.
-- Add command to toggle the current task.
-- Later consider listing tasks from the current file or notes folder.
-- Consider archiving completed tasks without creating a full productivity system.
+- Pending: add knowledge commands like `:scratch` and future wiki/link commands, plus `:theme amber`.
 
 ### T016 — Richer status bar and command line layout
 
@@ -182,17 +156,7 @@ Scope:
 - Done: defined Slate as a personal text workspace / terminal-like knowledge editor, not an Obsidian/Logseq clone.
 - Done: prioritized local files, capture first, commands before UI, progressive organization, and simple Markdown.
 - Done: explicitly documented anti-goals: early graph views, mandatory databases, heavy sidebars, plugin complexity, sync systems, and Emacs-level configurability.
-- Done: added feature decision rules for future scratch/daily/vault/wiki-link/index work.
-
-### T018 — Optional vault / local knowledge base
-
-Status: pending
-Scope:
-- Add a `Select vault` command that picks a normal folder as Slate's optional knowledge workspace.
-- Keep Slate usable as a regular text editor even when no vault is selected.
-- Treat the configured vault as the root for scratch, daily notes, ideas, projects, wiki links, and search.
-- Use normal folders/files such as `daily/`, `scratch.md`, `ideas/`, and `projects/`.
-- Add commands for creating, opening, and searching notes within that root.
+- Done: added feature decision rules for future scratch/wiki-link/search/tag work.
 
 ### T019 — Wiki links and note navigation
 
@@ -219,7 +183,7 @@ Scope:
 
 Status: pending
 Scope:
-- Add commands to move selection/current line to a new note, append to daily note, append to scratch, convert line to task, and archive completed tasks.
+- Add commands to move selection/current line to a related note/file and append to scratch.
 - Support commands that both edit the current text and append/capture a copy elsewhere.
 - Support the workflow: write first, organize later.
 
@@ -230,16 +194,6 @@ Scope:
 - Support simple inline tags like `#idea`, `#project`, and `#todo`.
 - Search/filter notes by tags.
 - Avoid complex frontmatter requirements unless clearly useful.
-
-### T023 — Vault index architecture: Markdown source plus rebuildable SQLite cache
-
-Status: pending
-Scope:
-- Keep Markdown files as the source of truth.
-- Use SQLite only as an optional/rebuildable index/cache for search, links, backlinks, tags, tasks, and recent/frequent results.
-- Evaluate SQLite FTS5 for fast content search and snippets.
-- Ensure Slate can delete/rebuild the index from the vault at any time.
-- Do not store canonical note content only inside SQLite.
 
 ### T024 — Link resolver trigger for `[[`
 
@@ -276,9 +230,9 @@ Scope:
 Status: pending
 Scope:
 - Parse wiki links robustly: `[[Note]]`, `[[path/file.md]]`, `[[path/file.md:line]]`, `[[path/file.md:line:column]]`, and `[[path/file.md:line:column|label]]`.
-- Resolve note titles and relative paths inside the selected vault.
+- Resolve note titles and relative paths from the current file/project context.
 - Safely handle spaces, punctuation, duplicate titles, missing files, and renamed/moved notes.
-- Define behavior for links outside the vault or when no vault is selected.
+- Define behavior for links outside the current project or when no project root is obvious.
 
 ### T028 — Follow-link navigation and cursor jump
 
@@ -286,7 +240,7 @@ Status: pending
 Scope:
 - Add shortcut such as Ctrl+Enter to follow the wiki link under cursor.
 - Open the target file and jump to the target line/column when present.
-- If target file does not exist, offer to create it in the vault.
+- If target file does not exist, offer to create it near the current file or in a chosen related-notes location.
 - Preserve current buffer state and dirty checks when navigating.
 - Later integrate with buffer history/back navigation.
 
@@ -304,7 +258,7 @@ Scope:
 
 Status: pending
 Scope:
-- Track wiki-link references across the vault through the index.
+- Track wiki-link references across relevant Markdown files through lightweight scanning/indexing.
 - Use backlink counts to power the resolver's `most linked` group.
 - Add command to show backlinks for the current note.
 - Avoid graph-view-first UX; backlinks should be textual/searchable first.
@@ -313,10 +267,10 @@ Scope:
 
 Status: pending
 Scope:
-- Start with simple filesystem scanning if needed, then move to SQLite/FTS when vault size demands it.
-- Incrementally update the index when files are opened/saved/changed.
-- Provide manual `Rebuild vault index` command.
-- Keep resolver responsive for large vaults by limiting result counts and doing expensive work off the UI path where possible.
+- Start with simple filesystem scanning over relevant Markdown files.
+- Incrementally update resolver/search data when files are opened/saved/changed if needed.
+- Provide manual `Rebuild link/search data` command if caching appears.
+- Keep resolver responsive for large folders by limiting result counts and doing expensive work off the UI path where possible.
 
 ### T032 — Soft Vim-inspired editing grammar
 
@@ -350,23 +304,23 @@ Scope:
 - Add repeat-last-edit behavior inspired by Vim's `.` command.
 - Consider recording/replaying a short sequence of editor operations later.
 - Keep this lightweight and optional; do not implement a full macro language early.
-- Ensure repeated commands work with Slate-native operations such as append-to-scratch/daily and task toggles where sensible.
+- Ensure repeated commands work with Slate-native operations such as append-to-scratch where sensible.
 
 ### T035 — Append/capture side effects from normal editing
 
 Status: pending
 Scope:
 - Add commands that insert or transform text in the current buffer while also appending/capturing related content elsewhere.
-- Examples: insert a note link and append context to scratch; create task here and append to daily; mark an idea inline and append it to `ideas/inbox.md`; create a new note from selection while replacing selection with a wiki link.
+- Examples: insert a note link and append context to scratch; create a new related file from selection while replacing selection with a wiki link.
 - Make side effects explicit, previewable, and undo-safe where possible.
-- Prefer vault-relative plain Markdown targets.
+- Prefer plain Markdown targets relative to the current file/project when possible.
 
 ### T036 — Textual result buffers
 
 Status: pending
 Scope:
 - Borrow Emacs' useful concept that tool outputs can be buffers.
-- Show search results, backlinks, task lists, command output, and index diagnostics as navigable text-like buffers or minimal panels.
+- Show search results, backlinks, checkbox lists, command output, and diagnostics as navigable text-like buffers or minimal panels.
 - Allow opening/jumping from result entries with keyboard shortcuts.
 - Keep these buffers optional and command-driven, not permanent UI clutter.
 
@@ -376,7 +330,7 @@ Status: pending
 Scope:
 - Borrow Doom Emacs' concept of curated power: strong defaults, coherent aesthetics, and discoverability.
 - Avoid exposing every internal behavior as a setting too early.
-- Add configuration only when it protects distinct workflows, such as compact/full links or vault location.
+- Add configuration only when it protects distinct workflows, such as compact/full links or scratch behavior.
 - Keep Slate powerful but not life-consuming.
 
 ### T038 — Literate Markdown configuration
@@ -442,7 +396,7 @@ Scope:
 - Support programmatic selection ranges independent of command line focus.
 - Implement `scroll_to_cursor` / `scroll_to_line` so commands can jump to results reliably.
 - Keep selection visible even when command line or a panel has focus where appropriate.
-- Use this for future find results, wiki-link follow, backlinks, task result buffers, and command outputs.
+- Use this for future find results, wiki-link follow, backlinks, checkbox result buffers, and command outputs.
 
 ### T044 — Search/find on native editor primitives
 
@@ -532,15 +486,14 @@ Search and replacement:
 - `:replace-all old new` — whole-buffer replace, with confirmation/status count.
 - `:clear-search` — clear search highlights explicitly.
 - `:find-selection` — search for current selection.
-- `:grep` / `:search-files` — future vault/project text search.
+- `:grep` / `:search-files` — future project/text search.
 
 Markdown and notes:
-- `:toggle-task` / `:task` — toggle `- [ ]` / `- [x]` on current line.
-- `:make-task` — turn current line into an unchecked task.
+- Checkbox parsing/rendering should support `[ ]`, `[/]`, and `[x]` as Markdown checkboxes, not Slate task objects.
 - `:heading 1..6` — convert current line to Markdown heading level.
 - `:promote-heading` / `:demote-heading` — adjust Markdown heading level.
 - `:insert-link` — insert Markdown link around selection or at cursor.
-- `:insert-wikilink` — insert `[[...]]` link later integrated with vault resolver.
+- `:insert-wikilink` — insert `[[...]]` link later integrated with the link resolver.
 - `:format-table` — eventually align simple Markdown tables if practical.
 
 Files and buffers:
@@ -548,18 +501,15 @@ Files and buffers:
 - `:recent` — open recent files picker/result list.
 - `:reopen` — reopen current file from disk after confirmation.
 - `:rename-file` — rename current file and update path.
-- `:copy-path` — copy full path or vault-relative path.
+- `:copy-path` — copy full path or project-relative path.
 - `:buffer-next` / `:bn` and `:buffer-prev` / `:bp` — future multi-buffer navigation.
 - `:buffer-close` / `:bd` — close current buffer when buffers exist.
 
 Capture and knowledge workflow:
 - `:scratch` — open scratch buffer.
 - `:capture` — append selection/current line to scratch.
-- `:daily` — open today's note.
-- `:yesterday` / `:tomorrow` — open adjacent daily notes.
-- `:append-daily` — append selection/current line to daily note.
-- `:new-note` — create note in selected vault.
-- `:backlinks` — show backlinks for current note once indexing exists.
+- `:new-note` — create a related Markdown note/file.
+- `:backlinks` — show backlinks for current note once link scanning exists.
 
 View and UI:
 - Already implemented: `:wrap`, `:preview`, `:settings`.
@@ -630,16 +580,13 @@ Follow-up — Duplicate placement transient mode: done.
 3. T007/T046 — Alt structural editing, batch 3: duplicate line and shortcut/help/docs polish. Done.
 4. T046 — Duplicate placement transient mode: duplicate a line into a movable pending placement, confirm with Enter/Space, cancel with Esc. Done.
 5. T002/T013 — Improve command discovery: fuzzy command matching, palette/command-line consistency, and recent/frequent commands. Done for T002; future command additions continue under T013.
-6. T003 — Expand persistent config for wrap/preview/theme/vault while keeping the plain config simple.
+6. T003 — Expand persistent config for wrap/preview/theme/scratch behavior while keeping the plain config simple.
 7. T004 — Build real recent-files list and `:recent` picker.
-8. T010 — Minimal project/vault file opener with fuzzy-ish file matching plus lightweight size/modified metadata. Done.
+8. T010 — Minimal project file opener with fuzzy-ish file matching plus lightweight size/modified metadata. Done.
 9. T047 — Replace native Open/Save/SaveAs dialogs with Slate-owned modals. Done.
 10. T017 — Write down Slate's knowledge-work philosophy so future features do not drift into Obsidian/Emacs sprawl. Done.
 11. T005 — Scratch buffer and quick capture workflow.
-12. T006 — Daily notes on top of the chosen notes/vault directory.
-13. T018 — Optional vault/root folder selection.
-14. T023 — Vault index architecture: Markdown source plus rebuildable SQLite cache.
-15. T020 — Global notes search, starting simple and later backed by the index.
+15. T020 — Global notes search, starting simple and later backed by lightweight scanning/cache only if needed.
 16. T024 — Link resolver trigger for `[[`.
 17. T025 — Link resolver ranking/result groups.
 18. T027 — Wiki-link parser and target resolver.
@@ -649,11 +596,9 @@ Follow-up — Duplicate placement transient mode: done.
 22. T031 — Link resolver performance and indexing lifecycle.
 23. T030 — Backlinks and most-linked notes.
 24. T021 — Progressive organization commands.
-25. T015 — Task/checklist commands.
 26. T022 — Tags and lightweight metadata.
 27. T035 — Append/capture side effects from normal editing.
 28. T036 — Textual result buffers.
-29. T014 — Templates.
 30. T009 — Theme system.
 31. T008 — Lightweight Markdown preview improvements.
 32. T011 — Buffers / multi-file workflow.
