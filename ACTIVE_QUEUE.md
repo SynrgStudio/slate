@@ -133,6 +133,12 @@ Scope:
 Status: pending
 Scope:
 - Support multiple open buffers.
+- Reuse the existing large local-link preview modal as the first multi-file workflow surface.
+- When a local link/file is opened in the modal, keep the current file as the main buffer and load the target as an editable secondary buffer inside the modal.
+- `Enter` promotes/opens the modal buffer as the main buffer, preserving the previous file as an open buffer rather than discarding it.
+- `Esc` closes the modal/secondary buffer view without switching away from the main buffer.
+- `Tab` swaps/promotes the main buffer and modal buffer positions, so the user can quickly flip which file is primary and which is in the large editable overlay.
+- Unlike the current read-only-ish link preview, the modal buffer should support real editing, save state, cursor/scroll, and dirty protection.
 - Add switch-buffer and close-buffer commands.
 - Prefer command-palette-driven buffers before visible tabs.
 - Borrow the useful Emacs concept of buffers without adopting Emacs complexity.

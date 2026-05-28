@@ -70,6 +70,7 @@ pub(crate) struct EditorView {
     target_cursor: Option<usize>,
     link_click_byte: Option<usize>,
     link_assist_trigger_start: Option<usize>,
+    focus_next: bool,
 }
 
 impl EditorView {
@@ -79,7 +80,12 @@ impl EditorView {
             target_cursor: None,
             link_click_byte: None,
             link_assist_trigger_start: None,
+            focus_next: false,
         }
+    }
+
+    pub(crate) fn request_keyboard_focus(&mut self) {
+        self.focus_next = true;
     }
 
     pub(crate) fn observe_buffer(&mut self, buffer: &EditorBuffer) {
@@ -126,6 +132,7 @@ impl EditorView {
         search_state: Option<&SearchState>,
         line_number_mode: LineNumberMode,
         keyboard_enabled: bool,
+        force_keyboard_focus: bool,
         active_line_text_highlight: Option<usize>,
         render_markdown: bool,
     ) -> (egui::Response, bool) {
@@ -135,13 +142,20 @@ impl EditorView {
         let line_height = ui.fonts_mut(|fonts| fonts.row_height(&font)) + 2.0;
         let available = ui.available_size();
         let (rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
+        let view_id = ui
+            .id()
+            .with(("native_editor_view", self as *const Self as usize));
         let response = ui
-            .interact(
-                rect,
-                ui.id().with("native_editor_view"),
-                egui::Sense::click_and_drag(),
-            )
+            .interact(rect, view_id, egui::Sense::click_and_drag())
             .on_hover_cursor(egui::CursorIcon::Text);
+        let requested_focus = self.focus_next;
+        if requested_focus {
+            response.request_focus();
+            ui.memory_mut(|memory| memory.request_focus(response.id));
+            self.focus_next = false;
+        }
+        let mut has_keyboard_focus =
+            force_keyboard_focus || response.has_focus() || requested_focus;
         let painter = ui.painter_at(rect);
         let gutter_width = 22.0;
         let text_x = rect.left() + gutter_width + 6.0;
@@ -153,6 +167,7 @@ impl EditorView {
 
         if response.clicked() {
             response.request_focus();
+            has_keyboard_focus = true;
             if let Some(pos) = response.interact_pointer_pos() {
                 let row_index = ((self.scroll_y + pos.y - rect.top()) / line_height)
                     .floor()
@@ -183,14 +198,14 @@ impl EditorView {
             }
         }
 
-        if response.hovered() || response.has_focus() {
+        if response.hovered() || has_keyboard_focus {
             let scroll_delta = ui.input(|input| input.smooth_scroll_delta.y);
             if scroll_delta != 0.0 {
                 self.scroll_y = (self.scroll_y - scroll_delta).clamp(0.0, max_scroll);
             }
         }
 
-        if keyboard_enabled && response.has_focus() && search_state.is_none() {
+        if keyboard_enabled && has_keyboard_focus && search_state.is_none() {
             changed = self.handle_keyboard(ui, buffer) || changed;
             if changed {
                 rows = self.visual_rows(&painter, buffer, &font, wrap_width, wrap);
@@ -319,7 +334,7 @@ impl EditorView {
             );
         }
 
-        if response.has_focus() {
+        if keyboard_enabled && has_keyboard_focus {
             self.paint_cursor(
                 ui,
                 &painter,

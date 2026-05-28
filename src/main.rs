@@ -556,6 +556,8 @@ struct SlateApp {
     link_preview_buffer: EditorBuffer,
     link_preview_view: EditorView,
     link_preview_path: Option<PathBuf>,
+    link_preview_dirty: bool,
+    focus_link_preview_once: bool,
     link_preview_heading_fragment: Option<String>,
     link_preview_heading_text: Option<String>,
     save_as_open: bool,
@@ -654,6 +656,8 @@ impl SlateApp {
             link_preview_buffer: EditorBuffer::new(),
             link_preview_view: EditorView::new(),
             link_preview_path: None,
+            link_preview_dirty: false,
+            focus_link_preview_once: false,
             link_preview_heading_fragment: None,
             link_preview_heading_text: None,
             save_as_open: false,
@@ -839,6 +843,8 @@ impl SlateApp {
                         .request_scroll_to_cursor(&self.link_preview_buffer);
                 }
                 self.link_preview_path = Some(path.clone());
+                self.link_preview_dirty = false;
+                self.focus_link_preview_once = true;
                 self.link_preview_heading_fragment = heading_fragment;
                 self.link_preview_heading_text = heading_text;
                 self.link_preview_open = true;
@@ -855,7 +861,22 @@ impl SlateApp {
             return;
         };
         let heading_fragment = self.link_preview_heading_fragment.clone();
-        self.close_link_preview();
+        let preview_dirty = self.link_preview_dirty;
+        let preview_text = self.link_preview_buffer.as_str().to_string();
+        self.close_link_preview_force();
+        if preview_dirty {
+            self.buffer.set_text(preview_text);
+            self.path = Some(path.clone());
+            self.dirty = true;
+            self.last_open_dir = path.parent().map(PathBuf::from);
+            self.remember_recent_file(path);
+            self.focus_editor_once = true;
+            self.status = "Promoted modified modal buffer".to_string();
+            if let Some(fragment) = heading_fragment {
+                self.jump_to_markdown_heading_fragment(&fragment);
+            }
+            return;
+        }
         if self.dirty {
             self.pending_project_file_path = Some(path);
             self.pending_open_heading_fragment = heading_fragment;
@@ -868,9 +889,75 @@ impl SlateApp {
         }
     }
 
-    fn close_link_preview(&mut self) {
+    fn save_link_preview(&mut self) {
+        let Some(path) = self.link_preview_path.clone() else {
+            self.status = "Modal buffer has no file path".to_string();
+            return;
+        };
+        match fs::write(&path, self.link_preview_buffer.as_str()) {
+            Ok(_) => {
+                self.link_preview_dirty = false;
+                self.last_open_dir = path.parent().map(PathBuf::from);
+                self.remember_recent_file(path.clone());
+                self.status = format!("Saved modal buffer {}", path.display());
+            }
+            Err(err) => self.status = format!("Save modal buffer failed: {err}"),
+        }
+    }
+
+    fn swap_link_preview_with_main(&mut self) {
+        self.remember_current_cursor_position();
+        let main_cursor = self.buffer.cursor_line_col();
+        let modal_cursor = self.link_preview_buffer.cursor_line_col();
+        std::mem::swap(&mut self.buffer, &mut self.link_preview_buffer);
+        std::mem::swap(&mut self.path, &mut self.link_preview_path);
+        std::mem::swap(&mut self.dirty, &mut self.link_preview_dirty);
+
+        let main_byte = self
+            .buffer
+            .line_col_to_byte(main_cursor.0 + 1, main_cursor.1 + 1);
+        let modal_byte = self
+            .link_preview_buffer
+            .line_col_to_byte(modal_cursor.0 + 1, modal_cursor.1 + 1);
+        self.buffer.set_cursor(main_byte);
+        self.link_preview_buffer.set_cursor(modal_byte);
+        self.editor_view.request_scroll_to_cursor(&self.buffer);
+        self.link_preview_view
+            .request_scroll_to_cursor(&self.link_preview_buffer);
+
+        self.search_state = None;
+        self.link_preview_heading_fragment = None;
+        self.link_preview_heading_text = None;
+        self.focus_link_preview_once = true;
+        self.link_preview_view.request_keyboard_focus();
+        if let Some(path) = self.path.clone() {
+            self.last_open_dir = path.parent().map(PathBuf::from);
+            self.remember_recent_file(path);
+        }
+        self.status = "Swapped main and modal buffers".to_string();
+    }
+
+    fn close_link_preview_force(&mut self) {
         self.link_preview_open = false;
         self.link_preview_path = None;
+        self.link_preview_dirty = false;
+        self.focus_link_preview_once = false;
+        self.link_preview_heading_fragment = None;
+        self.link_preview_heading_text = None;
+        self.link_preview_buffer.clear();
+        self.focus_editor_once = true;
+    }
+
+    fn close_link_preview(&mut self) {
+        if self.link_preview_dirty {
+            self.status = "Save modal buffer before closing".to_string();
+            self.focus_link_preview_once = true;
+            return;
+        }
+        self.link_preview_open = false;
+        self.link_preview_path = None;
+        self.link_preview_dirty = false;
+        self.focus_link_preview_once = false;
         self.link_preview_heading_fragment = None;
         self.link_preview_heading_text = None;
         self.link_preview_buffer.clear();
@@ -4133,6 +4220,8 @@ impl SlateApp {
         let mut link_heading_cancel = false;
         let mut link_preview_confirm = false;
         let mut link_preview_cancel = false;
+        let mut link_preview_save = false;
+        let mut link_preview_swap = false;
         let mut scratch_archive = false;
         let mut scratch_open_entries = false;
         let mut scratch_entries_previous = false;
@@ -4254,8 +4343,55 @@ impl SlateApp {
                 link_heading_cancel |= i.consume_key(egui::Modifiers::NONE, Key::Escape);
             }
             if self.link_preview_open {
-                link_preview_confirm |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
-                link_preview_cancel |= i.consume_key(egui::Modifiers::NONE, Key::Escape);
+                link_preview_confirm |= i.consume_key(egui::Modifiers::CTRL, Key::Enter);
+                link_preview_save |= i.consume_key(egui::Modifiers::CTRL, Key::S);
+                link_preview_swap |= i.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key {
+                            key: Key::Tab,
+                            pressed: true,
+                            repeat: false,
+                            modifiers,
+                            ..
+                        } if !modifiers.ctrl && !modifiers.command && !modifiers.alt && !modifiers.shift
+                    )
+                });
+                if link_preview_swap {
+                    i.events.retain(|event| {
+                        !matches!(
+                            event,
+                            egui::Event::Key {
+                                key: Key::Tab,
+                                pressed: true,
+                                ..
+                            }
+                        )
+                    });
+                }
+                link_preview_cancel |= i.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key {
+                            key: Key::Escape,
+                            pressed: true,
+                            repeat: false,
+                            ..
+                        }
+                    )
+                });
+                if link_preview_cancel {
+                    i.events.retain(|event| {
+                        !matches!(
+                            event,
+                            egui::Event::Key {
+                                key: Key::Escape,
+                                pressed: true,
+                                ..
+                            }
+                        )
+                    });
+                }
             }
             if self.save_as_open {
                 save_as_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
@@ -4294,7 +4430,9 @@ impl SlateApp {
                 self.doc_tasks_open = false;
                 self.file_picker_open = false;
                 self.link_heading_picker_open = false;
-                self.link_preview_open = false;
+                if !self.link_preview_dirty {
+                    self.link_preview_open = false;
+                }
                 self.save_as_open = false;
                 self.scratch_modal_open = false;
                 self.scratch_entries_open = false;
@@ -4321,7 +4459,9 @@ impl SlateApp {
                 self.doc_tasks_open = false;
                 self.file_picker_open = false;
                 self.link_heading_picker_open = false;
-                self.link_preview_open = false;
+                if !self.link_preview_dirty {
+                    self.link_preview_open = false;
+                }
                 self.save_as_open = false;
                 self.scratch_modal_open = false;
                 self.scratch_entries_open = false;
@@ -4364,7 +4504,8 @@ impl SlateApp {
             {
                 command = Some(Command::Open);
             }
-            let save_pressed = !self.scratch_modal_open
+            let save_pressed = !self.link_preview_open
+                && !self.scratch_modal_open
                 && !self.scratch_entries_open
                 && !self.capture_modal_open
                 && i.events.iter().any(|event| {
@@ -4379,7 +4520,8 @@ impl SlateApp {
                         } if modifiers.ctrl && !modifiers.alt && !modifiers.shift
                     )
                 });
-            let save_as_pressed = !self.scratch_modal_open
+            let save_as_pressed = !self.link_preview_open
+                && !self.scratch_modal_open
                 && !self.scratch_entries_open
                 && !self.capture_modal_open
                 && i.events.iter().any(|event| {
@@ -4559,6 +4701,16 @@ impl SlateApp {
 
         if link_preview_cancel {
             self.close_link_preview();
+            return;
+        }
+
+        if link_preview_save {
+            self.save_link_preview();
+            return;
+        }
+
+        if link_preview_swap {
+            self.swap_link_preview_with_main();
             return;
         }
 
@@ -5911,15 +6063,16 @@ impl SlateApp {
                             .as_ref()
                             .map(|path| path.display().to_string())
                             .unwrap_or_else(|| "link preview".to_string());
+                        let dirty_marker = if self.link_preview_dirty { "*" } else { "" };
 
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("link preview").font(title_font).color(accent));
-                            ui.label(RichText::new(title).font(font.clone()).color(dim));
+                            ui.label(RichText::new("modal buffer").font(title_font).color(accent));
+                            ui.label(RichText::new(format!("{dirty_marker}{title}")).font(font.clone()).color(dim));
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     ui.label(
-                                        RichText::new("[enter] open  [esc] close")
+                                        RichText::new("[tab] swap  [ctrl+enter] promote  [ctrl+s] save  [esc] close")
                                             .font(font.clone())
                                             .color(warn),
                                     );
@@ -5953,22 +6106,32 @@ impl SlateApp {
                         ui.add_space(8.0);
                         let editor_height = (ui.available_height() - 4.0).max(80.0);
                         ui.allocate_ui(Vec2::new(ui.available_width(), editor_height), |ui| {
+                            if self.focus_link_preview_once {
+                                self.link_preview_view.request_keyboard_focus();
+                            }
                             self.link_preview_view
                                 .observe_buffer(&self.link_preview_buffer);
                             let target_line = self
                                 .link_preview_heading_fragment
                                 .as_ref()
                                 .map(|_| self.link_preview_buffer.cursor_line_col().0);
-                            let _ = self.link_preview_view.render(
+                            let (_, changed) = self.link_preview_view.render(
                                 ui,
                                 &mut self.link_preview_buffer,
                                 self.wrap,
                                 None,
                                 self.line_number_mode,
-                                false,
+                                true,
+                                true,
                                 target_line,
                                 self.markdown_live_rendering,
                             );
+                            if self.focus_link_preview_once {
+                                self.focus_link_preview_once = false;
+                            }
+                            if changed {
+                                self.link_preview_dirty = true;
+                            }
                         });
                     });
             });
@@ -6310,6 +6473,7 @@ impl SlateApp {
                                     self.wrap,
                                     None,
                                     self.line_number_mode,
+                                    true,
                                     true,
                                     None,
                                     false,
@@ -7886,6 +8050,7 @@ impl eframe::App for SlateApp {
                                     self.search_state.as_ref(),
                                     self.line_number_mode,
                                     editor_keyboard_enabled,
+                                    false,
                                     active_line_text_highlight,
                                     false,
                                 );
@@ -7926,6 +8091,7 @@ impl eframe::App for SlateApp {
                                 self.search_state.as_ref(),
                                 self.line_number_mode,
                                 editor_keyboard_enabled,
+                                false,
                                 active_line_text_highlight,
                                 self.markdown_live_rendering,
                             );
@@ -8422,7 +8588,7 @@ impl eframe::App for SlateApp {
                     } else if self.link_heading_picker_open {
                         ("link heading  ↑↓ select · Enter insert · Esc cancel · first option = whole file".to_string(), footer_accent)
                     } else if self.link_preview_open {
-                        ("link preview  Enter open as buffer · Esc close".to_string(), footer_accent)
+                        ("modal buffer  Tab swap · Ctrl+Enter promote · Ctrl+S save · Esc close".to_string(), footer_accent)
                     } else if self.save_as_open {
                         ("save as  type file name · ↑↓ select · → enter folder · ← parent · Enter save · Esc close".to_string(), footer_accent)
                     } else if self.scratch_modal_open {
