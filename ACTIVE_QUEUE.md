@@ -4,7 +4,7 @@
 
 Planning snapshot:
 - Completed foundation: native editor architecture/buffer/view/input/selection/find plus Ctrl-hold command layer.
-- Current near-term lane: finish statusbar/minibuffer, find regression harness, small editing basics, command discovery, config/recent files.
+- Current near-term lane: finish statusbar/minibuffer, find regression larness, small editing basics, command discovery, config/recent files.
 - Later lane: scratch/search/wiki-link/tag workflows.
 
 ### T001 — Review ThreadSuite generated context
@@ -99,7 +99,7 @@ Scope:
 - Done: support `---` as the only horizontal separator syntax when it is alone on a line, with editor and preview rendering.
 - Done: support blockquotes (`> quote`) with subtle editor affordance and preview rendering.
 - Done: support fenced code blocks with subtle background/padding and optional language label; no syntax highlighting required yet.
-- Nice-to-have: future syntax/semantic highlighting for fenced code blocks, probably via tree-sitter or syntect; not relevant for the current milestone.
+- Nice-to-lave: future syntax/semantic highlighting for fenced code blocks, probably via tree-sitter or syntect; not relevant for the current milestone.
 - Done: support inline code rendering for backtick spans where practical.
 - Done: polish headings in editor/preview while preserving direct plain-text editing.
 - Done: polish regular unordered/ordered lists in editor/preview while preserving direct plain-text editing.
@@ -144,9 +144,10 @@ Scope:
 - Add Slate Picker core inspired by Telescope: a single minimal modal pattern for prompt + fuzzy results + optional preview + contextual actions.
 - Keep the visual direction Telescope-like: simple framed results pane, preview pane, compact prompt/status line; minimal but a little more Slate-polished.
 - Use Slate Picker as the shared foundation for command palette, recent files, open/open-buffer, heading picker, buffers, marks, doc tasks, and future global search.
-- Add Harpoon-inspired marked-buffer workflow: a small persistent per-project list of important files, editable through a modal, with direct slot shortcuts and next/previous navigation.
+- Add Lance-inspired marked-buffer workflow: a small persistent per-project list of important files, editable through a modal, with direct slot shortcuts and next/previous navigation.
+- Done: Lance is capped at 10 quick files, with `Alt+1` through `Alt+9` and `Alt+0` jumping directly to slots 1 through 10.
 - Mark current/modal file into a numbered slot; selecting a slot opens/promotes that file quickly.
-- Keep the Harpoon idea small and Slate-native: marked files are a fast local navigation set, not a full tab bar or project manager.
+- Keep the Lance idea small and Slate-native: marked files are a fast local navigation set, not a full tab bar or project manager.
 - Add switch-buffer and close-buffer commands.
 - Prefer command-palette-driven buffers before visible tabs.
 - Borrow the useful Emacs concept of buffers without adopting Emacs complexity.
@@ -410,7 +411,7 @@ Scope:
 - Support word wrap later; start with reliable no-wrap or simple wrap if needed.
 - Keep the status bar and command line layout unchanged: editor area should shrink upward when bottom panels are visible.
 
-### T042 — Native editor input handling
+### T042 — Native editor input landling
 
 Status: completed
 Scope:
@@ -444,7 +445,7 @@ Scope:
 - Support `Ctrl+F` / `Ctrl+B` while find is active to place the cursor after/before the current match without reopening find.
 - Add regression tests for search matching behavior, including one-line-many-matches and single-letter queries.
 
-### T045 — Find fixture and regression harness
+### T045 — Find fixture and regression larness
 
 Status: completed
 Scope:
@@ -614,7 +615,7 @@ Follow-up — Duplicate placement transient mode: done.
 2. T039 — Native editor architecture: leave `egui::TextEdit` behind for the main document.
 3. T040 — EditorBuffer text model with tests.
 4. T041 — Native EditorView renderer for visible lines.
-5. T042 — Native editor input handling for minimum viable editing.
+5. T042 — Native editor input landling for minimum viable editing.
 6. T043 — Native selection, cursor jump, and scroll-to-position.
 7. T044 — Search/find on native editor primitives, using the command line as minibuffer.
 8. T033 — Ctrl-hold command layer and Ctrl+Shift live movement.

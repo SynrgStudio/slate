@@ -14,7 +14,7 @@ For the project philosophy and feature decision rules, see [`PHILOSOPHY.md`](PHI
 
 ## Credits and inspiration
 
-Slate's planned marked-buffer / quick-file workflow is inspired by [Harpoon 2](https://github.com/ThePrimeagen/harpoon/tree/harpoon2). Full credit to [ThePrimeagen](https://github.com/ThePrimeagen) for the original Harpoon idea.
+Slate's `Lance` marked-buffer / quick-file workflow is inspired by [Harpoon 2](https://github.com/ThePrimeagen/harpoon/tree/harpoon2). Full credit to [ThePrimeagen](https://github.com/ThePrimeagen) for the original idea.
 
 ---
 
@@ -205,6 +205,23 @@ Examples:
 :settings
 :recent
 :recent notes
+:open-buffer       # open another file as editable modal buffer
+:ob README.md
+:lance             # Lance marked files modal
+:lc                # alias
+:marks             # alias
+:lance-add         # mark current file
+:la ~/notes/ref.md # add a file manually
+:lance 1           # jump to mark slot 1
+:lance-next
+:lance-prev
+Alt+1..Alt+9/0    # direct jump to Lance slots 1 through 10
+```
+
+Lance modal:
+
+```text
+↑↓ select · type filter · Enter open · Ctrl+Enter open as modal buffer · Ctrl+A add file manually · Delete remove · Esc close
 ```
 
 Goto:
@@ -287,7 +304,7 @@ Esc                              = cancel
 
 ## Alt structural editing
 
-`Alt` is reserved for structural text manipulation. It does not move the cursor directly; `Ctrl+Shift` already covers live cursor movement.
+`Alt` is reserved for structural text manipulation and quick Lance slot jumps. It does not move the cursor directly; `Ctrl+Shift` already covers live cursor movement.
 
 Current batch:
 
@@ -299,6 +316,7 @@ Current batch:
 | Move line to paragraph end | repeat down key, e.g. `Alt+k k` | repeat down key, e.g. `Alt+j j` |
 | Extend word selection left | `Alt+j` repeatedly | `Alt+h` repeatedly |
 | Extend word selection right | `Alt+l` repeatedly | `Alt+l` repeatedly |
+| Open Lance slot | `Alt+1` … `Alt+9`, `Alt+0` for 10 | `Alt+1` … `Alt+9`, `Alt+0` for 10 |
 
 A paragraph is a contiguous block of non-empty lines separated by blank lines.
 
@@ -399,7 +417,7 @@ Slate's roadmap is intentionally staged. The idea is to build stable editor foun
 - Native editor architecture
 - Native text buffer
 - Native renderer
-- Native input handling
+- Native input landling
 - Selection, cursor jumps, and scroll-to-position
 - Native find/highlight flow
 - Statusbar + minibuffer layout
@@ -410,7 +428,7 @@ Slate's roadmap is intentionally staged. The idea is to build stable editor foun
 
 ### Near-term
 
-- Finish find regression/performance harness
+- Finish find regression/performance larness
 - Duplicate line and move line up/down
 - `Alt+Up` / `Alt+Down` for moving lines
 - Better command discovery and fuzzy command matching

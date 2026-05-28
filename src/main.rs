@@ -67,6 +67,10 @@ enum Command {
     New,
     Open,
     OpenBuffer,
+    Lance,
+    LanceAdd,
+    LanceNext,
+    LancePrev,
     Save,
     SaveAs,
     Scratch,
@@ -154,6 +158,34 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         summary: "Open file or path",
         hint: "Ctrl+O",
         palette_command: Some(Command::Open),
+    },
+    CommandSpec {
+        name: "lance",
+        aliases: &["lc", "marks"],
+        summary: "Open Lance-style marked files",
+        hint: ":lance",
+        palette_command: Some(Command::Lance),
+    },
+    CommandSpec {
+        name: "lance-add",
+        aliases: &["la", "mark-buffer"],
+        summary: "Add current file to Lance marks",
+        hint: ":lance-add",
+        palette_command: Some(Command::LanceAdd),
+    },
+    CommandSpec {
+        name: "lance-next",
+        aliases: &["lnext"],
+        summary: "Open next Lance mark",
+        hint: ":lance-next",
+        palette_command: Some(Command::LanceNext),
+    },
+    CommandSpec {
+        name: "lance-prev",
+        aliases: &["lpv"],
+        summary: "Open previous Lance mark",
+        hint: ":lance-prev",
+        palette_command: Some(Command::LancePrev),
     },
     CommandSpec {
         name: "open-buffer",
@@ -466,6 +498,7 @@ struct DuplicatePlacement {
 enum FilePickerMode {
     Open,
     OpenBuffer,
+    AddLance,
     Browse,
     InsertMarkdownLink,
 }
@@ -541,6 +574,10 @@ struct SlateApp {
     recent_query: String,
     selected_recent_file: usize,
     pending_recent_path: Option<PathBuf>,
+    lance_open: bool,
+    lance_query: String,
+    lance_files: Vec<PathBuf>,
+    selected_lance_file: usize,
     doc_tasks_open: bool,
     doc_task_query: String,
     selected_doc_task_line: usize,
@@ -641,6 +678,10 @@ impl SlateApp {
             recent_query: String::new(),
             selected_recent_file: 0,
             pending_recent_path: None,
+            lance_open: false,
+            lance_query: String::new(),
+            lance_files: Vec::new(),
+            selected_lance_file: 0,
             doc_tasks_open: false,
             doc_task_query: String::new(),
             selected_doc_task_line: 0,
@@ -1688,6 +1729,185 @@ impl SlateApp {
         }
     }
 
+    fn resolve_command_path(input: &str) -> PathBuf {
+        let path = input.trim();
+        path.strip_prefix("~/")
+            .and_then(|rest| dirs_next::home_dir().map(|home| home.join(rest)))
+            .unwrap_or_else(|| PathBuf::from(path))
+    }
+
+    fn add_lance_file(&mut self, path: PathBuf) {
+        const LANCE_FILE_LIMIT: usize = 10;
+        if self.lance_files.contains(&path) {
+            self.status = format!("Already lanced {}", path.display());
+            return;
+        }
+        if self.lance_files.len() >= LANCE_FILE_LIMIT {
+            self.status = format!("Lance is full ({LANCE_FILE_LIMIT} files)");
+            return;
+        }
+        self.lance_files.push(path.clone());
+        self.selected_lance_file = self.lance_files.len().saturating_sub(1);
+        let _ = self.save_settings();
+        self.status = format!("Lanced {}", path.display());
+    }
+
+    fn lance_add_current(&mut self) {
+        let Some(path) = self.path.clone() else {
+            self.status = "Lance needs a saved file".to_string();
+            return;
+        };
+        self.add_lance_file(path);
+    }
+
+    fn open_lance(&mut self) {
+        self.shortcut_help_open = false;
+        self.palette_open = false;
+        self.recent_picker_open = false;
+        self.doc_tasks_open = false;
+        self.file_picker_open = false;
+        self.save_as_open = false;
+        self.scratch_modal_open = false;
+        self.scratch_entries_open = false;
+        self.capture_modal_open = false;
+        self.command_line_focused = false;
+        self.focus_command_line_once = false;
+        self.command_history_index = None;
+        self.lance_open = true;
+        if !self
+            .lance_file_indices()
+            .contains(&self.selected_lance_file)
+        {
+            self.selected_lance_file = self.lance_file_indices().first().copied().unwrap_or(0);
+        }
+        self.focus_editor_once = false;
+        self.status = if self.lance_files.is_empty() {
+            "Lance empty — Ctrl+A add file".to_string()
+        } else {
+            format!("{} lance marks", self.lance_files.len())
+        };
+    }
+
+    fn open_lance_file_picker(&mut self) {
+        self.open_file_picker_at(self.project_root(), FilePickerMode::AddLance);
+    }
+
+    fn lance_file_indices(&self) -> Vec<usize> {
+        let query = self.lance_query.trim().to_lowercase();
+        if query.is_empty() {
+            return (0..self.lance_files.len()).collect();
+        }
+        let mut scored = self
+            .lance_files
+            .iter()
+            .enumerate()
+            .filter_map(|(index, path)| {
+                let display = path.display().to_string();
+                let file_name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("");
+                let display_score = Self::fuzzy_score(&display, &query);
+                let name_score = Self::fuzzy_score(file_name, &query).map(|score| score / 2);
+                display_score
+                    .into_iter()
+                    .chain(name_score)
+                    .min()
+                    .map(|score| (score, index))
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by_key(|(score, index)| (*score, *index));
+        scored.into_iter().map(|(_, index)| index).collect()
+    }
+
+    fn move_lance_selection(&mut self, delta: isize) {
+        let indices = self.lance_file_indices();
+        if indices.is_empty() {
+            self.selected_lance_file = 0;
+            return;
+        }
+        let current_position = indices
+            .iter()
+            .position(|index| *index == self.selected_lance_file)
+            .unwrap_or(0);
+        let next_position = current_position
+            .saturating_add_signed(delta)
+            .min(indices.len().saturating_sub(1));
+        self.selected_lance_file = indices[next_position];
+    }
+
+    fn remove_selected_lance_file(&mut self) {
+        if self.selected_lance_file >= self.lance_files.len() {
+            return;
+        }
+        let removed = self.lance_files.remove(self.selected_lance_file);
+        self.selected_lance_file = self
+            .selected_lance_file
+            .min(self.lance_files.len().saturating_sub(1));
+        let _ = self.save_settings();
+        self.status = format!("Removed lance mark {}", removed.display());
+    }
+
+    fn open_selected_lance_file(&mut self) {
+        if !self
+            .lance_file_indices()
+            .contains(&self.selected_lance_file)
+        {
+            self.status = "No matching lance file".to_string();
+            return;
+        }
+        let Some(path) = self.lance_files.get(self.selected_lance_file).cloned() else {
+            self.status = "No lance file selected".to_string();
+            return;
+        };
+        self.lance_open = false;
+        if self.dirty {
+            self.pending_project_file_path = Some(path);
+            self.pending_open_heading_fragment = None;
+            self.confirm(PendingAction::OpenProjectFile);
+        } else {
+            self.open_path(path);
+            self.focus_editor_once = true;
+        }
+    }
+
+    fn open_selected_lance_file_as_modal(&mut self) {
+        if !self
+            .lance_file_indices()
+            .contains(&self.selected_lance_file)
+        {
+            self.status = "No matching lance file".to_string();
+            return;
+        }
+        let Some(path) = self.lance_files.get(self.selected_lance_file).cloned() else {
+            self.status = "No lance file selected".to_string();
+            return;
+        };
+        self.lance_open = false;
+        self.open_link_preview(path, None);
+    }
+
+    fn open_lance_slot(&mut self, slot: usize) {
+        if slot == 0 || slot > self.lance_files.len() {
+            self.status = format!("No lance mark {slot}");
+            return;
+        }
+        self.selected_lance_file = slot - 1;
+        self.open_selected_lance_file();
+    }
+
+    fn open_next_lance_file(&mut self, delta: isize) {
+        if self.lance_files.is_empty() {
+            self.status = "Lance empty".to_string();
+            return;
+        }
+        self.selected_lance_file = self
+            .selected_lance_file
+            .saturating_add_signed(delta)
+            .min(self.lance_files.len().saturating_sub(1));
+        self.open_selected_lance_file();
+    }
+
     fn open_doc_tasks(&mut self) {
         self.shortcut_help_open = false;
         self.palette_open = false;
@@ -1747,8 +1967,8 @@ impl SlateApp {
                     CheckboxState::Doing => "doing",
                     CheckboxState::Done => "done",
                 };
-                let haystack = format!("{} {} {}", task.line_index + 1, state, task.text);
-                Self::fuzzy_score(&haystack, &query).map(|score| (score, index))
+                let laystack = format!("{} {} {}", task.line_index + 1, state, task.text);
+                Self::fuzzy_score(&laystack, &query).map(|score| (score, index))
             })
             .collect::<Vec<_>>();
         scored.sort_by_key(|(score, index)| (*score, *index));
@@ -1944,6 +2164,7 @@ impl SlateApp {
         self.shortcut_help_open = false;
         self.palette_open = false;
         self.recent_picker_open = false;
+        self.lance_open = false;
         self.save_as_open = false;
         self.command_line_focused = false;
         self.focus_command_line_once = false;
@@ -2087,6 +2308,11 @@ impl SlateApp {
             FilePickerMode::OpenBuffer => {
                 self.file_picker_open = false;
                 self.open_link_preview(path, None);
+            }
+            FilePickerMode::AddLance => {
+                self.file_picker_open = false;
+                self.add_lance_file(path);
+                self.open_lance();
             }
             FilePickerMode::Open if self.dirty => {
                 self.pending_project_file_path = Some(path);
@@ -2326,6 +2552,15 @@ impl SlateApp {
                         }
                     }
                 }
+                "lance_file" | "harpoon_file" => {
+                    let value = Self::parse_config_string(value);
+                    if !value.is_empty() {
+                        let path = PathBuf::from(value);
+                        if !self.lance_files.contains(&path) {
+                            self.lance_files.push(path);
+                        }
+                    }
+                }
                 "file_cursor" => {
                     let value = Self::parse_config_string(value);
                     if let Some((path, line_index, column)) =
@@ -2384,6 +2619,7 @@ impl SlateApp {
             self.command_history.drain(0..keep_from);
         }
         self.recent_files.truncate(20);
+        self.lance_files.truncate(10);
         self.file_cursor_positions.truncate(100);
         self.command_usage.sort_by_key(|usage| {
             (
@@ -2490,6 +2726,12 @@ impl SlateApp {
             contents.push_str(&format!(
                 "recent_file = \"{}\"\n",
                 Self::escape_config_string(&recent.display().to_string())
+            ));
+        }
+        for path in &self.lance_files {
+            contents.push_str(&format!(
+                "lance_file = \"{}\"\n",
+                Self::escape_config_string(&path.display().to_string())
             ));
         }
         let current_cursor = self.path.as_ref().map(|path| {
@@ -2621,6 +2863,10 @@ impl SlateApp {
             Command::New => "new",
             Command::Open => "open",
             Command::OpenBuffer => "open-buffer",
+            Command::Lance => "lance",
+            Command::LanceAdd => "lance-add",
+            Command::LanceNext => "lance-next",
+            Command::LancePrev => "lance-prev",
             Command::Save => "save",
             Command::SaveAs => "save-as",
             Command::Scratch => "scratch",
@@ -2726,6 +2972,9 @@ impl SlateApp {
         if command != Command::DocTasks {
             self.doc_tasks_open = false;
         }
+        if command != Command::Lance {
+            self.lance_open = false;
+        }
         self.palette_query.clear();
         self.selected_command = 0;
         self.command_line_focused = false;
@@ -2749,6 +2998,10 @@ impl SlateApp {
                 }
             }
             Command::OpenBuffer => self.open_buffer_dialog(),
+            Command::Lance => self.open_lance(),
+            Command::LanceAdd => self.lance_add_current(),
+            Command::LanceNext => self.open_next_lance_file(1),
+            Command::LancePrev => self.open_next_lance_file(-1),
             Command::Save => self.save(),
             Command::SaveAs => self.open_save_as_modal(),
             Command::Scratch => self.open_scratch_modal(),
@@ -2959,10 +3212,7 @@ impl SlateApp {
                     self.status = "Save or discard changes before opening another file".to_string();
                 } else {
                     self.record_command_usage("open");
-                    let expanded = path
-                        .strip_prefix("~/")
-                        .and_then(|rest| dirs_next::home_dir().map(|home| home.join(rest)))
-                        .unwrap_or_else(|| PathBuf::from(path));
+                    let expanded = Self::resolve_command_path(&path);
                     self.open_path(expanded);
                 }
             }
@@ -2972,13 +3222,30 @@ impl SlateApp {
                     self.run_command(Command::OpenBuffer, ctx);
                 } else {
                     self.record_command_usage("open-buffer");
-                    let expanded = path
-                        .strip_prefix("~/")
-                        .and_then(|rest| dirs_next::home_dir().map(|home| home.join(rest)))
-                        .unwrap_or_else(|| PathBuf::from(path));
+                    let expanded = Self::resolve_command_path(&path);
                     self.open_link_preview(expanded, None);
                 }
             }
+            "lance" | "lc" | "marks" => {
+                let arg = parts.next();
+                if let Some(slot) = arg.and_then(|value| value.parse::<usize>().ok()) {
+                    self.record_command_usage("lance");
+                    self.open_lance_slot(slot);
+                } else {
+                    self.run_command(Command::Lance, ctx);
+                }
+            }
+            "lance-add" | "la" | "mark-buffer" => {
+                let path = parts.collect::<Vec<_>>().join(" ");
+                if path.is_empty() {
+                    self.run_command(Command::LanceAdd, ctx);
+                } else {
+                    self.record_command_usage("lance-add");
+                    self.add_lance_file(Self::resolve_command_path(&path));
+                }
+            }
+            "lance-next" | "lnext" => self.run_command(Command::LanceNext, ctx),
+            "lance-prev" | "lpv" => self.run_command(Command::LancePrev, ctx),
             "open-last" | "last" | "ol" => {
                 self.record_command_usage("open-last");
                 if self.dirty {
@@ -3482,6 +3749,7 @@ impl SlateApp {
             && !self.palette_open
             && !self.settings_open
             && !self.recent_picker_open
+            && !self.lance_open
             && !self.doc_tasks_open
             && !self.file_picker_open
             && !self.link_heading_picker_open
@@ -3775,6 +4043,14 @@ impl SlateApp {
                     continue;
                 }
 
+                if let Some(slot) = Self::lance_slot_key(key) {
+                    self.alt_layer_sequence.clear();
+                    self.alt_layer_last_key = None;
+                    self.open_lance_slot(slot);
+                    handled = true;
+                    continue;
+                }
+
                 let Some(ch) = Self::ctrl_layer_key(key) else {
                     continue;
                 };
@@ -3871,6 +4147,7 @@ impl SlateApp {
             && !self.palette_open
             && !self.settings_open
             && !self.recent_picker_open
+            && !self.lance_open
             && !self.doc_tasks_open
             && !self.file_picker_open
             && !self.link_assist_open
@@ -4056,6 +4333,22 @@ impl SlateApp {
         moved
     }
 
+    fn lance_slot_key(key: Key) -> Option<usize> {
+        match key {
+            Key::Num1 => Some(1),
+            Key::Num2 => Some(2),
+            Key::Num3 => Some(3),
+            Key::Num4 => Some(4),
+            Key::Num5 => Some(5),
+            Key::Num6 => Some(6),
+            Key::Num7 => Some(7),
+            Key::Num8 => Some(8),
+            Key::Num9 => Some(9),
+            Key::Num0 => Some(10),
+            _ => None,
+        }
+    }
+
     fn ctrl_layer_key(key: Key) -> Option<char> {
         match key {
             Key::A => Some('a'),
@@ -4236,6 +4529,13 @@ impl SlateApp {
         let mut recent_next = false;
         let mut recent_open = false;
         let mut recent_backspace = false;
+        let mut lance_previous = false;
+        let mut lance_next = false;
+        let mut lance_open = false;
+        let mut lance_open_modal = false;
+        let mut lance_add = false;
+        let mut lance_delete = false;
+        let mut lance_backspace = false;
         let mut doc_task_previous = false;
         let mut doc_task_next = false;
         let mut doc_task_open = false;
@@ -4292,6 +4592,7 @@ impl SlateApp {
             && !self.palette_open
             && !self.settings_open
             && !self.recent_picker_open
+            && !self.lance_open
             && !self.doc_tasks_open
             && !self.file_picker_open
             && !self.link_heading_picker_open
@@ -4316,6 +4617,15 @@ impl SlateApp {
                 recent_open |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
                 recent_open |= i.consume_key(egui::Modifiers::NONE, Key::Space);
                 recent_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
+            }
+            if self.lance_open {
+                lance_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
+                lance_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
+                lance_open_modal |= i.consume_key(egui::Modifiers::CTRL, Key::Enter);
+                lance_open |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
+                lance_add |= i.consume_key(egui::Modifiers::CTRL, Key::A);
+                lance_delete |= i.consume_key(egui::Modifiers::NONE, Key::Delete);
+                lance_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
             }
             if self.doc_tasks_open {
                 doc_task_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
@@ -4473,6 +4783,7 @@ impl SlateApp {
             }
             if i.consume_key(egui::Modifiers::CTRL, Key::P) {
                 self.recent_picker_open = false;
+                self.lance_open = false;
                 self.doc_tasks_open = false;
                 self.file_picker_open = false;
                 self.link_heading_picker_open = false;
@@ -4492,6 +4803,7 @@ impl SlateApp {
                 search_cursor_before |= i.consume_key(egui::Modifiers::CTRL, Key::B);
             } else if i.consume_key(egui::Modifiers::CTRL, Key::F) {
                 self.palette_open = false;
+                self.lance_open = false;
                 self.command_line = "find ".to_string();
                 self.command_line_cursor = self.command_line.len();
                 self.command_history_index = None;
@@ -4502,6 +4814,7 @@ impl SlateApp {
             if i.consume_key(egui::Modifiers::CTRL, Key::Period) {
                 self.palette_open = false;
                 self.recent_picker_open = false;
+                self.lance_open = false;
                 self.doc_tasks_open = false;
                 self.file_picker_open = false;
                 self.link_heading_picker_open = false;
@@ -4619,6 +4932,9 @@ impl SlateApp {
                     self.recent_picker_open = false;
                     self.pending_recent_path = None;
                     self.focus_editor_once = true;
+                } else if self.lance_open {
+                    self.lance_open = false;
+                    self.focus_editor_once = true;
                 } else if self.doc_tasks_open {
                     self.doc_tasks_open = false;
                     self.focus_editor_once = true;
@@ -4722,6 +5038,10 @@ impl SlateApp {
 
         if self.recent_picker_open {
             self.handle_recent_picker_text_input(ctx);
+        }
+
+        if self.lance_open {
+            self.handle_lance_text_input(ctx);
         }
 
         if self.doc_tasks_open {
@@ -4890,6 +5210,42 @@ impl SlateApp {
 
         if recent_open {
             self.open_selected_recent_file();
+            return;
+        }
+
+        if lance_backspace {
+            self.lance_query.pop();
+            self.selected_lance_file = self.lance_file_indices().first().copied().unwrap_or(0);
+            return;
+        }
+
+        if lance_previous {
+            self.move_lance_selection(-1);
+            return;
+        }
+
+        if lance_next {
+            self.move_lance_selection(1);
+            return;
+        }
+
+        if lance_add {
+            self.open_lance_file_picker();
+            return;
+        }
+
+        if lance_delete {
+            self.remove_selected_lance_file();
+            return;
+        }
+
+        if lance_open_modal {
+            self.open_selected_lance_file_as_modal();
+            return;
+        }
+
+        if lance_open {
+            self.open_selected_lance_file();
             return;
         }
 
@@ -5355,6 +5711,22 @@ impl SlateApp {
         }
         self.recent_query.push_str(&text);
         self.selected_recent_file = self.recent_file_indices().first().copied().unwrap_or(0);
+    }
+
+    fn handle_lance_text_input(&mut self, ctx: &egui::Context) {
+        let events = ctx.input(|input| input.events.clone());
+        if ctx.input(|input| input.modifiers.ctrl || input.modifiers.command || input.modifiers.alt)
+        {
+            return;
+        }
+        let Some((_, text)) = Self::normalized_text_input(&events) else {
+            return;
+        };
+        if text.chars().any(|ch| ch.is_control()) {
+            return;
+        }
+        self.lance_query.push_str(&text);
+        self.selected_lance_file = self.lance_file_indices().first().copied().unwrap_or(0);
     }
 
     fn handle_doc_tasks_text_input(&mut self, ctx: &egui::Context) {
@@ -6183,6 +6555,136 @@ impl SlateApp {
             });
     }
 
+    fn lance_dialog(&mut self, ctx: &egui::Context) {
+        if !self.lance_open {
+            return;
+        }
+
+        egui::Area::new("lance_dialog".into())
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let screen = ctx.content_rect();
+                let row_count = self.lance_file_indices().len().clamp(3, 10) as f32;
+                let height = (132.0 + row_count * 24.0).clamp(210.0, 380.0);
+                let size = Vec2::new(
+                    (screen.width() * 0.52).clamp(420.0, 720.0),
+                    height.min(screen.height() * 0.7),
+                );
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(22, 28, 37))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
+                    .corner_radius(0.0)
+                    .inner_margin(12.0)
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 12],
+                        blur: 28,
+                        spread: 0,
+                        color: Color32::from_black_alpha(170),
+                    })
+                    .show(ui, |ui| {
+                        ui.set_min_size(size);
+                        ui.set_max_size(size);
+                        let font = FontId::new(13.0, FontFamily::Monospace);
+                        let title_font = FontId::new(15.0, FontFamily::Monospace);
+                        let accent = Color32::from_rgb(136, 192, 208);
+                        let dim = Color32::from_rgb(136, 154, 176);
+                        let warn = Color32::from_rgb(235, 203, 139);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("lance").font(title_font).color(accent));
+                            ui.label(
+                                RichText::new(format!("{} marks", self.lance_files.len()))
+                                    .font(font.clone())
+                                    .color(dim),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(
+                                            "↑↓ select  Enter open  Ctrl+Enter modal  Ctrl+A add  Del remove  Esc close",
+                                        )
+                                        .font(font.clone())
+                                        .color(warn),
+                                    );
+                                },
+                            );
+                        });
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(">").font(font.clone()).color(accent));
+                            let query = if self.lance_query.is_empty() {
+                                "filter marks".to_string()
+                            } else {
+                                self.lance_query.clone()
+                            };
+                            ui.label(
+                                RichText::new(query)
+                                    .font(font.clone())
+                                    .color(if self.lance_query.is_empty() { dim } else { Color32::from_rgb(216, 222, 233) }),
+                            );
+                        });
+                        ui.add_space(8.0);
+                        let indices = self.lance_file_indices();
+                        let row_height = 24.0;
+                        let visible_rows = ((ui.available_height() - 10.0) / row_height).floor().max(1.0) as usize;
+                        let selected_position = indices
+                            .iter()
+                            .position(|index| *index == self.selected_lance_file)
+                            .unwrap_or(0);
+                        let start = Self::centered_window_start(selected_position, visible_rows, indices.len());
+                        let end = (start + visible_rows).min(indices.len());
+                        if indices.is_empty() {
+                            ui.add_space(20.0);
+                            ui.label(
+                                RichText::new("No lance marks yet. Ctrl+A adds a file manually; :lance-add marks the current file.")
+                                    .font(font.clone())
+                                    .color(dim),
+                            );
+                        }
+                        for index in indices[start..end].iter().copied() {
+                            let Some(path) = self.lance_files.get(index) else {
+                                continue;
+                            };
+                            let selected = index == self.selected_lance_file;
+                            let (rect, response) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), row_height),
+                                egui::Sense::click(),
+                            );
+                            let painter = ui.painter_at(rect);
+                            if selected {
+                                painter.rect_filled(rect, 0.0, Color32::from_rgb(38, 47, 61));
+                            }
+                            let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("unknown");
+                            painter.text(
+                                egui::pos2(rect.left() + 8.0, rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                if selected { ">" } else { " " },
+                                font.clone(),
+                                accent,
+                            );
+                            painter.text(
+                                egui::pos2(rect.left() + 28.0, rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                format!("{} {}", index + 1, name),
+                                font.clone(),
+                                if selected { Color32::from_rgb(216, 222, 233) } else { Color32::from_rgb(190, 200, 216) },
+                            );
+                            painter.text(
+                                egui::pos2(rect.left() + 220.0, rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                path.display().to_string(),
+                                font.clone(),
+                                dim,
+                            );
+                            if response.clicked() {
+                                self.selected_lance_file = index;
+                            }
+                        }
+                    });
+            });
+    }
+
     fn file_picker_dialog(&mut self, ctx: &egui::Context) {
         if !self.file_picker_open {
             return;
@@ -6227,6 +6729,7 @@ impl SlateApp {
                             let title = match self.file_picker_mode {
                                 FilePickerMode::Open => "open",
                                 FilePickerMode::OpenBuffer => "open buffer",
+                                FilePickerMode::AddLance => "add lance",
                                 FilePickerMode::Browse => "files",
                                 FilePickerMode::InsertMarkdownLink => "insert link file",
                             };
@@ -8066,6 +8569,7 @@ impl eframe::App for SlateApp {
                     && !self.palette_open
                     && !self.settings_open
                     && !self.recent_picker_open
+                    && !self.lance_open
                     && !self.doc_tasks_open
                     && !self.file_picker_open
                     && !self.link_assist_open
@@ -8105,6 +8609,7 @@ impl eframe::App for SlateApp {
                                     && !self.palette_open
                                     && !self.settings_open
                                     && !self.recent_picker_open
+                                    && !self.lance_open
                                     && !self.doc_tasks_open
                                     && !self.file_picker_open
                                     && !self.link_heading_picker_open
@@ -8146,6 +8651,7 @@ impl eframe::App for SlateApp {
                                 && !self.palette_open
                                 && !self.settings_open
                                 && !self.recent_picker_open
+                                && !self.lance_open
                                 && !self.doc_tasks_open
                                 && !self.file_picker_open
                                 && !self.link_heading_picker_open
@@ -8201,6 +8707,8 @@ impl eframe::App for SlateApp {
                     "command"
                 } else if self.recent_picker_open {
                     "recent"
+                } else if self.lance_open {
+                    "lance"
                 } else if self.doc_tasks_open {
                     "doc tasks"
                 } else if self.file_picker_open {
@@ -8630,6 +9138,11 @@ impl eframe::App for SlateApp {
                             format!("recent files {} ↑↓ select · type filter · Enter open · Esc close", if self.recent_query.is_empty() { "".to_string() } else { format!("/{} ", self.recent_query) }),
                             footer_accent,
                         )
+                    } else if self.lance_open {
+                        (
+                            format!("lance {} ↑↓ select · type filter · Enter open · Ctrl+Enter modal · Ctrl+A add · Del remove", if self.lance_query.is_empty() { "".to_string() } else { format!("/{} ", self.lance_query) }),
+                            footer_accent,
+                        )
                     } else if self.file_picker_open {
                         ("files  type filter · ↑↓ select · → enter folder · ← parent · Enter open · Esc close".to_string(), footer_accent)
                     } else if self.link_heading_picker_open {
@@ -8661,6 +9174,7 @@ impl eframe::App for SlateApp {
         self.shortcut_help_dialog(&ctx);
         self.link_assist_dialog(&ctx);
         self.link_preview_dialog(&ctx);
+        self.lance_dialog(&ctx);
         self.file_picker_dialog(&ctx);
         self.save_as_dialog(&ctx);
         self.scratch_modal_dialog(&ctx);
