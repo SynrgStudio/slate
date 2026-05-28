@@ -1,9 +1,10 @@
 use crate::{
     editor_buffer::EditorBuffer,
     markdown::{
-        CheckboxState, is_markdown_separator, markdown_link_target_at_byte, parse_blockquote_line,
-        parse_checkbox_line, parse_fenced_code_marker, parse_heading_line, parse_inline_code_spans,
-        parse_list_line, parse_markdown_link_spans,
+        CheckboxState, TableAlignment, is_markdown_separator, is_markdown_table_start,
+        markdown_link_target_at_byte, parse_blockquote_line, parse_checkbox_line,
+        parse_fenced_code_marker, parse_heading_line, parse_inline_code_spans, parse_list_line,
+        parse_markdown_link_spans, parse_markdown_table_separator, split_markdown_table_row,
     },
     search::SearchState,
 };
@@ -54,6 +55,13 @@ pub(crate) struct VisualRow {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CodeLineKind<'a> {
     Fence { language: &'a str },
+    Body,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TableLineKind {
+    Header,
+    Separator,
     Body,
 }
 
@@ -821,6 +829,75 @@ impl EditorView {
         None
     }
 
+    fn table_line_kind(&self, buffer: &EditorBuffer, line_index: usize) -> Option<TableLineKind> {
+        let line = buffer.line(line_index);
+        let cells = split_markdown_table_row(line)?;
+        if cells.len() < 2 {
+            return None;
+        }
+        if parse_markdown_table_separator(line).is_some() {
+            return Some(TableLineKind::Separator);
+        }
+        let next = (line_index + 1 < buffer.line_count()).then(|| buffer.line(line_index + 1));
+        if is_markdown_table_start(line, next) {
+            return Some(TableLineKind::Header);
+        }
+
+        let mut index = line_index;
+        while let Some(previous_index) = index.checked_sub(1) {
+            let previous = buffer.line(previous_index);
+            if parse_markdown_table_separator(previous).is_some() {
+                return Some(TableLineKind::Body);
+            }
+            if split_markdown_table_row(previous).is_none() {
+                break;
+            }
+            index = previous_index;
+        }
+        None
+    }
+
+    fn table_block_context(
+        &self,
+        painter: &egui::Painter,
+        buffer: &EditorBuffer,
+        line_index: usize,
+        font: &FontId,
+    ) -> Option<(Vec<TableAlignment>, Vec<f32>)> {
+        self.table_line_kind(buffer, line_index)?;
+        let mut start = line_index;
+        while start > 0 && split_markdown_table_row(buffer.line(start - 1)).is_some() {
+            start -= 1;
+        }
+        let mut end = line_index;
+        while end + 1 < buffer.line_count()
+            && split_markdown_table_row(buffer.line(end + 1)).is_some()
+        {
+            end += 1;
+        }
+
+        let separator_index = (start..=end)
+            .find(|index| parse_markdown_table_separator(buffer.line(*index)).is_some())?;
+        let alignments = parse_markdown_table_separator(buffer.line(separator_index))?;
+        let column_count = alignments.len();
+        let mut widths = vec![56.0_f32; column_count];
+        for index in start..=end {
+            if index == separator_index {
+                continue;
+            }
+            let Some(cells) = split_markdown_table_row(buffer.line(index)) else {
+                continue;
+            };
+            if cells.len() != column_count {
+                continue;
+            }
+            for (column, cell) in cells.iter().enumerate() {
+                widths[column] = widths[column].max(self.text_width(painter, cell, font) + 22.0);
+            }
+        }
+        Some((alignments, widths))
+    }
+
     fn code_block_range(&self, buffer: &EditorBuffer, line_index: usize) -> Option<(usize, usize)> {
         let mut block_start = None;
         for index in 0..buffer.line_count() {
@@ -858,6 +935,94 @@ impl EditorView {
     ) {
         if !render_markdown {
             return;
+        }
+
+        if let Some(table_kind) = self.table_line_kind(buffer, row.line_index) {
+            let table_width = self
+                .table_block_context(painter, buffer, row.line_index, font)
+                .map(|(_, widths)| widths.iter().sum::<f32>())
+                .unwrap_or_else(|| (right - text_x - 8.0).min(520.0));
+            let table_left = text_x - 4.0;
+            let table_right = (text_x + table_width + 4.0).min(right - 8.0);
+            let table_rect = egui::Rect::from_min_max(
+                egui::pos2(table_left, y),
+                egui::pos2(table_right, y + line_height),
+            );
+            let fill = match table_kind {
+                TableLineKind::Header => Color32::from_rgb(31, 38, 50),
+                TableLineKind::Separator => Color32::from_rgb(24, 30, 40),
+                TableLineKind::Body if row.line_index % 2 == 0 => Color32::from_rgb(29, 36, 48),
+                TableLineKind::Body => Color32::from_rgb(27, 33, 44),
+            };
+            let border = Color32::from_rgb(59, 70, 90);
+            let strong_border = Color32::from_rgb(76, 86, 106);
+            painter.rect_filled(table_rect, 0.0, fill);
+
+            let previous_is_table = row
+                .line_index
+                .checked_sub(1)
+                .and_then(|line_index| self.table_line_kind(buffer, line_index))
+                .is_some();
+            let next_is_table = (row.line_index + 1 < buffer.line_count())
+                .then(|| self.table_line_kind(buffer, row.line_index + 1))
+                .flatten()
+                .is_some();
+            let top_y = y;
+            let bottom_y = y + line_height;
+
+            painter.line_segment(
+                [
+                    egui::pos2(table_left, top_y),
+                    egui::pos2(table_left, bottom_y),
+                ],
+                Stroke::new(1.0, border),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(table_right, top_y),
+                    egui::pos2(table_right, bottom_y),
+                ],
+                Stroke::new(1.0, border),
+            );
+            if !previous_is_table {
+                painter.line_segment(
+                    [
+                        egui::pos2(table_left, top_y),
+                        egui::pos2(table_right, top_y),
+                    ],
+                    Stroke::new(1.0, border),
+                );
+            }
+            if !next_is_table {
+                painter.line_segment(
+                    [
+                        egui::pos2(table_left, bottom_y),
+                        egui::pos2(table_right, bottom_y),
+                    ],
+                    Stroke::new(1.0, border),
+                );
+            }
+            if let Some((_, widths)) =
+                self.table_block_context(painter, buffer, row.line_index, font)
+            {
+                let mut x = text_x;
+                for width in widths.iter().take(widths.len().saturating_sub(1)) {
+                    x += *width;
+                    painter.line_segment(
+                        [egui::pos2(x, top_y), egui::pos2(x, bottom_y)],
+                        Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
+                    );
+                }
+            }
+            if matches!(table_kind, TableLineKind::Header | TableLineKind::Separator) {
+                painter.line_segment(
+                    [
+                        egui::pos2(table_left, bottom_y),
+                        egui::pos2(table_right, bottom_y),
+                    ],
+                    Stroke::new(1.0, strong_border),
+                );
+            }
         }
 
         if self.code_line_kind(buffer, row.line_index).is_some() {
@@ -971,6 +1136,75 @@ impl EditorView {
                 }
                 _ => {}
             }
+        }
+
+        if let Some(table_kind) = self.table_line_kind(buffer, row.line_index) {
+            let cursor_line = buffer.cursor_line_col().0;
+            if row.start != line_start {
+                painter.text(
+                    egui::pos2(text_x, y + line_height * 0.5),
+                    egui::Align2::LEFT_CENTER,
+                    &buffer.as_str()[row.start..row.end],
+                    font.clone(),
+                    text_color,
+                );
+                return;
+            }
+            if table_kind == TableLineKind::Separator {
+                if cursor_line == row.line_index {
+                    painter.text(
+                        egui::pos2(text_x, y + line_height * 0.5),
+                        egui::Align2::LEFT_CENTER,
+                        line,
+                        font.clone(),
+                        Color32::from_rgb(94, 105, 126),
+                    );
+                }
+                return;
+            }
+
+            let Some(cells) = split_markdown_table_row(line) else {
+                return;
+            };
+            let (alignments, widths) = self
+                .table_block_context(painter, buffer, row.line_index, font)
+                .unwrap_or_else(|| {
+                    (
+                        vec![TableAlignment::Left; cells.len()],
+                        cells
+                            .iter()
+                            .map(|cell| self.text_width(painter, cell, font) + 22.0)
+                            .collect(),
+                    )
+                });
+            let table_color = match table_kind {
+                TableLineKind::Header => Color32::from_rgb(235, 203, 139),
+                TableLineKind::Separator => Color32::from_rgb(94, 105, 126),
+                TableLineKind::Body => Color32::from_rgb(216, 222, 233),
+            };
+            let mut x = text_x;
+            for (column, cell) in cells.iter().enumerate() {
+                let width = widths.get(column).copied().unwrap_or(72.0);
+                let cell_width = self.text_width(painter, cell, font);
+                let alignment = alignments
+                    .get(column)
+                    .copied()
+                    .unwrap_or(TableAlignment::Left);
+                let cell_x = match alignment {
+                    TableAlignment::Left => x + 8.0,
+                    TableAlignment::Center => x + ((width - cell_width) * 0.5).max(4.0),
+                    TableAlignment::Right => x + (width - cell_width - 8.0).max(4.0),
+                };
+                painter.text(
+                    egui::pos2(cell_x, y + line_height * 0.5),
+                    egui::Align2::LEFT_CENTER,
+                    cell,
+                    font.clone(),
+                    table_color,
+                );
+                x += width;
+            }
+            return;
         }
 
         if let Some(heading) = parse_heading_line(line) {

@@ -17,6 +17,65 @@ pub(crate) fn is_markdown_separator(line: &str) -> bool {
     line.trim() == "---"
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TableAlignment {
+    Left,
+    Center,
+    Right,
+}
+
+pub(crate) fn parse_markdown_table_separator(line: &str) -> Option<Vec<TableAlignment>> {
+    let cells = split_markdown_table_row(line)?;
+    if cells.is_empty() {
+        return None;
+    }
+
+    let mut alignments = Vec::with_capacity(cells.len());
+    for cell in cells {
+        let trimmed = cell.trim();
+        if trimmed.len() < 3 {
+            return None;
+        }
+        let left = trimmed.starts_with(':');
+        let right = trimmed.ends_with(':');
+        let core = trimmed.trim_matches(':');
+        if core.len() < 3 || !core.chars().all(|ch| ch == '-') {
+            return None;
+        }
+        alignments.push(match (left, right) {
+            (true, true) => TableAlignment::Center,
+            (false, true) => TableAlignment::Right,
+            _ => TableAlignment::Left,
+        });
+    }
+    Some(alignments)
+}
+
+pub(crate) fn split_markdown_table_row(line: &str) -> Option<Vec<String>> {
+    if !line.contains('|') {
+        return None;
+    }
+
+    let trimmed = line.trim();
+    let trimmed = trimmed.strip_prefix('|').unwrap_or(trimmed);
+    let trimmed = trimmed.strip_suffix('|').unwrap_or(trimmed);
+    let cells = trimmed
+        .split('|')
+        .map(|cell| cell.trim().to_string())
+        .collect::<Vec<_>>();
+    (cells.len() >= 2).then_some(cells)
+}
+
+pub(crate) fn is_markdown_table_start(header: &str, separator: Option<&str>) -> bool {
+    let Some(header_cells) = split_markdown_table_row(header) else {
+        return false;
+    };
+    let Some(separator_cells) = separator.and_then(parse_markdown_table_separator) else {
+        return false;
+    };
+    header_cells.len() == separator_cells.len()
+}
+
 pub(crate) struct ParsedBlockquoteLine<'a> {
     pub(crate) indent: &'a str,
     pub(crate) marker: &'a str,
@@ -293,6 +352,34 @@ mod tests {
         assert!(is_markdown_separator("  ---  "));
         assert!(!is_markdown_separator("----"));
         assert!(!is_markdown_separator("text ---"));
+    }
+
+    #[test]
+    fn parses_markdown_table_rows_and_separators() {
+        assert_eq!(
+            split_markdown_table_row("| Name | Status | Notes |").unwrap(),
+            vec!["Name", "Status", "Notes"]
+        );
+        assert_eq!(
+            split_markdown_table_row("Name | Status").unwrap(),
+            vec!["Name", "Status"]
+        );
+        assert!(split_markdown_table_row("not a table").is_none());
+
+        assert_eq!(
+            parse_markdown_table_separator("| :--- | :---: | ---: |").unwrap(),
+            vec![
+                TableAlignment::Left,
+                TableAlignment::Center,
+                TableAlignment::Right
+            ]
+        );
+        assert!(parse_markdown_table_separator("| --- | nope |").is_none());
+        assert!(is_markdown_table_start(
+            "| Name | Status |",
+            Some("| --- | :---: |")
+        ));
+        assert!(!is_markdown_table_start("| Name |", Some("| --- | --- |")));
     }
 
     #[test]

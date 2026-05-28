@@ -20,9 +20,10 @@ use eframe::egui::{
 };
 use goto::GotoTarget;
 use markdown::{
-    CheckboxState, is_markdown_separator, markdown_link_target_at_byte, parse_blockquote_line,
-    parse_checkbox_line, parse_fenced_code_marker, parse_heading_line, parse_inline_code_spans,
-    parse_list_line, parse_markdown_link_spans,
+    CheckboxState, TableAlignment, is_markdown_separator, is_markdown_table_start,
+    markdown_link_target_at_byte, parse_blockquote_line, parse_checkbox_line,
+    parse_fenced_code_marker, parse_heading_line, parse_inline_code_spans, parse_list_line,
+    parse_markdown_link_spans, parse_markdown_table_separator, split_markdown_table_row,
 };
 use search::SearchState;
 
@@ -7408,6 +7409,123 @@ impl SlateApp {
         true
     }
 
+    fn markdown_table_preview(
+        ui: &mut egui::Ui,
+        rows: &[Vec<String>],
+        alignments: &[TableAlignment],
+    ) {
+        if rows.is_empty() {
+            return;
+        }
+
+        let column_count = rows[0].len();
+        let char_width = 8.4;
+        let mut column_widths = vec![72.0_f32; column_count];
+        for row in rows {
+            for column in 0..column_count {
+                let len = row
+                    .get(column)
+                    .map(|text| text.chars().count())
+                    .unwrap_or(0);
+                column_widths[column] = column_widths[column].max(len as f32 * char_width + 28.0);
+            }
+        }
+
+        let row_height = 26.0;
+        let table_width = column_widths.iter().sum::<f32>();
+        let table_height = row_height * rows.len() as f32;
+        ui.add_space(6.0);
+        let (rect, _) = ui.allocate_exact_size(
+            Vec2::new(table_width.min(ui.available_width()), table_height),
+            egui::Sense::hover(),
+        );
+        let painter = ui.painter();
+        let border = Color32::from_rgb(59, 70, 90);
+        let strong_border = Color32::from_rgb(76, 86, 106);
+        let font = FontId::new(14.0, FontFamily::Monospace);
+
+        painter.rect_filled(rect, 3.0, Color32::from_rgb(24, 30, 40));
+        for (row_index, row) in rows.iter().enumerate() {
+            let y = rect.top() + row_index as f32 * row_height;
+            let row_rect = egui::Rect::from_min_max(
+                egui::pos2(rect.left(), y),
+                egui::pos2(rect.right(), y + row_height),
+            );
+            let row_fill = if row_index == 0 {
+                Color32::from_rgb(31, 38, 50)
+            } else if row_index % 2 == 0 {
+                Color32::from_rgb(28, 35, 46)
+            } else {
+                Color32::from_rgb(24, 30, 40)
+            };
+            painter.rect_filled(row_rect, 0.0, row_fill);
+
+            let mut x = rect.left();
+            for column in 0..column_count {
+                let width = column_widths[column];
+                let text = row.get(column).map(String::as_str).unwrap_or("");
+                let alignment = alignments
+                    .get(column)
+                    .copied()
+                    .unwrap_or(TableAlignment::Left);
+                let color = if row_index == 0 {
+                    Color32::from_rgb(235, 203, 139)
+                } else {
+                    Color32::from_rgb(216, 222, 233)
+                };
+                let (pos, align) = match alignment {
+                    TableAlignment::Left => (
+                        egui::pos2(x + 10.0, y + row_height * 0.5),
+                        egui::Align2::LEFT_CENTER,
+                    ),
+                    TableAlignment::Center => (
+                        egui::pos2(x + width * 0.5, y + row_height * 0.5),
+                        egui::Align2::CENTER_CENTER,
+                    ),
+                    TableAlignment::Right => (
+                        egui::pos2(x + width - 10.0, y + row_height * 0.5),
+                        egui::Align2::RIGHT_CENTER,
+                    ),
+                };
+                painter.text(pos, align, text, font.clone(), color);
+                x += width;
+            }
+        }
+
+        painter.rect_stroke(
+            rect,
+            3.0,
+            Stroke::new(1.0, border),
+            egui::StrokeKind::Inside,
+        );
+        let mut x = rect.left();
+        for width in column_widths.iter().take(column_count.saturating_sub(1)) {
+            x += *width;
+            painter.line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
+            );
+        }
+        if rows.len() > 1 {
+            let header_y = rect.top() + row_height;
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left(), header_y),
+                    egui::pos2(rect.right(), header_y),
+                ],
+                Stroke::new(1.0, strong_border),
+            );
+        }
+        for row_index in 2..rows.len() {
+            let y = rect.top() + row_index as f32 * row_height;
+            painter.line_segment(
+                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                Stroke::new(1.0, Color32::from_rgb(36, 45, 58)),
+            );
+        }
+        ui.add_space(6.0);
+    }
+
     fn inline_code_preview_label(ui: &mut egui::Ui, line: &str) -> bool {
         let spans = parse_inline_code_spans(line);
         if spans.is_empty() {
@@ -7477,9 +7595,12 @@ impl SlateApp {
     fn preview_ui(&self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.set_width(ui.available_width());
+            let lines = self.buffer.as_str().lines().collect::<Vec<_>>();
+            let mut index = 0;
             let mut in_code = false;
             let mut code_language = String::new();
-            for line in self.buffer.as_str().lines() {
+            while index < lines.len() {
+                let line = lines[index];
                 let trimmed = line.trim_start();
                 if let Some(fence) = parse_fenced_code_marker(line) {
                     if in_code {
@@ -7504,6 +7625,7 @@ impl SlateApp {
                             }
                         });
                     }
+                    index += 1;
                     continue;
                 }
 
@@ -7518,6 +7640,23 @@ impl SlateApp {
                                     .color(Color32::from_rgb(216, 222, 233)),
                             );
                         });
+                } else if is_markdown_table_start(line, lines.get(index + 1).copied()) {
+                    let mut rows = vec![split_markdown_table_row(line).unwrap_or_default()];
+                    let alignments = parse_markdown_table_separator(lines[index + 1])
+                        .unwrap_or_else(|| vec![TableAlignment::Left; rows[0].len()]);
+                    index += 2;
+                    while let Some(next_line) = lines.get(index).copied() {
+                        let Some(cells) = split_markdown_table_row(next_line) else {
+                            break;
+                        };
+                        if cells.len() != rows[0].len() {
+                            break;
+                        }
+                        rows.push(cells);
+                        index += 1;
+                    }
+                    Self::markdown_table_preview(ui, &rows, &alignments);
+                    continue;
                 } else if let Some(heading) = parse_heading_line(line) {
                     let size = match heading.level {
                         1 => 28.0,
@@ -7599,6 +7738,7 @@ impl SlateApp {
                 {
                     ui.label(RichText::new(line).size(15.0));
                 }
+                index += 1;
             }
         });
     }

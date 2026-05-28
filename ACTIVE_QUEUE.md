@@ -106,7 +106,7 @@ Scope:
 - Done: support Markdown links like `[text](./file.md)` and `[text](https://example.com)` with editor/preview visual affordance.
 - Done: support contextual open for Markdown links via `:open-link`.
 - Done: support `Ctrl+LeftClick` on web links to open them in the default browser and on local links to open them in Slate.
-- Pending: support simple Markdown tables in preview only; no table editor or auto-alignment for now.
+- Done: support simple Markdown tables in preview only; no table editor or auto-alignment for now.
 
 ### T009 — Theme system
 
