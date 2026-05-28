@@ -142,8 +142,9 @@ Scope:
 - `Tab` swaps/promotes the main buffer and modal buffer positions, so the user can quickly flip which file is primary and which is in the large editable overlay.
 - Unlike the current read-only-ish link preview, the modal buffer should support real editing, save state, cursor/scroll, and dirty protection.
 - Add Slate Picker core inspired by Telescope: a single minimal modal pattern for prompt + fuzzy results + optional preview + contextual actions.
+- Done: centralized `:open`, `:open-buffer`, `:recent`, and `:lance` on one shared Slate Picker modal surface while preserving contextual actions.
 - Keep the visual direction Telescope-like: simple framed results pane, preview pane, compact prompt/status line; minimal but a little more Slate-polished.
-- Use Slate Picker as the shared foundation for command palette, recent files, open/open-buffer, heading picker, buffers, marks, doc tasks, and future global search.
+- Use Slate Picker only where the workflow is a simple "pick one item and run an action" list. Do not force admin/editing workflows into it, and keep Periscope/search as a separate feature lane.
 - Add Lance-inspired marked-buffer workflow: a small persistent per-project list of important files, editable through a modal, with direct slot shortcuts and next/previous navigation.
 - Done: Lance is capped at 10 quick files, with `Alt+1` through `Alt+9` and `Alt+0` jumping directly to slots 1 through 10.
 - Mark current/modal file into a numbered slot; selecting a slot opens/promotes that file quickly.
@@ -490,6 +491,31 @@ Scope:
 - Done: after insertion, place the cursor inside the `[]` label so the user can immediately type the link text.
 - Done: resolve file targets relative to the current buffer when possible; fall back to project/current directory when the buffer has no path.
 - Done: keep the final document plain Markdown; `[[` is only the assist trigger, not a persistent custom link syntax.
+
+### T049 — Periscope: real fzf-style file search
+
+Status: in_progress
+Scope:
+- Done: build Periscope as Slate's dedicated fast file-search workflow, separate from the generic Slate Picker/list centralizer.
+- Done: add `:periscope` / `:ps` / `:fzf` command registry entries.
+- Done: default mode is Project Periscope: search files under the detected project root.
+- Done: project root detection starts from the current file directory and walks upward until a `.git` directory is found; that directory is the project root.
+- Done: if no `.git` project root exists, ask the user whether to define a project folder.
+- Done: if the user chooses yes, open a folder picker to select the project folder and then run Project Periscope there.
+- Done: if the user chooses no, skip project mode and open Home Periscope directly.
+- Done: `Tab` toggles between Project Periscope and Home Periscope when a project root exists; if no project root is configured, `Tab` shows a short status hint.
+- Replaced the experimental whole-system `plocate`/`locate` Global Periscope with Home Periscope because whole-system fuzzy was noisy and hit-or-miss in practice.
+- Done: Home Periscope indexes files under `$HOME` in the background, using `fd` when available and a Rust recursive fallback otherwise, then fuzzy-filters that local list in memory.
+- Done: Project mode starts with `fd` where available, with a Rust fallback over the project root; this is separate from the `$HOME` index.
+- Done: keep Periscope controls minimal: type filter/query, `↑↓` select, `Enter` open as main buffer, `Ctrl+Enter` open as modal buffer, `Tab` switch project/home, `Esc` close.
+- Done: Home Periscope displays up to 100 results.
+- Done: Periscope supports path-aware ordered queries such as `lua periscope readme` or `etc/ssh config`, matching tokens in path order so users can narrow by directories without filtering out system paths.
+- Done: add folder-group expansion inside Periscope results. When a query strongly matches a folder, Slate shows a folder row plus inline child rows, e.g. `/home/nd/slateamp/` followed by indented `---/README.md`, `---/Cargo.toml`, etc.
+- Done: `Enter` or `→` on a folder row expands/collapses that folder in the same Periscope list instead of leaving search mode or opening a separate file browser.
+- Done: child rows remain normal file results: `Enter` opens the file, `Ctrl+Enter` opens it as modal buffer.
+- Done: folder expansion stays transient and scoped to the current Periscope query/results; query/mode changes clear expansion state.
+- Pending optimization: debounce Project Periscope query updates, cancel stale backend processes where still applicable, and keep polishing indexing lifecycle/status.
+- Future but not part of the first pass: content search, custom indexes, Everything-like daemon/indexer, project-specific persisted roots, and search result buffers.
 
 Command groups worth considering:
 

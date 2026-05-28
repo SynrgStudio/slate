@@ -5,10 +5,13 @@ mod markdown;
 mod search;
 
 use std::{
+    collections::{BinaryHeap, HashSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
+    sync::mpsc::{self, Receiver, TryRecvError},
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -26,6 +29,8 @@ use markdown::{
     parse_markdown_link_spans, parse_markdown_table_separator, split_markdown_table_row,
 };
 use search::SearchState;
+
+const PERISCOPE_RESULT_LIMIT: usize = 100;
 
 fn main() -> eframe::Result {
     let mut scratch = false;
@@ -67,6 +72,7 @@ enum Command {
     New,
     Open,
     OpenBuffer,
+    Periscope,
     Lance,
     LanceAdd,
     LanceNext,
@@ -193,6 +199,13 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         summary: "Open a file in the editable modal buffer",
         hint: ":open-buffer",
         palette_command: Some(Command::OpenBuffer),
+    },
+    CommandSpec {
+        name: "periscope",
+        aliases: &["ps", "fzf"],
+        summary: "Open Periscope project/home file search",
+        hint: ":periscope",
+        palette_command: Some(Command::Periscope),
     },
     CommandSpec {
         name: "open-last",
@@ -501,6 +514,13 @@ enum FilePickerMode {
     AddLance,
     Browse,
     InsertMarkdownLink,
+    SetPeriscopeProject,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PeriscopeMode {
+    Project,
+    Global,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -534,6 +554,24 @@ struct LinkHeadingOption {
     text: String,
     anchor: String,
     line_index: usize,
+}
+
+struct PeriscopeIndexedPath {
+    path: PathBuf,
+    lower: String,
+    is_file: bool,
+}
+
+#[derive(Clone)]
+enum PeriscopeRow {
+    Folder {
+        path: PathBuf,
+        expanded: bool,
+    },
+    File {
+        path: PathBuf,
+        group: Option<PathBuf>,
+    },
 }
 
 struct SlateApp {
@@ -587,6 +625,18 @@ struct SlateApp {
     file_query: String,
     project_files: Vec<PathBuf>,
     selected_project_file: usize,
+    periscope_open: bool,
+    periscope_prompt_open: bool,
+    periscope_mode: PeriscopeMode,
+    periscope_project_root: Option<PathBuf>,
+    periscope_query: String,
+    periscope_results: Vec<PathBuf>,
+    selected_periscope_result: usize,
+    periscope_expanded_folders: HashSet<PathBuf>,
+    periscope_backend_status: String,
+    periscope_global_paths: Vec<PeriscopeIndexedPath>,
+    periscope_global_rx: Option<Receiver<Vec<PeriscopeIndexedPath>>>,
+    periscope_global_loading: bool,
     pending_project_file_path: Option<PathBuf>,
     pending_open_heading_fragment: Option<String>,
     link_assist_open: bool,
@@ -691,6 +741,18 @@ impl SlateApp {
             file_query: String::new(),
             project_files: Vec::new(),
             selected_project_file: 0,
+            periscope_open: false,
+            periscope_prompt_open: false,
+            periscope_mode: PeriscopeMode::Project,
+            periscope_project_root: None,
+            periscope_query: String::new(),
+            periscope_results: Vec::new(),
+            selected_periscope_result: 0,
+            periscope_expanded_folders: HashSet::new(),
+            periscope_backend_status: String::new(),
+            periscope_global_paths: Vec::new(),
+            periscope_global_rx: None,
+            periscope_global_loading: false,
             pending_project_file_path: None,
             pending_open_heading_fragment: None,
             link_assist_open: false,
@@ -2294,6 +2356,19 @@ impl SlateApp {
             return;
         };
         if path.is_dir() {
+            if self.file_picker_mode == FilePickerMode::SetPeriscopeProject {
+                self.file_picker_open = false;
+                self.periscope_project_root = Some(path.clone());
+                self.periscope_mode = PeriscopeMode::Project;
+                self.periscope_open = true;
+                self.periscope_query.clear();
+                self.periscope_results.clear();
+                self.periscope_expanded_folders.clear();
+                self.selected_periscope_result = 0;
+                self.refresh_periscope_results();
+                self.status = format!("Periscope project: {}", path.display());
+                return;
+            }
             self.file_picker_dir = path;
             self.file_query.clear();
             self.refresh_file_picker_entries();
@@ -2309,6 +2384,9 @@ impl SlateApp {
                 self.file_picker_open = false;
                 self.open_link_preview(path, None);
             }
+            FilePickerMode::SetPeriscopeProject => {
+                self.status = "Choose a folder for Periscope project".to_string();
+            }
             FilePickerMode::AddLance => {
                 self.file_picker_open = false;
                 self.add_lance_file(path);
@@ -2323,6 +2401,572 @@ impl SlateApp {
                 self.open_path(path);
                 self.focus_editor_once = true;
             }
+        }
+    }
+
+    fn open_periscope(&mut self) {
+        self.shortcut_help_open = false;
+        self.palette_open = false;
+        self.recent_picker_open = false;
+        self.lance_open = false;
+        self.doc_tasks_open = false;
+        self.file_picker_open = false;
+        self.save_as_open = false;
+        self.command_line_focused = false;
+        self.focus_command_line_once = false;
+        self.command_history_index = None;
+        self.periscope_query.clear();
+        self.periscope_results.clear();
+        self.periscope_expanded_folders.clear();
+        self.selected_periscope_result = 0;
+        self.periscope_backend_status.clear();
+        self.focus_editor_once = false;
+
+        if let Some(root) = self.detect_project_root() {
+            self.periscope_project_root = Some(root.clone());
+            self.periscope_mode = PeriscopeMode::Project;
+            self.periscope_open = true;
+            self.periscope_prompt_open = false;
+            self.refresh_periscope_results();
+            self.status = format!("Periscope project: {}", root.display());
+        } else {
+            self.periscope_open = false;
+            self.periscope_prompt_open = true;
+            self.status = "No .git project root found".to_string();
+        }
+    }
+
+    fn detect_project_root(&self) -> Option<PathBuf> {
+        let mut dir = self
+            .path
+            .as_ref()
+            .and_then(|path| path.parent().map(PathBuf::from))
+            .or_else(|| self.last_open_dir.clone())
+            .or_else(|| std::env::current_dir().ok())?;
+        loop {
+            if dir.join(".git").is_dir() {
+                return Some(dir);
+            }
+            if !dir.pop() {
+                return None;
+            }
+        }
+    }
+
+    fn open_periscope_project_folder_picker(&mut self) {
+        self.periscope_prompt_open = false;
+        self.open_file_picker_at(self.project_root(), FilePickerMode::SetPeriscopeProject);
+        self.status = "Choose Periscope project folder with Enter".to_string();
+    }
+
+    fn open_global_periscope(&mut self) {
+        self.periscope_prompt_open = false;
+        self.periscope_open = true;
+        self.periscope_mode = PeriscopeMode::Global;
+        self.periscope_query.clear();
+        self.periscope_results.clear();
+        self.periscope_expanded_folders.clear();
+        self.selected_periscope_result = 0;
+        self.refresh_periscope_results();
+        self.status = "Periscope global".to_string();
+        self.focus_editor_once = false;
+    }
+
+    fn toggle_periscope_mode(&mut self) {
+        if !self.periscope_open {
+            return;
+        }
+        match self.periscope_mode {
+            PeriscopeMode::Project => {
+                self.periscope_mode = PeriscopeMode::Global;
+                self.status = "Periscope global".to_string();
+            }
+            PeriscopeMode::Global => {
+                if self.periscope_project_root.is_some() {
+                    self.periscope_mode = PeriscopeMode::Project;
+                    self.status = "Periscope project".to_string();
+                } else {
+                    self.status = "No Periscope project root set".to_string();
+                }
+            }
+        }
+        self.periscope_expanded_folders.clear();
+        self.selected_periscope_result = 0;
+        self.refresh_periscope_results();
+    }
+
+    fn command_available(name: &str) -> bool {
+        ProcessCommand::new("sh")
+            .arg("-lc")
+            .arg(format!("command -v {} >/dev/null 2>&1", name))
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    fn collect_project_files(root: &Path, out: &mut Vec<PathBuf>, limit: usize) {
+        if out.len() >= limit {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            if out.len() >= limit {
+                return;
+            }
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            if path.is_dir() {
+                if name == ".git" {
+                    continue;
+                }
+                Self::collect_project_files(&path, out, limit);
+            } else if path.is_file() {
+                out.push(path);
+            }
+        }
+    }
+
+    fn periscope_project_results(&self, root: &Path, query: &str) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        if Self::command_available("fd") {
+            if let Ok(output) = ProcessCommand::new("fd")
+                .args(["--type", "f", "--hidden", "--no-ignore", "."])
+                .arg(root)
+                .output()
+            {
+                if output.status.success() {
+                    files = String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .take(20_000)
+                        .map(PathBuf::from)
+                        .collect();
+                }
+            }
+        }
+        if files.is_empty() {
+            Self::collect_project_files(root, &mut files, 20_000);
+        }
+        Self::rank_paths(files, root, query, PERISCOPE_RESULT_LIMIT)
+    }
+
+    fn start_periscope_global_index_load(&mut self) {
+        if self.periscope_global_loading || !self.periscope_global_paths.is_empty() {
+            return;
+        }
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            self.periscope_backend_status = "Home Periscope needs $HOME".to_string();
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        self.periscope_global_rx = Some(rx);
+        self.periscope_global_loading = true;
+        self.periscope_backend_status = format!("Home index: {} · loading…", home.display());
+        thread::spawn(move || {
+            let mut seen = HashSet::new();
+            let mut files = Vec::new();
+            if Self::command_available("fd") {
+                if let Ok(output) = ProcessCommand::new("fd")
+                    .args(["--type", "f", "."])
+                    .arg(&home)
+                    .output()
+                {
+                    if output.status.success() {
+                        files = String::from_utf8_lossy(&output.stdout)
+                            .lines()
+                            .map(PathBuf::from)
+                            .collect();
+                    }
+                }
+            }
+            if files.is_empty() {
+                Self::collect_project_files(&home, &mut files, 200_000);
+            }
+            let paths = files
+                .into_iter()
+                .filter_map(|path| {
+                    let display = path.display().to_string();
+                    if !seen.insert(display.clone()) {
+                        return None;
+                    }
+                    Some(PeriscopeIndexedPath {
+                        path,
+                        lower: display.to_lowercase(),
+                        is_file: true,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let _ = tx.send(paths);
+        });
+    }
+
+    fn poll_periscope_global_index(&mut self) {
+        let Some(rx) = &self.periscope_global_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(paths) => {
+                self.periscope_global_paths = paths;
+                self.periscope_global_rx = None;
+                self.periscope_global_loading = false;
+                self.periscope_backend_status = format!(
+                    "Home index loaded: {} files · in-memory fuzzy · capped at 100 results",
+                    self.periscope_global_paths.len()
+                );
+                if self.periscope_mode == PeriscopeMode::Global {
+                    self.periscope_results =
+                        self.periscope_global_cached_results(&self.periscope_query);
+                    self.selected_periscope_result = 0;
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.periscope_global_rx = None;
+                self.periscope_global_loading = false;
+                self.periscope_backend_status = "Home index load failed".to_string();
+            }
+        }
+    }
+
+    fn periscope_query_tokens(query: &str) -> Vec<&str> {
+        query
+            .split(|ch: char| ch.is_whitespace() || ch == '/')
+            .filter(|token| !token.is_empty())
+            .collect()
+    }
+
+    fn periscope_path_score_lower(
+        path_lower: &str,
+        name_lower: &str,
+        query_lower: &str,
+    ) -> Option<usize> {
+        let tokens = Self::periscope_query_tokens(query_lower);
+        if tokens.len() <= 1 {
+            let query = query_lower;
+            let components = path_lower
+                .split('/')
+                .filter(|component| !component.is_empty())
+                .collect::<Vec<_>>();
+
+            if name_lower == query {
+                return Some(0);
+            }
+
+            let mut best_component = None;
+            for (component_index, component) in components.iter().enumerate() {
+                if *component == query {
+                    let tail_depth = components.len().saturating_sub(component_index + 1);
+                    best_component = Some(
+                        best_component
+                            .unwrap_or(usize::MAX)
+                            .min(20 + component_index * 16 + tail_depth * 4 + name_lower.len()),
+                    );
+                }
+            }
+            if best_component.is_some() {
+                return best_component;
+            }
+
+            if name_lower.starts_with(query) {
+                return Some(120 + name_lower.len().saturating_sub(query.len()));
+            }
+
+            for (component_index, component) in components.iter().enumerate() {
+                if component.starts_with(query) {
+                    let tail_depth = components.len().saturating_sub(component_index + 1);
+                    best_component = Some(best_component.unwrap_or(usize::MAX).min(
+                        220 + component_index * 16
+                            + tail_depth * 4
+                            + component.len().saturating_sub(query.len()),
+                    ));
+                }
+            }
+            if best_component.is_some() {
+                return best_component;
+            }
+
+            if name_lower.contains(query) {
+                return Some(420 + name_lower.find(query).unwrap_or(0));
+            }
+            if let Some(position) = path_lower.find(query) {
+                return Some(620 + position + path_lower.len().saturating_sub(query.len()));
+            }
+
+            let path_score = Self::fuzzy_score_lower(path_lower, query).map(|score| score + 2_000);
+            let name_score = Self::fuzzy_score_lower(name_lower, query).map(|score| score + 1_500);
+            return path_score.into_iter().chain(name_score).min();
+        }
+
+        let mut search_start = 0usize;
+        let mut previous_end = 0usize;
+        let mut score = 0usize;
+        for token in tokens {
+            let mut found_position = None;
+            let mut offset = search_start;
+            while let Some(relative) = path_lower[offset..].find(token) {
+                let position = offset + relative;
+                let at_boundary = position == 0
+                    || matches!(
+                        path_lower.as_bytes().get(position.saturating_sub(1)),
+                        Some(b'/') | Some(b'-') | Some(b'_') | Some(b'.')
+                    );
+                if at_boundary {
+                    found_position = Some(position);
+                    break;
+                }
+                offset = position + 1;
+            }
+            let position = found_position?;
+            let gap = position.saturating_sub(previous_end);
+            score += gap;
+            search_start = position + token.len();
+            previous_end = search_start;
+        }
+        Some(score + path_lower.len().saturating_sub(query_lower.len()))
+    }
+
+    fn periscope_global_cached_results(&self, query: &str) -> Vec<PathBuf> {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let mut best: BinaryHeap<(usize, usize)> = BinaryHeap::new();
+        for (index, path) in self.periscope_global_paths.iter().enumerate() {
+            if !path.is_file {
+                continue;
+            }
+            let name_lower = path
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let Some(score) = Self::periscope_path_score_lower(&path.lower, &name_lower, &query)
+            else {
+                continue;
+            };
+            let candidate = (score, index);
+            if best.len() < PERISCOPE_RESULT_LIMIT {
+                best.push(candidate);
+            } else if best.peek().is_some_and(|worst| candidate < *worst) {
+                best.pop();
+                best.push(candidate);
+            }
+        }
+        let mut scored = best.into_vec();
+        scored.sort_by_key(|(score, index)| (*score, *index));
+        scored
+            .into_iter()
+            .map(|(_, index)| self.periscope_global_paths[index].path.clone())
+            .collect()
+    }
+
+    fn periscope_global_results(&mut self, query: &str) -> Vec<PathBuf> {
+        self.start_periscope_global_index_load();
+        if self.periscope_global_paths.is_empty() {
+            self.periscope_backend_status = if self.periscope_global_loading {
+                "Home index loading… type now, results will appear when ready".to_string()
+            } else {
+                "Home index unavailable".to_string()
+            };
+            return Vec::new();
+        }
+        let query = query.trim();
+        if query.is_empty() {
+            self.periscope_backend_status = format!(
+                "Home index: {} files · type to search · capped at 100 results",
+                self.periscope_global_paths.len()
+            );
+            return Vec::new();
+        }
+        self.periscope_backend_status = format!(
+            "Home index: {} files · in-memory fuzzy · capped at 100 results",
+            self.periscope_global_paths.len()
+        );
+        self.periscope_global_cached_results(query)
+    }
+
+    fn rank_paths(mut paths: Vec<PathBuf>, root: &Path, query: &str, limit: usize) -> Vec<PathBuf> {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() {
+            paths.sort();
+            paths.truncate(limit);
+            return paths;
+        }
+        let mut scored = paths
+            .into_iter()
+            .filter_map(|path| {
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("");
+                let relative_lower = relative.to_lowercase();
+                let name_lower = name.to_lowercase();
+                Self::periscope_path_score_lower(&relative_lower, &name_lower, &query)
+                    .map(|score| (score, path))
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by_key(|(score, path)| (*score, path.clone()));
+        scored
+            .into_iter()
+            .take(limit)
+            .map(|(_, path)| path)
+            .collect()
+    }
+
+    fn periscope_group_folder_for_path(&self, path: &Path) -> Option<PathBuf> {
+        let query = self.periscope_query.trim().to_lowercase();
+        if query.is_empty() {
+            return None;
+        }
+        let tokens = Self::periscope_query_tokens(&query);
+        let target = tokens.last().copied()?;
+        if target.is_empty() {
+            return None;
+        }
+        let components = path.components().collect::<Vec<_>>();
+        for (index, component) in components.iter().enumerate() {
+            let text = component.as_os_str().to_string_lossy().to_lowercase();
+            if text == target || text.starts_with(target) {
+                let mut folder = PathBuf::new();
+                for component in components.iter().take(index + 1) {
+                    folder.push(component.as_os_str());
+                }
+                if folder != path && path.starts_with(&folder) {
+                    return Some(folder);
+                }
+            }
+        }
+        None
+    }
+
+    fn periscope_rows(&self) -> Vec<PeriscopeRow> {
+        let mut rows = Vec::new();
+        let mut seen_folders = HashSet::new();
+        for path in &self.periscope_results {
+            if let Some(folder) = self.periscope_group_folder_for_path(path) {
+                if seen_folders.insert(folder.clone()) {
+                    let expanded = self.periscope_expanded_folders.contains(&folder);
+                    rows.push(PeriscopeRow::Folder {
+                        path: folder.clone(),
+                        expanded,
+                    });
+                }
+                if self.periscope_expanded_folders.contains(&folder) {
+                    rows.push(PeriscopeRow::File {
+                        path: path.clone(),
+                        group: Some(folder),
+                    });
+                }
+            } else {
+                rows.push(PeriscopeRow::File {
+                    path: path.clone(),
+                    group: None,
+                });
+            }
+        }
+        rows
+    }
+
+    fn selected_periscope_row(&self) -> Option<PeriscopeRow> {
+        self.periscope_rows()
+            .get(self.selected_periscope_result)
+            .cloned()
+    }
+
+    fn toggle_selected_periscope_folder(&mut self) -> bool {
+        let Some(PeriscopeRow::Folder { path, .. }) = self.selected_periscope_row() else {
+            return false;
+        };
+        if !self.periscope_expanded_folders.remove(&path) {
+            self.periscope_expanded_folders.insert(path);
+        }
+        true
+    }
+
+    fn refresh_periscope_results(&mut self) {
+        self.periscope_results = match self.periscope_mode {
+            PeriscopeMode::Project => self
+                .periscope_project_root
+                .clone()
+                .map(|root| self.periscope_project_results(&root, &self.periscope_query))
+                .unwrap_or_default(),
+            PeriscopeMode::Global => {
+                let query = self.periscope_query.clone();
+                self.periscope_global_results(&query)
+            }
+        };
+        self.selected_periscope_result = self
+            .selected_periscope_result
+            .min(self.periscope_rows().len().saturating_sub(1));
+    }
+
+    fn move_periscope_selection(&mut self, delta: isize) {
+        let row_count = self.periscope_rows().len();
+        if row_count == 0 {
+            self.selected_periscope_result = 0;
+            return;
+        }
+        self.selected_periscope_result = self
+            .selected_periscope_result
+            .saturating_add_signed(delta)
+            .min(row_count.saturating_sub(1));
+    }
+
+    fn open_selected_periscope_result(&mut self) {
+        if self.toggle_selected_periscope_folder() {
+            return;
+        }
+        let Some(PeriscopeRow::File { path, .. }) = self.selected_periscope_row() else {
+            self.status = "No Periscope result selected".to_string();
+            return;
+        };
+        if self.dirty {
+            self.status = "Save or discard changes before opening Periscope result".to_string();
+            return;
+        }
+        self.periscope_open = false;
+        self.open_path(path);
+        self.focus_editor_once = true;
+    }
+
+    fn open_selected_periscope_result_as_modal(&mut self) {
+        if self.toggle_selected_periscope_folder() {
+            return;
+        }
+        let Some(PeriscopeRow::File { path, .. }) = self.selected_periscope_row() else {
+            self.status = "No Periscope result selected".to_string();
+            return;
+        };
+        self.periscope_open = false;
+        self.open_link_preview(path, None);
+    }
+
+    fn handle_periscope_text_input(&mut self, ctx: &egui::Context) {
+        let mut changed = false;
+        ctx.input(|i| {
+            for event in &i.events {
+                if let egui::Event::Text(text) = event {
+                    if !text.chars().any(char::is_control) {
+                        self.periscope_query.push_str(text);
+                        changed = true;
+                    }
+                }
+            }
+        });
+        if changed {
+            self.periscope_expanded_folders.clear();
+            self.selected_periscope_result = 0;
+            self.refresh_periscope_results();
         }
     }
 
@@ -2863,6 +3507,7 @@ impl SlateApp {
             Command::New => "new",
             Command::Open => "open",
             Command::OpenBuffer => "open-buffer",
+            Command::Periscope => "periscope",
             Command::Lance => "lance",
             Command::LanceAdd => "lance-add",
             Command::LanceNext => "lance-next",
@@ -2959,6 +3604,10 @@ impl SlateApp {
         self.palette_open = false;
         self.recent_picker_open = false;
         self.file_picker_open = false;
+        if command != Command::Periscope {
+            self.periscope_open = false;
+            self.periscope_prompt_open = false;
+        }
         self.save_as_open = false;
         if command != Command::Scratch {
             self.scratch_modal_open = false;
@@ -2998,6 +3647,7 @@ impl SlateApp {
                 }
             }
             Command::OpenBuffer => self.open_buffer_dialog(),
+            Command::Periscope => self.open_periscope(),
             Command::Lance => self.open_lance(),
             Command::LanceAdd => self.lance_add_current(),
             Command::LanceNext => self.open_next_lance_file(1),
@@ -3126,6 +3776,35 @@ impl SlateApp {
             .map(|(_, token)| token)
     }
 
+    fn fuzzy_score_lower(candidate: &str, query: &str) -> Option<usize> {
+        if query.is_empty() {
+            return Some(0);
+        }
+        if candidate == query {
+            return Some(0);
+        }
+        if candidate.starts_with(query) {
+            return Some(1 + candidate.len().saturating_sub(query.len()));
+        }
+        if candidate.contains(query) {
+            return Some(100 + candidate.find(query).unwrap_or(0));
+        }
+
+        let mut score = 200usize;
+        let mut last_match = None;
+        let mut chars = candidate.char_indices();
+        for query_ch in query.chars() {
+            let Some((index, _)) = chars.find(|(_, candidate_ch)| *candidate_ch == query_ch) else {
+                return None;
+            };
+            if let Some(last) = last_match {
+                score += index.saturating_sub(last + 1);
+            }
+            last_match = Some(index);
+        }
+        Some(score + candidate.len().saturating_sub(query.len()))
+    }
+
     fn fuzzy_score(candidate: &str, query: &str) -> Option<usize> {
         if query.is_empty() {
             return Some(0);
@@ -3226,6 +3905,7 @@ impl SlateApp {
                     self.open_link_preview(expanded, None);
                 }
             }
+            "periscope" | "ps" | "fzf" => self.run_command(Command::Periscope, ctx),
             "lance" | "lc" | "marks" => {
                 let arg = parts.next();
                 if let Some(slot) = arg.and_then(|value| value.parse::<usize>().ok()) {
@@ -3752,6 +4432,8 @@ impl SlateApp {
             && !self.lance_open
             && !self.doc_tasks_open
             && !self.file_picker_open
+            && !self.periscope_open
+            && !self.periscope_prompt_open
             && !self.link_heading_picker_open
             && !self.link_preview_open
             && !self.save_as_open
@@ -4150,6 +4832,8 @@ impl SlateApp {
             && !self.lance_open
             && !self.doc_tasks_open
             && !self.file_picker_open
+            && !self.periscope_open
+            && !self.periscope_prompt_open
             && !self.link_assist_open
             && !self.link_assist_web_open
             && !self.link_heading_picker_open
@@ -4547,6 +5231,15 @@ impl SlateApp {
         let mut file_enter_dir = false;
         let mut file_parent = false;
         let mut file_backspace = false;
+        let mut periscope_previous = false;
+        let mut periscope_next = false;
+        let mut periscope_open = false;
+        let mut periscope_open_modal = false;
+        let mut periscope_toggle_mode = false;
+        let mut periscope_expand_folder = false;
+        let mut periscope_backspace = false;
+        let mut periscope_prompt_yes = false;
+        let mut periscope_prompt_no = false;
         let mut save_as_previous = false;
         let mut save_as_next = false;
         let mut save_as_enter = false;
@@ -4679,6 +5372,20 @@ impl SlateApp {
                 file_open |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
                 file_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
             }
+            if self.periscope_open {
+                periscope_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
+                periscope_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
+                periscope_open_modal |= i.consume_key(egui::Modifiers::CTRL, Key::Enter);
+                periscope_open |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
+                periscope_toggle_mode |= i.consume_key(egui::Modifiers::NONE, Key::Tab);
+                periscope_expand_folder |= i.consume_key(egui::Modifiers::NONE, Key::ArrowRight);
+                periscope_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
+            }
+            if self.periscope_prompt_open {
+                periscope_prompt_yes |= i.consume_key(egui::Modifiers::NONE, Key::Y);
+                periscope_prompt_yes |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
+                periscope_prompt_no |= i.consume_key(egui::Modifiers::NONE, Key::N);
+            }
             if self.link_assist_open {
                 link_assist_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
                 link_assist_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
@@ -4786,6 +5493,8 @@ impl SlateApp {
                 self.lance_open = false;
                 self.doc_tasks_open = false;
                 self.file_picker_open = false;
+                self.periscope_open = false;
+                self.periscope_prompt_open = false;
                 self.link_heading_picker_open = false;
                 if !self.link_preview_dirty {
                     self.link_preview_open = false;
@@ -4817,6 +5526,8 @@ impl SlateApp {
                 self.lance_open = false;
                 self.doc_tasks_open = false;
                 self.file_picker_open = false;
+                self.periscope_open = false;
+                self.periscope_prompt_open = false;
                 self.link_heading_picker_open = false;
                 if !self.link_preview_dirty {
                     self.link_preview_open = false;
@@ -4946,6 +5657,12 @@ impl SlateApp {
                         self.cancel_link_assist();
                     }
                     self.focus_editor_once = true;
+                } else if self.periscope_open {
+                    self.periscope_open = false;
+                    self.focus_editor_once = true;
+                } else if self.periscope_prompt_open {
+                    self.periscope_prompt_open = false;
+                    self.focus_editor_once = true;
                 } else if self.link_heading_picker_open {
                     self.cancel_link_assist();
                 } else if self.link_preview_open {
@@ -5050,6 +5767,10 @@ impl SlateApp {
 
         if self.file_picker_open {
             self.handle_file_picker_text_input(ctx);
+        }
+
+        if self.periscope_open {
+            self.handle_periscope_text_input(ctx);
         }
 
         if self.link_assist_web_open {
@@ -5158,6 +5879,53 @@ impl SlateApp {
 
         if save_as_enter {
             self.confirm_save_as();
+            return;
+        }
+
+        if periscope_prompt_yes {
+            self.open_periscope_project_folder_picker();
+            return;
+        }
+
+        if periscope_prompt_no {
+            self.open_global_periscope();
+            return;
+        }
+
+        if periscope_backspace {
+            self.periscope_query.pop();
+            self.periscope_expanded_folders.clear();
+            self.selected_periscope_result = 0;
+            self.refresh_periscope_results();
+            return;
+        }
+
+        if periscope_previous {
+            self.move_periscope_selection(-1);
+            return;
+        }
+
+        if periscope_next {
+            self.move_periscope_selection(1);
+            return;
+        }
+
+        if periscope_toggle_mode {
+            self.toggle_periscope_mode();
+            return;
+        }
+
+        if periscope_expand_folder && self.toggle_selected_periscope_folder() {
+            return;
+        }
+
+        if periscope_open_modal {
+            self.open_selected_periscope_result_as_modal();
+            return;
+        }
+
+        if periscope_open {
+            self.open_selected_periscope_result();
             return;
         }
 
@@ -6555,6 +7323,7 @@ impl SlateApp {
             });
     }
 
+    #[allow(dead_code)]
     fn lance_dialog(&mut self, ctx: &egui::Context) {
         if !self.lance_open {
             return;
@@ -6685,6 +7454,756 @@ impl SlateApp {
             });
     }
 
+    fn slate_picker_dialog(&mut self, ctx: &egui::Context) {
+        enum ActivePicker {
+            File,
+            Lance,
+            Recent,
+        }
+
+        let active = if self.file_picker_open {
+            ActivePicker::File
+        } else if self.lance_open {
+            ActivePicker::Lance
+        } else if self.recent_picker_open {
+            ActivePicker::Recent
+        } else {
+            return;
+        };
+
+        let file_matches = if matches!(active, ActivePicker::File) {
+            self.project_file_indices()
+        } else {
+            Vec::new()
+        };
+        let lance_matches = if matches!(active, ActivePicker::Lance) {
+            self.lance_file_indices()
+        } else {
+            Vec::new()
+        };
+        let recent_matches = if matches!(active, ActivePicker::Recent) {
+            self.recent_file_indices()
+        } else {
+            Vec::new()
+        };
+
+        let (title, subtitle, prompt, query, selected_index, total_len, visible_rows) = match active
+        {
+            ActivePicker::File => {
+                let title = match self.file_picker_mode {
+                    FilePickerMode::Open => "open",
+                    FilePickerMode::OpenBuffer => "open buffer",
+                    FilePickerMode::AddLance => "add lance",
+                    FilePickerMode::Browse => "files",
+                    FilePickerMode::InsertMarkdownLink => "insert link file",
+                    FilePickerMode::SetPeriscopeProject => "set periscope project",
+                };
+                (
+                    title.to_string(),
+                    format!(
+                        "{} entries · {}",
+                        self.project_files.len(),
+                        self.file_picker_dir.display()
+                    ),
+                    "type to fuzzy-find files and folders".to_string(),
+                    self.file_query.clone(),
+                    file_matches
+                        .iter()
+                        .position(|index| *index == self.selected_project_file)
+                        .unwrap_or(0),
+                    file_matches.len(),
+                    16usize,
+                )
+            }
+            ActivePicker::Lance => (
+                "lance".to_string(),
+                format!("{} marks", self.lance_files.len()),
+                "filter marks".to_string(),
+                self.lance_query.clone(),
+                lance_matches
+                    .iter()
+                    .position(|index| *index == self.selected_lance_file)
+                    .unwrap_or(0),
+                lance_matches.len(),
+                10usize,
+            ),
+            ActivePicker::Recent => (
+                "recent".to_string(),
+                format!("{} files", self.recent_files.len()),
+                "filter recent files".to_string(),
+                self.recent_query.clone(),
+                recent_matches
+                    .iter()
+                    .position(|index| *index == self.selected_recent_file)
+                    .unwrap_or(0),
+                recent_matches.len(),
+                10usize,
+            ),
+        };
+
+        let start = Self::centered_window_start(selected_index, visible_rows, total_len);
+        let end = (start + visible_rows).min(total_len);
+
+        egui::Area::new("slate_picker_dialog".into())
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, -16.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(25, 31, 40))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
+                    .corner_radius(0.0)
+                    .inner_margin(14.0)
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 10],
+                        blur: 24,
+                        spread: 0,
+                        color: Color32::from_black_alpha(150),
+                    })
+                    .show(ui, |ui| {
+                        ui.set_width(match active {
+                            ActivePicker::File => 820.0,
+                            ActivePicker::Lance | ActivePicker::Recent => 760.0,
+                        });
+                        let font = FontId::new(13.0, FontFamily::Monospace);
+                        let title_font = FontId::new(16.0, FontFamily::Monospace);
+                        let accent = Color32::from_rgb(136, 192, 208);
+                        let text = Color32::from_rgb(216, 222, 233);
+                        let dim = Color32::from_rgb(136, 154, 176);
+                        let faint = Color32::from_rgb(94, 105, 126);
+                        let warn = Color32::from_rgb(235, 203, 139);
+
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(title).font(title_font).color(accent));
+                            ui.label(RichText::new(subtitle).font(font.clone()).color(faint));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new("[esc] close").font(font.clone()).color(warn),
+                                    );
+                                },
+                            );
+                        });
+                        ui.add_space(10.0);
+
+                        let input_height = 30.0;
+                        let (input_rect, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), input_height),
+                            egui::Sense::hover(),
+                        );
+                        let painter = ui.painter_at(input_rect);
+                        painter.rect_filled(input_rect, 0.0, Color32::from_rgb(30, 36, 48));
+                        painter.rect_stroke(
+                            input_rect,
+                            0.0,
+                            Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
+                            egui::StrokeKind::Outside,
+                        );
+                        let query_text = if query.is_empty() {
+                            prompt
+                        } else {
+                            query.clone()
+                        };
+                        let query_color = if query.is_empty() { faint } else { text };
+                        painter.text(
+                            egui::pos2(input_rect.left() + 10.0, input_rect.center().y - 0.5),
+                            egui::Align2::LEFT_CENTER,
+                            ">",
+                            font.clone(),
+                            accent,
+                        );
+                        let query_rect = painter.text(
+                            egui::pos2(input_rect.left() + 32.0, input_rect.center().y - 0.5),
+                            egui::Align2::LEFT_CENTER,
+                            query_text,
+                            font.clone(),
+                            query_color,
+                        );
+                        let cursor_x = if query.is_empty() {
+                            input_rect.left() + 32.0
+                        } else {
+                            query_rect.right() + 2.0
+                        };
+                        painter.line_segment(
+                            [
+                                egui::pos2(cursor_x, input_rect.top() + 7.0),
+                                egui::pos2(cursor_x, input_rect.bottom() - 7.0),
+                            ],
+                            Stroke::new(1.0, accent),
+                        );
+
+                        ui.add_space(8.0);
+                        let row_height = 24.0;
+                        let list_height = (visible_rows.max(1) as f32 + 1.0) * row_height;
+                        let (list_rect, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), list_height),
+                            egui::Sense::hover(),
+                        );
+                        let painter = ui.painter_at(list_rect).with_clip_rect(list_rect);
+                        painter.rect_filled(list_rect, 0.0, Color32::from_rgb(22, 28, 37));
+                        painter.rect_stroke(
+                            list_rect,
+                            0.0,
+                            Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
+                            egui::StrokeKind::Outside,
+                        );
+                        let header_y = list_rect.top() + row_height * 0.5;
+                        painter.text(
+                            egui::pos2(list_rect.left() + 32.0, header_y),
+                            egui::Align2::LEFT_CENTER,
+                            "name",
+                            font.clone(),
+                            faint,
+                        );
+                        painter.text(
+                            egui::pos2(list_rect.left() + 240.0, header_y),
+                            egui::Align2::LEFT_CENTER,
+                            "path / detail",
+                            font.clone(),
+                            faint,
+                        );
+                        if matches!(active, ActivePicker::File) {
+                            painter.text(
+                                egui::pos2(list_rect.right() - 180.0, header_y),
+                                egui::Align2::LEFT_CENTER,
+                                "size",
+                                font.clone(),
+                                faint,
+                            );
+                            painter.text(
+                                egui::pos2(list_rect.right() - 92.0, header_y),
+                                egui::Align2::LEFT_CENTER,
+                                "modified",
+                                font.clone(),
+                                faint,
+                            );
+                        }
+
+                        if total_len == 0 {
+                            painter.text(
+                                list_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "no matches",
+                                font.clone(),
+                                faint,
+                            );
+                        }
+
+                        for (row, match_position) in (start..end).enumerate() {
+                            let row_top = list_rect.top() + (row as f32 + 1.0) * row_height;
+                            let row_rect = egui::Rect::from_min_size(
+                                egui::pos2(list_rect.left() + 4.0, row_top),
+                                Vec2::new(list_rect.width() - 8.0, row_height),
+                            );
+                            let selected = match_position == selected_index;
+                            if selected {
+                                painter.rect_filled(row_rect, 0.0, Color32::from_rgb(38, 47, 61));
+                            }
+
+                            let (item_index, name, detail, size_label, modified_label, is_dir) =
+                                match active {
+                                    ActivePicker::File => {
+                                        let index = file_matches[match_position];
+                                        let path = &self.project_files[index];
+                                        let name = path
+                                            .file_name()
+                                            .and_then(|name| name.to_str())
+                                            .unwrap_or("unknown");
+                                        let relative = path
+                                            .strip_prefix(&self.file_picker_dir)
+                                            .unwrap_or(path)
+                                            .display()
+                                            .to_string();
+                                        let (size, modified) = if path.is_dir() {
+                                            ("dir".to_string(), "".to_string())
+                                        } else {
+                                            Self::file_metadata_labels(path)
+                                        };
+                                        (
+                                            index,
+                                            name.to_string(),
+                                            relative,
+                                            size,
+                                            modified,
+                                            path.is_dir(),
+                                        )
+                                    }
+                                    ActivePicker::Lance => {
+                                        let index = lance_matches[match_position];
+                                        let path = &self.lance_files[index];
+                                        let name = path
+                                            .file_name()
+                                            .and_then(|name| name.to_str())
+                                            .unwrap_or("unknown");
+                                        (
+                                            index,
+                                            format!("{} {}", index + 1, name),
+                                            path.display().to_string(),
+                                            String::new(),
+                                            String::new(),
+                                            false,
+                                        )
+                                    }
+                                    ActivePicker::Recent => {
+                                        let index = recent_matches[match_position];
+                                        let path = &self.recent_files[index];
+                                        let name = path
+                                            .file_name()
+                                            .and_then(|name| name.to_str())
+                                            .unwrap_or("unknown");
+                                        (
+                                            index,
+                                            name.to_string(),
+                                            path.display().to_string(),
+                                            String::new(),
+                                            String::new(),
+                                            false,
+                                        )
+                                    }
+                                };
+
+                            let y = row_rect.center().y - 0.5;
+                            painter.text(
+                                egui::pos2(row_rect.left() + 8.0, y),
+                                egui::Align2::LEFT_CENTER,
+                                if selected { ">" } else { " " },
+                                font.clone(),
+                                accent,
+                            );
+                            painter.text(
+                                egui::pos2(row_rect.left() + 28.0, y),
+                                egui::Align2::LEFT_CENTER,
+                                Self::text_for_width(
+                                    &format!("{}{}", if is_dir { "▸ " } else { "" }, name),
+                                    190.0,
+                                    13.0,
+                                ),
+                                font.clone(),
+                                if selected { text } else { accent },
+                            );
+                            painter.text(
+                                egui::pos2(row_rect.left() + 236.0, y),
+                                egui::Align2::LEFT_CENTER,
+                                Self::text_for_width(&detail, list_rect.width() - 430.0, 13.0),
+                                font.clone(),
+                                if selected { dim } else { faint },
+                            );
+                            if matches!(active, ActivePicker::File) {
+                                painter.text(
+                                    egui::pos2(row_rect.right() - 176.0, y),
+                                    egui::Align2::LEFT_CENTER,
+                                    size_label,
+                                    font.clone(),
+                                    if selected { dim } else { faint },
+                                );
+                                painter.text(
+                                    egui::pos2(row_rect.right() - 88.0, y),
+                                    egui::Align2::LEFT_CENTER,
+                                    modified_label,
+                                    font.clone(),
+                                    if selected { dim } else { faint },
+                                );
+                            }
+
+                            let response = ui.interact(
+                                row_rect,
+                                ui.id().with(("slate_picker", match_position)),
+                                egui::Sense::click(),
+                            );
+                            if response.clicked() || response.double_clicked() {
+                                match active {
+                                    ActivePicker::File => self.selected_project_file = item_index,
+                                    ActivePicker::Lance => self.selected_lance_file = item_index,
+                                    ActivePicker::Recent => self.selected_recent_file = item_index,
+                                }
+                            }
+                            if response.double_clicked() {
+                                match active {
+                                    ActivePicker::File => self.open_selected_project_file(),
+                                    ActivePicker::Lance => self.open_selected_lance_file(),
+                                    ActivePicker::Recent => self.open_selected_recent_file(),
+                                }
+                            }
+                        }
+
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            let actions: &[(&str, &str)] = match active {
+                                ActivePicker::File => &[
+                                    ("↑↓", "select"),
+                                    ("type", "filter"),
+                                    ("→", "enter dir"),
+                                    ("←", "parent"),
+                                    ("enter", "open"),
+                                    ("esc", "close"),
+                                ],
+                                ActivePicker::Lance => &[
+                                    ("↑↓", "select"),
+                                    ("type", "filter"),
+                                    ("enter", "open"),
+                                    ("Ctrl+Enter", "modal"),
+                                    ("Ctrl+A", "add"),
+                                    ("Del", "remove"),
+                                ],
+                                ActivePicker::Recent => &[
+                                    ("↑↓", "select"),
+                                    ("type", "filter"),
+                                    ("enter", "open"),
+                                    ("esc", "close"),
+                                ],
+                            };
+                            for (key, label) in actions {
+                                ui.label(
+                                    RichText::new(format!("[{key}]"))
+                                        .font(font.clone())
+                                        .color(warn),
+                                );
+                                ui.label(RichText::new(*label).font(font.clone()).color(dim));
+                                ui.add_space(10.0);
+                            }
+                        });
+                    });
+            });
+    }
+
+    fn periscope_prompt_dialog(&mut self, ctx: &egui::Context) {
+        if !self.periscope_prompt_open {
+            return;
+        }
+        egui::Area::new("periscope_prompt_dialog".into())
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, -16.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(25, 31, 40))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
+                    .corner_radius(0.0)
+                    .inner_margin(16.0)
+                    .show(ui, |ui| {
+                        ui.set_width(620.0);
+                        let font = FontId::new(13.0, FontFamily::Monospace);
+                        let title_font = FontId::new(16.0, FontFamily::Monospace);
+                        let accent = Color32::from_rgb(136, 192, 208);
+                        let text = Color32::from_rgb(216, 222, 233);
+                        let dim = Color32::from_rgb(136, 154, 176);
+                        let warn = Color32::from_rgb(235, 203, 139);
+                        ui.label(RichText::new("Periscope").font(title_font).color(accent));
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(
+                                "No .git project root found for the current file/context.",
+                            )
+                            .font(font.clone())
+                            .color(text),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "Define a project folder, or jump straight to Home search?",
+                            )
+                            .font(font.clone())
+                            .color(dim),
+                        );
+                        ui.add_space(14.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("[Y/Enter]").font(font.clone()).color(warn));
+                            ui.label(
+                                RichText::new("choose project folder")
+                                    .font(font.clone())
+                                    .color(dim),
+                            );
+                            ui.add_space(16.0);
+                            ui.label(RichText::new("[N]").font(font.clone()).color(warn));
+                            ui.label(
+                                RichText::new("Home Periscope")
+                                    .font(font.clone())
+                                    .color(dim),
+                            );
+                            ui.add_space(16.0);
+                            ui.label(RichText::new("[Esc]").font(font.clone()).color(warn));
+                            ui.label(RichText::new("cancel").font(font.clone()).color(dim));
+                        });
+                    });
+            });
+    }
+
+    fn periscope_dialog(&mut self, ctx: &egui::Context) {
+        if !self.periscope_open {
+            return;
+        }
+        self.poll_periscope_global_index();
+        let rows = self.periscope_rows();
+        let visible_rows = 16usize;
+        let selected = self
+            .selected_periscope_result
+            .min(rows.len().saturating_sub(1));
+        let start = Self::centered_window_start(selected, visible_rows, rows.len());
+        let end = (start + visible_rows).min(rows.len());
+        let mode_label = match self.periscope_mode {
+            PeriscopeMode::Project => "project",
+            PeriscopeMode::Global => "home",
+        };
+        let scope = match self.periscope_mode {
+            PeriscopeMode::Project => self
+                .periscope_project_root
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "no project".to_string()),
+            PeriscopeMode::Global => std::env::var("HOME").unwrap_or_else(|_| "~".to_string()),
+        };
+
+        egui::Area::new("periscope_dialog".into())
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, -16.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(25, 31, 40))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
+                    .corner_radius(0.0)
+                    .inner_margin(14.0)
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 10],
+                        blur: 24,
+                        spread: 0,
+                        color: Color32::from_black_alpha(150),
+                    })
+                    .show(ui, |ui| {
+                        ui.set_width(860.0);
+                        let font = FontId::new(13.0, FontFamily::Monospace);
+                        let title_font = FontId::new(16.0, FontFamily::Monospace);
+                        let accent = Color32::from_rgb(136, 192, 208);
+                        let text = Color32::from_rgb(216, 222, 233);
+                        let dim = Color32::from_rgb(136, 154, 176);
+                        let faint = Color32::from_rgb(94, 105, 126);
+                        let warn = Color32::from_rgb(235, 203, 139);
+                        let danger = Color32::from_rgb(191, 97, 106);
+
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("Periscope · {mode_label}"))
+                                    .font(title_font)
+                                    .color(accent),
+                            );
+                            ui.label(RichText::new(scope.clone()).font(font.clone()).color(faint));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new("[esc] close").font(font.clone()).color(warn),
+                                    );
+                                },
+                            );
+                        });
+                        if !self.periscope_backend_status.is_empty() {
+                            ui.label(
+                                RichText::new(self.periscope_backend_status.clone())
+                                    .font(font.clone())
+                                    .color(faint),
+                            );
+                        }
+                        ui.add_space(8.0);
+
+                        let input_height = 30.0;
+                        let (input_rect, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), input_height),
+                            egui::Sense::hover(),
+                        );
+                        let painter = ui.painter_at(input_rect);
+                        painter.rect_filled(input_rect, 0.0, Color32::from_rgb(30, 36, 48));
+                        painter.rect_stroke(
+                            input_rect,
+                            0.0,
+                            Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
+                            egui::StrokeKind::Outside,
+                        );
+                        let query = if self.periscope_query.is_empty() {
+                            "type to search files".to_string()
+                        } else {
+                            self.periscope_query.clone()
+                        };
+                        let query_color = if self.periscope_query.is_empty() {
+                            faint
+                        } else {
+                            text
+                        };
+                        painter.text(
+                            egui::pos2(input_rect.left() + 10.0, input_rect.center().y - 0.5),
+                            egui::Align2::LEFT_CENTER,
+                            ">",
+                            font.clone(),
+                            accent,
+                        );
+                        let query_rect = painter.text(
+                            egui::pos2(input_rect.left() + 32.0, input_rect.center().y - 0.5),
+                            egui::Align2::LEFT_CENTER,
+                            query,
+                            font.clone(),
+                            query_color,
+                        );
+                        let cursor_x = if self.periscope_query.is_empty() {
+                            input_rect.left() + 32.0
+                        } else {
+                            query_rect.right() + 2.0
+                        };
+                        painter.line_segment(
+                            [
+                                egui::pos2(cursor_x, input_rect.top() + 7.0),
+                                egui::pos2(cursor_x, input_rect.bottom() - 7.0),
+                            ],
+                            Stroke::new(1.0, accent),
+                        );
+
+                        ui.add_space(8.0);
+                        let row_height = 24.0;
+                        let list_height = (visible_rows as f32 + 1.0) * row_height;
+                        let (list_rect, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), list_height),
+                            egui::Sense::hover(),
+                        );
+                        let painter = ui.painter_at(list_rect).with_clip_rect(list_rect);
+                        painter.rect_filled(list_rect, 0.0, Color32::from_rgb(22, 28, 37));
+                        painter.rect_stroke(
+                            list_rect,
+                            0.0,
+                            Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
+                            egui::StrokeKind::Outside,
+                        );
+                        painter.text(
+                            egui::pos2(list_rect.left() + 32.0, list_rect.top() + row_height * 0.5),
+                            egui::Align2::LEFT_CENTER,
+                            "path",
+                            font.clone(),
+                            faint,
+                        );
+
+                        if rows.is_empty() {
+                            let message = if self.periscope_mode == PeriscopeMode::Global
+                                && self.periscope_global_loading
+                            {
+                                "loading home index…"
+                            } else if self.periscope_mode == PeriscopeMode::Global
+                                && self.periscope_query.trim().is_empty()
+                            {
+                                "type to search $HOME · capped at 100 results"
+                            } else if self.periscope_query.trim().is_empty() {
+                                "type a query to search this project"
+                            } else {
+                                "no matches"
+                            };
+                            painter.text(
+                                list_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                message,
+                                font.clone(),
+                                faint,
+                            );
+                        }
+
+                        for (row, index) in (start..end).enumerate() {
+                            let row_top = list_rect.top() + (row as f32 + 1.0) * row_height;
+                            let row_rect = egui::Rect::from_min_size(
+                                egui::pos2(list_rect.left() + 4.0, row_top),
+                                Vec2::new(list_rect.width() - 8.0, row_height),
+                            );
+                            let selected = index == self.selected_periscope_result;
+                            if selected {
+                                painter.rect_filled(row_rect, 0.0, Color32::from_rgb(38, 47, 61));
+                            }
+                            let row = &rows[index];
+                            let (path, path_text, is_folder) = match row {
+                                PeriscopeRow::Folder { path, expanded } => {
+                                    let mut label = format!("{}/", path.display());
+                                    if *expanded {
+                                        label.push_str("  expanded");
+                                    }
+                                    (path, label, true)
+                                }
+                                PeriscopeRow::File { path, group } => {
+                                    let label = if let Some(group) = group {
+                                        format!(
+                                            "---/{}",
+                                            path.strip_prefix(group).unwrap_or(path).display()
+                                        )
+                                    } else if self.periscope_mode == PeriscopeMode::Project {
+                                        if let Some(root) = &self.periscope_project_root {
+                                            path.strip_prefix(root)
+                                                .unwrap_or(path)
+                                                .display()
+                                                .to_string()
+                                        } else {
+                                            path.display().to_string()
+                                        }
+                                    } else {
+                                        path.display().to_string()
+                                    };
+                                    (path, label, false)
+                                }
+                            };
+                            let full = path.display().to_string();
+                            let sensitive = full.starts_with("/etc/")
+                                || full.starts_with("/boot/")
+                                || full.starts_with("/usr/")
+                                || full.starts_with("/var/")
+                                || full.contains("/.ssh/");
+                            let y = row_rect.center().y - 0.5;
+                            painter.text(
+                                egui::pos2(row_rect.left() + 8.0, y),
+                                egui::Align2::LEFT_CENTER,
+                                if selected { ">" } else { " " },
+                                font.clone(),
+                                accent,
+                            );
+                            painter.text(
+                                egui::pos2(row_rect.left() + 28.0, y),
+                                egui::Align2::LEFT_CENTER,
+                                Self::text_for_width(&path_text, list_rect.width() - 56.0, 13.0),
+                                font.clone(),
+                                if sensitive {
+                                    danger
+                                } else if is_folder {
+                                    warn
+                                } else if selected {
+                                    text
+                                } else {
+                                    dim
+                                },
+                            );
+                            let response = ui.interact(
+                                row_rect,
+                                ui.id().with(("periscope", index)),
+                                egui::Sense::click(),
+                            );
+                            if response.clicked() || response.double_clicked() {
+                                self.selected_periscope_result = index;
+                            }
+                            if response.double_clicked() {
+                                self.open_selected_periscope_result();
+                            }
+                        }
+
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            for (key, label) in [
+                                ("↑↓", "select"),
+                                ("type", "search"),
+                                ("Tab", "project/home"),
+                                ("→", "expand"),
+                                ("Enter", "open/expand"),
+                                ("Ctrl+Enter", "modal"),
+                            ] {
+                                ui.label(
+                                    RichText::new(format!("[{key}]"))
+                                        .font(font.clone())
+                                        .color(warn),
+                                );
+                                ui.label(RichText::new(label).font(font.clone()).color(dim));
+                                ui.add_space(8.0);
+                            }
+                        });
+                    });
+            });
+    }
+
+    #[allow(dead_code)]
     fn file_picker_dialog(&mut self, ctx: &egui::Context) {
         if !self.file_picker_open {
             return;
@@ -6732,6 +8251,7 @@ impl SlateApp {
                                 FilePickerMode::AddLance => "add lance",
                                 FilePickerMode::Browse => "files",
                                 FilePickerMode::InsertMarkdownLink => "insert link file",
+                                FilePickerMode::SetPeriscopeProject => "set periscope project",
                             };
                             ui.label(RichText::new(title).font(title_font).color(accent));
                             ui.label(
@@ -8514,16 +10034,8 @@ impl eframe::App for SlateApp {
                 } else {
                     self.selected_command_line_suggestion = 0;
                 }
-                let recent_file_indices = if self.recent_picker_open {
-                    self.recent_file_indices()
-                } else {
-                    Vec::new()
-                };
-                let visible_recent_rows = if self.recent_picker_open {
-                    recent_file_indices.len().min(8)
-                } else {
-                    0
-                };
+                let recent_file_indices = Vec::<usize>::new();
+                let visible_recent_rows = 0;
                 let doc_tasks = if self.doc_tasks_open {
                     self.doc_tasks()
                 } else {
@@ -8572,6 +10084,8 @@ impl eframe::App for SlateApp {
                     && !self.lance_open
                     && !self.doc_tasks_open
                     && !self.file_picker_open
+                    && !self.periscope_open
+                    && !self.periscope_prompt_open
                     && !self.link_assist_open
                     && !self.link_assist_web_open
                     && !self.link_heading_picker_open
@@ -8612,6 +10126,8 @@ impl eframe::App for SlateApp {
                                     && !self.lance_open
                                     && !self.doc_tasks_open
                                     && !self.file_picker_open
+                                    && !self.periscope_open
+                                    && !self.periscope_prompt_open
                                     && !self.link_heading_picker_open
                                     && !self.link_preview_open
                                     && !self.save_as_open
@@ -8654,6 +10170,8 @@ impl eframe::App for SlateApp {
                                 && !self.lance_open
                                 && !self.doc_tasks_open
                                 && !self.file_picker_open
+                                && !self.periscope_open
+                                && !self.periscope_prompt_open
                                 && !self.link_heading_picker_open
                                 && !self.link_preview_open
                                 && !self.save_as_open
@@ -8713,6 +10231,10 @@ impl eframe::App for SlateApp {
                     "doc tasks"
                 } else if self.file_picker_open {
                     "files"
+                } else if self.periscope_open {
+                    "periscope"
+                } else if self.periscope_prompt_open {
+                    "periscope?"
                 } else if self.link_heading_picker_open {
                     "link heading"
                 } else if self.link_preview_open {
@@ -9145,6 +10667,10 @@ impl eframe::App for SlateApp {
                         )
                     } else if self.file_picker_open {
                         ("files  type filter · ↑↓ select · → enter folder · ← parent · Enter open · Esc close".to_string(), footer_accent)
+                    } else if self.periscope_open {
+                        ("periscope  type search · ↑↓ select · Tab project/home · Enter open · Ctrl+Enter modal".to_string(), footer_accent)
+                    } else if self.periscope_prompt_open {
+                        ("periscope  Y/Enter project folder · N global · Esc cancel".to_string(), footer_accent)
                     } else if self.link_heading_picker_open {
                         ("link heading  ↑↓ select · Enter insert · Esc cancel · first option = whole file".to_string(), footer_accent)
                     } else if self.link_preview_open {
@@ -9174,8 +10700,9 @@ impl eframe::App for SlateApp {
         self.shortcut_help_dialog(&ctx);
         self.link_assist_dialog(&ctx);
         self.link_preview_dialog(&ctx);
-        self.lance_dialog(&ctx);
-        self.file_picker_dialog(&ctx);
+        self.slate_picker_dialog(&ctx);
+        self.periscope_prompt_dialog(&ctx);
+        self.periscope_dialog(&ctx);
         self.save_as_dialog(&ctx);
         self.scratch_modal_dialog(&ctx);
         self.capture_dialog(&ctx);

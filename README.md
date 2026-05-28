@@ -205,6 +205,8 @@ Examples:
 :settings
 :recent
 :recent notes
+:periscope         # fzf-style project/home file search
+:ps / :fzf         # periscope aliases
 :open-buffer       # open another file as editable modal buffer
 :ob README.md
 :lance             # Lance marked files modal
@@ -218,10 +220,25 @@ Examples:
 Alt+1..Alt+9/0    # direct jump to Lance slots 1 through 10
 ```
 
-Lance modal:
+Slate Picker modal:
 
 ```text
-↑↓ select · type filter · Enter open · Ctrl+Enter open as modal buffer · Ctrl+A add file manually · Delete remove · Esc close
+:open, :open-buffer, :recent, and :lance share the same picker surface.
+type filter · ↑↓ select · Enter open · Esc close
+files also support → enter folder and ← parent
+lance also supports Ctrl+Enter modal, Ctrl+A add, Delete remove
+```
+
+Periscope:
+
+```text
+:periscope / :ps / :fzf
+Project mode searches the nearest .git root.
+If no .git root exists, Slate asks whether to choose a project folder or jump to Home mode.
+Home mode indexes `$HOME` in the background and searches that local file list in memory.
+Path-aware queries work in order: `descargas rmenu main`, `lua periscope readme`, or `etc/ssh config`.
+Folder matches can expand inline: `→` or `Enter` on a folder row shows `---/child` file rows in the same result list.
+Tab toggles project/home · Enter opens or expands · Ctrl+Enter opens files as modal buffer.
 ```
 
 Goto:
