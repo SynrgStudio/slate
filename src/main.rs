@@ -66,6 +66,7 @@ fn main() -> eframe::Result {
 enum Command {
     New,
     Open,
+    OpenBuffer,
     Save,
     SaveAs,
     Scratch,
@@ -153,6 +154,13 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         summary: "Open file or path",
         hint: "Ctrl+O",
         palette_command: Some(Command::Open),
+    },
+    CommandSpec {
+        name: "open-buffer",
+        aliases: &["ob", "buffer-open"],
+        summary: "Open a file in the editable modal buffer",
+        hint: ":open-buffer",
+        palette_command: Some(Command::OpenBuffer),
     },
     CommandSpec {
         name: "open-last",
@@ -457,6 +465,7 @@ struct DuplicatePlacement {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FilePickerMode {
     Open,
+    OpenBuffer,
     Browse,
     InsertMarkdownLink,
 }
@@ -826,6 +835,11 @@ impl SlateApp {
     }
 
     fn open_link_preview(&mut self, path: PathBuf, heading_fragment: Option<String>) {
+        if self.link_preview_open && self.link_preview_dirty {
+            self.status = "Save modal buffer before opening another modal buffer".to_string();
+            self.focus_link_preview_once = true;
+            return;
+        }
         match fs::read_to_string(&path) {
             Ok(text) => {
                 self.link_preview_buffer.set_text(text);
@@ -1560,6 +1574,15 @@ impl SlateApp {
         self.open_file_picker_for_open();
     }
 
+    fn open_buffer_dialog(&mut self) {
+        if self.link_preview_open && self.link_preview_dirty {
+            self.status = "Save modal buffer before opening another modal buffer".to_string();
+            self.focus_link_preview_once = true;
+            return;
+        }
+        self.open_file_picker_for_buffer();
+    }
+
     fn open_last(&mut self) {
         let Some(path) = self.last_opened_path.clone() else {
             self.status = "No last file".to_string();
@@ -1913,6 +1936,10 @@ impl SlateApp {
         self.open_file_picker_at(self.project_root(), FilePickerMode::Open);
     }
 
+    fn open_file_picker_for_buffer(&mut self) {
+        self.open_file_picker_at(self.project_root(), FilePickerMode::OpenBuffer);
+    }
+
     fn open_file_picker_at(&mut self, dir: PathBuf, mode: FilePickerMode) {
         self.shortcut_help_open = false;
         self.palette_open = false;
@@ -2056,6 +2083,10 @@ impl SlateApp {
                 let target = self.markdown_link_target_for_file(&path);
                 self.file_picker_open = false;
                 self.open_link_heading_picker_or_insert(&path, target);
+            }
+            FilePickerMode::OpenBuffer => {
+                self.file_picker_open = false;
+                self.open_link_preview(path, None);
             }
             FilePickerMode::Open if self.dirty => {
                 self.pending_project_file_path = Some(path);
@@ -2589,6 +2620,7 @@ impl SlateApp {
         match command {
             Command::New => "new",
             Command::Open => "open",
+            Command::OpenBuffer => "open-buffer",
             Command::Save => "save",
             Command::SaveAs => "save-as",
             Command::Scratch => "scratch",
@@ -2716,6 +2748,7 @@ impl SlateApp {
                     self.open_dialog();
                 }
             }
+            Command::OpenBuffer => self.open_buffer_dialog(),
             Command::Save => self.save(),
             Command::SaveAs => self.open_save_as_modal(),
             Command::Scratch => self.open_scratch_modal(),
@@ -2931,6 +2964,19 @@ impl SlateApp {
                         .and_then(|rest| dirs_next::home_dir().map(|home| home.join(rest)))
                         .unwrap_or_else(|| PathBuf::from(path));
                     self.open_path(expanded);
+                }
+            }
+            "open-buffer" | "ob" | "buffer-open" => {
+                let path = parts.collect::<Vec<_>>().join(" ");
+                if path.is_empty() {
+                    self.run_command(Command::OpenBuffer, ctx);
+                } else {
+                    self.record_command_usage("open-buffer");
+                    let expanded = path
+                        .strip_prefix("~/")
+                        .and_then(|rest| dirs_next::home_dir().map(|home| home.join(rest)))
+                        .unwrap_or_else(|| PathBuf::from(path));
+                    self.open_link_preview(expanded, None);
                 }
             }
             "open-last" | "last" | "ol" => {
@@ -6180,6 +6226,7 @@ impl SlateApp {
                         ui.horizontal(|ui| {
                             let title = match self.file_picker_mode {
                                 FilePickerMode::Open => "open",
+                                FilePickerMode::OpenBuffer => "open buffer",
                                 FilePickerMode::Browse => "files",
                                 FilePickerMode::InsertMarkdownLink => "insert link file",
                             };

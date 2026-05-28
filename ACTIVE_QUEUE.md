@@ -134,11 +134,19 @@ Status: pending
 Scope:
 - Support multiple open buffers.
 - Reuse the existing large local-link preview modal as the first multi-file workflow surface.
+- Done: `Ctrl+LeftClick` on a local Markdown link opens the target as an editable modal buffer.
+- Add `:open-buffer` / `:ob` to manually open any file into that same editable modal buffer workflow, without requiring a link under cursor.
 - When a local link/file is opened in the modal, keep the current file as the main buffer and load the target as an editable secondary buffer inside the modal.
 - `Enter` promotes/opens the modal buffer as the main buffer, preserving the previous file as an open buffer rather than discarding it.
 - `Esc` closes the modal/secondary buffer view without switching away from the main buffer.
 - `Tab` swaps/promotes the main buffer and modal buffer positions, so the user can quickly flip which file is primary and which is in the large editable overlay.
 - Unlike the current read-only-ish link preview, the modal buffer should support real editing, save state, cursor/scroll, and dirty protection.
+- Add Slate Picker core inspired by Telescope: a single minimal modal pattern for prompt + fuzzy results + optional preview + contextual actions.
+- Keep the visual direction Telescope-like: simple framed results pane, preview pane, compact prompt/status line; minimal but a little more Slate-polished.
+- Use Slate Picker as the shared foundation for command palette, recent files, open/open-buffer, heading picker, buffers, marks, doc tasks, and future global search.
+- Add Harpoon-inspired marked-buffer workflow: a small persistent per-project list of important files, editable through a modal, with direct slot shortcuts and next/previous navigation.
+- Mark current/modal file into a numbered slot; selecting a slot opens/promotes that file quickly.
+- Keep the Harpoon idea small and Slate-native: marked files are a fast local navigation set, not a full tab bar or project manager.
 - Add switch-buffer and close-buffer commands.
 - Prefer command-palette-driven buffers before visible tabs.
 - Borrow the useful Emacs concept of buffers without adopting Emacs complexity.

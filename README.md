@@ -12,6 +12,12 @@ For the project philosophy and feature decision rules, see [`PHILOSOPHY.md`](PHI
 
 ---
 
+## Credits and inspiration
+
+Slate's planned marked-buffer / quick-file workflow is inspired by [Harpoon 2](https://github.com/ThePrimeagen/harpoon/tree/harpoon2). Full credit to [ThePrimeagen](https://github.com/ThePrimeagen) for the original Harpoon idea.
+
+---
+
 ## What Slate does today
 
 Slate currently provides a minimal native GUI editor with a terminal-inspired interface:
