@@ -379,6 +379,100 @@ impl EditorBuffer {
         self.insert_text("\n");
     }
 
+    pub(crate) fn indent_current_or_selected_lines(&mut self) -> bool {
+        let (start_line, end_line) = self.selection_line_range().unwrap_or_else(|| {
+            let line = self.line_index_for_byte(self.cursor);
+            (line, line)
+        });
+        if start_line > end_line || end_line >= self.line_count() {
+            return false;
+        }
+
+        let original_cursor = self.cursor;
+        let had_selection = self.selection.is_some();
+        let affected_starts = (start_line..=end_line)
+            .map(|line| self.line_start(line))
+            .collect::<Vec<_>>();
+
+        self.record_undo_snapshot();
+        self.selection = None;
+        for start in affected_starts.iter().rev() {
+            self.text.insert_str(*start, "    ");
+        }
+        let cursor_shift = affected_starts
+            .iter()
+            .filter(|start| **start <= original_cursor)
+            .count()
+            * 4;
+        self.cursor = original_cursor + cursor_shift;
+        self.revision = self.revision.wrapping_add(1);
+        self.rebuild_line_index();
+
+        if had_selection {
+            let selection_start = self.line_start(start_line);
+            let selection_end = self.line_end(end_line);
+            self.set_selection(selection_start, selection_end);
+        }
+        true
+    }
+
+    pub(crate) fn dedent_current_or_selected_lines(&mut self) -> bool {
+        let (start_line, end_line) = self.selection_line_range().unwrap_or_else(|| {
+            let line = self.line_index_for_byte(self.cursor);
+            (line, line)
+        });
+        if start_line > end_line || end_line >= self.line_count() {
+            return false;
+        }
+
+        let removals = (start_line..=end_line)
+            .filter_map(|line| {
+                let start = self.line_start(line);
+                let remove_len = self
+                    .line(line)
+                    .chars()
+                    .take_while(|ch| *ch == ' ')
+                    .take(4)
+                    .count();
+                (remove_len > 0).then_some((start, remove_len))
+            })
+            .collect::<Vec<_>>();
+        if removals.is_empty() {
+            return false;
+        }
+
+        let original_cursor = self.cursor;
+        let had_selection = self.selection.is_some();
+        let cursor_shift = removals
+            .iter()
+            .map(|(start, len)| {
+                if original_cursor >= start + len {
+                    *len
+                } else if original_cursor > *start {
+                    original_cursor - *start
+                } else {
+                    0
+                }
+            })
+            .sum::<usize>();
+
+        self.record_undo_snapshot();
+        self.selection = None;
+        for (start, len) in removals.iter().rev() {
+            self.text.replace_range(*start..(*start + *len), "");
+        }
+        self.cursor = self.clamp_to_char_boundary(original_cursor.saturating_sub(cursor_shift));
+        self.revision = self.revision.wrapping_add(1);
+        self.rebuild_line_index();
+
+        if had_selection {
+            let selection_start = self.line_start(start_line);
+            let selection_end = self.line_end(end_line);
+            self.set_selection(selection_start, selection_end);
+        }
+        true
+    }
+
     #[allow(dead_code)]
     pub(crate) fn backspace(&mut self) {
         if let Some((start, end)) = self.selection {
@@ -1154,6 +1248,50 @@ mod tests {
 
         assert_eq!(buffer.as_str(), "hello slate");
         assert!(!buffer.redo());
+    }
+
+    #[test]
+    fn editor_buffer_indents_current_line_with_four_spaces() {
+        let mut buffer = EditorBuffer::from_text("one\ntwo".to_string());
+        buffer.set_cursor(5);
+
+        assert!(buffer.indent_current_or_selected_lines());
+
+        assert_eq!(buffer.as_str(), "one\n    two");
+        assert_eq!(buffer.cursor(), 9);
+    }
+
+    #[test]
+    fn editor_buffer_indents_selected_lines() {
+        let mut buffer = EditorBuffer::from_text("one\ntwo\nthree".to_string());
+        buffer.set_selection(1, 8);
+
+        assert!(buffer.indent_current_or_selected_lines());
+
+        assert_eq!(buffer.as_str(), "    one\n    two\nthree");
+        assert_eq!(buffer.selection(), Some((0, 15)));
+    }
+
+    #[test]
+    fn editor_buffer_dedents_current_line_by_up_to_four_spaces() {
+        let mut buffer = EditorBuffer::from_text("  one\n    two".to_string());
+        buffer.set_cursor(9);
+
+        assert!(buffer.dedent_current_or_selected_lines());
+
+        assert_eq!(buffer.as_str(), "  one\ntwo");
+        assert_eq!(buffer.cursor(), 6);
+    }
+
+    #[test]
+    fn editor_buffer_dedents_selected_lines_without_crossing_text() {
+        let mut buffer = EditorBuffer::from_text("  one\n    two\nthree".to_string());
+        buffer.set_selection(0, buffer.as_str().len());
+
+        assert!(buffer.dedent_current_or_selected_lines());
+
+        assert_eq!(buffer.as_str(), "one\ntwo\nthree");
+        assert_eq!(buffer.selection(), Some((0, buffer.as_str().len())));
     }
 
     #[test]

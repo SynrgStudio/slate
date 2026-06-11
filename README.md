@@ -42,6 +42,8 @@ Slate should feel like opening a clean terminal and writing.
 - Per-file cursor position persistence.
 - Mouse text selection.
 - System clipboard copy/paste.
+- `Tab` indents by four spaces; `Shift+Tab` dedents by up to four leading spaces.
+- Multiline selections can be indented/dedented as a block with `Tab` / `Shift+Tab`.
 - Word wrap toggle.
 - Absolute and relative line numbers.
 - Goto line/column, including relative jumps.
@@ -177,6 +179,8 @@ slate --scratch
 | `Ctrl+M` | Toggle Markdown preview |
 | `Ctrl+F` | Find |
 | `Ctrl+Enter` | Cycle checkbox state on current line/task |
+| `Tab` | Indent current line or selected lines by 4 spaces |
+| `Shift+Tab` | Dedent current line or selected lines by up to 4 spaces |
 | `Ctrl+LeftClick` | Open Markdown/web link under pointer |
 | `Ctrl+Q` | Quit |
 | `Alt+1` … `Alt+9`, `Alt+0` | Open Lance slots 1 through 10 |

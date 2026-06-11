@@ -312,6 +312,20 @@ impl EditorView {
             }
         }
 
+        if has_keyboard_focus {
+            ui.memory_mut(|memory| {
+                memory.set_focus_lock_filter(
+                    response.id,
+                    egui::EventFilter {
+                        tab: true,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        escape: true,
+                    },
+                );
+            });
+        }
+
         if keyboard_enabled && has_keyboard_focus && search_state.is_none() {
             changed = self.handle_keyboard(ui, buffer) || changed;
             if changed {
@@ -603,7 +617,41 @@ impl EditorView {
         let mut changed = false;
         let mut moved = false;
         let events = ui.input(|input| input.events.clone());
-        if !ui.input(|input| input.modifiers.ctrl || input.modifiers.command || input.modifiers.alt)
+        let tab_indent_action = events.iter().find_map(|event| match event {
+            egui::Event::Key {
+                key: Key::Tab,
+                pressed: true,
+                repeat: false,
+                modifiers,
+                ..
+            } if !modifiers.ctrl && !modifiers.command && !modifiers.alt => {
+                Some(if modifiers.shift { -1 } else { 1 })
+            }
+            egui::Event::Text(text) if text == "\t" => Some(1),
+            egui::Event::Ime(egui::ImeEvent::Commit(text)) if text == "\t" => Some(1),
+            _ => None,
+        });
+        let mut handled_tab_indent = false;
+        if let Some(tab_indent_action) = tab_indent_action {
+            let was_near_flow_item = Self::cursor_near_flow_item_context(buffer);
+            let indented = if tab_indent_action < 0 {
+                buffer.dedent_current_or_selected_lines()
+            } else {
+                buffer.indent_current_or_selected_lines()
+            };
+            if indented && (was_near_flow_item || Self::cursor_near_flow_item_context(buffer)) {
+                self.flow_agenda_update_requested = true;
+            }
+            if indented {
+                self.request_scroll_to_cursor(buffer);
+            }
+            changed = indented || changed;
+            handled_tab_indent = true;
+        }
+        if !handled_tab_indent
+            && !ui.input(|input| {
+                input.modifiers.ctrl || input.modifiers.command || input.modifiers.alt
+            })
         {
             if let Some(text) = text_input_from_events(&events) {
                 self.flow_metadata_month_offset = 0;
