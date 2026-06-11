@@ -221,15 +221,46 @@ impl EditorBuffer {
             return false;
         }
         let line_index = self.line_index_for_byte(self.cursor);
-        if self.line(line_index).trim().is_empty() {
-            return false;
+
+        let mut paragraph_line = if self.line(line_index).trim().is_empty() {
+            line_index.checked_sub(1)
+        } else {
+            Some(line_index)
+        };
+        while let Some(index) = paragraph_line {
+            if !self.line(index).trim().is_empty() {
+                break;
+            }
+            paragraph_line = index.checked_sub(1);
         }
 
-        let mut target = line_index;
+        let Some(mut target) = paragraph_line else {
+            return false;
+        };
         while target > 0 && !self.line(target - 1).trim().is_empty() {
             target -= 1;
         }
-        self.set_cursor(self.line_start(target));
+
+        let target_byte = self.line_start(target);
+        if self.cursor != target_byte {
+            self.set_cursor(target_byte);
+            return true;
+        }
+
+        if target == 0 {
+            return false;
+        }
+        let mut previous = target - 1;
+        while self.line(previous).trim().is_empty() {
+            let Some(next_previous) = previous.checked_sub(1) else {
+                return false;
+            };
+            previous = next_previous;
+        }
+        while previous > 0 && !self.line(previous - 1).trim().is_empty() {
+            previous -= 1;
+        }
+        self.set_cursor(self.line_start(previous));
         true
     }
 
@@ -238,15 +269,50 @@ impl EditorBuffer {
             return false;
         }
         let line_index = self.line_index_for_byte(self.cursor);
-        if self.line(line_index).trim().is_empty() {
-            return false;
+        let line_count = self.line_count();
+
+        let mut paragraph_line = if self.line(line_index).trim().is_empty() {
+            (line_index + 1 < line_count).then_some(line_index + 1)
+        } else {
+            Some(line_index)
+        };
+        while let Some(index) = paragraph_line {
+            if index >= line_count {
+                return false;
+            }
+            if !self.line(index).trim().is_empty() {
+                break;
+            }
+            paragraph_line = (index + 1 < line_count).then_some(index + 1);
         }
 
-        let mut target = line_index;
-        while target + 1 < self.line_count() && !self.line(target + 1).trim().is_empty() {
+        let Some(mut target) = paragraph_line else {
+            return false;
+        };
+        while target + 1 < line_count && !self.line(target + 1).trim().is_empty() {
             target += 1;
         }
-        self.set_cursor(self.line_end(target));
+
+        let target_byte = self.line_end(target);
+        if self.cursor != target_byte {
+            self.set_cursor(target_byte);
+            return true;
+        }
+
+        if target + 1 >= line_count {
+            return false;
+        }
+        let mut next = target + 1;
+        while next < line_count && self.line(next).trim().is_empty() {
+            next += 1;
+        }
+        if next >= line_count {
+            return false;
+        }
+        while next + 1 < line_count && !self.line(next + 1).trim().is_empty() {
+            next += 1;
+        }
+        self.set_cursor(self.line_end(next));
         true
     }
 
@@ -255,7 +321,13 @@ impl EditorBuffer {
         let Some((start, _)) = self
             .word_ranges()
             .into_iter()
-            .take_while(|(start, _)| *start <= cursor)
+            .take_while(|(start, end)| {
+                if *start < cursor && cursor <= *end {
+                    true
+                } else {
+                    *start < cursor
+                }
+            })
             .last()
         else {
             return false;
@@ -335,6 +407,16 @@ impl EditorBuffer {
 
         let next = self.next_char_boundary(self.cursor);
         self.replace_selection_or_range(self.cursor, next, "");
+    }
+
+    pub(crate) fn replace_current_line(&mut self, replacement: &str, cursor_column: usize) -> bool {
+        let line_index = self.line_index_for_byte(self.cursor);
+        let start = self.line_start(line_index);
+        let end = self.line_end(line_index);
+        self.replace_selection_or_range(start, end, replacement);
+        let cursor_column = cursor_column.min(replacement.chars().count());
+        self.cursor = self.line_col_to_byte(line_index + 1, cursor_column + 1);
+        true
     }
 
     pub(crate) fn delete_current_line(&mut self) -> bool {
@@ -562,6 +644,51 @@ impl EditorBuffer {
             return false;
         };
         self.replace_selection_or_range(start, end, "");
+        true
+    }
+
+    pub(crate) fn delete_word_before_cursor(&mut self) -> bool {
+        if let Some((start, end)) = self.selection {
+            if start != end {
+                self.replace_selection_or_range(start, end, "");
+                return true;
+            }
+        }
+        let cursor = self.cursor;
+        if cursor == 0 {
+            return false;
+        }
+        let Some((start, _)) = self
+            .word_ranges()
+            .into_iter()
+            .take_while(|(start, _)| *start < cursor)
+            .last()
+        else {
+            return false;
+        };
+        self.replace_selection_or_range(start, cursor, "");
+        true
+    }
+
+    pub(crate) fn delete_word_after_cursor(&mut self) -> bool {
+        if let Some((start, end)) = self.selection {
+            if start != end {
+                self.replace_selection_or_range(start, end, "");
+                return true;
+            }
+        }
+        let cursor = self.cursor;
+        if cursor >= self.text.len() {
+            return false;
+        }
+        let Some((_, end)) = self
+            .word_ranges()
+            .into_iter()
+            .find(|(start, end)| (*start <= cursor && cursor < *end) || *start >= cursor)
+        else {
+            return false;
+        };
+        self.replace_selection_or_range(cursor, end, "");
         true
     }
 
@@ -1364,6 +1491,43 @@ mod tests {
     }
 
     #[test]
+    fn editor_buffer_deletes_word_before_cursor() {
+        let mut buffer = EditorBuffer::from_text("hello brave world".to_string());
+        buffer.set_cursor("hello brave".len());
+
+        assert!(buffer.delete_word_before_cursor());
+
+        assert_eq!(buffer.as_str(), "hello  world");
+        assert_eq!(buffer.cursor(), "hello ".len());
+    }
+
+    #[test]
+    fn editor_buffer_deletes_word_after_cursor() {
+        let mut buffer = EditorBuffer::from_text("hello brave world".to_string());
+        buffer.set_cursor("hello ".len());
+
+        assert!(buffer.delete_word_after_cursor());
+
+        assert_eq!(buffer.as_str(), "hello  world");
+        assert_eq!(buffer.cursor(), "hello ".len());
+    }
+
+    #[test]
+    fn editor_buffer_deletes_word_across_surrounding_space() {
+        let mut before = EditorBuffer::from_text("hello   brave".to_string());
+        before.set_cursor("hello   ".len());
+        assert!(before.delete_word_before_cursor());
+        assert_eq!(before.as_str(), "brave");
+        assert_eq!(before.cursor(), 0);
+
+        let mut after = EditorBuffer::from_text("hello   brave".to_string());
+        after.set_cursor("hello".len());
+        assert!(after.delete_word_after_cursor());
+        assert_eq!(after.as_str(), "hello");
+        assert_eq!(after.cursor(), "hello".len());
+    }
+
+    #[test]
     fn editor_buffer_moves_to_top_and_bottom() {
         let mut buffer = EditorBuffer::from_text("one\ntwo".to_string());
         buffer.move_to_bottom();
@@ -1387,6 +1551,24 @@ mod tests {
     }
 
     #[test]
+    fn editor_buffer_repeats_paragraph_boundary_jumps() {
+        let mut buffer = EditorBuffer::from_text("one\ntwo\n\nthree\nfour\n\nfive".to_string());
+        buffer.set_cursor("one\ntwo\n\nthree".len());
+
+        assert!(buffer.move_to_paragraph_start());
+        assert_eq!(buffer.cursor(), "one\ntwo\n\n".len());
+
+        assert!(buffer.move_to_paragraph_start());
+        assert_eq!(buffer.cursor(), 0);
+
+        assert!(buffer.move_to_paragraph_end());
+        assert_eq!(buffer.cursor(), "one\ntwo".len());
+
+        assert!(buffer.move_to_paragraph_end());
+        assert_eq!(buffer.cursor(), "one\ntwo\n\nthree\nfour".len());
+    }
+
+    #[test]
     fn editor_buffer_moves_cursor_to_word_edges() {
         let mut buffer = EditorBuffer::from_text("hello brave world".to_string());
         buffer.set_cursor("hello br".len());
@@ -1397,5 +1579,20 @@ mod tests {
         buffer.set_cursor("hello brave w".len());
         assert!(buffer.move_to_word_end_right());
         assert_eq!(buffer.cursor(), "hello brave world".len());
+    }
+
+    #[test]
+    fn editor_buffer_repeats_word_start_left_from_word_boundary() {
+        let mut buffer = EditorBuffer::from_text("hello brave world".to_string());
+        buffer.set_cursor("hello brave world".len());
+
+        assert!(buffer.move_to_word_start_left());
+        assert_eq!(buffer.cursor(), "hello brave ".len());
+
+        assert!(buffer.move_to_word_start_left());
+        assert_eq!(buffer.cursor(), "hello ".len());
+
+        assert!(buffer.move_to_word_start_left());
+        assert_eq!(buffer.cursor(), 0);
     }
 }

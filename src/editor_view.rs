@@ -1,5 +1,6 @@
 use crate::{
     editor_buffer::EditorBuffer,
+    flow::{FlowItemKind, parse_flow_note_or_idea_line},
     markdown::{
         CheckboxState, TableAlignment, is_markdown_separator, is_markdown_table_start,
         markdown_link_target_at_byte, parse_blockquote_line, parse_checkbox_line,
@@ -9,12 +10,26 @@ use crate::{
     search::SearchState,
 };
 
-use eframe::egui::{self, Color32, FontFamily, FontId, Key, Stroke};
+use std::path::Path;
+
+use chrono::{Datelike, Local, NaiveDate};
+use eframe::egui::{self, Color32, FontFamily, FontId, Key, Pos2, Stroke};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LineNumberMode {
     Absolute,
     Relative,
+}
+
+fn source_label_line_fragment(text: &str, start: usize, end: usize) -> Option<usize> {
+    let label = text.get(start..end)?;
+    let colon = label.rfind(':')?;
+    let line = label.get(colon + 1..)?;
+    if !line.is_empty() && line.chars().all(|ch| ch.is_ascii_digit()) {
+        Some(start + colon)
+    } else {
+        None
+    }
 }
 
 impl LineNumberMode {
@@ -65,12 +80,45 @@ enum TableLineKind {
     Body,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FlowMetadataKey {
+    Scheduled,
+    Due,
+}
+
+struct FlowMetadataLine {
+    key: FlowMetadataKey,
+    prefix: String,
+    value: String,
+}
+
 pub(crate) struct EditorView {
     scroll_y: f32,
     target_cursor: Option<usize>,
     link_click_byte: Option<usize>,
+    link_click_target: Option<String>,
+    virtual_line_click: Option<String>,
     link_assist_trigger_start: Option<usize>,
     focus_next: bool,
+    mouse_selection_anchor: Option<usize>,
+    flow_metadata_month_offset: i32,
+    flow_agenda_update_requested: bool,
+    last_cursor_pos: Option<Pos2>,
+    last_text_input: Option<String>,
+}
+
+fn virtual_tail_buffer(buffer: &EditorBuffer, tail: &str) -> EditorBuffer {
+    let mut text = buffer.as_str().to_string();
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push('\n');
+    text.push_str(tail.trim_start_matches('\n'));
+    let cursor = buffer.cursor();
+    let mut display = EditorBuffer::new();
+    display.set_text(text);
+    display.set_cursor(cursor);
+    display
 }
 
 impl EditorView {
@@ -79,13 +127,34 @@ impl EditorView {
             scroll_y: 0.0,
             target_cursor: None,
             link_click_byte: None,
+            link_click_target: None,
+            virtual_line_click: None,
             link_assist_trigger_start: None,
             focus_next: false,
+            mouse_selection_anchor: None,
+            flow_metadata_month_offset: 0,
+            flow_agenda_update_requested: false,
+            last_cursor_pos: None,
+            last_text_input: None,
         }
+    }
+
+    pub(crate) fn take_flow_agenda_update_request(&mut self) -> bool {
+        let requested = self.flow_agenda_update_requested;
+        self.flow_agenda_update_requested = false;
+        requested
     }
 
     pub(crate) fn request_keyboard_focus(&mut self) {
         self.focus_next = true;
+    }
+
+    pub(crate) fn last_cursor_pos(&self) -> Option<Pos2> {
+        self.last_cursor_pos
+    }
+
+    pub(crate) fn take_last_text_input(&mut self) -> Option<String> {
+        self.last_text_input.take()
     }
 
     pub(crate) fn observe_buffer(&mut self, buffer: &EditorBuffer) {
@@ -135,8 +204,11 @@ impl EditorView {
         force_keyboard_focus: bool,
         active_line_text_highlight: Option<usize>,
         render_markdown: bool,
+        virtual_tail: Option<&str>,
     ) -> (egui::Response, bool) {
         self.observe_buffer(buffer);
+        self.last_cursor_pos = None;
+        self.last_text_input = None;
 
         let font = FontId::new(15.0, FontFamily::Monospace);
         let line_height = ui.fonts_mut(|fonts| fonts.row_height(&font)) + 2.0;
@@ -161,7 +233,15 @@ impl EditorView {
         let text_x = rect.left() + gutter_width + 6.0;
         let gutter_x = rect.left() + gutter_width - 4.0;
         let wrap_width = (rect.right() - text_x - 8.0).max(40.0);
-        let mut rows = self.visual_rows(&painter, buffer, &font, wrap_width, wrap);
+        let real_line_count = buffer.line_count();
+        let mut display_buffer_storage = virtual_tail.map(|tail| virtual_tail_buffer(buffer, tail));
+        let mut rows = self.visual_rows(
+            &painter,
+            display_buffer_storage.as_ref().unwrap_or(buffer),
+            &font,
+            wrap_width,
+            wrap,
+        );
         let mut max_scroll = (rows.len() as f32 * line_height - rect.height()).max(0.0);
         let mut changed = false;
 
@@ -169,33 +249,60 @@ impl EditorView {
             response.request_focus();
             has_keyboard_focus = true;
             if let Some(pos) = response.interact_pointer_pos() {
-                let row_index = ((self.scroll_y + pos.y - rect.top()) / line_height)
-                    .floor()
-                    .max(0.0) as usize;
-                let row = rows
-                    .get(row_index.min(rows.len().saturating_sub(1)))
-                    .copied()
-                    .unwrap_or(VisualRow {
-                        line_index: 0,
-                        start: 0,
-                        end: 0,
-                    });
-                let byte = self.byte_for_x(&painter, buffer, row, pos.x - text_x, &font);
-                let ctrl_click = ui.input(|input| input.modifiers.ctrl || input.modifiers.command);
-                let clicked_link = ctrl_click
-                    && markdown_link_target_at_byte(
-                        buffer.line(row.line_index),
-                        buffer.line_start(row.line_index),
-                        byte,
-                    )
-                    .is_some();
-                if clicked_link {
-                    self.link_click_byte = Some(byte);
+                let display_buffer = display_buffer_storage.as_ref().unwrap_or(buffer);
+                let row = self.row_for_pointer(display_buffer, &rows, rect, line_height, pos.y);
+                let byte = self.byte_for_x(&painter, display_buffer, row, pos.x - text_x, &font);
+                let clicked_link = markdown_link_target_at_byte(
+                    display_buffer.line(row.line_index),
+                    display_buffer.line_start(row.line_index),
+                    byte,
+                );
+                if let Some(target) = clicked_link {
+                    if row.line_index >= real_line_count {
+                        self.link_click_target = Some(target.to_string());
+                    } else {
+                        self.link_click_byte = Some(byte);
+                    }
+                } else if row.line_index >= real_line_count {
+                    let line = display_buffer.line(row.line_index).trim().to_string();
+                    if line.contains("SLATE REFERENCES")
+                        || line.contains("virtual references")
+                        || line.contains("Backlinks")
+                        || line.contains("Mentions")
+                    {
+                        self.virtual_line_click = Some(line);
+                    }
                 } else {
                     buffer.set_cursor(byte);
                     self.request_scroll_to_cursor(buffer);
                 }
             }
+        }
+
+        if response.drag_started() {
+            response.request_focus();
+            has_keyboard_focus = true;
+            if let Some(pos) = response.interact_pointer_pos() {
+                let row = self.row_for_pointer(buffer, &rows, rect, line_height, pos.y);
+                let byte = self.byte_for_x(&painter, buffer, row, pos.x - text_x, &font);
+                self.mouse_selection_anchor = Some(byte);
+                buffer.set_cursor(byte);
+            }
+        }
+
+        if response.dragged() {
+            has_keyboard_focus = true;
+            if let (Some(anchor), Some(pos)) =
+                (self.mouse_selection_anchor, response.interact_pointer_pos())
+            {
+                let row = self.row_for_pointer(buffer, &rows, rect, line_height, pos.y);
+                let byte = self.byte_for_x(&painter, buffer, row, pos.x - text_x, &font);
+                buffer.set_selection(anchor, byte);
+            }
+        }
+
+        if response.drag_stopped() {
+            self.mouse_selection_anchor = None;
         }
 
         if response.hovered() || has_keyboard_focus {
@@ -208,7 +315,14 @@ impl EditorView {
         if keyboard_enabled && has_keyboard_focus && search_state.is_none() {
             changed = self.handle_keyboard(ui, buffer) || changed;
             if changed {
-                rows = self.visual_rows(&painter, buffer, &font, wrap_width, wrap);
+                display_buffer_storage = virtual_tail.map(|tail| virtual_tail_buffer(buffer, tail));
+                rows = self.visual_rows(
+                    &painter,
+                    display_buffer_storage.as_ref().unwrap_or(buffer),
+                    &font,
+                    wrap_width,
+                    wrap,
+                );
                 max_scroll = (rows.len() as f32 * line_height - rect.height()).max(0.0);
             }
         }
@@ -226,6 +340,7 @@ impl EditorView {
 
         painter.rect_filled(rect, 0.0, Color32::from_rgb(30, 36, 48));
 
+        let display_buffer = display_buffer_storage.as_ref().unwrap_or(buffer);
         let range = self.visible_row_range(rows.len(), rect.height(), line_height);
         let y_offset = self.scroll_y % line_height;
         let current_line_index = buffer.cursor_line_col().0;
@@ -242,23 +357,59 @@ impl EditorView {
                 egui::pos2(rect.left(), y),
                 egui::vec2(rect.width(), line_height),
             );
-            if row.line_index % 2 == 0 {
+            let is_virtual_row = row.line_index >= real_line_count;
+            if is_virtual_row {
+                let virtual_rect = egui::Rect::from_min_max(
+                    egui::pos2(rect.left() + 2.0, y),
+                    egui::pos2(rect.right() - 2.0, y + line_height),
+                );
+                painter.rect_filled(virtual_rect, 0.0, Color32::from_rgb(25, 31, 42));
+                painter.line_segment(
+                    [
+                        egui::pos2(virtual_rect.left(), virtual_rect.top()),
+                        egui::pos2(virtual_rect.right(), virtual_rect.top()),
+                    ],
+                    Stroke::new(1.0, Color32::from_rgb(74, 89, 113)),
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(virtual_rect.left(), virtual_rect.bottom()),
+                        egui::pos2(virtual_rect.right(), virtual_rect.bottom()),
+                    ],
+                    Stroke::new(1.0, Color32::from_rgb(44, 55, 72)),
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(virtual_rect.left(), virtual_rect.top()),
+                        egui::pos2(virtual_rect.left(), virtual_rect.bottom()),
+                    ],
+                    Stroke::new(1.0, Color32::from_rgb(74, 89, 113)),
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(virtual_rect.right(), virtual_rect.top()),
+                        egui::pos2(virtual_rect.right(), virtual_rect.bottom()),
+                    ],
+                    Stroke::new(1.0, Color32::from_rgb(74, 89, 113)),
+                );
+            } else if row.line_index % 2 == 0 {
                 painter.rect_filled(line_rect, 0.0, Color32::from_rgb(29, 35, 46));
             }
 
-            self.paint_markdown_line_background(
-                &painter,
-                buffer,
-                row,
-                text_x,
-                y,
-                line_height,
-                rect.right(),
-                render_markdown,
-                &font,
-            );
-
-            if active_line_text_highlight == Some(row.line_index) {
+            if !is_virtual_row {
+                self.paint_markdown_line_background(
+                    &painter,
+                    display_buffer,
+                    row,
+                    text_x,
+                    y,
+                    line_height,
+                    rect.right(),
+                    render_markdown,
+                    &font,
+                );
+            }
+            if active_line_text_highlight == Some(row.line_index) && !is_virtual_row {
                 let highlight_rect = egui::Rect::from_min_max(
                     egui::pos2(text_x - 8.0, y + 1.0),
                     egui::pos2(rect.right() - 6.0, y + line_height - 1.0),
@@ -271,8 +422,9 @@ impl EditorView {
                 );
             }
 
-            if let Some(search_state) =
-                search_state.filter(|state| state.buffer_revision == buffer.revision)
+            if !is_virtual_row
+                && let Some(search_state) =
+                    search_state.filter(|state| state.buffer_revision == buffer.revision)
             {
                 self.paint_search_matches(
                     &painter,
@@ -287,7 +439,7 @@ impl EditorView {
                 );
             }
 
-            if let Some((selection_start, selection_end)) = buffer.selection() {
+            if !is_virtual_row && let Some((selection_start, selection_end)) = buffer.selection() {
                 self.paint_selection(
                     &painter,
                     buffer,
@@ -305,7 +457,9 @@ impl EditorView {
             painter.text(
                 egui::pos2(gutter_x, y + line_height * 0.5 + 2.0),
                 egui::Align2::RIGHT_CENTER,
-                if row.start == buffer.line_start(row.line_index) {
+                if is_virtual_row {
+                    "·".to_string()
+                } else if row.start == buffer.line_start(row.line_index) {
                     format!(
                         "{}",
                         line_number_mode.number_for_line(row.line_index, current_line_index)
@@ -316,12 +470,28 @@ impl EditorView {
                 FontId::new(12.0, FontFamily::Monospace),
                 Color32::from_rgb(94, 105, 126),
             );
-            let text_color = if active_line_text_highlight == Some(row.line_index) {
+            let text_color = if is_virtual_row {
+                Color32::from_rgb(160, 176, 198)
+            } else if active_line_text_highlight == Some(row.line_index) {
                 Color32::from_rgb(235, 203, 139)
             } else {
                 Color32::from_rgb(216, 222, 233)
             };
             self.paint_line_text(
+                &painter,
+                display_buffer,
+                row,
+                text_x,
+                y,
+                line_height,
+                &font,
+                text_color,
+                render_markdown,
+            );
+            if is_virtual_row {
+                continue;
+            }
+            self.paint_flow_metadata_suggestion(
                 &painter,
                 buffer,
                 row,
@@ -329,7 +499,6 @@ impl EditorView {
                 y,
                 line_height,
                 &font,
-                text_color,
                 render_markdown,
             );
         }
@@ -416,6 +585,20 @@ impl EditorView {
             .unwrap_or_else(|| rows.len().saturating_sub(1))
     }
 
+    fn cursor_near_flow_item_context(buffer: &EditorBuffer) -> bool {
+        let line_index = buffer.line_index_for_byte(buffer.cursor());
+        line_index
+            .checked_sub(1)
+            .into_iter()
+            .chain(std::iter::once(line_index))
+            .chain(std::iter::once(line_index + 1))
+            .any(|index| {
+                let line = buffer.line(index);
+                parse_checkbox_line(line).is_some()
+                    || parse_flow_note_or_idea_line(line, index, None).is_some()
+            })
+    }
+
     pub(crate) fn handle_keyboard(&mut self, ui: &egui::Ui, buffer: &mut EditorBuffer) -> bool {
         let mut changed = false;
         let mut moved = false;
@@ -423,42 +606,143 @@ impl EditorView {
         if !ui.input(|input| input.modifiers.ctrl || input.modifiers.command || input.modifiers.alt)
         {
             if let Some(text) = text_input_from_events(&events) {
+                self.flow_metadata_month_offset = 0;
+                self.last_text_input = Some(text.clone());
+                let was_near_flow_item = Self::cursor_near_flow_item_context(buffer);
                 self.insert_text_with_checkbox_expansion(buffer, &text);
+                if was_near_flow_item || Self::cursor_near_flow_item_context(buffer) {
+                    self.flow_agenda_update_requested = true;
+                }
                 self.request_scroll_to_cursor(buffer);
                 changed = true;
             }
         }
         for event in events {
-            if let egui::Event::Paste(text) = event {
-                let text = Self::normalize_paste_text(&text);
-                buffer.insert_text(&text);
-                self.request_scroll_to_cursor(buffer);
-                changed = true;
+            match event {
+                egui::Event::Copy => {
+                    if let Some((start, end)) = buffer.selection() {
+                        ui.ctx().copy_text(buffer.as_str()[start..end].to_string());
+                    }
+                }
+                egui::Event::Paste(text) => {
+                    let text = Self::normalize_paste_text(&text);
+                    buffer.insert_text(&text);
+                    self.request_scroll_to_cursor(buffer);
+                    changed = true;
+                }
+                _ => {}
             }
         }
 
         ui.input_mut(|input| {
             if input.consume_key(egui::Modifiers::CTRL, Key::Enter) {
-                changed = Self::cycle_current_line_checkbox(buffer) || changed;
+                let cycled = Self::cycle_current_line_checkbox(buffer);
+                if cycled {
+                    self.flow_agenda_update_requested = true;
+                }
+                changed = cycled || changed;
+            }
+            if input.consume_key(egui::Modifiers::SHIFT, Key::Enter) {
+                let inserted = self.insert_flow_task_metadata_start(buffer);
+                if inserted {
+                    self.flow_agenda_update_requested = true;
+                }
+                changed = inserted || changed;
+                self.request_scroll_to_cursor(buffer);
             }
             if input.consume_key(egui::Modifiers::NONE, Key::Enter) {
-                if !Self::insert_space_after_markdown_link_label(buffer)
+                let was_near_flow_task = Self::cursor_near_flow_item_context(buffer);
+                let tagged_flow_line = Self::ensure_current_flow_line_default_tag(buffer);
+                if !self.handle_flow_metadata_enter(buffer)
+                    && !Self::insert_space_after_markdown_link_label(buffer)
                     && !self.insert_predictive_list_newline(buffer)
                 {
                     buffer.insert_newline();
                 }
+                if tagged_flow_line
+                    || was_near_flow_task
+                    || Self::cursor_near_flow_item_context(buffer)
+                {
+                    self.flow_agenda_update_requested = true;
+                }
                 self.request_scroll_to_cursor(buffer);
                 changed = true;
             }
+            if input.consume_key(egui::Modifiers::CTRL, Key::Backspace) {
+                let was_near_flow_task = Self::cursor_near_flow_item_context(buffer);
+                let deleted = buffer.delete_word_before_cursor();
+                if deleted && (was_near_flow_task || Self::cursor_near_flow_item_context(buffer)) {
+                    self.flow_agenda_update_requested = true;
+                }
+                self.request_scroll_to_cursor(buffer);
+                changed = deleted || changed;
+            }
+            if input.consume_key(egui::Modifiers::CTRL, Key::Delete) {
+                let was_near_flow_task = Self::cursor_near_flow_item_context(buffer);
+                let deleted = buffer.delete_word_after_cursor();
+                if deleted && (was_near_flow_task || Self::cursor_near_flow_item_context(buffer)) {
+                    self.flow_agenda_update_requested = true;
+                }
+                self.request_scroll_to_cursor(buffer);
+                changed = deleted || changed;
+            }
             if input.consume_key(egui::Modifiers::NONE, Key::Backspace) {
+                let was_near_flow_task = Self::cursor_near_flow_item_context(buffer);
                 buffer.backspace();
+                if was_near_flow_task || Self::cursor_near_flow_item_context(buffer) {
+                    self.flow_agenda_update_requested = true;
+                }
                 self.request_scroll_to_cursor(buffer);
                 changed = true;
             }
             if input.consume_key(egui::Modifiers::NONE, Key::Delete) {
+                let was_near_flow_task = Self::cursor_near_flow_item_context(buffer);
                 buffer.delete();
+                if was_near_flow_task || Self::cursor_near_flow_item_context(buffer) {
+                    self.flow_agenda_update_requested = true;
+                }
                 self.request_scroll_to_cursor(buffer);
                 changed = true;
+            }
+
+            let ctrl_shift_left = input.consume_key(
+                egui::Modifiers {
+                    alt: false,
+                    ctrl: true,
+                    shift: true,
+                    mac_cmd: false,
+                    command: false,
+                },
+                Key::ArrowLeft,
+            );
+            if ctrl_shift_left || input.consume_key(egui::Modifiers::CTRL, Key::ArrowLeft) {
+                let anchor = Self::selection_anchor(buffer);
+                if ctrl_shift_left {
+                    buffer.clear_selection();
+                }
+                buffer.move_to_word_start_left();
+                Self::extend_selection(buffer, anchor, ctrl_shift_left);
+                moved = true;
+            }
+
+            let ctrl_shift_right = input.consume_key(
+                egui::Modifiers {
+                    alt: false,
+                    ctrl: true,
+                    shift: true,
+                    mac_cmd: false,
+                    command: false,
+                },
+                Key::ArrowRight,
+            );
+            if ctrl_shift_right || input.consume_key(egui::Modifiers::CTRL, Key::ArrowRight) {
+                let anchor = Self::selection_anchor(buffer);
+                if ctrl_shift_right {
+                    buffer.clear_selection();
+                }
+                buffer.move_to_word_end_right();
+                Self::extend_selection(buffer, anchor, ctrl_shift_right);
+                moved = true;
             }
 
             let shift_left = input.consume_key(egui::Modifiers::SHIFT, Key::ArrowLeft);
@@ -483,6 +767,33 @@ impl EditorView {
                 moved = true;
             }
 
+            if self.current_flow_metadata_suggestion(buffer).is_some()
+                && input.consume_key(egui::Modifiers::NONE, Key::ArrowUp)
+            {
+                self.adjust_flow_metadata_month(buffer, 1);
+                moved = true;
+            }
+
+            let ctrl_shift_up = input.consume_key(
+                egui::Modifiers {
+                    alt: false,
+                    ctrl: true,
+                    shift: true,
+                    mac_cmd: false,
+                    command: false,
+                },
+                Key::ArrowUp,
+            );
+            if ctrl_shift_up || input.consume_key(egui::Modifiers::CTRL, Key::ArrowUp) {
+                let anchor = Self::selection_anchor(buffer);
+                if ctrl_shift_up {
+                    buffer.clear_selection();
+                }
+                let moved_to_paragraph = buffer.move_to_paragraph_start();
+                Self::extend_selection(buffer, anchor, ctrl_shift_up);
+                moved = moved || moved_to_paragraph;
+            }
+
             let shift_up = input.consume_key(egui::Modifiers::SHIFT, Key::ArrowUp);
             if shift_up || input.consume_key(egui::Modifiers::NONE, Key::ArrowUp) {
                 let anchor = Self::selection_anchor(buffer);
@@ -492,6 +803,33 @@ impl EditorView {
                 buffer.move_up();
                 Self::extend_selection(buffer, anchor, shift_up);
                 moved = true;
+            }
+
+            if self.current_flow_metadata_suggestion(buffer).is_some()
+                && input.consume_key(egui::Modifiers::NONE, Key::ArrowDown)
+            {
+                self.adjust_flow_metadata_month(buffer, -1);
+                moved = true;
+            }
+
+            let ctrl_shift_down = input.consume_key(
+                egui::Modifiers {
+                    alt: false,
+                    ctrl: true,
+                    shift: true,
+                    mac_cmd: false,
+                    command: false,
+                },
+                Key::ArrowDown,
+            );
+            if ctrl_shift_down || input.consume_key(egui::Modifiers::CTRL, Key::ArrowDown) {
+                let anchor = Self::selection_anchor(buffer);
+                if ctrl_shift_down {
+                    buffer.clear_selection();
+                }
+                let moved_to_paragraph = buffer.move_to_paragraph_end();
+                Self::extend_selection(buffer, anchor, ctrl_shift_down);
+                moved = moved || moved_to_paragraph;
             }
 
             let shift_down = input.consume_key(egui::Modifiers::SHIFT, Key::ArrowDown);
@@ -619,7 +957,7 @@ impl EditorView {
         let next_marker = match parsed.state {
             CheckboxState::Empty => "[/]",
             CheckboxState::Doing => "[x]",
-            CheckboxState::Done => "[ ]",
+            CheckboxState::Done => "[]",
         };
         let next_cursor = if cursor <= marker_start {
             cursor
@@ -667,6 +1005,18 @@ impl EditorView {
                 && cursor >= line_start + text_start
                 && cursor <= line_start + text_end
             {
+                if text_start == text_end {
+                    let target = &line[target_start..target_end];
+                    if let Some(label) = markdown_file_label_from_target(target) {
+                        buffer.replace_selection_or_range(
+                            line_start + text_start,
+                            line_start + text_end,
+                            &label,
+                        );
+                        buffer.set_cursor(line_start + marker_end + label.len());
+                        return true;
+                    }
+                }
                 let insert_at = line_start + marker_end;
                 buffer.replace_selection_or_range(insert_at, insert_at, " ");
                 return true;
@@ -708,42 +1058,97 @@ impl EditorView {
         true
     }
 
+    fn ensure_current_flow_line_default_tag(buffer: &mut EditorBuffer) -> bool {
+        if buffer.selection().is_some() {
+            return false;
+        }
+        let line_index = buffer.line_index_for_byte(buffer.cursor());
+        let line_start = buffer.line_start(line_index);
+        let line = buffer.line(line_index).to_string();
+        if !line[buffer.cursor().saturating_sub(line_start)..]
+            .trim()
+            .is_empty()
+        {
+            return false;
+        }
+        Self::ensure_flow_line_default_tags_at_line(buffer, line_index)
+    }
+
+    fn ensure_flow_line_default_tags_at_line(buffer: &mut EditorBuffer, line_index: usize) -> bool {
+        let line_end = buffer.line_end(line_index);
+        let line = buffer.line(line_index).to_string();
+        let tags = Self::default_flow_tags_for_line(&line);
+        let missing_tags = tags
+            .into_iter()
+            .filter(|tag| {
+                !line
+                    .split_whitespace()
+                    .any(|word| word.eq_ignore_ascii_case(&format!("#{tag}")))
+            })
+            .collect::<Vec<_>>();
+        if missing_tags.is_empty() {
+            return false;
+        }
+        buffer.set_cursor(line_end);
+        buffer.insert_text(&format!(
+            " {}",
+            missing_tags
+                .iter()
+                .map(|tag| format!("#{tag}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+        true
+    }
+
+    fn default_flow_tags_for_line(line: &str) -> Vec<&'static str> {
+        let trimmed = line.trim_start();
+        if let Some(checkbox) = parse_checkbox_line(line) {
+            if checkbox.text.trim().is_empty() {
+                return Vec::new();
+            }
+            let has_extra = checkbox.text.split_whitespace().any(|word| {
+                word.starts_with('#')
+                    || word.starts_with('@')
+                    || matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "ALTA" | "MEDIA" | "BAJA"
+                    )
+                    || word.starts_with("due:")
+                    || word.starts_with("scheduled:")
+            });
+            return if has_extra {
+                vec!["task"]
+            } else {
+                vec!["task", "inbox"]
+            };
+        }
+        if trimmed.starts_with(": ") && trimmed[2..].trim().is_empty() {
+            return Vec::new();
+        }
+        if trimmed.starts_with(": ") {
+            return vec!["inbox"];
+        }
+        let Some(parsed) = parse_flow_note_or_idea_line(line, 0, None) else {
+            return Vec::new();
+        };
+        match parsed.kind {
+            FlowItemKind::Task => vec!["task"],
+            FlowItemKind::Note => vec!["note"],
+            FlowItemKind::Idea => vec!["idea"],
+            FlowItemKind::Inbox => vec!["inbox"],
+        }
+    }
+
     pub(crate) fn insert_text_with_checkbox_expansion(
         &mut self,
         buffer: &mut EditorBuffer,
         text: &str,
     ) {
-        if text == " " && buffer.selection().is_none() && buffer.cursor() >= 2 {
-            let cursor = buffer.cursor();
-            let source = buffer.as_str();
-            if source.get(cursor.saturating_sub(2)..cursor) == Some("[]") {
-                let line_index = buffer.line_index_for_byte(cursor);
-                let line_start = buffer.line_start(line_index);
-                let before_marker = &source[line_start..cursor.saturating_sub(2)];
-                let marker_allowed = before_marker.chars().all(char::is_whitespace)
-                    || before_marker
-                        .strip_suffix("- ")
-                        .map(|before_prefix| before_prefix.chars().all(char::is_whitespace))
-                        .unwrap_or(false)
-                    || before_marker
-                        .strip_suffix("-- ")
-                        .map(|before_prefix| before_prefix.chars().all(char::is_whitespace))
-                        .unwrap_or(false);
-                if marker_allowed {
-                    buffer.replace_selection_or_range(cursor - 2, cursor, "[ ] ");
-                    return;
-                }
-            }
-        }
         let inserted_at = buffer.cursor();
         buffer.insert_text(text);
-        if buffer.selection().is_none() && buffer.cursor() >= 2 {
-            let cursor = buffer.cursor();
-            if buffer.as_str().get(cursor.saturating_sub(2)..cursor) == Some("[[") {
-                self.link_assist_trigger_start = Some(cursor - 2);
-            } else if text == "[[" {
-                self.link_assist_trigger_start = Some(inserted_at);
-            }
+        if buffer.selection().is_none() && text == "[" {
+            self.link_assist_trigger_start = Some(inserted_at);
         }
     }
 
@@ -818,6 +1223,83 @@ impl EditorView {
         if extend {
             buffer.set_selection(anchor, buffer.cursor());
         }
+    }
+
+    fn insert_flow_task_metadata_start(&mut self, buffer: &mut EditorBuffer) -> bool {
+        let line_index = buffer.line_index_for_byte(buffer.cursor());
+        let line = buffer.line(line_index);
+        let Some(task) = parse_checkbox_line(line) else {
+            return false;
+        };
+        let child_indent = format!("{}  ", task.indent);
+        Self::ensure_flow_line_default_tags_at_line(buffer, line_index);
+        let insertion = format!("\n{child_indent}- scheduled: ");
+        buffer.set_cursor(buffer.line_end(line_index));
+        buffer.insert_text(&insertion);
+        self.flow_metadata_month_offset = 0;
+        true
+    }
+
+    fn handle_flow_metadata_enter(&mut self, buffer: &mut EditorBuffer) -> bool {
+        let Some(line) =
+            flow_metadata_line(buffer.line(buffer.line_index_for_byte(buffer.cursor())))
+        else {
+            return false;
+        };
+        let accepted = self.accept_flow_metadata_suggestion(buffer);
+        let line = flow_metadata_line(buffer.line(buffer.line_index_for_byte(buffer.cursor())))
+            .unwrap_or(line);
+        match line.key {
+            FlowMetadataKey::Scheduled => {
+                let child_prefix = flow_metadata_child_prefix(&line);
+                if line.value.trim().is_empty() && !accepted {
+                    let replacement = format!("{child_prefix}due: ");
+                    buffer.replace_current_line(&replacement, replacement.chars().count());
+                } else {
+                    buffer.set_cursor(buffer.line_end(buffer.line_index_for_byte(buffer.cursor())));
+                    buffer.insert_text(&format!("\n{child_prefix}due: "));
+                }
+                self.flow_metadata_month_offset = 0;
+                true
+            }
+            FlowMetadataKey::Due => {
+                if line.value.trim().is_empty() && !accepted {
+                    buffer.replace_current_line("", 0);
+                } else {
+                    buffer.set_cursor(buffer.line_end(buffer.line_index_for_byte(buffer.cursor())));
+                    buffer.insert_text("\n");
+                }
+                self.flow_metadata_month_offset = 0;
+                true
+            }
+        }
+    }
+
+    fn accept_flow_metadata_suggestion(&mut self, buffer: &mut EditorBuffer) -> bool {
+        let Some(suggestion) = self.current_flow_metadata_suggestion(buffer) else {
+            return false;
+        };
+        let line_index = buffer.line_index_for_byte(buffer.cursor());
+        let Some(line) = flow_metadata_line(buffer.line(line_index)) else {
+            return false;
+        };
+        let replacement = format!("{}{}", line.prefix, suggestion.format("%Y-%m-%d"));
+        buffer.replace_current_line(&replacement, replacement.chars().count());
+        true
+    }
+
+    fn adjust_flow_metadata_month(&mut self, buffer: &EditorBuffer, delta: i32) -> bool {
+        if self.current_flow_metadata_suggestion(buffer).is_none() {
+            return false;
+        }
+        self.flow_metadata_month_offset = self.flow_metadata_month_offset.saturating_add(delta);
+        true
+    }
+
+    fn current_flow_metadata_suggestion(&self, buffer: &EditorBuffer) -> Option<NaiveDate> {
+        let line_index = buffer.line_index_for_byte(buffer.cursor());
+        let line = flow_metadata_line(buffer.line(line_index))?;
+        suggest_flow_metadata_date(&line.value, self.flow_metadata_month_offset)
     }
 
     fn code_line_kind<'a>(
@@ -1061,6 +1543,32 @@ impl EditorView {
 
         let line = buffer.line(row.line_index);
         let line_start = buffer.line_start(row.line_index);
+        if row.start == line_start {
+            if let Some(task) = parse_checkbox_line(line) {
+                let task_color = match task.state {
+                    CheckboxState::Empty => Color32::from_rgb(136, 192, 208),
+                    CheckboxState::Doing => Color32::from_rgb(235, 203, 139),
+                    CheckboxState::Done => Color32::from_rgb(163, 190, 140),
+                };
+                let bar_rect = egui::Rect::from_min_max(
+                    egui::pos2(text_x - 7.0, y + 4.0),
+                    egui::pos2(text_x - 4.0, y + line_height - 4.0),
+                );
+                painter.rect_filled(bar_rect, 1.5, task_color);
+            } else if let Some(item) = parse_flow_note_or_idea_line(line, row.line_index, None) {
+                let item_color = match item.kind {
+                    FlowItemKind::Task => Color32::from_rgb(136, 192, 208),
+                    FlowItemKind::Note => Color32::from_rgb(180, 142, 173),
+                    FlowItemKind::Idea => Color32::from_rgb(235, 203, 139),
+                    FlowItemKind::Inbox => Color32::from_rgb(136, 154, 176),
+                };
+                let bar_rect = egui::Rect::from_min_max(
+                    egui::pos2(text_x - 7.0, y + 4.0),
+                    egui::pos2(text_x - 4.0, y + line_height - 4.0),
+                );
+                painter.rect_filled(bar_rect, 1.5, item_color);
+            }
+        }
         let cursor = buffer.cursor();
         let spans = parse_inline_code_spans(line);
         if spans.iter().any(|span| {
@@ -1356,6 +1864,64 @@ impl EditorView {
             }
         }
 
+        if let Some(item) = parse_flow_note_or_idea_line(line, row.line_index, None) {
+            let trimmed = line.trim_start();
+            let indent_len = line.len().saturating_sub(trimmed.len());
+            let marker_len = match item.kind {
+                FlowItemKind::Task => 0,
+                FlowItemKind::Note if trimmed.starts_with(":nota") => ":nota".len(),
+                FlowItemKind::Note => ":note".len(),
+                FlowItemKind::Idea => ":idea".len(),
+                FlowItemKind::Inbox => ":".len(),
+            };
+            let marker_start = line_start + indent_len;
+            let marker_end = marker_start + marker_len;
+            let text_start = marker_end;
+            let cursor_in_marker = buffer.cursor() >= marker_start && buffer.cursor() <= marker_end;
+            if !cursor_in_marker && row.start == line_start && row.end > marker_start {
+                let indent = &line[..indent_len];
+                let marker = &line[indent_len..indent_len + marker_len];
+                let indent_width = self.text_width(painter, indent, font);
+                let marker_width = self.text_width(painter, marker, font);
+                if !indent.is_empty() {
+                    painter.text(
+                        egui::pos2(text_x, y + line_height * 0.5),
+                        egui::Align2::LEFT_CENTER,
+                        indent,
+                        font.clone(),
+                        text_color,
+                    );
+                }
+                let marker_color = match item.kind {
+                    FlowItemKind::Task => Color32::from_rgb(136, 192, 208),
+                    FlowItemKind::Note => Color32::from_rgb(180, 142, 173),
+                    FlowItemKind::Idea => Color32::from_rgb(235, 203, 139),
+                    FlowItemKind::Inbox => Color32::from_rgb(136, 154, 176),
+                };
+                painter.text(
+                    egui::pos2(text_x + indent_width, y + line_height * 0.5),
+                    egui::Align2::LEFT_CENTER,
+                    marker,
+                    font.clone(),
+                    marker_color,
+                );
+                if row.end > text_start {
+                    self.paint_flow_task_text(
+                        painter,
+                        buffer,
+                        text_start,
+                        row.end,
+                        text_x + indent_width + marker_width,
+                        y,
+                        line_height,
+                        font,
+                        text_color,
+                    );
+                }
+                return;
+            }
+        }
+
         let Some(parsed) = parse_checkbox_line(line) else {
             if let Some(list) = parse_list_line(line) {
                 let marker_start = line_start + list.indent.len();
@@ -1387,13 +1953,33 @@ impl EditorView {
                         marker_color,
                     );
                     if row.end > marker_end {
-                        painter.text(
-                            egui::pos2(text_x + indent_width + marker_width, y + line_height * 0.5),
-                            egui::Align2::LEFT_CENTER,
-                            &buffer.as_str()[marker_end..row.end],
-                            font.clone(),
+                        let text_row = VisualRow {
+                            line_index: row.line_index,
+                            start: marker_end,
+                            end: row.end,
+                        };
+                        if !self.paint_markdown_link_text(
+                            painter,
+                            buffer,
+                            text_row,
+                            text_x + indent_width + marker_width,
+                            y,
+                            line_height,
+                            font,
                             text_color,
-                        );
+                        ) {
+                            self.paint_flow_task_text(
+                                painter,
+                                buffer,
+                                marker_end,
+                                row.end,
+                                text_x + indent_width + marker_width,
+                                y,
+                                line_height,
+                                font,
+                                text_color,
+                            );
+                        }
                     }
                     return;
                 }
@@ -1436,13 +2022,13 @@ impl EditorView {
 
         let marker_start = line_start + parsed.indent.len() + parsed.task_prefix.len();
         let marker_text_end = marker_start + parsed.marker.len();
-        let marker_end = marker_text_end + 1;
+        let text_start = marker_text_end;
         let cursor_in_checkbox =
             buffer.cursor() >= marker_start && buffer.cursor() <= marker_text_end;
         if cursor_in_checkbox
             || row.start != line_start
             || row.end <= marker_start
-            || row.start >= marker_end
+            || row.start >= text_start
         {
             painter.text(
                 egui::pos2(text_x, y + line_height * 0.5),
@@ -1456,8 +2042,7 @@ impl EditorView {
 
         let indent_width = self.text_width(painter, parsed.indent, font);
         let prefix_width = self.text_width(painter, parsed.task_prefix, font);
-        let checkbox_slot = if parsed.marker == "[]" { "[] " } else { "[x] " };
-        let checkbox_slot_width = self.text_width(painter, checkbox_slot, font);
+        let checkbox_slot_width = self.text_width(painter, parsed.marker, font);
         if !parsed.indent.is_empty() {
             painter.text(
                 egui::pos2(text_x, y + line_height * 0.5),
@@ -1527,19 +2112,107 @@ impl EditorView {
             }
         }
 
-        let text_start = marker_end;
         if row.end > text_start {
+            self.paint_flow_task_text(
+                painter,
+                buffer,
+                text_start,
+                row.end,
+                text_x + indent_width + prefix_width + checkbox_slot_width,
+                y,
+                line_height,
+                font,
+                text_color,
+            );
+        }
+    }
+
+    fn paint_flow_task_text(
+        &self,
+        painter: &egui::Painter,
+        buffer: &EditorBuffer,
+        text_start: usize,
+        text_end: usize,
+        x: f32,
+        y: f32,
+        line_height: f32,
+        font: &FontId,
+        text_color: Color32,
+    ) {
+        let mut cursor = text_start;
+        for (token_start, token_end, color) in
+            flow_task_token_spans(buffer.as_str(), text_start, text_end)
+        {
+            if cursor < token_start {
+                let segment_x =
+                    x + self.text_width(painter, &buffer.as_str()[text_start..cursor], font);
+                painter.text(
+                    egui::pos2(segment_x, y + line_height * 0.5),
+                    egui::Align2::LEFT_CENTER,
+                    &buffer.as_str()[cursor..token_start],
+                    font.clone(),
+                    text_color,
+                );
+            }
+            let token_x =
+                x + self.text_width(painter, &buffer.as_str()[text_start..token_start], font);
             painter.text(
-                egui::pos2(
-                    text_x + indent_width + prefix_width + checkbox_slot_width,
-                    y + line_height * 0.5,
-                ),
+                egui::pos2(token_x, y + line_height * 0.5),
                 egui::Align2::LEFT_CENTER,
-                &buffer.as_str()[text_start..row.end],
+                &buffer.as_str()[token_start..token_end],
+                font.clone(),
+                color,
+            );
+            cursor = token_end;
+        }
+        if cursor < text_end {
+            let segment_x =
+                x + self.text_width(painter, &buffer.as_str()[text_start..cursor], font);
+            painter.text(
+                egui::pos2(segment_x, y + line_height * 0.5),
+                egui::Align2::LEFT_CENTER,
+                &buffer.as_str()[cursor..text_end],
                 font.clone(),
                 text_color,
             );
         }
+    }
+
+    fn paint_flow_metadata_suggestion(
+        &self,
+        painter: &egui::Painter,
+        buffer: &EditorBuffer,
+        row: VisualRow,
+        text_x: f32,
+        y: f32,
+        line_height: f32,
+        font: &FontId,
+        render_markdown: bool,
+    ) {
+        if !render_markdown || row.start != buffer.line_start(row.line_index) {
+            return;
+        }
+        if buffer.line_index_for_byte(buffer.cursor()) != row.line_index {
+            return;
+        }
+        let Some(line) = flow_metadata_line(buffer.line(row.line_index)) else {
+            return;
+        };
+        if line.value.trim().is_empty() {
+            return;
+        }
+        let Some(suggestion) = self.current_flow_metadata_suggestion(buffer) else {
+            return;
+        };
+        let ghost = format!(" → {}", suggestion.format("%Y-%m-%d"));
+        let x = text_x + self.text_width(painter, buffer.line(row.line_index), font) + 8.0;
+        painter.text(
+            egui::pos2(x, y + line_height * 0.5),
+            egui::Align2::LEFT_CENTER,
+            ghost,
+            font.clone(),
+            Color32::from_rgb(94, 105, 126),
+        );
     }
 
     fn paint_markdown_link_text(
@@ -1588,6 +2261,8 @@ impl EditorView {
             let link_text = Color32::from_rgb(136, 192, 208);
             let link_target = Color32::from_rgb(163, 190, 140);
             let link_heading = Color32::from_rgb(235, 203, 139);
+            let label_line_start =
+                source_label_line_fragment(buffer.as_str(), text_start, text_end);
             let mut segments = vec![
                 (byte, marker_start.min(row.end), text_color),
                 (
@@ -1595,14 +2270,29 @@ impl EditorView {
                     text_start.min(row.end),
                     link_dim,
                 ),
-                (text_start.max(row.start), text_end.min(row.end), link_text),
+            ];
+            if let Some(line_start) = label_line_start {
+                segments.push((
+                    text_start.max(row.start),
+                    line_start.min(row.end),
+                    link_target,
+                ));
+                segments.push((
+                    line_start.max(row.start),
+                    text_end.min(row.end),
+                    link_heading,
+                ));
+            } else {
+                segments.push((text_start.max(row.start), text_end.min(row.end), link_text));
+            }
+            segments.extend([
                 (text_end.max(row.start), target_start.min(row.end), link_dim),
                 (
                     target_start.max(row.start),
                     target_path_end.min(row.end),
                     link_target,
                 ),
-            ];
+            ]);
             if let Some(fragment_start) = target_fragment_start {
                 segments.push((
                     fragment_start.max(row.start),
@@ -1800,8 +2490,8 @@ impl EditorView {
         if start >= end {
             return;
         }
-        let start_x = text_x + self.text_width(painter, &buffer.as_str()[row.start..start], font);
-        let end_x = text_x + self.text_width(painter, &buffer.as_str()[row.start..end], font);
+        let start_x = self.visual_x_for_byte(painter, buffer, row, start, text_x, font);
+        let end_x = self.visual_x_for_byte(painter, buffer, row, end, text_x, font);
         let rect = egui::Rect::from_min_max(
             egui::pos2(start_x, y + 2.0),
             egui::pos2(end_x.min(right), y + line_height - 2.0),
@@ -1810,7 +2500,7 @@ impl EditorView {
     }
 
     pub(crate) fn paint_cursor(
-        &self,
+        &mut self,
         ui: &egui::Ui,
         painter: &egui::Painter,
         buffer: &EditorBuffer,
@@ -1828,8 +2518,8 @@ impl EditorView {
         if y + line_height < rect.top() || y > rect.bottom() {
             return;
         }
-        let x =
-            text_x + self.text_width(painter, &buffer.as_str()[row.start..buffer.cursor()], font);
+        let x = self.visual_x_for_byte(painter, buffer, row, buffer.cursor(), text_x, font);
+        self.last_cursor_pos = Some(egui::pos2(x, y + line_height));
         painter.line_segment(
             [egui::pos2(x, y + 3.0), egui::pos2(x, y + line_height - 3.0)],
             Stroke::new(1.5, Color32::from_rgb(236, 239, 244)),
@@ -1846,6 +2536,58 @@ impl EditorView {
                 .size()
                 .x
         }
+    }
+
+    fn visual_x_for_byte(
+        &self,
+        painter: &egui::Painter,
+        buffer: &EditorBuffer,
+        row: VisualRow,
+        byte: usize,
+        text_x: f32,
+        font: &FontId,
+    ) -> f32 {
+        let byte = byte.max(row.start).min(row.end);
+        if row.start != buffer.line_start(row.line_index) {
+            return text_x + self.text_width(painter, &buffer.as_str()[row.start..byte], font);
+        }
+        let line = buffer.line(row.line_index);
+        let Some(parsed) = parse_checkbox_line(line) else {
+            return text_x + self.text_width(painter, &buffer.as_str()[row.start..byte], font);
+        };
+        let marker_start = row.start + parsed.indent.len() + parsed.task_prefix.len();
+        let marker_text_end = marker_start + parsed.marker.len();
+        if byte < marker_text_end {
+            return text_x + self.text_width(painter, &buffer.as_str()[row.start..byte], font);
+        }
+        let indent_width = self.text_width(painter, parsed.indent, font);
+        let prefix_width = self.text_width(painter, parsed.task_prefix, font);
+        let checkbox_slot_width = self.text_width(painter, parsed.marker, font);
+        text_x
+            + indent_width
+            + prefix_width
+            + checkbox_slot_width
+            + self.text_width(painter, &buffer.as_str()[marker_text_end..byte], font)
+    }
+
+    fn row_for_pointer(
+        &self,
+        buffer: &EditorBuffer,
+        rows: &[VisualRow],
+        rect: egui::Rect,
+        line_height: f32,
+        pointer_y: f32,
+    ) -> VisualRow {
+        let row_index = ((self.scroll_y + pointer_y - rect.top()) / line_height)
+            .floor()
+            .max(0.0) as usize;
+        rows.get(row_index.min(rows.len().saturating_sub(1)))
+            .copied()
+            .unwrap_or(VisualRow {
+                line_index: 0,
+                start: 0,
+                end: buffer.line_end(0),
+            })
     }
 
     pub(crate) fn byte_for_x(
@@ -1885,6 +2627,14 @@ impl EditorView {
         self.link_click_byte.take()
     }
 
+    pub(crate) fn take_link_click_target(&mut self) -> Option<String> {
+        self.link_click_target.take()
+    }
+
+    pub(crate) fn take_virtual_line_click(&mut self) -> Option<String> {
+        self.virtual_line_click.take()
+    }
+
     pub(crate) fn take_link_assist_trigger_start(&mut self) -> Option<usize> {
         self.link_assist_trigger_start.take()
     }
@@ -1893,6 +2643,166 @@ impl EditorView {
     pub(crate) fn clear_scroll_target(&mut self) {
         self.target_cursor = None;
     }
+}
+
+fn flow_metadata_line(line: &str) -> Option<FlowMetadataLine> {
+    let trimmed = line.trim_start();
+    let indent_len = line.len() - trimmed.len();
+    let indent = &line[..indent_len];
+    let rest = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+    if let Some(value) = rest.strip_prefix("scheduled:") {
+        return Some(FlowMetadataLine {
+            key: FlowMetadataKey::Scheduled,
+            prefix: format!("{indent}- scheduled: "),
+            value: value.trim_start().to_string(),
+        });
+    }
+    if let Some(value) = rest.strip_prefix("due:") {
+        return Some(FlowMetadataLine {
+            key: FlowMetadataKey::Due,
+            prefix: format!("{indent}- due: "),
+            value: value.trim_start().to_string(),
+        });
+    }
+    None
+}
+
+fn flow_metadata_child_prefix(line: &FlowMetadataLine) -> String {
+    line.prefix
+        .strip_suffix("scheduled: ")
+        .or_else(|| line.prefix.strip_suffix("due: "))
+        .unwrap_or(&line.prefix)
+        .to_string()
+}
+
+fn suggest_flow_metadata_date(value: &str, month_offset: i32) -> Option<NaiveDate> {
+    let value = value.trim();
+    if value.is_empty() || NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok() {
+        return None;
+    }
+    let numbers = value
+        .split(|ch: char| !ch.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u32>().ok())
+        .collect::<Vec<_>>();
+    let today = Local::now().date_naive();
+    match numbers.as_slice() {
+        [day] if (1..=31).contains(day) => {
+            let mut year = today.year();
+            let mut month = today.month();
+            let max_day = days_in_month(year, month);
+            let candidate = NaiveDate::from_ymd_opt(year, month, (*day).min(max_day))?;
+            if candidate < today {
+                (year, month) = add_months(year, month, 1);
+            }
+            let (year, month) = add_months(year, month, month_offset);
+            let day = (*day).min(days_in_month(year, month));
+            NaiveDate::from_ymd_opt(year, month, day)
+        }
+        [day, month] if (1..=31).contains(day) && (1..=12).contains(month) => {
+            let mut year = today.year();
+            let max_day = days_in_month(year, *month);
+            let candidate = NaiveDate::from_ymd_opt(year, *month, (*day).min(max_day))?;
+            if candidate < today {
+                year += 1;
+            }
+            let (year, month) = add_months(year, *month, month_offset);
+            let day = (*day).min(days_in_month(year, month));
+            NaiveDate::from_ymd_opt(year, month, day)
+        }
+        [day, month, year] if (1..=31).contains(day) && (1..=12).contains(month) => {
+            let year = if *year < 100 {
+                2000 + *year as i32
+            } else {
+                *year as i32
+            };
+            let (year, month) = add_months(year, *month, month_offset);
+            let day = (*day).min(days_in_month(year, month));
+            NaiveDate::from_ymd_opt(year, month, day)
+        }
+        _ => None,
+    }
+}
+
+fn add_months(year: i32, month: u32, offset: i32) -> (i32, u32) {
+    let total = year * 12 + month as i32 - 1 + offset;
+    (total.div_euclid(12), total.rem_euclid(12) as u32 + 1)
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    let (next_year, next_month) = add_months(year, month, 1);
+    let Some(first_next) = NaiveDate::from_ymd_opt(next_year, next_month, 1) else {
+        return 28;
+    };
+    first_next.pred_opt().map(|date| date.day()).unwrap_or(28)
+}
+
+fn flow_task_token_spans(
+    text: &str,
+    text_start: usize,
+    text_end: usize,
+) -> Vec<(usize, usize, Color32)> {
+    let mut spans = Vec::new();
+    let slice = &text[text_start..text_end];
+    let mut token_start = None;
+    for (offset, ch) in slice
+        .char_indices()
+        .chain(std::iter::once((slice.len(), ' ')))
+    {
+        if ch.is_whitespace() {
+            if let Some(start) = token_start.take() {
+                let end = offset;
+                let token = &slice[start..end];
+                let trimmed = token.trim_matches(|ch: char| matches!(ch, ',' | ';' | ')' | '('));
+                let color = if trimmed.starts_with('#') && trimmed.len() > 1 {
+                    Some(Color32::from_rgb(136, 192, 208))
+                } else if trimmed.starts_with('@') && trimmed.len() > 1 {
+                    Some(Color32::from_rgb(180, 142, 173))
+                } else if matches!(trimmed, "ALTA" | "MEDIA" | "BAJA") {
+                    Some(match trimmed {
+                        "ALTA" => Color32::from_rgb(235, 203, 139),
+                        "MEDIA" => Color32::from_rgb(163, 190, 140),
+                        _ => Color32::from_rgb(136, 154, 176),
+                    })
+                } else if matches!(trimmed, "due:" | "scheduled:" | "related:" | "note:") {
+                    Some(Color32::from_rgb(94, 105, 126))
+                } else {
+                    None
+                };
+                if let Some(color) = color {
+                    spans.push((text_start + start, text_start + end, color));
+                }
+            }
+        } else if token_start.is_none() {
+            token_start = Some(offset);
+        }
+    }
+    spans
+}
+
+fn markdown_file_label_from_target(target: &str) -> Option<String> {
+    if target.contains("://") || target.starts_with("mailto:") {
+        return None;
+    }
+    let without_fragment = target
+        .split_once('#')
+        .map(|(path, _)| path)
+        .unwrap_or(target);
+    let path_part = without_fragment
+        .split_once('?')
+        .map(|(path, _)| path)
+        .unwrap_or(without_fragment);
+    let extension = Path::new(path_part)
+        .extension()
+        .and_then(|extension| extension.to_str())?;
+    if !matches!(extension.to_ascii_lowercase().as_str(), "md" | "markdown") {
+        return None;
+    }
+    Path::new(path_part)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.trim().is_empty())
+        .map(|stem| stem.to_string())
 }
 
 fn text_input_from_events(events: &[egui::Event]) -> Option<String> {
@@ -1984,6 +2894,18 @@ mod tests {
     }
 
     #[test]
+    fn enter_inside_empty_markdown_file_link_uses_file_stem_as_label() {
+        let mut buffer = EditorBuffer::from_text("[](docs/periscope.md#ideas)".to_string());
+        buffer.set_cursor(1);
+
+        assert!(EditorView::insert_space_after_markdown_link_label(
+            &mut buffer
+        ));
+        assert_eq!(buffer.as_str(), "[periscope](docs/periscope.md#ideas)");
+        assert_eq!(buffer.cursor(), buffer.as_str().len());
+    }
+
+    #[test]
     fn enter_inside_empty_markdown_link_label_moves_after_link_with_space() {
         let mut buffer = EditorBuffer::from_text("[](https://example.com)".to_string());
         buffer.set_cursor(1);
@@ -2008,54 +2930,54 @@ mod tests {
     }
 
     #[test]
-    fn expands_compact_empty_checkbox_when_space_is_typed() {
+    fn keeps_compact_empty_checkbox_when_space_is_typed() {
         let mut buffer = EditorBuffer::from_text("[]".to_string());
         buffer.set_cursor(2);
         let mut view = EditorView::new();
 
         view.insert_text_with_checkbox_expansion(&mut buffer, " ");
 
-        assert_eq!(buffer.as_str(), "[ ] ");
-        assert_eq!(buffer.cursor(), 4);
+        assert_eq!(buffer.as_str(), "[] ");
+        assert_eq!(buffer.cursor(), 3);
     }
 
     #[test]
-    fn expands_compact_empty_subtask_when_space_is_typed() {
+    fn keeps_compact_empty_subtask_when_space_is_typed() {
         let mut buffer = EditorBuffer::from_text("- []".to_string());
         buffer.set_cursor(4);
         let mut view = EditorView::new();
 
         view.insert_text_with_checkbox_expansion(&mut buffer, " ");
 
-        assert_eq!(buffer.as_str(), "- [ ] ");
-        assert_eq!(buffer.cursor(), 6);
+        assert_eq!(buffer.as_str(), "- [] ");
+        assert_eq!(buffer.cursor(), 5);
     }
 
     #[test]
-    fn expands_compact_empty_subsubtask_when_space_is_typed() {
+    fn keeps_compact_empty_subsubtask_when_space_is_typed() {
         let mut buffer = EditorBuffer::from_text("-- []".to_string());
         buffer.set_cursor(5);
         let mut view = EditorView::new();
 
         view.insert_text_with_checkbox_expansion(&mut buffer, " ");
 
-        assert_eq!(buffer.as_str(), "-- [ ] ");
-        assert_eq!(buffer.cursor(), 7);
+        assert_eq!(buffer.as_str(), "-- [] ");
+        assert_eq!(buffer.cursor(), 6);
     }
 
     #[test]
     fn cycles_checkbox_state_on_current_line() {
-        let mut buffer = EditorBuffer::from_text("[ ] todo".to_string());
+        let mut buffer = EditorBuffer::from_text("[]todo".to_string());
         buffer.set_cursor(1);
 
         assert!(EditorView::cycle_current_line_checkbox(&mut buffer));
-        assert_eq!(buffer.as_str(), "[/] todo");
+        assert_eq!(buffer.as_str(), "[/]todo");
 
         assert!(EditorView::cycle_current_line_checkbox(&mut buffer));
-        assert_eq!(buffer.as_str(), "[x] todo");
+        assert_eq!(buffer.as_str(), "[x]todo");
 
         assert!(EditorView::cycle_current_line_checkbox(&mut buffer));
-        assert_eq!(buffer.as_str(), "[ ] todo");
+        assert_eq!(buffer.as_str(), "[]todo");
     }
 
     #[test]
@@ -2067,6 +2989,43 @@ mod tests {
 
         assert_eq!(buffer.as_str(), "[/] todo");
         assert_eq!(buffer.cursor(), 8);
+    }
+
+    #[test]
+    fn starting_flow_metadata_adds_default_task_tags_first() {
+        let mut buffer = EditorBuffer::from_text("[] nombre del task".to_string());
+        buffer.set_cursor(buffer.as_str().len());
+        let mut view = EditorView::new();
+
+        assert!(view.insert_flow_task_metadata_start(&mut buffer));
+        assert_eq!(
+            buffer.as_str(),
+            "[] nombre del task #task #inbox\n  - scheduled: "
+        );
+    }
+
+    #[test]
+    fn flow_metadata_empty_scheduled_becomes_due_without_nesting_key() {
+        let mut buffer = EditorBuffer::from_text("- [ ] task\n  - scheduled: ".to_string());
+        buffer.set_cursor(buffer.as_str().len());
+        let mut view = EditorView::new();
+
+        assert!(view.handle_flow_metadata_enter(&mut buffer));
+
+        assert_eq!(buffer.as_str(), "- [ ] task\n  - due: ");
+        assert!(!buffer.as_str().contains("scheduled: due:"));
+    }
+
+    #[test]
+    fn flow_metadata_scheduled_date_inserts_due_sibling() {
+        let mut buffer = EditorBuffer::from_text("- [ ] task\n  - scheduled: 10".to_string());
+        buffer.set_cursor(buffer.as_str().len());
+        let mut view = EditorView::new();
+
+        assert!(view.handle_flow_metadata_enter(&mut buffer));
+
+        assert!(buffer.as_str().contains("\n  - due: "));
+        assert!(!buffer.as_str().contains("scheduled: due:"));
     }
 
     #[test]

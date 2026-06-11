@@ -1,12 +1,23 @@
+mod agenda;
+mod commands;
+mod daily;
 mod editor_buffer;
 mod editor_view;
+mod file_dialogs;
+mod flow;
+mod flow_edit;
+mod flow_runtime;
 mod goto;
+mod link_ui;
 mod markdown;
+mod periscope;
+mod scratch;
 mod search;
 
 use std::{
-    collections::{BinaryHeap, HashSet},
+    collections::HashSet,
     fs,
+    hash::{Hash, Hasher},
     io::Write,
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
@@ -15,37 +26,96 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use agenda::{AgendaDatedRow, AgendaFocus, AgendaItem, AgendaTab};
+use chrono::{Datelike, Duration, Local, NaiveDate};
+use commands::{
+    COMMAND_SPECS, Command, CommandLineAction, CommandLineNumberMode, CommandSpec, CommandUsage,
+    best_command_token, clamp_history_limit, command_name, command_prefix, fuzzy_score,
+    parse_command_line,
+};
+use daily::{DailyEvent, DailyEventKind};
 use editor_buffer::EditorBuffer;
 use editor_view::{EditorView, LineNumberMode};
 use eframe::egui::{
     self, Color32, FontFamily, FontId, Key, RichText, Stroke, TextEdit, Vec2,
     text::{LayoutJob, LayoutSection, TextFormat},
 };
+use file_dialogs::FilePickerMode;
+use flow_edit::{
+    FlowItemEditState, FlowOrgMode as AgendaOrgMode, org_query_at_cursor, org_token_span_at_cursor,
+    organization_suggestions, organization_token, replace_org_token_at_cursor,
+};
 use goto::GotoTarget;
+use link_ui::{LinkAssistChoice, LinkHeadingOption};
 use markdown::{
     CheckboxState, TableAlignment, is_markdown_separator, is_markdown_table_start,
     markdown_link_target_at_byte, parse_blockquote_line, parse_checkbox_line,
     parse_fenced_code_marker, parse_heading_line, parse_inline_code_spans, parse_list_line,
     parse_markdown_link_spans, parse_markdown_table_separator, split_markdown_table_row,
 };
+use periscope::{PeriscopeIndexedPath, PeriscopeMode, PeriscopeRow};
+use scratch::ScratchEntry;
 use search::SearchState;
 
 const PERISCOPE_RESULT_LIMIT: usize = 100;
+const DEFAULT_CURSOR_SIZE: &str = "24";
+
+fn normalize_cursor_environment() {
+    if std::env::var_os("XCURSOR_SIZE").is_none() {
+        // eframe/winit runs Slate through X11/XWayland in this build. Without an
+        // explicit cursor size, some desktops/themes pick a huge client-side
+        // cursor only inside the app window.
+        unsafe {
+            std::env::set_var("XCURSOR_SIZE", DEFAULT_CURSOR_SIZE);
+        }
+    }
+    if std::env::var_os("HYPRCURSOR_SIZE").is_none() {
+        unsafe {
+            std::env::set_var("HYPRCURSOR_SIZE", DEFAULT_CURSOR_SIZE);
+        }
+    }
+}
 
 fn main() -> eframe::Result {
-    let mut scratch = false;
-    let mut path = None;
+    normalize_cursor_environment();
 
-    for arg in std::env::args().skip(1) {
+    let raw_args = std::env::args().skip(1).collect::<Vec<_>>();
+    if raw_args.first().map(String::as_str) == Some("flow-api") {
+        if let Err(err) = run_flow_api(&raw_args[1..]) {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    let mut scratch = false;
+    let mut standalone_agenda = false;
+    let mut path = None;
+    let mut startup_line = None;
+    let mut args = raw_args.into_iter().peekable();
+
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "--scratch" | "-s" => scratch = true,
+            "--agenda" | "--ag" => standalone_agenda = true,
+            "--line" | "-l" => {
+                startup_line = args.next().and_then(|value| value.parse::<usize>().ok());
+            }
             _ => path = Some(PathBuf::from(arg)),
         }
     }
 
-    let title = if scratch { "Slate Scratch" } else { "Slate" };
+    let title = if scratch {
+        "Slate Scratch"
+    } else if standalone_agenda {
+        "Slate Agenda"
+    } else {
+        "Slate"
+    };
     let size = if scratch {
         [760.0, 460.0]
+    } else if standalone_agenda {
+        [900.0, 620.0]
     } else {
         [900.0, 560.0]
     };
@@ -54,7 +124,11 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title(title)
             .with_inner_size(size)
-            .with_min_inner_size([420.0, 260.0]),
+            .with_min_inner_size(if standalone_agenda {
+                [620.0, 360.0]
+            } else {
+                [420.0, 260.0]
+            }),
         vsync: false,
         renderer: eframe::Renderer::Glow,
         ..Default::default()
@@ -63,375 +137,590 @@ fn main() -> eframe::Result {
     eframe::run_native(
         title,
         options,
-        Box::new(|cc| Ok(Box::new(SlateApp::new(cc, path, scratch)))),
+        Box::new(|cc| {
+            Ok(Box::new(SlateApp::new(
+                cc,
+                path,
+                scratch,
+                standalone_agenda,
+                startup_line,
+            )))
+        }),
     )
 }
 
+#[derive(Clone, Debug)]
+struct FlowApiTask {
+    kind: String,
+    id: String,
+    path: PathBuf,
+    relative_path: String,
+    line_number: usize,
+    line_index: usize,
+    state: String,
+    title: String,
+    tags: Vec<String>,
+    projects: Vec<String>,
+    priority: Option<String>,
+    due: Option<String>,
+    scheduled: Option<String>,
+    heading: Option<String>,
+    source_snippet: String,
+}
+
+fn run_flow_api(args: &[String]) -> Result<(), String> {
+    let Some(command) = args.first().map(String::as_str) else {
+        return Err("Usage: slate flow-api list|complete|open|rescan".to_string());
+    };
+    match command {
+        "list" => {
+            let scope = flow_api_scope(args)?;
+            let days = flow_api_usize_arg(args, "--days").unwrap_or(45);
+            flow_api_rescan_if_empty(&scope)?;
+            let tasks = flow_api_load_tasks(&scope)?;
+            println!("{}", flow_api_tasks_json(&tasks, days));
+            Ok(())
+        }
+        "complete" => {
+            let id = args
+                .get(1)
+                .ok_or_else(|| "Usage: slate flow-api complete <id> [--scope PATH]".to_string())?;
+            let scope = flow_api_scope(args)?;
+            flow_api_complete(&scope, id)?;
+            println!("{{\"ok\":true}}");
+            Ok(())
+        }
+        "open" => {
+            let id = args
+                .get(1)
+                .ok_or_else(|| "Usage: slate flow-api open <id> [--scope PATH]".to_string())?;
+            let scope = flow_api_scope(args)?;
+            let task = flow_api_load_tasks(&scope)?
+                .into_iter()
+                .find(|task| task.id == *id)
+                .ok_or_else(|| format!("Slate Flow API task not found: {id}"))?;
+            ProcessCommand::new(std::env::current_exe().map_err(|err| err.to_string())?)
+                .arg(&task.path)
+                .arg("--line")
+                .arg(task.line_number.to_string())
+                .spawn()
+                .map_err(|err| format!("Slate Flow API open failed: {err}"))?;
+            println!("{{\"ok\":true}}");
+            Ok(())
+        }
+        "rescan" => {
+            let scope = flow_api_scope(args)?;
+            let (files, tasks) = flow_api_rescan(&scope)?;
+            println!(
+                "{{\"ok\":true,\"indexedFiles\":{},\"indexedTasks\":{}}}",
+                files, tasks
+            );
+            Ok(())
+        }
+        _ => Err(format!("Unknown Slate Flow API command: {command}")),
+    }
+}
+
+fn flow_api_scope(args: &[String]) -> Result<PathBuf, String> {
+    if let Some(scope) = flow_api_string_arg(args, "--scope") {
+        return Ok(flow_api_normalize_scope(PathBuf::from(scope))?);
+    }
+    if let Ok(scope) = std::env::var("SLATE_FLOW_SCOPE") {
+        if !scope.trim().is_empty() {
+            return Ok(flow_api_normalize_scope(PathBuf::from(scope))?);
+        }
+    }
+    let cwd = std::env::current_dir().map_err(|err| format!("Flow API scope failed: {err}"))?;
+    Ok(flow_api_normalize_scope(cwd)?)
+}
+
+fn flow_api_normalize_scope(path: PathBuf) -> Result<PathBuf, String> {
+    let path = if path.exists() {
+        fs::canonicalize(&path).map_err(|err| format!("Flow API scope failed: {err}"))?
+    } else {
+        path
+    };
+    if path.is_file() {
+        Ok(SlateApp::flow_project_root_for_path(&path))
+    } else if path.join(".git").is_dir() || path.join(".slate").is_dir() {
+        Ok(path)
+    } else {
+        Ok(SlateApp::flow_project_root_for_path(&path.join("inbox.md")))
+    }
+}
+
+fn flow_api_string_arg(args: &[String], flag: &str) -> Option<String> {
+    args.windows(2)
+        .find_map(|pair| (pair[0] == flag).then(|| pair[1].clone()))
+}
+
+fn flow_api_usize_arg(args: &[String], flag: &str) -> Option<usize> {
+    flow_api_string_arg(args, flag).and_then(|value| value.parse().ok())
+}
+
+fn flow_api_rescan_if_empty(scope: &Path) -> Result<(), String> {
+    let sqlite_path = SlateApp::flow_sqlite_path_for_root(scope)?;
+    if !sqlite_path.exists() {
+        let _ = flow_api_rescan(scope)?;
+    }
+    Ok(())
+}
+
+fn flow_api_rescan(scope: &Path) -> Result<(usize, usize), String> {
+    let sqlite_path = SlateApp::flow_sqlite_path_for_root(scope)?;
+    let mut files = Vec::new();
+    SlateApp::collect_flow_markdown_files(scope, &mut files, 20_000);
+    let mut indexed_files = 0usize;
+    let mut indexed_tasks = 0usize;
+    for path in files {
+        let Ok(contents) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let summary = flow::update_flow_index_for_file(scope, &sqlite_path, &path, &contents)?;
+        indexed_files += 1;
+        indexed_tasks += summary.tasks.len();
+    }
+    Ok((indexed_files, indexed_tasks))
+}
+
+fn flow_api_load_tasks(scope: &Path) -> Result<Vec<FlowApiTask>, String> {
+    let sqlite_path = SlateApp::flow_sqlite_path_for_root(scope)?;
+    if !sqlite_path.exists() {
+        return Ok(Vec::new());
+    }
+    let query = "SELECT path, line_number, line_index, COALESCE(kind,'task'), state, title, tags, projects, COALESCE(priority,''), COALESCE(due,''), COALESCE(scheduled,''), COALESCE(heading,''), source_snippet FROM tasks ORDER BY COALESCE(scheduled, due, ''), path, line_number;";
+    let output = ProcessCommand::new("sqlite3")
+        .arg("-separator")
+        .arg("\t")
+        .arg(&sqlite_path)
+        .arg(query)
+        .output()
+        .map_err(|err| format!("Slate Flow API failed: sqlite3 unavailable: {err}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| flow_api_parse_row(scope, line))
+        .collect())
+}
+
+fn flow_api_parse_row(scope: &Path, line: &str) -> Option<FlowApiTask> {
+    let mut fields = line.split('\t');
+    let relative_path = fields.next()?.to_string();
+    let line_number = fields.next()?.parse().ok()?;
+    let line_index = fields.next()?.parse().ok()?;
+    let kind = fields.next()?.to_string();
+    let state = fields.next()?.to_string();
+    let title = fields.next()?.to_string();
+    let tags = split_cache_list(fields.next()?);
+    let projects = split_cache_list(fields.next()?);
+    let priority = non_empty_string(fields.next()?);
+    let due = non_empty_string(fields.next()?);
+    let scheduled = non_empty_string(fields.next()?);
+    let heading = non_empty_string(fields.next().unwrap_or(""));
+    let source_snippet = fields.next().unwrap_or("").to_string();
+    let id = flow_api_task_id(scope, &relative_path, line_number, &title);
+    Some(FlowApiTask {
+        kind,
+        id,
+        path: scope.join(&relative_path),
+        relative_path,
+        line_number,
+        line_index,
+        state,
+        title,
+        tags,
+        projects,
+        priority,
+        due,
+        scheduled,
+        heading,
+        source_snippet,
+    })
+}
+
+fn flow_api_task_id(scope: &Path, relative_path: &str, line_number: usize, title: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    scope.display().to_string().hash(&mut hasher);
+    let scope_hash = hasher.finish();
+    let mut title_hasher = std::collections::hash_map::DefaultHasher::new();
+    title.hash(&mut title_hasher);
+    format!(
+        "slate:{scope_hash:016x}:{}:{line_number}:{:016x}",
+        relative_path.replace(':', "%3A"),
+        title_hasher.finish()
+    )
+}
+
+fn flow_api_complete(scope: &Path, id: &str) -> Result<(), String> {
+    let task = flow_api_load_tasks(scope)?
+        .into_iter()
+        .find(|task| task.id == id)
+        .ok_or_else(|| format!("Slate Flow API task not found: {id}"))?;
+    if task.kind != "task" {
+        return Err(format!(
+            "Slate Flow API cannot complete {} items",
+            task.kind
+        ));
+    }
+    if task.state == "done" {
+        return Ok(());
+    }
+
+    // Always leave a tiny local completion request for any open Slate window.
+    // If the task is in a dirty in-memory buffer, the API process cannot safely
+    // edit that memory directly, so the running editor applies this request on
+    // its next UI tick and refreshes the derived agenda cache.
+    append_flow_completion_request(scope, &task)?;
+
+    let contents = fs::read_to_string(&task.path)
+        .map_err(|err| format!("Slate Flow API complete failed reading source: {err}"))?;
+    let mut lines = contents.lines().map(str::to_string).collect::<Vec<_>>();
+    let Some(line) = lines.get_mut(task.line_index) else {
+        return Ok(());
+    };
+    if line.trim_end() != task.source_snippet.trim_end() {
+        return Ok(());
+    }
+    let Some(parsed) = parse_checkbox_line(line) else {
+        return Ok(());
+    };
+    let marker_start = parsed.indent.len() + parsed.task_prefix.len();
+    let marker_end = marker_start + parsed.marker.len();
+    line.replace_range(marker_start..marker_end, "[x]");
+    let mut next = lines.join("\n");
+    if contents.ends_with('\n') {
+        next.push('\n');
+    }
+    let tmp = task.path.with_extension(format!(
+        "{}.tmp",
+        task.path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("md")
+    ));
+    fs::write(&tmp, next).map_err(|err| format!("Slate Flow API complete write failed: {err}"))?;
+    fs::rename(&tmp, &task.path)
+        .map_err(|err| format!("Slate Flow API complete replace failed: {err}"))?;
+    let updated = fs::read_to_string(&task.path)
+        .map_err(|err| format!("Slate Flow API reindex read failed: {err}"))?;
+    flow::update_flow_index_for_file(
+        scope,
+        &SlateApp::flow_sqlite_path_for_root(scope)?,
+        &task.path,
+        &updated,
+    )?;
+    Ok(())
+}
+
+fn append_flow_completion_request(scope: &Path, task: &FlowApiTask) -> Result<(), String> {
+    flow_runtime::append_completion_request(
+        &SlateApp::flow_sqlite_path_for_root(scope)?,
+        &task.id,
+        &task.relative_path,
+        task.line_index,
+        &task.title,
+    )
+}
+
+fn append_flow_organization_request(
+    scope: &Path,
+    item: &AgendaItem,
+    token: &str,
+) -> Result<(), String> {
+    flow_runtime::append_organization_request(
+        &SlateApp::flow_sqlite_path_for_root(scope)?,
+        &item.relative_path,
+        item.line_index,
+        token,
+    )
+}
+
+fn append_flow_edit_request(
+    scope: &Path,
+    item: &AgendaItem,
+    replacement: &str,
+) -> Result<(), String> {
+    flow_runtime::append_edit_request(
+        &SlateApp::flow_sqlite_path_for_root(scope)?,
+        &item.relative_path,
+        item.line_index,
+        replacement,
+    )
+}
+
+fn append_flow_open_request(
+    scope: &Path,
+    relative_path: &str,
+    line_index: usize,
+) -> Result<(), String> {
+    flow_runtime::append_open_request(
+        &SlateApp::flow_sqlite_path_for_root(scope)?,
+        relative_path,
+        line_index,
+    )
+}
+
+fn flow_api_tasks_json(tasks: &[FlowApiTask], days: usize) -> String {
+    let today = Local::now().date_naive();
+    let horizon = today + Duration::days(days as i64);
+    let mut out = String::from("[");
+    let mut first = true;
+    for task in tasks {
+        let due = task.due.as_deref().and_then(parse_cache_date);
+        let scheduled = task.scheduled.as_deref().and_then(parse_cache_date);
+        let dated = due.or(scheduled);
+        if dated.is_some_and(|date| date > horizon) {
+            continue;
+        }
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        out.push_str(&flow_api_task_json(task));
+    }
+    out.push(']');
+    out
+}
+
+fn flow_api_task_json(task: &FlowApiTask) -> String {
+    let project = task.projects.first().cloned();
+    let priority = task.priority.as_deref().and_then(|value| match value {
+        "ALTA" => Some("high"),
+        "MEDIA" => Some("medium"),
+        "BAJA" => Some("low"),
+        _ => None,
+    });
+    format!(
+        "{{\"id\":{},\"source\":\"slate\",\"kind\":{},\"title\":{},\"status\":{},\"priority\":{},\"project\":{},\"tags\":{},\"dueIso\":{},\"scheduledAtIso\":{},\"path\":{},\"lineNumber\":{},\"heading\":{}}}",
+        json_string(&task.id),
+        json_string(&task.kind),
+        json_string(&task.title),
+        json_string(&task.state),
+        json_option(priority),
+        json_option(project.as_deref()),
+        json_string_array(&task.tags),
+        json_option(task.due.as_deref()),
+        json_option(task.scheduled.as_deref()),
+        json_string(&task.relative_path),
+        task.line_number,
+        json_option(task.heading.as_deref()),
+    )
+}
+
+fn json_option(value: Option<&str>) -> String {
+    value.map(json_string).unwrap_or_else(|| "null".to_string())
+}
+
+fn json_string_array(values: &[String]) -> String {
+    format!(
+        "[{}]",
+        values
+            .iter()
+            .map(|value| json_string(value))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn collect_link_target_files(root: &Path, out: &mut Vec<PathBuf>, limit: usize) {
+    if out.len() >= limit {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        if out.len() >= limit {
+            return;
+        }
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if path.is_dir() {
+            if file_dialogs::default_should_skip_dir(name) {
+                continue;
+            }
+            collect_link_target_files(&path, out, limit);
+        } else if path.is_file() {
+            out.push(path);
+        }
+    }
+}
+
+fn is_markdown_like_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| matches!(extension.to_ascii_lowercase().as_str(), "md" | "markdown"))
+        .unwrap_or(false)
+}
+
+fn absolutize_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+    })
+}
+
+fn line_has_backlink_to_current(
+    line: &str,
+    source_file: &Path,
+    current_path: &Path,
+    current_abs: &Path,
+) -> bool {
+    parse_markdown_link_spans(line).into_iter().any(|span| {
+        let target = &line[span.target_start..span.target_end];
+        if link_ui::is_http_url(target) {
+            return false;
+        }
+        let path_part = target
+            .split_once('#')
+            .map(|(path, _)| path)
+            .unwrap_or(target);
+        if path_part.trim().is_empty() {
+            return false;
+        }
+        let resolved = link_ui::resolve_markdown_link_path(path_part, Some(source_file));
+        let resolved_abs = absolutize_path(&resolved);
+        resolved_abs == current_abs || resolved_abs == absolutize_path(current_path)
+    })
+}
+
+fn line_mentions_current(line: &str, current_path: &Path) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let file_name = current_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let stem = current_path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let path = current_path.display().to_string().to_ascii_lowercase();
+    (!file_name.is_empty() && lower.contains(&file_name))
+        || (!stem.is_empty() && lower.contains(&stem))
+        || lower.contains(&path)
+}
+
+fn line_start_offsets(contents: &str) -> Vec<usize> {
+    let mut offsets = vec![0];
+    for (index, ch) in contents.char_indices() {
+        if ch == '\n' && index + 1 < contents.len() {
+            offsets.push(index + 1);
+        }
+    }
+    offsets
+}
+
+fn append_markdown_block(path: &Path, block: &str) -> Result<(), String> {
+    let mut contents = fs::read_to_string(path).unwrap_or_default();
+    append_markdown_block_to_string(&mut contents, block);
+    fs::write(path, contents).map_err(|err| err.to_string())
+}
+
+fn append_markdown_block_to_heading(
+    path: &Path,
+    heading: &link_ui::LinkHeadingOption,
+    block: &str,
+) -> Result<(), String> {
+    let mut contents = fs::read_to_string(path).unwrap_or_default();
+    let insert_at =
+        markdown_heading_insert_offset(&contents, heading).unwrap_or_else(|| contents.len());
+    let mut insertion = String::new();
+    if insert_at > 0 && !contents[..insert_at].ends_with('\n') {
+        insertion.push('\n');
+    }
+    insertion.push('\n');
+    insertion.push_str(block.trim_end());
+    insertion.push('\n');
+    contents.insert_str(insert_at, &insertion);
+    fs::write(path, contents).map_err(|err| err.to_string())
+}
+
+fn append_markdown_block_to_string(contents: &mut String, block: &str) {
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    if !contents.is_empty() {
+        contents.push('\n');
+    }
+    contents.push_str(block.trim_end());
+    contents.push('\n');
+}
+
+fn markdown_heading_insert_offset(
+    contents: &str,
+    heading: &link_ui::LinkHeadingOption,
+) -> Option<usize> {
+    let heading_line_start = contents
+        .lines()
+        .take(heading.line_index)
+        .map(|line| line.len() + 1)
+        .sum::<usize>();
+    let search_start = contents[heading_line_start..]
+        .find('\n')
+        .map(|offset| heading_line_start + offset + 1)
+        .unwrap_or(contents.len());
+    let mut byte = search_start;
+    for line in contents[search_start..].split_inclusive('\n') {
+        let line_without_newline = line.trim_end_matches('\n');
+        if let Some(next_heading) = parse_heading_line(line_without_newline) {
+            if next_heading.level <= heading.level {
+                return Some(byte);
+            }
+        }
+        byte += line.len();
+    }
+    Some(contents.len())
+}
+
+fn json_string(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Command {
-    New,
-    Open,
-    OpenBuffer,
-    Periscope,
-    Lance,
-    LanceAdd,
-    LanceNext,
-    LancePrev,
-    Save,
-    SaveAs,
-    Scratch,
-    ScratchEntries,
-    Capture,
-    TogglePreview,
-    ToggleWrap,
-    Settings,
-    LineNumbersAbsolute,
-    LineNumbersRelative,
-    WrapOn,
-    WrapOff,
-    PreviewOn,
-    PreviewOff,
-    DocTasks,
-    OpenLink,
-    Quit,
+enum LinkHeadingPickerMode {
+    InsertLink,
+    BidirectionalLink,
+    Refile,
 }
 
 #[derive(Clone)]
-struct ScratchEntry {
-    heading: Option<String>,
-    body: String,
+enum FindNoteRow {
+    File {
+        path: PathBuf,
+        match_hint: String,
+    },
+    Heading {
+        path: PathBuf,
+        line: usize,
+        title: String,
+        level: usize,
+    },
 }
-
-impl ScratchEntry {
-    fn title(&self) -> String {
-        self.heading
-            .clone()
-            .unwrap_or_else(|| "untitled scratch".to_string())
-    }
-
-    fn preview(&self) -> String {
-        self.body
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or("")
-            .trim()
-            .chars()
-            .take(80)
-            .collect()
-    }
-}
-
-struct CommandSpec {
-    name: &'static str,
-    aliases: &'static [&'static str],
-    summary: &'static str,
-    hint: &'static str,
-    palette_command: Option<Command>,
-}
-
-const COMMAND_SPECS: &[CommandSpec] = &[
-    CommandSpec {
-        name: "save",
-        aliases: &["w", "write"],
-        summary: "Save current buffer",
-        hint: "Ctrl+S",
-        palette_command: Some(Command::Save),
-    },
-    CommandSpec {
-        name: "quit",
-        aliases: &["q", "exit"],
-        summary: "Quit Slate",
-        hint: "Ctrl+Q",
-        palette_command: Some(Command::Quit),
-    },
-    CommandSpec {
-        name: "wq",
-        aliases: &["x"],
-        summary: "Save and quit",
-        hint: ":wq",
-        palette_command: None,
-    },
-    CommandSpec {
-        name: "new",
-        aliases: &["enew"],
-        summary: "New buffer",
-        hint: "Ctrl+N",
-        palette_command: Some(Command::New),
-    },
-    CommandSpec {
-        name: "open",
-        aliases: &["edit", "e"],
-        summary: "Open file or path",
-        hint: "Ctrl+O",
-        palette_command: Some(Command::Open),
-    },
-    CommandSpec {
-        name: "lance",
-        aliases: &["lc", "marks"],
-        summary: "Open Lance-style marked files",
-        hint: ":lance",
-        palette_command: Some(Command::Lance),
-    },
-    CommandSpec {
-        name: "lance-add",
-        aliases: &["la", "mark-buffer"],
-        summary: "Add current file to Lance marks",
-        hint: ":lance-add",
-        palette_command: Some(Command::LanceAdd),
-    },
-    CommandSpec {
-        name: "lance-next",
-        aliases: &["lnext"],
-        summary: "Open next Lance mark",
-        hint: ":lance-next",
-        palette_command: Some(Command::LanceNext),
-    },
-    CommandSpec {
-        name: "lance-prev",
-        aliases: &["lpv"],
-        summary: "Open previous Lance mark",
-        hint: ":lance-prev",
-        palette_command: Some(Command::LancePrev),
-    },
-    CommandSpec {
-        name: "open-buffer",
-        aliases: &["ob", "buffer-open"],
-        summary: "Open a file in the editable modal buffer",
-        hint: ":open-buffer",
-        palette_command: Some(Command::OpenBuffer),
-    },
-    CommandSpec {
-        name: "periscope",
-        aliases: &["ps", "fzf"],
-        summary: "Open Periscope project/home file search",
-        hint: ":periscope",
-        palette_command: Some(Command::Periscope),
-    },
-    CommandSpec {
-        name: "open-last",
-        aliases: &["last", "ol"],
-        summary: "Open last file",
-        hint: "Ctrl+O L",
-        palette_command: None,
-    },
-    CommandSpec {
-        name: "recent",
-        aliases: &["rec"],
-        summary: "Open recent files picker",
-        hint: ":recent",
-        palette_command: None,
-    },
-    CommandSpec {
-        name: "scratch",
-        aliases: &["sc"],
-        summary: "Open quick scratch capture modal",
-        hint: ":scratch",
-        palette_command: Some(Command::Scratch),
-    },
-    CommandSpec {
-        name: "capture",
-        aliases: &["cap"],
-        summary: "Capture selection or current line to scratch",
-        hint: ":capture",
-        palette_command: Some(Command::Capture),
-    },
-    CommandSpec {
-        name: "scratch-entries",
-        aliases: &["scratch-log", "scl"],
-        summary: "Review and clean scratch archive entries",
-        hint: ":scratch-entries",
-        palette_command: Some(Command::ScratchEntries),
-    },
-    CommandSpec {
-        name: "save-as",
-        aliases: &["saveas", "write-as"],
-        summary: "Save current buffer with a new path",
-        hint: "Ctrl+Alt+S",
-        palette_command: Some(Command::SaveAs),
-    },
-    CommandSpec {
-        name: "preview",
-        aliases: &["md"],
-        summary: "Toggle Markdown preview",
-        hint: "Ctrl+M",
-        palette_command: Some(Command::TogglePreview),
-    },
-    CommandSpec {
-        name: "wrap",
-        aliases: &[],
-        summary: "Toggle word wrap",
-        hint: ":wrap",
-        palette_command: Some(Command::ToggleWrap),
-    },
-    CommandSpec {
-        name: "wrap-on",
-        aliases: &["wrap-enable"],
-        summary: "Enable word wrap",
-        hint: ":wrap on",
-        palette_command: Some(Command::WrapOn),
-    },
-    CommandSpec {
-        name: "wrap-off",
-        aliases: &["nowrap", "wrap-disable"],
-        summary: "Disable word wrap",
-        hint: ":wrap off",
-        palette_command: Some(Command::WrapOff),
-    },
-    CommandSpec {
-        name: "preview-on",
-        aliases: &["md-on"],
-        summary: "Enable Markdown preview",
-        hint: ":preview on",
-        palette_command: Some(Command::PreviewOn),
-    },
-    CommandSpec {
-        name: "preview-off",
-        aliases: &["md-off"],
-        summary: "Disable Markdown preview",
-        hint: ":preview off",
-        palette_command: Some(Command::PreviewOff),
-    },
-    CommandSpec {
-        name: "open-link",
-        aliases: &["olink", "follow-link"],
-        summary: "Open Markdown link under cursor",
-        hint: ":open-link",
-        palette_command: Some(Command::OpenLink),
-    },
-    CommandSpec {
-        name: "doc-tasks",
-        aliases: &["tasks"],
-        summary: "Browse current-document checkboxes",
-        hint: ":doc-tasks",
-        palette_command: Some(Command::DocTasks),
-    },
-    CommandSpec {
-        name: "find",
-        aliases: &["f"],
-        summary: "Find text",
-        hint: "Ctrl+F",
-        palette_command: None,
-    },
-    CommandSpec {
-        name: "goto",
-        aliases: &["g", "line", "l"],
-        summary: "Go to line/column",
-        hint: ":g 10",
-        palette_command: None,
-    },
-    CommandSpec {
-        name: "select-word",
-        aliases: &["sw"],
-        summary: "Select word under cursor",
-        hint: "Ctrl S W",
-        palette_command: None,
-    },
-    CommandSpec {
-        name: "select-line",
-        aliases: &["sl"],
-        summary: "Select current line",
-        hint: "Ctrl S L",
-        palette_command: None,
-    },
-    CommandSpec {
-        name: "delete-word",
-        aliases: &["dw"],
-        summary: "Delete word under cursor",
-        hint: "Ctrl D W",
-        palette_command: None,
-    },
-    CommandSpec {
-        name: "delete-line",
-        aliases: &["dl"],
-        summary: "Delete current line",
-        hint: "Ctrl D L",
-        palette_command: None,
-    },
-    CommandSpec {
-        name: "duplicate-line",
-        aliases: &["dup"],
-        summary: "Duplicate current line",
-        hint: "Ctrl D U P",
-        palette_command: None,
-    },
-    CommandSpec {
-        name: "duplicate-place",
-        aliases: &["dupp"],
-        summary: "Duplicate line then place it",
-        hint: "Ctrl D U P P",
-        palette_command: None,
-    },
-    CommandSpec {
-        name: "move-line-up",
-        aliases: &["mlu"],
-        summary: "Move current line up",
-        hint: "Alt+Up",
-        palette_command: None,
-    },
-    CommandSpec {
-        name: "move-line-down",
-        aliases: &["mld"],
-        summary: "Move current line down",
-        hint: "Alt+Down",
-        palette_command: None,
-    },
-    CommandSpec {
-        name: "move-line-to-paragraph-start",
-        aliases: &["mlps"],
-        summary: "Move line to paragraph start",
-        hint: "Alt double-up",
-        palette_command: None,
-    },
-    CommandSpec {
-        name: "move-line-to-paragraph-end",
-        aliases: &["mlpe"],
-        summary: "Move line to paragraph end",
-        hint: "Alt double-down",
-        palette_command: None,
-    },
-    CommandSpec {
-        name: "top",
-        aliases: &["go-top", "gt"],
-        summary: "Go to top of file",
-        hint: "Ctrl G T",
-        palette_command: None,
-    },
-    CommandSpec {
-        name: "bottom",
-        aliases: &["go-bottom", "gb"],
-        summary: "Go to bottom of file",
-        hint: "Ctrl G B",
-        palette_command: None,
-    },
-    CommandSpec {
-        name: "line-numbers",
-        aliases: &["ln", "linenumbers"],
-        summary: "Set line number mode",
-        hint: ":line-numbers relative",
-        palette_command: None,
-    },
-    CommandSpec {
-        name: "line-numbers-absolute",
-        aliases: &["ln-abs"],
-        summary: "Use absolute line numbers",
-        hint: ":ln absolute",
-        palette_command: Some(Command::LineNumbersAbsolute),
-    },
-    CommandSpec {
-        name: "line-numbers-relative",
-        aliases: &["ln-rel"],
-        summary: "Use relative line numbers",
-        hint: ":ln relative",
-        palette_command: Some(Command::LineNumbersRelative),
-    },
-    CommandSpec {
-        name: "settings",
-        aliases: &["set", "prefs", "preferences"],
-        summary: "Open settings",
-        hint: ":settings",
-        palette_command: Some(Command::Settings),
-    },
-];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PendingAction {
@@ -440,6 +729,7 @@ enum PendingAction {
     OpenLast,
     OpenRecent,
     OpenProjectFile,
+    OpenDaily,
     Quit,
 }
 
@@ -497,6 +787,7 @@ impl PendingAction {
             PendingAction::OpenProjectFile => {
                 "buffer has unsaved changes; open selected file anyway?"
             }
+            PendingAction::OpenDaily => "buffer has unsaved changes; open Daily anyway?",
             PendingAction::Quit => "buffer has unsaved changes; close anyway?",
         }
     }
@@ -507,26 +798,12 @@ struct DuplicatePlacement {
     was_dirty: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FilePickerMode {
-    Open,
-    OpenBuffer,
-    AddLance,
-    Browse,
-    InsertMarkdownLink,
-    SetPeriscopeProject,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PeriscopeMode {
-    Project,
-    Global,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum LinkAssistChoice {
-    File,
-    Web,
+#[derive(Clone)]
+struct RefileDraft {
+    source_path: PathBuf,
+    source_line_number: usize,
+    source_line_index: usize,
+    text: String,
 }
 
 #[derive(Clone)]
@@ -537,10 +814,11 @@ struct DocTask {
     text: String,
 }
 
-struct CommandUsage {
-    name: String,
-    count: usize,
-    last_used: i64,
+struct FlowBackgroundResult {
+    root: PathBuf,
+    indexed_files: usize,
+    indexed_tasks: usize,
+    errors: usize,
 }
 
 struct FileCursorPosition {
@@ -549,29 +827,10 @@ struct FileCursorPosition {
     column: usize,
 }
 
-struct LinkHeadingOption {
-    level: usize,
-    text: String,
-    anchor: String,
-    line_index: usize,
-}
-
-struct PeriscopeIndexedPath {
-    path: PathBuf,
-    lower: String,
-    is_file: bool,
-}
-
-#[derive(Clone)]
-enum PeriscopeRow {
-    Folder {
-        path: PathBuf,
-        expanded: bool,
-    },
-    File {
-        path: PathBuf,
-        group: Option<PathBuf>,
-    },
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReferenceResultKind {
+    Backlinks,
+    Mentions,
 }
 
 struct SlateApp {
@@ -587,6 +846,10 @@ struct SlateApp {
     wrap: bool,
     focus_editor_once: bool,
     scratch: bool,
+    standalone_agenda: bool,
+    scratch_close_after: Option<f64>,
+    agenda_updated_toast_until: Option<f64>,
+    pending_flow_agenda_sync_at: Option<f64>,
     pending_action: Option<PendingAction>,
     settings_open: bool,
     selected_setting: usize,
@@ -604,6 +867,10 @@ struct SlateApp {
     ctrl_shift_move_mode: CtrlShiftMoveMode,
     reopen_last_file_on_startup: bool,
     markdown_live_rendering: bool,
+    virtual_references_enabled: bool,
+    virtual_references_collapsed: bool,
+    virtual_backlinks_collapsed: bool,
+    virtual_mentions_collapsed: bool,
     last_opened_path: Option<PathBuf>,
     last_open_dir: Option<PathBuf>,
     recent_files: Vec<PathBuf>,
@@ -619,6 +886,34 @@ struct SlateApp {
     doc_tasks_open: bool,
     doc_task_query: String,
     selected_doc_task_line: usize,
+    agenda_open: bool,
+    agenda_items: Vec<AgendaItem>,
+    selected_agenda_item: usize,
+    agenda_filter: String,
+    agenda_start_offset_days: i64,
+    agenda_focus: AgendaFocus,
+    agenda_tab: AgendaTab,
+    agenda_selected_dated_row: usize,
+    agenda_selected_inbox_item: usize,
+    agenda_selected_tab_items: [usize; 5],
+    agenda_expanded_dates: HashSet<NaiveDate>,
+    agenda_show_done: bool,
+    agenda_scroll_to_selected: bool,
+    agenda_org_mode: Option<AgendaOrgMode>,
+    agenda_org_query: String,
+    selected_agenda_org_suggestion: usize,
+    flow_inline_org_mode: Option<AgendaOrgMode>,
+    flow_inline_org_anchor: Option<usize>,
+    selected_flow_inline_org_suggestion: usize,
+    link_inline_anchor: Option<usize>,
+    link_inline_files: Vec<PathBuf>,
+    selected_link_inline_suggestion: usize,
+    pending_bidirectional_link_source_line: Option<usize>,
+    link_heading_target_path: Option<PathBuf>,
+    flow_item_edit: Option<FlowItemEditState>,
+    flow_background_rx: Option<Receiver<FlowBackgroundResult>>,
+    flow_background_root: Option<PathBuf>,
+    flow_background_loading: bool,
     file_picker_open: bool,
     file_picker_mode: FilePickerMode,
     file_picker_dir: PathBuf,
@@ -637,14 +932,24 @@ struct SlateApp {
     periscope_global_paths: Vec<PeriscopeIndexedPath>,
     periscope_global_rx: Option<Receiver<Vec<PeriscopeIndexedPath>>>,
     periscope_global_loading: bool,
+    find_note_open: bool,
+    find_note_query: String,
+    find_note_files: Vec<PathBuf>,
+    find_note_rows: Vec<FindNoteRow>,
+    selected_find_note_row: usize,
+    find_note_expanded_files: HashSet<PathBuf>,
     pending_project_file_path: Option<PathBuf>,
     pending_open_heading_fragment: Option<String>,
+    pending_daily_target: Option<String>,
+    pending_refile: Option<RefileDraft>,
+    pending_refile_destination: Option<PathBuf>,
     link_assist_open: bool,
     link_assist_choice: LinkAssistChoice,
     link_assist_trigger_start: Option<usize>,
     link_assist_web_open: bool,
     link_assist_web_url: String,
     link_heading_picker_open: bool,
+    link_heading_picker_mode: LinkHeadingPickerMode,
     link_heading_base_target: String,
     link_heading_options: Vec<LinkHeadingOption>,
     selected_link_heading: usize,
@@ -687,7 +992,13 @@ struct SlateApp {
 }
 
 impl SlateApp {
-    fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>, scratch: bool) -> Self {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        path: Option<PathBuf>,
+        scratch: bool,
+        standalone_agenda: bool,
+        startup_line: Option<usize>,
+    ) -> Self {
         setup_style(&cc.egui_ctx);
 
         let mut app = Self {
@@ -703,6 +1014,10 @@ impl SlateApp {
             wrap: true,
             focus_editor_once: true,
             scratch,
+            standalone_agenda,
+            scratch_close_after: None,
+            agenda_updated_toast_until: None,
+            pending_flow_agenda_sync_at: None,
             pending_action: None,
             settings_open: false,
             selected_setting: 0,
@@ -720,6 +1035,10 @@ impl SlateApp {
             ctrl_shift_move_mode: CtrlShiftMoveMode::Vim,
             reopen_last_file_on_startup: false,
             markdown_live_rendering: true,
+            virtual_references_enabled: true,
+            virtual_references_collapsed: false,
+            virtual_backlinks_collapsed: false,
+            virtual_mentions_collapsed: false,
             last_opened_path: None,
             last_open_dir: None,
             recent_files: Vec::new(),
@@ -735,6 +1054,34 @@ impl SlateApp {
             doc_tasks_open: false,
             doc_task_query: String::new(),
             selected_doc_task_line: 0,
+            agenda_open: false,
+            agenda_items: Vec::new(),
+            selected_agenda_item: 0,
+            agenda_filter: String::new(),
+            agenda_start_offset_days: 0,
+            agenda_focus: AgendaFocus::Dated,
+            agenda_tab: AgendaTab::Agenda,
+            agenda_selected_dated_row: 0,
+            agenda_selected_inbox_item: 0,
+            agenda_selected_tab_items: [0; 5],
+            agenda_expanded_dates: HashSet::new(),
+            agenda_show_done: false,
+            agenda_scroll_to_selected: false,
+            agenda_org_mode: None,
+            agenda_org_query: String::new(),
+            selected_agenda_org_suggestion: 0,
+            flow_inline_org_mode: None,
+            flow_inline_org_anchor: None,
+            selected_flow_inline_org_suggestion: 0,
+            link_inline_anchor: None,
+            link_inline_files: Vec::new(),
+            selected_link_inline_suggestion: 0,
+            pending_bidirectional_link_source_line: None,
+            link_heading_target_path: None,
+            flow_item_edit: None,
+            flow_background_rx: None,
+            flow_background_root: None,
+            flow_background_loading: false,
             file_picker_open: false,
             file_picker_mode: FilePickerMode::Browse,
             file_picker_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -753,14 +1100,24 @@ impl SlateApp {
             periscope_global_paths: Vec::new(),
             periscope_global_rx: None,
             periscope_global_loading: false,
+            find_note_open: false,
+            find_note_query: String::new(),
+            find_note_files: Vec::new(),
+            find_note_rows: Vec::new(),
+            selected_find_note_row: 0,
+            find_note_expanded_files: HashSet::new(),
             pending_project_file_path: None,
             pending_open_heading_fragment: None,
+            pending_daily_target: None,
+            pending_refile: None,
+            pending_refile_destination: None,
             link_assist_open: false,
             link_assist_choice: LinkAssistChoice::File,
             link_assist_trigger_start: None,
             link_assist_web_open: false,
             link_assist_web_url: String::new(),
             link_heading_picker_open: false,
+            link_heading_picker_mode: LinkHeadingPickerMode::InsertLink,
             link_heading_base_target: String::new(),
             link_heading_options: Vec::new(),
             selected_link_heading: 0,
@@ -806,6 +1163,15 @@ impl SlateApp {
 
         if let Some(path) = path {
             app.open_path(path);
+            if let Some(line) = startup_line {
+                app.goto_startup_line(line);
+            }
+        } else if standalone_agenda {
+            // Standalone agenda should be a view over the latest published Flow
+            // cache. Do not immediately rescan from disk here: an open Slate
+            // editor may have just published unsaved in-memory Flow items, and
+            // a disk rescan would make those live agenda rows disappear.
+            app.open_agenda();
         } else if !scratch && app.reopen_last_file_on_startup {
             if let Some(last_path) = app.last_opened_path.clone() {
                 app.open_path(last_path);
@@ -824,6 +1190,8 @@ impl SlateApp {
             .unwrap_or("untitled");
         if self.scratch && self.path.is_none() {
             format!("{}Slate Scratch", if self.dirty { "*" } else { "" })
+        } else if self.standalone_agenda && self.path.is_none() {
+            "Slate Agenda".to_string()
         } else {
             format!("{}{} — Slate", if self.dirty { "*" } else { "" }, name)
         }
@@ -840,11 +1208,322 @@ impl SlateApp {
                 self.dirty = false;
                 self.search_state = None;
                 self.remember_recent_file(path.clone());
+                let flow_summary = self
+                    .refresh_flow_index_for_path(&path, self.buffer.as_str())
+                    .ok()
+                    .flatten();
+                let flow_root = Self::flow_project_root_for_path(&path);
+                self.start_flow_background_rescan(flow_root);
                 let _ = self.save_settings();
-                self.status = format!("Opened {}", path.display());
+                self.status = if let Some(summary) = flow_summary {
+                    format!(
+                        "Opened {} · indexed {} Flow tasks · scanning folder…",
+                        path.display(),
+                        summary.tasks.len()
+                    )
+                } else {
+                    format!("Opened {} · scanning folder…", path.display())
+                };
             }
             Err(err) => self.status = format!("Open failed: {err}"),
         }
+    }
+
+    fn start_refile_current_line(&mut self) {
+        let Some(source_path) = self.path.clone() else {
+            self.status = "Refile needs a saved source file".to_string();
+            return;
+        };
+        if self.dirty {
+            self.status = "Save current buffer before refile".to_string();
+            return;
+        }
+        let line_index = self.buffer.line_index_for_byte(self.buffer.cursor());
+        let text = self.buffer.line(line_index).trim().to_string();
+        self.start_refile_draft(source_path, line_index, text);
+    }
+
+    fn start_refile_selected_agenda_item(&mut self) {
+        let Some(index) = self.selected_agenda_task_index() else {
+            self.status = "Agenda refile: no item selected".to_string();
+            return;
+        };
+        let Some(item) = self.agenda_items.get(index).cloned() else {
+            self.status = "Agenda refile: no item selected".to_string();
+            return;
+        };
+        if self.path.as_ref() == Some(&item.path) && self.dirty {
+            self.status = "Save current source buffer before agenda refile".to_string();
+            return;
+        }
+        let text = if self.path.as_ref() == Some(&item.path) {
+            self.buffer.line(item.line_index).trim().to_string()
+        } else {
+            match fs::read_to_string(&item.path) {
+                Ok(contents) => contents
+                    .lines()
+                    .nth(item.line_index)
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .to_string(),
+                Err(err) => {
+                    self.status = format!("Agenda refile failed reading source: {err}");
+                    return;
+                }
+            }
+        };
+        self.start_refile_draft(item.path, item.line_index, text);
+    }
+
+    fn start_refile_draft(&mut self, source_path: PathBuf, line_index: usize, text: String) {
+        if text.trim().is_empty() {
+            self.status = "Refile needs a non-empty source line".to_string();
+            return;
+        }
+        self.pending_refile = Some(RefileDraft {
+            source_path,
+            source_line_number: line_index + 1,
+            source_line_index: line_index,
+            text,
+        });
+        self.open_file_picker_at(self.project_root(), FilePickerMode::Refile);
+        self.status = "Refile: choose destination Markdown file".to_string();
+    }
+
+    fn open_refile_heading_picker_or_finish(&mut self, destination: PathBuf) {
+        let is_markdown = destination
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| matches!(extension.to_lowercase().as_str(), "md" | "markdown"))
+            .unwrap_or(false);
+        if !is_markdown {
+            self.finish_refile_to_path(destination, None);
+            return;
+        }
+        let headings = fs::read_to_string(&destination)
+            .map(|contents| link_ui::markdown_heading_options(&contents))
+            .unwrap_or_default();
+        if headings.is_empty() {
+            self.finish_refile_to_path(destination, None);
+            return;
+        }
+        self.pending_refile_destination = Some(destination.clone());
+        self.link_heading_picker_open = true;
+        self.link_heading_picker_mode = LinkHeadingPickerMode::Refile;
+        self.link_heading_base_target =
+            link_ui::markdown_link_target_for_file(&destination, self.path.as_deref());
+        self.link_heading_options = headings;
+        self.selected_link_heading = 0;
+        self.focus_editor_once = false;
+        self.status = "Refile: choose heading or append to whole file".to_string();
+    }
+
+    fn finish_refile_to_selected_target(&mut self, heading: Option<link_ui::LinkHeadingOption>) {
+        let Some(destination) = self.pending_refile_destination.take() else {
+            self.status = "No pending refile target".to_string();
+            self.pending_refile = None;
+            return;
+        };
+        self.finish_refile_to_path(destination, heading);
+    }
+
+    fn finish_refile_to_path(
+        &mut self,
+        destination: PathBuf,
+        heading: Option<link_ui::LinkHeadingOption>,
+    ) {
+        let Some(draft) = self.pending_refile.take() else {
+            self.status = "No pending refile".to_string();
+            return;
+        };
+        if destination == draft.source_path {
+            self.status = "Refile target is the same file".to_string();
+            return;
+        }
+        let source_label = draft
+            .source_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| format!("{name}:{}", draft.source_line_number))
+            .unwrap_or_else(|| {
+                format!(
+                    "{}:{}",
+                    draft.source_path.display(),
+                    draft.source_line_number
+                )
+            });
+        let source_target_for_destination = format!(
+            "{}#L{}",
+            link_ui::markdown_link_target_for_file(&draft.source_path, Some(&destination)),
+            draft.source_line_number
+        );
+        let source_target_for_daily = format!(
+            "{}#L{}",
+            draft.source_path.display(),
+            draft.source_line_number
+        );
+        let mut target_for_source =
+            link_ui::markdown_link_target_for_file(&destination, Some(&draft.source_path));
+        let mut target_for_daily = destination.display().to_string();
+        if let Some(heading) = heading.as_ref() {
+            target_for_source.push('#');
+            target_for_source.push_str(&heading.anchor);
+            target_for_daily.push('#');
+            target_for_daily.push_str(&heading.anchor);
+        }
+        let base_target_label = destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("refile target");
+        let target_label = heading
+            .as_ref()
+            .map(|heading| format!("{base_target_label}#{}", heading.text))
+            .unwrap_or_else(|| base_target_label.to_string());
+        let block = format!(
+            "{}\n  - source: [{}]({})\n",
+            draft.text.trim(),
+            source_label,
+            source_target_for_destination
+        );
+        let append_result = if let Some(heading) = heading.as_ref() {
+            append_markdown_block_to_heading(&destination, heading, &block)
+        } else {
+            append_markdown_block(&destination, &block)
+        };
+        if let Err(err) = append_result {
+            self.status = format!("Refile failed: {err}");
+            return;
+        }
+
+        let backlink = format!(
+            "  - refiled to: [{}]({})\n",
+            target_label, target_for_source
+        );
+        if let Err(err) = self.insert_refile_backlink(&draft, &backlink) {
+            self.status = format!("Refile backlink failed: {err}");
+            return;
+        }
+        let _ = self.refresh_flow_index_for_path(
+            &destination,
+            &fs::read_to_string(&destination).unwrap_or_default(),
+        );
+        self.schedule_current_flow_buffer_agenda_sync_later();
+        let daily_event = DailyEvent::now(
+            DailyEventKind::Organized,
+            draft.text.trim().to_string(),
+            Vec::new(),
+            Vec::new(),
+            source_label,
+            Some(source_target_for_daily),
+        )
+        .with_target(target_label, Some(target_for_daily));
+        let _ = daily::append_event(&daily_event);
+        if self.agenda_open {
+            if let Ok(mut items) = self.load_agenda_items() {
+                self.overlay_current_buffer_agenda_items(&mut items);
+                self.agenda_items = items;
+                self.clamp_agenda_selection();
+            }
+        }
+        self.status = format!("Refiled non-destructively to {}", destination.display());
+    }
+
+    fn insert_refile_backlink(
+        &mut self,
+        draft: &RefileDraft,
+        backlink: &str,
+    ) -> Result<(), String> {
+        if self.path.as_ref() == Some(&draft.source_path) {
+            let insert_at = if draft.source_line_index + 1 < self.buffer.line_count() {
+                self.buffer.line_start(draft.source_line_index + 1)
+            } else {
+                self.buffer.as_str().len()
+            };
+            self.buffer.set_cursor(insert_at);
+            let needs_leading_newline = insert_at == self.buffer.as_str().len()
+                && !self.buffer.as_str().is_empty()
+                && !self.buffer.as_str().ends_with('\n');
+            let source_note = if needs_leading_newline {
+                format!("\n{backlink}")
+            } else {
+                backlink.to_string()
+            };
+            self.buffer.insert_text(&source_note);
+            self.dirty = true;
+            self.schedule_current_flow_buffer_agenda_sync_later();
+            return Ok(());
+        }
+
+        let mut contents = fs::read_to_string(&draft.source_path).map_err(|err| err.to_string())?;
+        let line_starts = line_start_offsets(&contents);
+        let insert_at = line_starts
+            .get(draft.source_line_index + 1)
+            .copied()
+            .unwrap_or(contents.len());
+        let needs_leading_newline =
+            insert_at == contents.len() && !contents.is_empty() && !contents.ends_with('\n');
+        let source_note = if needs_leading_newline {
+            format!("\n{backlink}")
+        } else {
+            backlink.to_string()
+        };
+        contents.insert_str(insert_at, &source_note);
+        fs::write(&draft.source_path, contents.clone()).map_err(|err| err.to_string())?;
+        let _ = self.refresh_flow_index_for_path(&draft.source_path, &contents);
+        Ok(())
+    }
+
+    fn schedule_current_flow_buffer_agenda_sync_later(&mut self) {
+        self.pending_flow_agenda_sync_at = Some(0.0);
+    }
+
+    fn open_daily_with_target(&mut self, raw_target: &str) {
+        if self.dirty {
+            self.pending_daily_target = Some(raw_target.to_string());
+            self.confirm(PendingAction::OpenDaily);
+            return;
+        }
+        let target = match daily::parse_open_target(raw_target) {
+            Ok(target) => target,
+            Err(err) => {
+                self.status = err;
+                return;
+            }
+        };
+        let date = daily::resolve_open_date(&target);
+        let path = match daily::ensure_monthly_document(date) {
+            Ok(path) => path,
+            Err(err) => {
+                self.status = err;
+                return;
+            }
+        };
+        let refreshing = matches!(target, daily::DailyOpenTarget::Refresh);
+        self.open_path(path.clone());
+        self.jump_to_daily_day(date);
+        self.status = if refreshing {
+            format!("Daily refreshed/opened at {date}: {}", path.display())
+        } else {
+            format!("Daily opened at {date}: {}", path.display())
+        };
+    }
+
+    fn jump_to_daily_day(&mut self, date: chrono::NaiveDate) {
+        let Some(byte) = daily::day_heading_byte(self.buffer.as_str(), date) else {
+            return;
+        };
+        self.buffer.set_cursor(byte);
+        self.editor_view.request_scroll_to_cursor(&self.buffer);
+    }
+
+    fn goto_startup_line(&mut self, line_number: usize) {
+        if line_number == 0 || self.buffer.line_count() == 0 {
+            return;
+        }
+        let line = (line_number - 1).min(self.buffer.line_count().saturating_sub(1));
+        self.buffer.set_cursor(self.buffer.line_end(line));
+        self.editor_view.request_scroll_to_cursor(&self.buffer);
+        self.status = format!("Opened at line {}", line + 1);
     }
 
     fn remember_current_cursor_position(&mut self) {
@@ -881,6 +1560,664 @@ impl SlateApp {
         self.editor_view.request_scroll_to_cursor(&self.buffer);
     }
 
+    fn refresh_flow_index_for_path(
+        &self,
+        path: &Path,
+        contents: &str,
+    ) -> Result<Option<flow::FlowIndexSummary>, String> {
+        if !flow::should_index_flow_path(path) {
+            return Ok(None);
+        }
+        let project_root = Self::flow_project_root_for_path(path);
+        let sqlite_path = Self::flow_sqlite_path_for_root(&project_root)?;
+        flow::update_flow_index_for_file(&project_root, &sqlite_path, path, contents).map(Some)
+    }
+
+    fn record_daily_events_for_flow_update(
+        &mut self,
+        path: &Path,
+        old_items: &[AgendaItem],
+        summary: &flow::FlowIndexSummary,
+    ) {
+        let relative_path = summary.known_file.path.clone();
+        let old_for_path = old_items
+            .iter()
+            .filter(|item| item.path == path)
+            .map(|item| (item.line_index, item))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        for task in &summary.tasks {
+            let source = format!("{}:{}", relative_path, task.line_number);
+            let source_link = Some(format!("{}#L{}", path.display(), task.line_number));
+            let old = old_for_path.get(&task.line_index).copied();
+            let event_kind = if old.is_none() {
+                Some(DailyEventKind::Captured)
+            } else if task.kind == flow::FlowItemKind::Task
+                && old.map(|item| item.state.as_str()) != Some("done")
+                && task.state == CheckboxState::Done
+            {
+                Some(DailyEventKind::Completed)
+            } else {
+                None
+            };
+
+            let Some(kind) = event_kind else {
+                continue;
+            };
+            let event = DailyEvent::now(
+                kind,
+                task.title.clone(),
+                task.tags.clone(),
+                task.projects.clone(),
+                source,
+                source_link,
+            );
+            if let Err(err) = daily::append_event(&event) {
+                self.status = err;
+                return;
+            }
+        }
+    }
+
+    fn flow_project_root_for_path(path: &Path) -> PathBuf {
+        let mut dir = path
+            .parent()
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        loop {
+            if dir.join(".git").is_dir() {
+                return dir;
+            }
+            if !dir.pop() {
+                return path
+                    .parent()
+                    .map(PathBuf::from)
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| PathBuf::from("."));
+            }
+        }
+    }
+
+    fn flow_sqlite_path_for_root(root: &Path) -> Result<PathBuf, String> {
+        let Some(mut sqlite_path) = dirs_next::data_dir() else {
+            return Err("Flow index failed: no data dir".to_string());
+        };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        root.display().to_string().hash(&mut hasher);
+        sqlite_path.push("slate");
+        sqlite_path.push("flow");
+        sqlite_path.push(format!("scope-{:016x}", hasher.finish()));
+        sqlite_path.push("agenda.db");
+        Ok(sqlite_path)
+    }
+
+    fn flow_sqlite_path(&self) -> Result<PathBuf, String> {
+        Self::flow_sqlite_path_for_root(&self.flow_scope_root())
+    }
+
+    fn flow_scope_root(&self) -> PathBuf {
+        self.path
+            .as_ref()
+            .map(|path| Self::flow_project_root_for_path(path))
+            .or_else(|| self.detect_project_root())
+            .unwrap_or_else(|| self.project_root())
+    }
+
+    fn collect_flow_markdown_files(root: &Path, out: &mut Vec<PathBuf>, limit: usize) {
+        if out.len() >= limit {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            if out.len() >= limit {
+                return;
+            }
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            if path.is_dir() {
+                if file_dialogs::default_should_skip_dir(name) {
+                    continue;
+                }
+                Self::collect_flow_markdown_files(&path, out, limit);
+            } else if path.is_file() && flow::should_index_flow_path(&path) {
+                out.push(path);
+            }
+        }
+    }
+
+    fn start_flow_background_rescan(&mut self, root: PathBuf) {
+        if self.flow_background_loading && self.flow_background_root.as_ref() == Some(&root) {
+            return;
+        }
+        let Ok(sqlite_path) = Self::flow_sqlite_path_for_root(&root) else {
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        self.flow_background_rx = Some(rx);
+        self.flow_background_root = Some(root.clone());
+        self.flow_background_loading = true;
+        thread::spawn(move || {
+            let mut files = Vec::new();
+            Self::collect_flow_markdown_files(&root, &mut files, 20_000);
+            let mut indexed_files = 0usize;
+            let mut indexed_tasks = 0usize;
+            let mut errors = 0usize;
+            for path in files {
+                let Ok(contents) = fs::read_to_string(&path) else {
+                    errors += 1;
+                    continue;
+                };
+                match flow::update_flow_index_for_file(&root, &sqlite_path, &path, &contents) {
+                    Ok(summary) => {
+                        indexed_files += 1;
+                        indexed_tasks += summary.tasks.len();
+                    }
+                    Err(_) => errors += 1,
+                }
+            }
+            let _ = tx.send(FlowBackgroundResult {
+                root,
+                indexed_files,
+                indexed_tasks,
+                errors,
+            });
+        });
+    }
+
+    fn poll_flow_background_rescan(&mut self) {
+        let Some(rx) = &self.flow_background_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.flow_background_rx = None;
+                self.flow_background_root = None;
+                self.flow_background_loading = false;
+                if self.agenda_open || self.standalone_agenda {
+                    if let Ok(items) = self.load_agenda_items() {
+                        self.agenda_items = items;
+                        self.clamp_agenda_selection();
+                        if self.standalone_agenda {
+                            self.agenda_open = true;
+                            self.focus_editor_once = false;
+                        }
+                    }
+                }
+                self.status = format!(
+                    "Flow ready: indexed {} files, {} tasks in {}{}",
+                    result.indexed_files,
+                    result.indexed_tasks,
+                    result.root.display(),
+                    if result.errors > 0 {
+                        format!(", {} errors", result.errors)
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.flow_background_rx = None;
+                self.flow_background_root = None;
+                self.flow_background_loading = false;
+                self.status = "Flow background scan failed".to_string();
+            }
+        }
+    }
+
+    fn flow_rescan_current_scope(&mut self, rebuild: bool) {
+        if self.dirty {
+            self.status = "Save current buffer before Flow rescan".to_string();
+            return;
+        }
+        let Ok(sqlite_path) = self.flow_sqlite_path() else {
+            self.status = "Flow rescan failed: no data dir".to_string();
+            return;
+        };
+        let root = self.flow_scope_root();
+        if rebuild {
+            let _ = fs::remove_file(root.join(".slate").join("index.tsv"));
+            let _ = fs::remove_file(&sqlite_path);
+        }
+
+        let mut files = Vec::new();
+        Self::collect_flow_markdown_files(&root, &mut files, 20_000);
+        if files.is_empty() {
+            self.status = format!(
+                "Flow {} found no Markdown files in {}",
+                if rebuild { "rebuild" } else { "rescan" },
+                root.display()
+            );
+            return;
+        }
+
+        let mut indexed_files = 0usize;
+        let mut indexed_tasks = 0usize;
+        let mut errors = 0usize;
+        for path in files {
+            let Ok(contents) = fs::read_to_string(&path) else {
+                errors += 1;
+                continue;
+            };
+            match flow::update_flow_index_for_file(&root, &sqlite_path, &path, &contents) {
+                Ok(summary) => {
+                    indexed_files += 1;
+                    indexed_tasks += summary.tasks.len();
+                }
+                Err(_) => errors += 1,
+            }
+        }
+
+        self.status = format!(
+            "Flow {}: indexed {} files, {} tasks{}",
+            if rebuild { "rebuild" } else { "rescan" },
+            indexed_files,
+            indexed_tasks,
+            if errors > 0 {
+                format!(", {errors} errors")
+            } else {
+                String::new()
+            }
+        );
+    }
+
+    fn flow_inbox_path(&self) -> PathBuf {
+        self.flow_scope_root().join("inbox.md")
+    }
+
+    fn is_current_path(&self, path: &Path) -> bool {
+        let Some(current) = &self.path else {
+            return false;
+        };
+        if current == path {
+            return true;
+        }
+        match (current.canonicalize(), path.canonicalize()) {
+            (Ok(current), Ok(path)) => current == path,
+            _ => false,
+        }
+    }
+
+    fn append_flow_task_to_current_buffer(&mut self, task_line: &str) {
+        let needs_leading_newline =
+            !self.buffer.as_str().is_empty() && !self.buffer.as_str().ends_with('\n');
+        let prefix = if self.buffer.as_str().trim().is_empty() {
+            "# Inbox\n\n"
+        } else if needs_leading_newline {
+            "\n"
+        } else {
+            ""
+        };
+        let insertion = format!("{prefix}{task_line}\n");
+        self.buffer.set_cursor(self.buffer.as_str().len());
+        self.buffer.insert_text(&insertion);
+        self.dirty = true;
+        self.editor_view.request_scroll_to_cursor(&self.buffer);
+    }
+
+    fn quickadd_flow_task(&mut self, text: &str) -> bool {
+        let Some(task_line) = scratch::normalize_quickadd_task_line(text) else {
+            self.status = "Quickadd cancelled".to_string();
+            return false;
+        };
+        let path = self.flow_inbox_path();
+
+        if self.is_current_path(&path) {
+            self.append_flow_task_to_current_buffer(&task_line);
+            if self.agenda_open {
+                if let Ok(items) = self.load_agenda_items() {
+                    self.agenda_items = items;
+                    self.clamp_agenda_selection();
+                }
+            }
+            self.status = format!("Quickadded to current inbox buffer: {task_line}");
+            return true;
+        }
+
+        if let Some(dir) = path.parent() {
+            if let Err(err) = fs::create_dir_all(dir) {
+                self.status = format!("Quickadd failed: {err}");
+                return false;
+            }
+        }
+
+        let needs_header = !path.exists()
+            || fs::metadata(&path)
+                .map(|metadata| metadata.len() == 0)
+                .unwrap_or(true);
+        let entry = if needs_header {
+            format!("# Inbox\n\n{task_line}\n")
+        } else {
+            format!("{task_line}\n")
+        };
+
+        match fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(mut file) => {
+                if let Err(err) = file.write_all(entry.as_bytes()) {
+                    self.status = format!("Quickadd failed: {err}");
+                    return false;
+                }
+            }
+            Err(err) => {
+                self.status = format!("Quickadd failed: {err}");
+                return false;
+            }
+        }
+
+        match fs::read_to_string(&path)
+            .map_err(|err| err.to_string())
+            .and_then(|contents| {
+                self.refresh_flow_index_for_path(&path, &contents)
+                    .map(|_| ())
+            }) {
+            Ok(()) => {
+                if self.agenda_open {
+                    if let Ok(items) = self.load_agenda_items() {
+                        self.agenda_items = items;
+                        self.clamp_agenda_selection();
+                    }
+                }
+                self.status = format!("Quickadded to {}", path.display());
+                true
+            }
+            Err(err) => {
+                self.status = format!("Quickadded, Flow index failed: {err}");
+                true
+            }
+        }
+    }
+
+    fn open_find_note_results(&mut self, query: &str) {
+        self.shortcut_help_open = false;
+        self.palette_open = false;
+        self.recent_picker_open = false;
+        self.lance_open = false;
+        self.doc_tasks_open = false;
+        self.file_picker_open = false;
+        self.periscope_open = false;
+        self.save_as_open = false;
+        self.command_line_focused = false;
+        self.focus_command_line_once = false;
+        self.find_note_query = query.trim().to_string();
+        self.find_note_expanded_files.clear();
+        self.selected_find_note_row = 0;
+        self.find_note_open = true;
+        self.focus_editor_once = false;
+        self.refresh_find_note_results();
+        self.status =
+            "Find note: type to filter · Enter open · Shift+Enter front modal".to_string();
+    }
+
+    fn refresh_find_note_results(&mut self) {
+        let root = self.project_root();
+        let mut files = Vec::new();
+        collect_link_target_files(&root, &mut files, 20_000);
+        files.retain(|path| is_markdown_like_path(path));
+        files.sort();
+        files.dedup();
+        let query = self.find_note_query.trim().to_ascii_lowercase();
+        self.find_note_files = files
+            .into_iter()
+            .filter(|path| self.find_note_file_matches(path, &query))
+            .take(200)
+            .collect();
+        self.rebuild_find_note_rows();
+    }
+
+    fn find_note_file_matches(&self, path: &Path, query: &str) -> bool {
+        if query.is_empty() {
+            return true;
+        }
+        let root = self.project_root();
+        let label = path
+            .strip_prefix(&root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        if label.to_ascii_lowercase().contains(query)
+            || path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(|stem| stem.to_ascii_lowercase().contains(query))
+                .unwrap_or(false)
+        {
+            return true;
+        }
+        fs::read_to_string(path)
+            .map(|contents| contents.to_ascii_lowercase().contains(query))
+            .unwrap_or(false)
+    }
+
+    fn rebuild_find_note_rows(&mut self) {
+        let query = self.find_note_query.trim().to_ascii_lowercase();
+        let mut rows = Vec::new();
+        for path in &self.find_note_files {
+            let hint = if query.is_empty() {
+                "note".to_string()
+            } else {
+                self.find_note_match_hint(path, &query)
+            };
+            rows.push(FindNoteRow::File {
+                path: path.clone(),
+                match_hint: hint,
+            });
+            if self.find_note_expanded_files.contains(path) {
+                if let Ok(contents) = fs::read_to_string(path) {
+                    for (line_index, line) in contents.lines().enumerate() {
+                        if let Some(heading) = parse_heading_line(line) {
+                            rows.push(FindNoteRow::Heading {
+                                path: path.clone(),
+                                line: line_index + 1,
+                                title: heading.text.trim().to_string(),
+                                level: heading.level,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        self.find_note_rows = rows;
+        self.selected_find_note_row = self
+            .selected_find_note_row
+            .min(self.find_note_rows.len().saturating_sub(1));
+    }
+
+    fn find_note_match_hint(&self, path: &Path, query: &str) -> String {
+        let root = self.project_root();
+        let label = path
+            .strip_prefix(&root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        if label.to_ascii_lowercase().contains(query) {
+            return "file".to_string();
+        }
+        let Ok(contents) = fs::read_to_string(path) else {
+            return "note".to_string();
+        };
+        for line in contents.lines() {
+            let lower = line.to_ascii_lowercase();
+            if let Some(heading) = parse_heading_line(line) {
+                if heading.text.to_ascii_lowercase().contains(query) {
+                    return format!("heading: {}", heading.text.trim());
+                }
+            } else if lower.contains(query) {
+                return line.trim().chars().take(80).collect();
+            }
+        }
+        "note".to_string()
+    }
+
+    fn move_find_note_selection(&mut self, delta: isize) {
+        self.selected_find_note_row = self
+            .selected_find_note_row
+            .saturating_add_signed(delta)
+            .min(self.find_note_rows.len().saturating_sub(1));
+    }
+
+    fn selected_find_note_target(&self) -> Option<(PathBuf, Option<String>)> {
+        match self.find_note_rows.get(self.selected_find_note_row)? {
+            FindNoteRow::File { path, .. } => Some((path.clone(), None)),
+            FindNoteRow::Heading { path, line, .. } => {
+                Some((path.clone(), Some(format!("L{line}"))))
+            }
+        }
+    }
+
+    fn selected_find_note_file_path(&self) -> Option<PathBuf> {
+        match self.find_note_rows.get(self.selected_find_note_row)? {
+            FindNoteRow::File { path, .. } | FindNoteRow::Heading { path, .. } => {
+                Some(path.clone())
+            }
+        }
+    }
+
+    fn toggle_selected_find_note_file(&mut self) {
+        let Some(path) = self.selected_find_note_file_path() else {
+            return;
+        };
+        if self.find_note_expanded_files.remove(&path) {
+            self.rebuild_find_note_rows();
+            return;
+        }
+        self.find_note_expanded_files.insert(path);
+        self.rebuild_find_note_rows();
+    }
+
+    fn open_selected_find_note(&mut self, as_modal: bool) {
+        let Some((path, fragment)) = self.selected_find_note_target() else {
+            self.status = "No find-note result selected".to_string();
+            return;
+        };
+        self.find_note_open = false;
+        if as_modal {
+            self.open_link_preview(path, fragment);
+        } else if self.dirty {
+            self.status = "Save or discard changes before opening find-note result".to_string();
+        } else {
+            self.open_path(path);
+            if let Some(fragment) = fragment {
+                self.jump_to_markdown_fragment(&fragment);
+            }
+            self.focus_editor_once = true;
+        }
+    }
+
+    fn handle_find_note_text_input(&mut self, ctx: &egui::Context) {
+        let mut changed = false;
+        ctx.input_mut(|i| {
+            let mut consumed_text = false;
+            for event in &i.events {
+                if let egui::Event::Text(text) = event {
+                    if !text.chars().any(char::is_control) {
+                        self.find_note_query.push_str(text);
+                        changed = true;
+                        consumed_text = true;
+                    }
+                }
+            }
+            if consumed_text {
+                i.events
+                    .retain(|event| !matches!(event, egui::Event::Text(_)));
+            }
+        });
+        if changed {
+            self.find_note_expanded_files.clear();
+            self.selected_find_note_row = 0;
+            self.refresh_find_note_results();
+        }
+    }
+
+    fn open_reference_results(&mut self, kind: ReferenceResultKind) {
+        let Some(current_path) = self.path.clone() else {
+            self.status = "References need a saved current file".to_string();
+            return;
+        };
+        let title = match kind {
+            ReferenceResultKind::Backlinks => "Backlinks",
+            ReferenceResultKind::Mentions => "Mentions",
+        };
+        let document = self.reference_results_document(kind, &current_path);
+        self.link_preview_buffer.set_text(document);
+        self.link_preview_path = None;
+        self.link_preview_dirty = false;
+        self.link_preview_heading_fragment = None;
+        self.link_preview_heading_text = Some(title.to_string());
+        self.link_preview_open = true;
+        self.focus_link_preview_once = true;
+        self.focus_editor_once = false;
+        self.status = format!("{title} for {}", current_path.display());
+    }
+
+    fn reference_results_document(&self, kind: ReferenceResultKind, current_path: &Path) -> String {
+        let root = self.project_root();
+        let current_name = current_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("current file");
+        let title = match kind {
+            ReferenceResultKind::Backlinks => "Backlinks",
+            ReferenceResultKind::Mentions => "Mentions",
+        };
+        let rows = self.reference_rows(kind, current_path);
+
+        let mut doc = format!("# {title} — {current_name}\n\n");
+        if rows.is_empty() {
+            doc.push_str("No results.\n");
+            return doc;
+        }
+        for (file, line_number, line) in rows {
+            let label = file
+                .strip_prefix(&root)
+                .unwrap_or(&file)
+                .display()
+                .to_string();
+            let target = format!("{}#L{}", file.display(), line_number);
+            doc.push_str(&format!("- [{}:{}]({})\n", label, line_number, target));
+            doc.push_str(&format!("  - {}\n", line));
+        }
+        doc
+    }
+
+    fn reference_rows(
+        &self,
+        kind: ReferenceResultKind,
+        current_path: &Path,
+    ) -> Vec<(PathBuf, usize, String)> {
+        let root = self.project_root();
+        let current_abs = absolutize_path(current_path);
+        let mut files = Vec::new();
+        collect_link_target_files(&root, &mut files, 20_000);
+        files.retain(|path| is_markdown_like_path(path) && absolutize_path(path) != current_abs);
+        files.sort();
+        files.dedup();
+
+        let mut rows = Vec::new();
+        for file in files {
+            let Ok(contents) = fs::read_to_string(&file) else {
+                continue;
+            };
+            for (line_index, line) in contents.lines().enumerate() {
+                let matched = match kind {
+                    ReferenceResultKind::Backlinks => {
+                        line_has_backlink_to_current(line, &file, current_path, &current_abs)
+                    }
+                    ReferenceResultKind::Mentions => line_mentions_current(line, current_path),
+                };
+                if matched {
+                    rows.push((file.clone(), line_index + 1, line.trim().to_string()));
+                }
+            }
+        }
+        rows
+    }
+
     fn markdown_link_target_at_byte(&self, byte: usize) -> Option<&str> {
         let line_index = self.buffer.line_index_for_byte(byte);
         let line_start = self.buffer.line_start(line_index);
@@ -901,7 +2238,7 @@ impl SlateApp {
 
     fn open_markdown_link_target(&mut self, target: &str) {
         let target = target.trim();
-        if Self::is_http_url(target) {
+        if link_ui::is_http_url(target) {
             self.open_web_link(target, target);
             return;
         }
@@ -910,8 +2247,8 @@ impl SlateApp {
             .split_once('#')
             .map(|(path, fragment)| (path, Some(fragment)))
             .unwrap_or((target, None));
-        if Self::looks_like_bare_web_target(target) {
-            let path = self.resolve_markdown_link_path(path_part);
+        if link_ui::looks_like_bare_web_target(target) {
+            let path = link_ui::resolve_markdown_link_path(path_part, self.path.as_deref());
             if !path.exists() {
                 let browser_target = format!("https://{target}");
                 self.open_web_link(&browser_target, target);
@@ -922,7 +2259,7 @@ impl SlateApp {
             self.status = "Link has no local file target".to_string();
             return;
         }
-        let path = self.resolve_markdown_link_path(path_part);
+        let path = link_ui::resolve_markdown_link_path(path_part, self.path.as_deref());
         if self.dirty {
             self.pending_project_file_path = Some(path.clone());
             self.pending_open_heading_fragment = heading_fragment.map(str::to_string);
@@ -947,7 +2284,7 @@ impl SlateApp {
             Ok(text) => {
                 self.link_preview_buffer.set_text(text);
                 let heading_text = if let Some(fragment) = heading_fragment.as_deref() {
-                    Self::jump_buffer_to_markdown_heading_fragment(
+                    Self::jump_buffer_to_markdown_fragment(
                         &mut self.link_preview_buffer,
                         &mut self.link_preview_view,
                         fragment,
@@ -990,7 +2327,7 @@ impl SlateApp {
             self.focus_editor_once = true;
             self.status = "Promoted modified modal buffer".to_string();
             if let Some(fragment) = heading_fragment {
-                self.jump_to_markdown_heading_fragment(&fragment);
+                self.jump_to_markdown_fragment(&fragment);
             }
             return;
         }
@@ -1002,7 +2339,7 @@ impl SlateApp {
         }
         self.open_path(path);
         if let Some(fragment) = heading_fragment {
-            self.jump_to_markdown_heading_fragment(&fragment);
+            self.jump_to_markdown_fragment(&fragment);
         }
     }
 
@@ -1081,19 +2418,19 @@ impl SlateApp {
         self.focus_editor_once = true;
     }
 
-    fn jump_to_markdown_heading_fragment(&mut self, fragment: &str) {
-        if let Some(heading_text) = Self::jump_buffer_to_markdown_heading_fragment(
+    fn jump_to_markdown_fragment(&mut self, fragment: &str) {
+        if let Some(target) = Self::jump_buffer_to_markdown_fragment(
             &mut self.buffer,
             &mut self.editor_view,
             fragment,
         ) {
-            self.status = format!("Opened heading {heading_text}");
+            self.status = format!("Opened {target}");
         } else {
-            self.status = format!("Heading not found: #{fragment}");
+            self.status = format!("Link target not found: #{fragment}");
         }
     }
 
-    fn jump_buffer_to_markdown_heading_fragment(
+    fn jump_buffer_to_markdown_fragment(
         buffer: &mut EditorBuffer,
         view: &mut EditorView,
         fragment: &str,
@@ -1102,15 +2439,28 @@ impl SlateApp {
         if fragment.is_empty() {
             return None;
         }
+        if let Some(line_number) = fragment
+            .strip_prefix('L')
+            .or_else(|| fragment.strip_prefix("line-"))
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            if line_number == 0 || buffer.line_count() == 0 {
+                return None;
+            }
+            let line_index = (line_number - 1).min(buffer.line_count().saturating_sub(1));
+            buffer.set_cursor(buffer.line_start(line_index));
+            view.request_scroll_to_cursor(buffer);
+            return Some(format!("line {line_number}"));
+        }
         for line_index in 0..buffer.line_count() {
             let Some(heading) = parse_heading_line(buffer.line(line_index)) else {
                 continue;
             };
             let heading_text = heading.text.trim().to_string();
-            if Self::markdown_heading_anchor(&heading_text) == fragment {
+            if link_ui::markdown_heading_anchor(&heading_text) == fragment {
                 buffer.set_cursor(buffer.line_start(line_index));
                 view.request_scroll_to_cursor(buffer);
-                return Some(heading_text);
+                return Some(format!("heading {heading_text}"));
             }
         }
         None
@@ -1123,55 +2473,205 @@ impl SlateApp {
         }
     }
 
-    fn is_http_url(target: &str) -> bool {
-        target.starts_with("http://") || target.starts_with("https://")
-    }
-
-    fn looks_like_bare_web_target(target: &str) -> bool {
-        if target.is_empty()
-            || target.starts_with("./")
-            || target.starts_with("../")
-            || target.starts_with('/')
-            || target.starts_with('~')
-            || target.chars().any(char::is_whitespace)
-            || target.contains("://")
-        {
-            return false;
-        }
-
-        let host = target
-            .split(['/', '?', '#'])
-            .next()
-            .unwrap_or_default()
-            .trim_start_matches("www.");
-        let Some(tld) = host.rsplit('.').next() else {
-            return false;
-        };
-        host.contains('.')
-            && tld.len() >= 2
-            && tld.chars().all(|ch| ch.is_ascii_alphabetic())
-            && host.split('.').all(|label| {
-                !label.is_empty()
-                    && label
-                        .chars()
-                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
-            })
-    }
-
     fn open_link_assist(&mut self, trigger_start: usize) {
-        self.link_assist_open = true;
+        self.pending_bidirectional_link_source_line = None;
+        self.link_inline_anchor = Some(trigger_start);
+        self.link_inline_files = self.collect_link_inline_files();
+        self.selected_link_inline_suggestion = 0;
+        self.link_assist_open = false;
         self.link_assist_choice = LinkAssistChoice::File;
         self.link_assist_trigger_start = Some(trigger_start);
         self.link_assist_web_open = false;
         self.link_assist_web_url.clear();
-        self.focus_editor_once = false;
-        self.status = "Insert link: choose Archivo or Web".to_string();
+        self.focus_editor_once = true;
+        self.status = "Link: type to fuzzy-find files · Enter inserts Markdown link".to_string();
+    }
+
+    fn close_link_inline_autocomplete(&mut self) {
+        self.link_inline_anchor = None;
+        self.link_inline_files.clear();
+        self.selected_link_inline_suggestion = 0;
+    }
+
+    fn detect_inline_bidirectional_link_command(&mut self, typed: Option<&str>) -> bool {
+        if typed != Some(" ")
+            || self.link_inline_anchor.is_some()
+            || self.buffer.selection().is_some()
+        {
+            return false;
+        }
+        let cursor = self.buffer.cursor();
+        let line_index = self.buffer.line_index_for_byte(cursor);
+        let line_start = self.buffer.line_start(line_index);
+        let Some(prefix) = self.buffer.as_str().get(line_start..cursor) else {
+            return false;
+        };
+        if prefix != ":link " {
+            return false;
+        }
+        self.buffer
+            .replace_selection_or_range(line_start, cursor, "[");
+        self.buffer.set_cursor(line_start + 1);
+        self.pending_bidirectional_link_source_line = Some(line_index + 1);
+        self.link_inline_anchor = Some(line_start);
+        self.link_inline_files = self.collect_link_inline_files();
+        self.selected_link_inline_suggestion = 0;
+        self.link_assist_trigger_start = Some(line_start);
+        self.focus_editor_once = true;
+        self.status =
+            ":link: choose target; Slate will write the reciprocal Markdown link".to_string();
+        true
+    }
+
+    fn collect_link_inline_files(&self) -> Vec<PathBuf> {
+        let root = self.project_root();
+        let mut out = Vec::new();
+        collect_link_target_files(&root, &mut out, 20_000);
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    fn current_link_inline_query(&self) -> Option<String> {
+        let anchor = self.link_inline_anchor?;
+        let cursor = self.buffer.cursor();
+        let text = self.buffer.as_str();
+        if self.buffer.selection().is_some()
+            || anchor >= text.len()
+            || cursor < anchor + 1
+            || text.as_bytes().get(anchor) != Some(&b'[')
+        {
+            return None;
+        }
+        let query = text.get(anchor + 1..cursor)?;
+        if query.contains('\n') || query.contains(']') || query.contains('(') || query.contains(')')
+        {
+            return None;
+        }
+        Some(query.to_string())
+    }
+
+    fn link_inline_suggestions(&self) -> Vec<PathBuf> {
+        let Some(query) = self.current_link_inline_query() else {
+            return Vec::new();
+        };
+        let root = self.project_root();
+        if query.trim().is_empty() {
+            let mut seen = HashSet::new();
+            let mut results = Vec::new();
+            for path in self
+                .recent_files
+                .iter()
+                .chain(self.link_inline_files.iter())
+            {
+                if path.is_file()
+                    && path.starts_with(&root)
+                    && seen.insert(path.display().to_string())
+                {
+                    results.push(path.clone());
+                    if results.len() >= 20 {
+                        break;
+                    }
+                }
+            }
+            return results;
+        }
+        periscope::rank_paths(self.link_inline_files.clone(), &root, &query, 20)
+    }
+
+    fn refresh_link_inline_state(&mut self, typed: Option<&str>) {
+        if self.link_inline_anchor.is_none() {
+            return;
+        }
+        if typed
+            .map(|text| text.contains(']') || text.contains('\n'))
+            .unwrap_or(false)
+        {
+            self.close_link_inline_autocomplete();
+            return;
+        }
+        if self.current_link_inline_query().is_none() {
+            self.close_link_inline_autocomplete();
+            return;
+        }
+        let suggestions = self.link_inline_suggestions();
+        if suggestions.is_empty() {
+            self.selected_link_inline_suggestion = 0;
+        } else {
+            self.selected_link_inline_suggestion = self
+                .selected_link_inline_suggestion
+                .min(suggestions.len().saturating_sub(1));
+        }
+    }
+
+    fn selected_link_inline_path(&self) -> Option<PathBuf> {
+        let suggestions = self.link_inline_suggestions();
+        suggestions
+            .get(self.selected_link_inline_suggestion)
+            .cloned()
+            .or_else(|| suggestions.first().cloned())
+    }
+
+    fn confirm_link_inline_autocomplete(&mut self) {
+        let Some(anchor) = self.link_inline_anchor else {
+            return;
+        };
+        let Some(path) = self.selected_link_inline_path() else {
+            self.close_link_inline_autocomplete();
+            return;
+        };
+        let target = link_ui::markdown_link_target_for_file(&path, self.path.as_deref());
+        let cursor = self.buffer.cursor();
+        self.buffer
+            .replace_selection_or_range(anchor, cursor, &format!("[]({target})"));
+        self.buffer.set_cursor(anchor + 1);
+        self.dirty = true;
+        self.search_state = None;
+        self.editor_view.request_scroll_to_cursor(&self.buffer);
+        self.close_link_inline_autocomplete();
+        self.focus_editor_once = true;
+        if self.pending_bidirectional_link_source_line.is_some() {
+            self.write_reciprocal_markdown_link(&path, None);
+        } else {
+            self.status =
+                "Inserted Markdown link; type label or Enter to use file name".to_string();
+        }
+    }
+
+    fn link_target_has_headings(path: &Path) -> bool {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| matches!(extension.to_lowercase().as_str(), "md" | "markdown"))
+            .unwrap_or(false)
+            && fs::read_to_string(path)
+                .map(|contents| !link_ui::markdown_heading_options(&contents).is_empty())
+                .unwrap_or(false)
+    }
+
+    fn open_selected_link_inline_headings(&mut self) {
+        let Some(path) = self.selected_link_inline_path() else {
+            self.close_link_inline_autocomplete();
+            return;
+        };
+        let target = link_ui::markdown_link_target_for_file(&path, self.path.as_deref());
+        let bidirectional = self.pending_bidirectional_link_source_line.is_some();
+        self.close_link_inline_autocomplete();
+        self.open_link_heading_picker_or_insert(&path, target);
+        if bidirectional && self.link_heading_picker_open {
+            self.link_heading_picker_mode = LinkHeadingPickerMode::BidirectionalLink;
+        }
     }
 
     fn cancel_link_assist(&mut self) {
+        self.close_link_inline_autocomplete();
         self.link_assist_open = false;
         self.link_assist_web_open = false;
         self.link_heading_picker_open = false;
+        self.link_heading_picker_mode = LinkHeadingPickerMode::InsertLink;
+        self.pending_refile = None;
+        self.pending_refile_destination = None;
+        self.pending_bidirectional_link_source_line = None;
+        self.link_heading_target_path = None;
         self.link_assist_web_url.clear();
         self.link_heading_base_target.clear();
         self.link_heading_options.clear();
@@ -1201,6 +2701,7 @@ impl SlateApp {
     }
 
     fn open_link_heading_picker_or_insert(&mut self, path: &Path, base_target: String) {
+        self.link_heading_target_path = Some(path.to_path_buf());
         let is_markdown = path
             .extension()
             .and_then(|extension| extension.to_str())
@@ -1212,7 +2713,7 @@ impl SlateApp {
         }
 
         let headings = fs::read_to_string(path)
-            .map(|contents| Self::markdown_heading_options(&contents))
+            .map(|contents| link_ui::markdown_heading_options(&contents))
             .unwrap_or_default();
         if headings.is_empty() {
             self.insert_assisted_markdown_link(&base_target);
@@ -1220,48 +2721,12 @@ impl SlateApp {
         }
 
         self.link_heading_picker_open = true;
+        self.link_heading_picker_mode = LinkHeadingPickerMode::InsertLink;
         self.link_heading_base_target = base_target;
         self.link_heading_options = headings;
         self.selected_link_heading = 0;
         self.focus_editor_once = false;
         self.status = "Insert link: choose heading or whole file".to_string();
-    }
-
-    fn markdown_heading_options(contents: &str) -> Vec<LinkHeadingOption> {
-        contents
-            .lines()
-            .enumerate()
-            .filter_map(|(line_index, line)| {
-                let heading = parse_heading_line(line)?;
-                let text = heading.text.trim();
-                if text.is_empty() {
-                    return None;
-                }
-                Some(LinkHeadingOption {
-                    level: heading.level,
-                    text: text.to_string(),
-                    anchor: Self::markdown_heading_anchor(text),
-                    line_index,
-                })
-            })
-            .collect()
-    }
-
-    fn markdown_heading_anchor(text: &str) -> String {
-        let mut anchor = String::new();
-        let mut last_was_dash = false;
-        for ch in text.trim().to_lowercase().chars() {
-            if ch.is_ascii_alphanumeric() {
-                anchor.push(ch);
-                last_was_dash = false;
-            } else if ch.is_whitespace() || ch == '-' {
-                if !last_was_dash && !anchor.is_empty() {
-                    anchor.push('-');
-                    last_was_dash = true;
-                }
-            }
-        }
-        anchor.trim_matches('-').to_string()
     }
 
     fn confirm_link_heading_picker(&mut self) {
@@ -1276,11 +2741,31 @@ impl SlateApp {
             };
             format!("{}#{}", self.link_heading_base_target, heading.anchor)
         };
+        let selected_heading = (self.selected_link_heading > 0)
+            .then(|| {
+                self.link_heading_options
+                    .get(self.selected_link_heading - 1)
+                    .cloned()
+            })
+            .flatten();
+        let mode = self.link_heading_picker_mode;
         self.link_heading_picker_open = false;
+        self.link_heading_picker_mode = LinkHeadingPickerMode::InsertLink;
         self.link_heading_base_target.clear();
         self.link_heading_options.clear();
         self.selected_link_heading = 0;
-        self.insert_assisted_markdown_link(&target);
+        match mode {
+            LinkHeadingPickerMode::InsertLink => self.insert_assisted_markdown_link(&target),
+            LinkHeadingPickerMode::BidirectionalLink => {
+                self.insert_assisted_markdown_link(&target);
+                if let Some(path) = self.link_heading_target_path.take() {
+                    self.write_reciprocal_markdown_link(&path, selected_heading.as_ref());
+                }
+            }
+            LinkHeadingPickerMode::Refile => {
+                self.finish_refile_to_selected_target(selected_heading)
+            }
+        }
     }
 
     fn move_link_heading_selection(&mut self, delta: isize) {
@@ -1300,7 +2785,24 @@ impl SlateApp {
             self.status = "Insert link failed: missing trigger".to_string();
             return;
         };
-        let trigger_end = (trigger_start + 2).min(self.buffer.as_str().len());
+        let text = self.buffer.as_str();
+        let cursor = self.buffer.cursor();
+        let trigger_end = if text.as_bytes().get(trigger_start) == Some(&b'[')
+            && cursor >= trigger_start + 1
+            && text
+                .get(trigger_start + 1..cursor)
+                .map(|query| {
+                    !query.contains('\n')
+                        && !query.contains(']')
+                        && !query.contains('(')
+                        && !query.contains(')')
+                })
+                .unwrap_or(false)
+        {
+            cursor
+        } else {
+            (trigger_start + 1).min(text.len())
+        };
         let insertion = format!("]({target})");
         self.buffer.replace_selection_or_range(
             trigger_start,
@@ -1312,44 +2814,48 @@ impl SlateApp {
         self.search_state = None;
         self.editor_view.request_scroll_to_cursor(&self.buffer);
         self.focus_editor_once = true;
-        self.status = "Inserted Markdown link; type the label".to_string();
-    }
-
-    fn markdown_link_target_for_file(&self, path: &Path) -> String {
-        let base = self
-            .path
-            .as_ref()
-            .and_then(|path| path.parent().map(Path::to_path_buf))
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-        let raw = path
-            .strip_prefix(&base)
-            .map(|relative| {
-                let relative = relative.display().to_string();
-                if relative.starts_with("../") || relative.starts_with("./") {
-                    relative
-                } else {
-                    format!("./{relative}")
-                }
-            })
-            .unwrap_or_else(|_| path.display().to_string());
-        raw.replace('\\', "/")
-    }
-
-    fn resolve_markdown_link_path(&self, target: &str) -> PathBuf {
-        let expanded = target
-            .strip_prefix("~/")
-            .and_then(|rest| dirs_next::home_dir().map(|home| home.join(rest)))
-            .unwrap_or_else(|| PathBuf::from(target));
-        if expanded.is_absolute() {
-            return expanded;
+        if self.pending_bidirectional_link_source_line.is_some() {
+            if let Some(path) = self.link_heading_target_path.take() {
+                self.write_reciprocal_markdown_link(&path, None);
+            }
+        } else {
+            self.status = "Inserted Markdown link; type the label".to_string();
         }
+    }
 
-        let base = self
-            .path
-            .as_ref()
-            .and_then(|path| path.parent().map(Path::to_path_buf))
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-        base.join(expanded)
+    fn write_reciprocal_markdown_link(
+        &mut self,
+        target_path: &Path,
+        heading: Option<&link_ui::LinkHeadingOption>,
+    ) {
+        let Some(source_line) = self.pending_bidirectional_link_source_line.take() else {
+            return;
+        };
+        let Some(source_path) = self.path.clone() else {
+            self.status = "Bidirectional link needs a saved source file".to_string();
+            return;
+        };
+        let source_target = format!(
+            "{}#L{}",
+            link_ui::markdown_link_target_for_file(&source_path, Some(target_path)),
+            source_line
+        );
+        let source_label = source_path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("source");
+        let block = format!("- linked from: [{source_label}:{source_line}]({source_target})");
+        let result = if let Some(heading) = heading {
+            append_markdown_block_to_heading(target_path, heading, &block)
+        } else {
+            append_markdown_block(target_path, &block)
+        };
+        match result {
+            Ok(()) => {
+                self.status = format!("Inserted bidirectional link to {}", target_path.display())
+            }
+            Err(err) => self.status = format!("Inserted link, reciprocal failed: {err}"),
+        }
     }
 
     fn save(&mut self) {
@@ -1362,71 +2868,330 @@ impl SlateApp {
     }
 
     fn scratch_archive_path(&mut self) -> Option<PathBuf> {
-        let Some(mut dir) = dirs_next::data_dir() else {
+        let path = scratch::archive_path();
+        if path.is_none() {
             self.status = "Scratch failed: no data dir".to_string();
-            return None;
-        };
-        dir.push("slate");
-        Some(dir.join("scratch.md"))
+        }
+        path
     }
 
     fn append_text_to_scratch_archive(&mut self, text: &str) -> bool {
-        let text = text.trim_end();
-        if text.trim().is_empty() {
-            return false;
-        }
-
         let Some(path) = self.scratch_archive_path() else {
             self.status = "Scratch append failed: no data dir".to_string();
             return false;
         };
-        if let Some(dir) = path.parent() {
-            if let Err(err) = fs::create_dir_all(dir) {
-                self.status = format!("Scratch append failed: {err}");
-                return false;
+        match scratch::append_text_to_archive(&path, text) {
+            Ok(()) => {
+                self.status = format!("Appended to {}", path.display());
+                true
             }
-        }
-
-        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-        let needs_header =
-            !path.exists() || fs::metadata(&path).map(|m| m.len() == 0).unwrap_or(true);
-        let entry = if needs_header {
-            format!("# Scratch\n\n## {now}\n\n{text}\n")
-        } else {
-            format!("\n\n## {now}\n\n{text}\n")
-        };
-
-        match fs::OpenOptions::new().create(true).append(true).open(&path) {
-            Ok(mut file) => match file.write_all(entry.as_bytes()) {
-                Ok(_) => {
-                    self.status = format!("Appended to {}", path.display());
-                    true
-                }
-                Err(err) => {
-                    self.status = format!("Scratch append failed: {err}");
-                    false
-                }
-            },
             Err(err) => {
-                self.status = format!("Scratch append failed: {err}");
+                self.status = err;
                 false
             }
         }
     }
 
-    fn append_to_scratch_archive(&mut self) {
+    fn append_to_scratch_archive(&mut self) -> bool {
         if !self.scratch
             || self.path.is_some()
             || !self.dirty
             || self.buffer.as_str().trim().is_empty()
         {
-            return;
+            return false;
         }
 
         let text = self.buffer.as_str().to_string();
-        if self.append_text_to_scratch_archive(&text) {
-            self.dirty = false;
+        let (quickadds, remaining) = scratch::split_quickadds(&text);
+        let mut quickadd_count = 0usize;
+        for task in quickadds {
+            if self.quickadd_flow_task(&task) {
+                quickadd_count += 1;
+            }
         }
+
+        let archived = if remaining.trim().is_empty() {
+            false
+        } else {
+            self.append_text_to_scratch_archive(&remaining)
+        };
+
+        let saved = archived || quickadd_count > 0;
+        if saved {
+            self.dirty = false;
+            if quickadd_count > 0 && archived {
+                self.status = format!("Scratch archived · quickadded {quickadd_count} Flow tasks");
+            } else if quickadd_count > 0 {
+                self.status = format!("Quickadded {quickadd_count} Flow tasks");
+            }
+        }
+        saved
+    }
+
+    fn close_scratch_with_feedback(&mut self, ctx: &egui::Context) {
+        let previous_status = self.status.clone();
+        if self.append_to_scratch_archive() {
+            self.status = previous_status;
+            let until = ctx.input(|input| input.time) + 0.4;
+            self.scratch_close_after = Some(until);
+            self.agenda_updated_toast_until = Some(until);
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    fn show_agenda_updated_toast(&mut self, ctx: &egui::Context) {
+        self.agenda_updated_toast_until = Some(ctx.input(|input| input.time) + 0.4);
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+    }
+
+    fn schedule_current_flow_buffer_agenda_sync(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        if !flow::should_index_flow_path(&path) {
+            return;
+        }
+        self.pending_flow_agenda_sync_at = Some(ctx.input(|input| input.time) + 0.8);
+        ctx.request_repaint_after(std::time::Duration::from_millis(850));
+    }
+
+    fn poll_pending_flow_agenda_sync(&mut self, ctx: &egui::Context) {
+        let Some(sync_at) = self.pending_flow_agenda_sync_at else {
+            return;
+        };
+        let now = ctx.input(|input| input.time);
+        if now < sync_at {
+            let remaining_ms = ((sync_at - now) * 1000.0).max(25.0) as u64;
+            ctx.request_repaint_after(std::time::Duration::from_millis(remaining_ms.min(850)));
+            return;
+        }
+        self.pending_flow_agenda_sync_at = None;
+        self.sync_current_flow_buffer_to_agenda(ctx);
+    }
+
+    fn sync_current_flow_buffer_to_agenda(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        if !flow::should_index_flow_path(&path) {
+            return;
+        }
+        self.publish_current_flow_buffer_to_agenda(ctx);
+    }
+
+    fn publish_current_flow_buffer_to_agenda(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        let old_items = self.load_agenda_items().unwrap_or_default();
+        let summary = match self.refresh_flow_index_for_path(&path, self.buffer.as_str()) {
+            Ok(summary) => summary,
+            Err(err) => {
+                self.status = format!("Flow agenda update failed: {err}");
+                return;
+            }
+        };
+        if let Some(summary) = summary.as_ref() {
+            self.record_daily_events_for_flow_update(&path, &old_items, summary);
+        }
+        if self.agenda_open {
+            if let Ok(mut items) = self.load_agenda_items() {
+                self.overlay_current_buffer_agenda_items(&mut items);
+                self.agenda_items = items;
+                self.clamp_agenda_selection();
+            }
+        }
+        self.show_agenda_updated_toast(ctx);
+    }
+
+    fn publish_active_flow_buffer_heartbeat(&self) {
+        let Some(current_path) = self.path.clone() else {
+            return;
+        };
+        if self.standalone_agenda || !flow::should_index_flow_path(&current_path) {
+            return;
+        }
+        let scope = Self::flow_project_root_for_path(&current_path);
+        let Ok(sqlite_path) = Self::flow_sqlite_path_for_root(&scope) else {
+            return;
+        };
+        let _ = flow_runtime::publish_active_buffer_heartbeat(&sqlite_path, &scope, &current_path);
+    }
+
+    fn flow_item_is_active_in_live_editor(&self, item: &AgendaItem) -> bool {
+        let Ok(sqlite_path) = Self::flow_sqlite_path_for_root(&self.flow_scope_root()) else {
+            return false;
+        };
+        flow_runtime::active_buffer_contains(&sqlite_path, &item.relative_path)
+    }
+
+    fn poll_flow_open_requests(&mut self) {
+        let Some(current_path) = self.path.clone() else {
+            return;
+        };
+        if !flow::should_index_flow_path(&current_path) {
+            return;
+        }
+        let scope = Self::flow_project_root_for_path(&current_path);
+        let Ok(sqlite_path) = Self::flow_sqlite_path_for_root(&scope) else {
+            return;
+        };
+        let Some((requests_path, requests, remaining)) =
+            flow_runtime::drain_open_requests_for_path(&sqlite_path, &scope, &current_path)
+        else {
+            return;
+        };
+        let opened_line = requests.last().map(|request| {
+            request
+                .line_index
+                .min(self.buffer.line_count().saturating_sub(1))
+        });
+        flow_runtime::finish_request_drain(&requests_path, remaining);
+        if let Some(line) = opened_line {
+            self.buffer.set_cursor(self.buffer.line_end(line));
+            self.editor_view.request_scroll_to_cursor(&self.buffer);
+            self.focus_editor_once = true;
+            self.status = format!("Agenda jumped to open buffer line {}", line + 1);
+        }
+    }
+
+    fn poll_flow_completion_requests(&mut self, ctx: &egui::Context) {
+        let Some(current_path) = self.path.clone() else {
+            return;
+        };
+        if !flow::should_index_flow_path(&current_path) {
+            return;
+        }
+        let scope = Self::flow_project_root_for_path(&current_path);
+        let Ok(sqlite_path) = Self::flow_sqlite_path_for_root(&scope) else {
+            return;
+        };
+        let Some((requests_path, requests, mut remaining)) =
+            flow_runtime::drain_completion_requests_for_path(&sqlite_path, &scope, &current_path)
+        else {
+            return;
+        };
+        let mut applied = false;
+        for request in requests {
+            if self.apply_flow_completion_to_buffer(request.line_index, &request.title) {
+                applied = true;
+            } else {
+                remaining.push(request.raw);
+            }
+        }
+        flow_runtime::finish_request_drain(&requests_path, remaining);
+        if applied {
+            self.dirty = true;
+            self.search_state = None;
+            self.publish_current_flow_buffer_to_agenda(ctx);
+        }
+    }
+
+    fn poll_flow_organization_requests(&mut self, ctx: &egui::Context) {
+        let Some(current_path) = self.path.clone() else {
+            return;
+        };
+        if !flow::should_index_flow_path(&current_path) {
+            return;
+        }
+        let scope = Self::flow_project_root_for_path(&current_path);
+        let Ok(sqlite_path) = Self::flow_sqlite_path_for_root(&scope) else {
+            return;
+        };
+        let Some((requests_path, requests, mut remaining)) =
+            flow_runtime::drain_organization_requests_for_path(&sqlite_path, &scope, &current_path)
+        else {
+            return;
+        };
+        let mut applied = false;
+        for request in requests {
+            if self.apply_flow_token_to_buffer(request.line_index, &request.value) {
+                applied = true;
+            } else {
+                remaining.push(request.raw);
+            }
+        }
+        flow_runtime::finish_request_drain(&requests_path, remaining);
+        if applied {
+            self.dirty = true;
+            self.search_state = None;
+            self.publish_current_flow_buffer_to_agenda(ctx);
+        }
+    }
+
+    fn poll_flow_edit_requests(&mut self, ctx: &egui::Context) {
+        let Some(current_path) = self.path.clone() else {
+            return;
+        };
+        if !flow::should_index_flow_path(&current_path) {
+            return;
+        }
+        let scope = Self::flow_project_root_for_path(&current_path);
+        let Ok(sqlite_path) = Self::flow_sqlite_path_for_root(&scope) else {
+            return;
+        };
+        let Some((requests_path, requests, mut remaining)) =
+            flow_runtime::drain_edit_requests_for_path(&sqlite_path, &scope, &current_path)
+        else {
+            return;
+        };
+        let mut applied = false;
+        for request in requests {
+            if self.apply_flow_line_edit_to_buffer(request.line_index, &request.value) {
+                applied = true;
+            } else {
+                remaining.push(request.raw);
+            }
+        }
+        flow_runtime::finish_request_drain(&requests_path, remaining);
+        if applied {
+            self.dirty = true;
+            self.search_state = None;
+            self.publish_current_flow_buffer_to_agenda(ctx);
+        }
+    }
+
+    fn apply_flow_line_edit_to_buffer(&mut self, line_index: usize, replacement: &str) -> bool {
+        if line_index >= self.buffer.line_count() {
+            return false;
+        }
+        let line_start = self.buffer.line_start(line_index);
+        let line_end = self.buffer.line_end(line_index);
+        self.buffer
+            .replace_selection_or_range(line_start, line_end, replacement);
+        true
+    }
+
+    fn apply_flow_completion_to_buffer(&mut self, line_index: usize, title: &str) -> bool {
+        let candidate_indices = [line_index, line_index.saturating_sub(1), line_index + 1];
+        for index in candidate_indices {
+            let line = self.buffer.line(index);
+            let Some(parsed) = parse_checkbox_line(line) else {
+                continue;
+            };
+            if parsed.state == CheckboxState::Done {
+                return true;
+            }
+            let Some(task) = flow::parse_flow_task_line(line, index, None) else {
+                continue;
+            };
+            if task.title != title {
+                continue;
+            }
+            let line_start = self.buffer.line_start(index);
+            let marker_start = line_start + parsed.indent.len() + parsed.task_prefix.len();
+            let marker_end = marker_start + parsed.marker.len();
+            self.buffer
+                .replace_selection_or_range(marker_start, marker_end, "[x]");
+            return true;
+        }
+        false
+    }
+
+    fn scratch_feedback_toast(&self, ctx: &egui::Context) {
+        scratch::feedback_toast(ctx, self.agenda_updated_toast_until);
     }
 
     fn archive_scratch_modal(&mut self) {
@@ -1438,10 +3203,29 @@ impl SlateApp {
             return;
         }
         let text = self.scratch_buffer.as_str().to_string();
-        if self.append_text_to_scratch_archive(&text) {
+        let (quickadds, remaining) = scratch::split_quickadds(&text);
+        let mut quickadd_count = 0usize;
+        for task in quickadds {
+            if self.quickadd_flow_task(&task) {
+                quickadd_count += 1;
+            }
+        }
+
+        let archived = if remaining.trim().is_empty() {
+            false
+        } else {
+            self.append_text_to_scratch_archive(&remaining)
+        };
+
+        if archived || quickadd_count > 0 {
             self.scratch_buffer.clear();
             self.scratch_modal_open = false;
             self.focus_editor_once = true;
+            if quickadd_count > 0 && archived {
+                self.status = format!("Scratch archived · quickadded {quickadd_count} Flow tasks");
+            } else if quickadd_count > 0 {
+                self.status = format!("Quickadded {quickadd_count} Flow tasks");
+            }
         }
     }
 
@@ -1471,63 +3255,13 @@ impl SlateApp {
         self.status = "Scratch capture".to_string();
     }
 
-    fn parse_scratch_entries(text: &str) -> Vec<ScratchEntry> {
-        let mut entries = Vec::new();
-        let mut heading: Option<String> = None;
-        let mut body = String::new();
-        let mut seen_entry = false;
-
-        let flush =
-            |entries: &mut Vec<ScratchEntry>, heading: &mut Option<String>, body: &mut String| {
-                if heading.is_some() || !body.trim().is_empty() {
-                    entries.push(ScratchEntry {
-                        heading: heading.take(),
-                        body: body.trim_matches('\n').to_string(),
-                    });
-                    body.clear();
-                }
-            };
-
-        for line in text.lines() {
-            if line.trim() == "# Scratch"
-                && !seen_entry
-                && heading.is_none()
-                && body.trim().is_empty()
-            {
-                continue;
-            }
-            if let Some(rest) = line.strip_prefix("## ") {
-                flush(&mut entries, &mut heading, &mut body);
-                heading = Some(rest.trim().to_string());
-                seen_entry = true;
-            } else {
-                body.push_str(line);
-                body.push('\n');
-            }
-        }
-        flush(&mut entries, &mut heading, &mut body);
-        entries
-    }
-
-    fn serialize_scratch_entries(entries: &[ScratchEntry]) -> String {
-        let mut text = "# Scratch\n".to_string();
-        for entry in entries {
-            text.push_str("\n## ");
-            text.push_str(entry.heading.as_deref().unwrap_or("untitled scratch"));
-            text.push_str("\n\n");
-            text.push_str(entry.body.trim_end());
-            text.push('\n');
-        }
-        text
-    }
-
     fn load_scratch_entries(&mut self) -> bool {
         let Some(path) = self.scratch_archive_path() else {
             return false;
         };
         match fs::read_to_string(&path) {
             Ok(text) => {
-                self.scratch_entries = Self::parse_scratch_entries(&text);
+                self.scratch_entries = scratch::parse_entries(&text);
                 if self.scratch_entries.is_empty() {
                     self.selected_scratch_entry = 0;
                 } else {
@@ -1605,12 +3339,7 @@ impl SlateApp {
             self.focus_editor_once = true;
             return;
         }
-        let title = self.capture_title.trim();
-        let entry = if title.is_empty() {
-            self.capture_text.trim_end().to_string()
-        } else {
-            format!("**{title}**\n\n{}", self.capture_text.trim_end())
-        };
+        let entry = scratch::format_capture_entry(&self.capture_title, &self.capture_text);
         if self.append_text_to_scratch_archive(&entry) {
             self.capture_modal_open = false;
             self.capture_title.clear();
@@ -1640,10 +3369,7 @@ impl SlateApp {
                 return;
             }
         }
-        match fs::write(
-            &path,
-            Self::serialize_scratch_entries(&self.scratch_entries),
-        ) {
+        match fs::write(&path, scratch::serialize_entries(&self.scratch_entries)) {
             Ok(_) => self.status = format!("Deleted scratch entry {}", deleted.title()),
             Err(err) => self.status = format!("Scratch delete failed: {err}"),
         }
@@ -1656,8 +3382,20 @@ impl SlateApp {
                 self.last_open_dir = path.parent().map(PathBuf::from);
                 self.dirty = false;
                 self.remember_recent_file(path.clone());
+                let flow_summary = self
+                    .refresh_flow_index_for_path(&path, self.buffer.as_str())
+                    .ok()
+                    .flatten();
                 let _ = self.save_settings();
-                self.status = format!("Saved {}", path.display());
+                self.status = if let Some(summary) = flow_summary {
+                    format!(
+                        "Saved {} · indexed {} Flow tasks",
+                        path.display(),
+                        summary.tasks.len()
+                    )
+                } else {
+                    format!("Saved {}", path.display())
+                };
             }
             Err(err) => self.status = format!("Save failed: {err}"),
         }
@@ -1725,48 +3463,13 @@ impl SlateApp {
     }
 
     fn recent_file_indices(&self) -> Vec<usize> {
-        let query = self.recent_query.trim().to_lowercase();
-        if query.is_empty() {
-            return (0..self.recent_files.len()).collect();
-        }
-
-        let mut scored = self
-            .recent_files
-            .iter()
-            .enumerate()
-            .filter_map(|(index, path)| {
-                let display = path.display().to_string();
-                let file_name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("");
-                let display_score = Self::fuzzy_score(&display, &query);
-                let name_score = Self::fuzzy_score(file_name, &query).map(|score| score / 2);
-                display_score
-                    .into_iter()
-                    .chain(name_score)
-                    .min()
-                    .map(|score| (score, index))
-            })
-            .collect::<Vec<_>>();
-        scored.sort_by_key(|(score, index)| (*score, *index));
-        scored.into_iter().map(|(_, index)| index).collect()
+        file_dialogs::path_list_indices(&self.recent_files, &self.recent_query)
     }
 
     fn move_recent_selection(&mut self, delta: isize) {
         let indices = self.recent_file_indices();
-        if indices.is_empty() {
-            self.selected_recent_file = 0;
-            return;
-        }
-        let current_position = indices
-            .iter()
-            .position(|index| *index == self.selected_recent_file)
-            .unwrap_or(0);
-        let next_position = current_position
-            .saturating_add_signed(delta)
-            .min(indices.len().saturating_sub(1));
-        self.selected_recent_file = indices[next_position];
+        self.selected_recent_file =
+            file_dialogs::move_selected_index(&indices, self.selected_recent_file, delta);
     }
 
     fn open_selected_recent_file(&mut self) {
@@ -1855,47 +3558,13 @@ impl SlateApp {
     }
 
     fn lance_file_indices(&self) -> Vec<usize> {
-        let query = self.lance_query.trim().to_lowercase();
-        if query.is_empty() {
-            return (0..self.lance_files.len()).collect();
-        }
-        let mut scored = self
-            .lance_files
-            .iter()
-            .enumerate()
-            .filter_map(|(index, path)| {
-                let display = path.display().to_string();
-                let file_name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("");
-                let display_score = Self::fuzzy_score(&display, &query);
-                let name_score = Self::fuzzy_score(file_name, &query).map(|score| score / 2);
-                display_score
-                    .into_iter()
-                    .chain(name_score)
-                    .min()
-                    .map(|score| (score, index))
-            })
-            .collect::<Vec<_>>();
-        scored.sort_by_key(|(score, index)| (*score, *index));
-        scored.into_iter().map(|(_, index)| index).collect()
+        file_dialogs::path_list_indices(&self.lance_files, &self.lance_query)
     }
 
     fn move_lance_selection(&mut self, delta: isize) {
         let indices = self.lance_file_indices();
-        if indices.is_empty() {
-            self.selected_lance_file = 0;
-            return;
-        }
-        let current_position = indices
-            .iter()
-            .position(|index| *index == self.selected_lance_file)
-            .unwrap_or(0);
-        let next_position = current_position
-            .saturating_add_signed(delta)
-            .min(indices.len().saturating_sub(1));
-        self.selected_lance_file = indices[next_position];
+        self.selected_lance_file =
+            file_dialogs::move_selected_index(&indices, self.selected_lance_file, delta);
     }
 
     fn remove_selected_lance_file(&mut self) {
@@ -2030,7 +3699,7 @@ impl SlateApp {
                     CheckboxState::Done => "done",
                 };
                 let laystack = format!("{} {} {}", task.line_index + 1, state, task.text);
-                Self::fuzzy_score(&laystack, &query).map(|score| (score, index))
+                fuzzy_score(&laystack, &query).map(|score| (score, index))
             })
             .collect::<Vec<_>>();
         scored.sort_by_key(|(score, index)| (*score, *index));
@@ -2100,6 +3769,1020 @@ impl SlateApp {
         }
     }
 
+    fn open_agenda(&mut self) {
+        self.open_agenda_with_filter(String::new());
+    }
+
+    fn open_agenda_with_filter(&mut self, filter: String) {
+        self.shortcut_help_open = false;
+        self.palette_open = false;
+        self.recent_picker_open = false;
+        self.file_picker_open = false;
+        self.save_as_open = false;
+        self.scratch_modal_open = false;
+        self.scratch_entries_open = false;
+        self.capture_modal_open = false;
+        self.command_line_focused = false;
+        self.focus_command_line_once = false;
+        self.command_history_index = None;
+        self.ctrl_layer_active = false;
+        self.ctrl_layer_sequence.clear();
+        self.agenda_filter = filter.trim().to_string();
+        self.agenda_start_offset_days = 0;
+        self.agenda_tab = AgendaTab::Agenda;
+        self.agenda_focus = AgendaFocus::Dated;
+        self.agenda_selected_dated_row =
+            Local::now().date_naive().weekday().num_days_from_monday() as usize;
+        self.agenda_selected_inbox_item = 0;
+        self.agenda_selected_tab_items = [0; 5];
+        self.agenda_org_mode = None;
+        self.agenda_org_query.clear();
+        self.selected_agenda_org_suggestion = 0;
+        self.flow_item_edit = None;
+        self.agenda_scroll_to_selected = false;
+
+        match self.load_agenda_items() {
+            Ok(mut items) => {
+                self.overlay_current_buffer_agenda_items(&mut items);
+                self.agenda_items = items;
+                self.clamp_agenda_selection();
+                self.agenda_open = true;
+                self.focus_editor_once = false;
+                let visible_count = self.agenda_visible_item_indices().len();
+                self.status = if self.agenda_filter.is_empty() {
+                    format!("{} Flow agenda tasks", visible_count)
+                } else {
+                    format!(
+                        "{} Flow agenda tasks matching {}",
+                        visible_count, self.agenda_filter
+                    )
+                };
+            }
+            Err(err) => {
+                let mut items = Vec::new();
+                self.overlay_current_buffer_agenda_items(&mut items);
+                if items.is_empty() {
+                    self.agenda_open = false;
+                    self.agenda_items.clear();
+                    self.status = err;
+                    self.focus_editor_once = true;
+                } else {
+                    self.agenda_items = items;
+                    self.clamp_agenda_selection();
+                    self.agenda_open = true;
+                    self.focus_editor_once = false;
+                    self.status = "Flow agenda from current buffer".to_string();
+                }
+            }
+        }
+    }
+
+    fn load_agenda_items(&self) -> Result<Vec<AgendaItem>, String> {
+        agenda::load_items_from_cache(&self.flow_sqlite_path()?, &self.flow_scope_root())
+    }
+
+    fn overlay_current_buffer_agenda_items(&self, items: &mut Vec<AgendaItem>) {
+        let Some(path) = self.path.as_ref() else {
+            return;
+        };
+        if !flow::should_index_flow_path(path) {
+            return;
+        }
+
+        let root = Self::flow_project_root_for_path(path);
+        agenda::overlay_live_buffer_items(items, path, &root, self.buffer.as_str());
+    }
+
+    fn agenda_visible_item_indices(&self) -> Vec<usize> {
+        agenda::visible_item_indices(
+            &self.agenda_items,
+            self.agenda_tab,
+            &self.agenda_filter,
+            self.agenda_show_done,
+        )
+    }
+
+    fn agenda_week_start(&self) -> NaiveDate {
+        agenda::week_start(self.agenda_start_offset_days)
+    }
+
+    fn agenda_items_for_date(&self, date: NaiveDate) -> Vec<usize> {
+        agenda::item_indices_for_date(
+            &self.agenda_items,
+            self.agenda_tab,
+            &self.agenda_filter,
+            self.agenda_show_done,
+            date,
+        )
+    }
+
+    fn agenda_inbox_item_indices(&self) -> Vec<usize> {
+        agenda::inbox_item_indices(
+            &self.agenda_items,
+            self.agenda_tab,
+            &self.agenda_filter,
+            self.agenda_show_done,
+        )
+    }
+
+    fn agenda_flat_item_indices(&self) -> Vec<usize> {
+        self.agenda_visible_item_indices()
+    }
+
+    fn agenda_dated_rows(&self) -> Vec<AgendaDatedRow> {
+        agenda::dated_rows(
+            &self.agenda_items,
+            self.agenda_tab,
+            &self.agenda_filter,
+            self.agenda_show_done,
+            self.agenda_start_offset_days,
+            &self.agenda_expanded_dates,
+        )
+    }
+
+    fn clamp_agenda_selection(&mut self) {
+        agenda::clamp_selection(
+            &self.agenda_items,
+            self.agenda_tab,
+            &self.agenda_filter,
+            self.agenda_show_done,
+            self.agenda_start_offset_days,
+            &self.agenda_expanded_dates,
+            &mut self.agenda_selected_dated_row,
+            &mut self.agenda_selected_inbox_item,
+            &mut self.agenda_selected_tab_items,
+        );
+    }
+
+    fn move_agenda_selection(&mut self, delta: isize) {
+        self.agenda_scroll_to_selected = agenda::move_selection(
+            &self.agenda_items,
+            self.agenda_tab,
+            self.agenda_focus,
+            &self.agenda_filter,
+            self.agenda_show_done,
+            self.agenda_start_offset_days,
+            &self.agenda_expanded_dates,
+            &mut self.agenda_selected_dated_row,
+            &mut self.agenda_selected_inbox_item,
+            &mut self.agenda_selected_tab_items,
+            delta,
+        );
+    }
+
+    fn move_agenda_week_window(&mut self, delta_weeks: i64) {
+        self.agenda_start_offset_days = self
+            .agenda_start_offset_days
+            .saturating_add(delta_weeks.saturating_mul(7));
+        self.agenda_expanded_dates.clear();
+        self.agenda_selected_dated_row = 0;
+        self.agenda_focus = AgendaFocus::Dated;
+        let start_date = self.agenda_week_start();
+        self.status = format!("Agenda week starts {start_date}");
+        self.agenda_scroll_to_selected = false;
+    }
+
+    fn jump_agenda_to_today(&mut self) {
+        self.agenda_start_offset_days = 0;
+        self.agenda_selected_dated_row =
+            Local::now().date_naive().weekday().num_days_from_monday() as usize;
+        self.agenda_focus = AgendaFocus::Dated;
+        self.status = "Agenda week: current".to_string();
+        self.agenda_scroll_to_selected = false;
+    }
+
+    fn toggle_agenda_focus(&mut self) {
+        if self.agenda_tab != AgendaTab::Agenda {
+            return;
+        }
+        self.agenda_focus = match self.agenda_focus {
+            AgendaFocus::Dated => AgendaFocus::Inbox,
+            AgendaFocus::Inbox => AgendaFocus::Dated,
+        };
+        self.clamp_agenda_selection();
+        self.agenda_scroll_to_selected = true;
+        self.status = match self.agenda_focus {
+            AgendaFocus::Dated => "Agenda focus: dated week".to_string(),
+            AgendaFocus::Inbox => "Agenda focus: no-date items".to_string(),
+        };
+    }
+
+    fn cycle_agenda_tab(&mut self) {
+        let current = AgendaTab::ALL
+            .iter()
+            .position(|tab| *tab == self.agenda_tab)
+            .unwrap_or(0);
+        self.agenda_tab = AgendaTab::ALL[(current + 1) % AgendaTab::ALL.len()];
+        self.clamp_agenda_selection();
+        self.agenda_scroll_to_selected = true;
+        self.status = format!("Agenda tab: {}", self.agenda_tab.label());
+    }
+
+    fn toggle_agenda_done_visibility(&mut self) {
+        self.agenda_show_done = !self.agenda_show_done;
+        self.clamp_agenda_selection();
+        self.agenda_scroll_to_selected = true;
+        self.status = if self.agenda_show_done {
+            "Agenda: showing done tasks".to_string()
+        } else {
+            "Agenda: hiding done tasks".to_string()
+        };
+    }
+
+    fn activate_selected_agenda_row(&mut self) {
+        if self.agenda_tab != AgendaTab::Agenda {
+            let indices = self.agenda_flat_item_indices();
+            let tab_index = self.agenda_tab.index();
+            let Some(index) = indices
+                .get(self.agenda_selected_tab_items[tab_index])
+                .copied()
+            else {
+                self.status = format!("No {} item selected", self.agenda_tab.label());
+                return;
+            };
+            self.jump_to_agenda_item_index(index);
+            return;
+        }
+
+        match self.agenda_focus {
+            AgendaFocus::Dated => {
+                let rows = self.agenda_dated_rows();
+                let Some(row) = rows.get(self.agenda_selected_dated_row).copied() else {
+                    self.status = "No dated agenda row".to_string();
+                    return;
+                };
+                match row {
+                    AgendaDatedRow::Day(date) => {
+                        if !self.agenda_expanded_dates.insert(date) {
+                            self.agenda_expanded_dates.remove(&date);
+                            self.status = format!("Collapsed {}", date.format("%A %-d %B"));
+                        } else {
+                            let count = self.agenda_items_for_date(date).len();
+                            self.status = format!(
+                                "Expanded {} · {} task{}",
+                                date.format("%A %-d %B"),
+                                count,
+                                if count == 1 { "" } else { "s" }
+                            );
+                        }
+                        self.clamp_agenda_selection();
+                    }
+                    AgendaDatedRow::Task(index) => self.jump_to_agenda_item_index(index),
+                }
+            }
+            AgendaFocus::Inbox => {
+                let indices = self.agenda_inbox_item_indices();
+                let Some(index) = indices.get(self.agenda_selected_inbox_item).copied() else {
+                    self.status = "No no-date task selected".to_string();
+                    return;
+                };
+                self.jump_to_agenda_item_index(index);
+            }
+        }
+    }
+
+    fn selected_agenda_task_index(&self) -> Option<usize> {
+        agenda::selected_item_index(
+            &self.agenda_items,
+            self.agenda_tab,
+            self.agenda_focus,
+            &self.agenda_filter,
+            self.agenda_show_done,
+            self.agenda_start_offset_days,
+            &self.agenda_expanded_dates,
+            self.agenda_selected_dated_row,
+            self.agenda_selected_inbox_item,
+            &self.agenda_selected_tab_items,
+        )
+    }
+
+    fn agenda_org_suggestions(&self) -> Vec<String> {
+        let values = self
+            .agenda_items
+            .iter()
+            .flat_map(|item| match self.agenda_org_mode {
+                Some(AgendaOrgMode::Tag) => item.tags.clone(),
+                Some(AgendaOrgMode::Project) => item.projects.clone(),
+                None => Vec::new(),
+            });
+        organization_suggestions(values, &self.agenda_org_query)
+    }
+
+    fn all_flow_org_values(&self, mode: AgendaOrgMode) -> Vec<String> {
+        let current_path = self.path.as_ref();
+        let mut values = self
+            .agenda_items
+            .iter()
+            .filter(|item| current_path.map(|path| item.path != *path).unwrap_or(true))
+            .flat_map(|item| match mode {
+                AgendaOrgMode::Tag => item.tags.clone(),
+                AgendaOrgMode::Project => item.projects.clone(),
+            })
+            .collect::<Vec<_>>();
+        values.extend(self.current_buffer_flow_org_values(
+            mode,
+            self.current_flow_inline_org_token_global_range(mode),
+        ));
+        values
+    }
+
+    fn current_buffer_flow_org_values(
+        &self,
+        mode: AgendaOrgMode,
+        exclude: Option<std::ops::Range<usize>>,
+    ) -> Vec<String> {
+        let prefix = match mode {
+            AgendaOrgMode::Tag => '#',
+            AgendaOrgMode::Project => '@',
+        };
+        let mut values = Vec::new();
+        let mut line_start = 0;
+        for line in self.buffer.as_str().split('\n') {
+            if Self::line_supports_flow_inline_org(line) {
+                let mut index = 0;
+                while index < line.len() {
+                    let Some(ch) = line[index..].chars().next() else {
+                        break;
+                    };
+                    if ch != prefix {
+                        index += ch.len_utf8();
+                        continue;
+                    }
+                    if index > 0 {
+                        if let Some((_, before)) = line[..index].char_indices().next_back() {
+                            if !before.is_whitespace() && !matches!(before, '(' | '[' | '{') {
+                                index += ch.len_utf8();
+                                continue;
+                            }
+                        }
+                    }
+                    let value_start = index + ch.len_utf8();
+                    let mut end = value_start;
+                    while end < line.len() {
+                        let Some(next) = line[end..].chars().next() else {
+                            break;
+                        };
+                        if next.is_alphanumeric() || matches!(next, '-' | '_' | '/' | '.') {
+                            end += next.len_utf8();
+                        } else {
+                            break;
+                        }
+                    }
+                    let global_range = line_start + index..line_start + end;
+                    let overlaps_excluded = exclude
+                        .as_ref()
+                        .map(|excluded| {
+                            global_range.start < excluded.end && excluded.start < global_range.end
+                        })
+                        .unwrap_or(false);
+                    if !overlaps_excluded && end > value_start {
+                        values.push(line[value_start..end].to_string());
+                    }
+                    index = end.max(index + ch.len_utf8());
+                }
+            }
+            line_start += line.len() + 1;
+        }
+        values
+    }
+
+    fn flow_inline_org_suggestions(&self) -> Vec<String> {
+        let Some((mode, query)) = self.current_flow_inline_org_token() else {
+            return Vec::new();
+        };
+        if self.current_flow_inline_org_token_is_complete_existing(mode) {
+            return Vec::new();
+        }
+        let query = query.trim().to_ascii_lowercase();
+        let mut values = self.all_flow_org_values(mode);
+        values.sort_by_key(|value| value.to_ascii_lowercase());
+        values.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        values
+            .into_iter()
+            .filter(|value| query.is_empty() || value.to_ascii_lowercase().contains(&query))
+            .filter(|value| !self.current_line_has_org_value(mode, value))
+            .collect()
+    }
+
+    fn current_flow_inline_org_token_span(
+        &self,
+        mode: AgendaOrgMode,
+    ) -> Option<(std::ops::Range<usize>, usize)> {
+        let (line_index, column) = self.buffer.cursor_line_col();
+        let line = self.buffer.line(line_index);
+        let (range, _) = org_token_span_at_cursor(line, column, mode)?;
+        let cursor_byte = line
+            .char_indices()
+            .nth(column)
+            .map(|(index, _)| index)
+            .unwrap_or(line.len());
+        Some((range, cursor_byte))
+    }
+
+    fn current_flow_inline_org_token_global_start(&self, mode: AgendaOrgMode) -> Option<usize> {
+        self.current_flow_inline_org_token_global_range(mode)
+            .map(|range| range.start)
+    }
+
+    fn current_flow_inline_org_token_global_range(
+        &self,
+        mode: AgendaOrgMode,
+    ) -> Option<std::ops::Range<usize>> {
+        let (line_index, _) = self.buffer.cursor_line_col();
+        let (range, _) = self.current_flow_inline_org_token_span(mode)?;
+        let line_start = self.buffer.line_start(line_index);
+        Some(line_start + range.start..line_start + range.end)
+    }
+
+    fn current_flow_inline_org_token_is_complete_existing(&self, mode: AgendaOrgMode) -> bool {
+        let (line_index, _) = self.buffer.cursor_line_col();
+        let line = self.buffer.line(line_index);
+        let Some((range, _)) = self.current_flow_inline_org_token_span(mode) else {
+            return false;
+        };
+        let prefix_len = match mode {
+            AgendaOrgMode::Tag => '#'.len_utf8(),
+            AgendaOrgMode::Project => '@'.len_utf8(),
+        };
+        let value = line[range.start + prefix_len..range.end].trim();
+        !value.is_empty()
+            && self
+                .all_flow_org_values(mode)
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(value))
+    }
+
+    fn current_line_has_org_value(&self, mode: AgendaOrgMode, value: &str) -> bool {
+        if value.trim().is_empty() {
+            return false;
+        }
+        let (line_index, _) = self.buffer.cursor_line_col();
+        let prefix = match mode {
+            AgendaOrgMode::Tag => '#',
+            AgendaOrgMode::Project => '@',
+        };
+        self.buffer.line(line_index).split_whitespace().any(|word| {
+            word.strip_prefix(prefix)
+                .map(|candidate| {
+                    let candidate = candidate.trim_end_matches(|ch: char| {
+                        !ch.is_alphanumeric() && !matches!(ch, '-' | '_' | '/' | '.')
+                    });
+                    candidate.eq_ignore_ascii_case(value.trim())
+                })
+                .unwrap_or(false)
+        })
+    }
+
+    fn current_flow_inline_org_token(&self) -> Option<(AgendaOrgMode, String)> {
+        let (line_index, column) = self.buffer.cursor_line_col();
+        let line = self.buffer.line(line_index);
+        if !Self::line_supports_flow_inline_org(line) {
+            return None;
+        }
+        for mode in [AgendaOrgMode::Tag, AgendaOrgMode::Project] {
+            if let Some(query) = org_query_at_cursor(line, column, mode) {
+                return Some((mode, query));
+            }
+        }
+        None
+    }
+
+    fn line_supports_flow_inline_org(line: &str) -> bool {
+        let trimmed = line.trim_start();
+        parse_checkbox_line(line).is_some()
+            || trimmed.starts_with(":note")
+            || trimmed.starts_with(":nota")
+            || trimmed.starts_with(":idea")
+            || trimmed.starts_with(": ")
+    }
+
+    fn refresh_flow_inline_org_state(&mut self, typed: Option<&str>) {
+        let current = self.current_flow_inline_org_token();
+        let current_query_empty = current
+            .as_ref()
+            .map(|(_, query)| query.trim().is_empty())
+            .unwrap_or(true);
+        let explicit_trigger = typed.and_then(|text| {
+            text.chars().rev().find_map(|ch| match ch {
+                '#' => Some(AgendaOrgMode::Tag),
+                '@' => Some(AgendaOrgMode::Project),
+                _ => None,
+            })
+        });
+        let mut next_anchor = self.flow_inline_org_anchor;
+        let next_mode = match (
+            self.flow_inline_org_mode,
+            explicit_trigger,
+            current.as_ref(),
+        ) {
+            (_, Some(trigger), Some((current_mode, _))) if trigger == *current_mode => {
+                next_anchor = self.current_flow_inline_org_token_global_start(trigger);
+                Some(trigger)
+            }
+            (Some(active), _, Some((current_mode, _))) if active == *current_mode => {
+                let current_anchor = self.current_flow_inline_org_token_global_start(active);
+                if current_anchor.is_some() && current_anchor == self.flow_inline_org_anchor {
+                    Some(active)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if next_mode != self.flow_inline_org_mode {
+            self.selected_flow_inline_org_suggestion = 0;
+        }
+        self.flow_inline_org_mode = next_mode;
+        self.flow_inline_org_anchor = next_mode.and(next_anchor);
+        if next_mode.is_none() {
+            self.close_flow_inline_org_autocomplete();
+            return;
+        }
+        let suggestions = self.flow_inline_org_suggestions();
+        if suggestions.is_empty() {
+            if current_query_empty {
+                return;
+            }
+            self.close_flow_inline_org_autocomplete();
+            return;
+        }
+        let len = suggestions.len();
+        self.selected_flow_inline_org_suggestion = self
+            .selected_flow_inline_org_suggestion
+            .min(len.saturating_sub(1));
+    }
+
+    fn close_flow_inline_org_autocomplete(&mut self) {
+        self.flow_inline_org_mode = None;
+        self.flow_inline_org_anchor = None;
+        self.selected_flow_inline_org_suggestion = 0;
+    }
+
+    fn confirm_flow_inline_org_autocomplete(&mut self, ctx: &egui::Context) {
+        let Some((mode, query)) = self.current_flow_inline_org_token() else {
+            self.close_flow_inline_org_autocomplete();
+            return;
+        };
+        let suggestions = self.flow_inline_org_suggestions();
+        let value = suggestions
+            .get(self.selected_flow_inline_org_suggestion)
+            .cloned()
+            .unwrap_or(query);
+        let Some(token) = organization_token(mode, &value) else {
+            self.close_flow_inline_org_autocomplete();
+            return;
+        };
+        let (line_index, column) = self.buffer.cursor_line_col();
+        let line_start = self.buffer.line_start(line_index);
+        let mut line = self.buffer.line(line_index).to_string();
+        let next_column = replace_org_token_at_cursor(&mut line, column, mode, &token);
+        let line_end = self.buffer.line_end(line_index);
+        self.buffer
+            .replace_selection_or_range(line_start, line_end, &line);
+        let next_byte = line_start
+            + line
+                .char_indices()
+                .nth(next_column)
+                .map(|(index, _)| index)
+                .unwrap_or(line.len());
+        self.buffer.set_cursor(next_byte);
+        self.dirty = true;
+        self.search_state = None;
+        self.editor_view.request_scroll_to_cursor(&self.buffer);
+        self.sync_current_flow_buffer_to_agenda(ctx);
+        self.close_flow_inline_org_autocomplete();
+        self.status = format!("Inserted {token}");
+    }
+
+    fn open_agenda_org_autocomplete(&mut self, mode: AgendaOrgMode) {
+        if self.selected_agenda_task_index().is_none() {
+            self.status = "No agenda item selected".to_string();
+            return;
+        }
+        self.agenda_org_mode = Some(mode);
+        self.agenda_org_query.clear();
+        self.selected_agenda_org_suggestion = 0;
+        self.status = match mode {
+            AgendaOrgMode::Tag => "Agenda tag autocomplete (#)".to_string(),
+            AgendaOrgMode::Project => "Agenda project autocomplete (@)".to_string(),
+        };
+    }
+
+    fn close_agenda_org_autocomplete(&mut self) {
+        self.agenda_org_mode = None;
+        self.agenda_org_query.clear();
+        self.selected_agenda_org_suggestion = 0;
+    }
+
+    fn confirm_agenda_org_autocomplete(&mut self, ctx: &egui::Context) {
+        let Some(mode) = self.agenda_org_mode else {
+            return;
+        };
+        let Some(index) = self.selected_agenda_task_index() else {
+            self.close_agenda_org_autocomplete();
+            return;
+        };
+        let suggestions = self.agenda_org_suggestions();
+        let value = suggestions
+            .get(self.selected_agenda_org_suggestion)
+            .cloned()
+            .unwrap_or_else(|| self.agenda_org_query.trim().to_string());
+        let Some(token) = organization_token(mode, &value) else {
+            self.close_agenda_org_autocomplete();
+            return;
+        };
+        self.close_agenda_org_autocomplete();
+        self.append_token_to_agenda_item(index, &token, ctx);
+    }
+
+    fn open_selected_flow_item_edit(&mut self) {
+        let Some(index) = self.selected_agenda_task_index() else {
+            self.status = "No agenda item selected".to_string();
+            return;
+        };
+        let Some(item) = self.agenda_items.get(index).cloned() else {
+            self.status = "No agenda item selected".to_string();
+            return;
+        };
+        match self.agenda_item_source_line(&item) {
+            Ok(line) => {
+                self.flow_item_edit = Some(FlowItemEditState::new(index, line));
+                self.close_agenda_org_autocomplete();
+                self.status = "Editing Flow item · Ctrl+Enter save · Esc cancel".to_string();
+            }
+            Err(err) => self.status = err,
+        }
+    }
+
+    fn agenda_item_source_line(&self, item: &AgendaItem) -> Result<String, String> {
+        if self.path.as_ref() == Some(&item.path) {
+            return Ok(self.buffer.line(item.line_index).to_string());
+        }
+        let contents = fs::read_to_string(&item.path)
+            .map_err(|err| format!("Flow edit read failed: {err}"))?;
+        contents
+            .lines()
+            .nth(item.line_index)
+            .map(str::to_string)
+            .ok_or_else(|| "Flow edit line not found".to_string())
+    }
+
+    fn confirm_flow_item_edit(&mut self, index: usize, replacement: String, ctx: &egui::Context) {
+        self.flow_item_edit = None;
+        self.replace_agenda_item_source_line(index, &replacement, ctx);
+    }
+
+    fn replace_agenda_item_source_line(
+        &mut self,
+        index: usize,
+        replacement: &str,
+        ctx: &egui::Context,
+    ) {
+        let Some(item) = self.agenda_items.get(index).cloned() else {
+            return;
+        };
+        if self.standalone_agenda && self.flow_item_is_active_in_live_editor(&item) {
+            match append_flow_edit_request(&self.flow_scope_root(), &item, replacement) {
+                Ok(()) => {
+                    self.status = format!(
+                        "Requested edit for {}:{}",
+                        item.relative_path, item.line_number
+                    );
+                    return;
+                }
+                Err(err) => {
+                    self.status = err;
+                    return;
+                }
+            }
+        }
+        if self.path.as_ref() == Some(&item.path) {
+            if self.apply_flow_line_edit_to_buffer(item.line_index, replacement) {
+                self.dirty = true;
+                self.publish_current_flow_buffer_to_agenda(ctx);
+                self.status = "Flow item edited".to_string();
+            }
+            return;
+        }
+        match Self::replace_flow_line_in_file(&self.flow_scope_root(), &item, replacement) {
+            Ok(()) => {
+                self.status = format!("Edited {}:{}", item.relative_path, item.line_number);
+                if let Ok(mut items) = self.load_agenda_items() {
+                    self.overlay_current_buffer_agenda_items(&mut items);
+                    self.agenda_items = items;
+                    self.clamp_agenda_selection();
+                }
+            }
+            Err(err) => self.status = err,
+        }
+    }
+
+    fn append_token_to_agenda_item(&mut self, index: usize, token: &str, ctx: &egui::Context) {
+        let Some(item) = self.agenda_items.get(index).cloned() else {
+            return;
+        };
+        if self.standalone_agenda && self.flow_item_is_active_in_live_editor(&item) {
+            match append_flow_organization_request(&self.flow_scope_root(), &item, token) {
+                Ok(()) => {
+                    self.status = format!(
+                        "Requested {token} for {}:{}",
+                        item.relative_path, item.line_number
+                    );
+                    return;
+                }
+                Err(err) => {
+                    self.status = err;
+                    return;
+                }
+            }
+        }
+        if self.path.as_ref() == Some(&item.path) {
+            if self.apply_flow_token_to_buffer(item.line_index, token) {
+                self.dirty = true;
+                self.publish_current_flow_buffer_to_agenda(ctx);
+                self.status = format!("Added {token} to agenda item");
+            }
+            return;
+        }
+        match Self::append_flow_token_to_file(&self.flow_scope_root(), &item, token) {
+            Ok(()) => {
+                self.status = format!(
+                    "Added {token} to {}:{}",
+                    item.relative_path, item.line_number
+                );
+                if let Ok(mut items) = self.load_agenda_items() {
+                    self.overlay_current_buffer_agenda_items(&mut items);
+                    self.agenda_items = items;
+                    self.clamp_agenda_selection();
+                }
+            }
+            Err(err) => self.status = err,
+        }
+    }
+
+    fn apply_flow_token_to_buffer(&mut self, line_index: usize, token: &str) -> bool {
+        let candidate_indices = [line_index, line_index.saturating_sub(1), line_index + 1];
+        for index in candidate_indices {
+            if index >= self.buffer.line_count() {
+                continue;
+            }
+            let line = self.buffer.line(index).to_string();
+            if line
+                .split_whitespace()
+                .any(|word| word.eq_ignore_ascii_case(token))
+            {
+                return true;
+            }
+            if parse_checkbox_line(&line).is_none()
+                && flow::parse_flow_note_or_idea_line(&line, index, None).is_none()
+            {
+                continue;
+            }
+            let line_end = self.buffer.line_end(index);
+            self.buffer.set_cursor(line_end);
+            self.buffer.insert_text(&format!(" {token}"));
+            return true;
+        }
+        false
+    }
+
+    fn replace_flow_line_in_file(
+        scope: &Path,
+        item: &AgendaItem,
+        replacement: &str,
+    ) -> Result<(), String> {
+        let contents = fs::read_to_string(&item.path)
+            .map_err(|err| format!("Flow edit read failed: {err}"))?;
+        let mut lines = contents.lines().map(str::to_string).collect::<Vec<_>>();
+        let Some(line) = lines.get_mut(item.line_index) else {
+            return Err("Flow edit line not found".to_string());
+        };
+        *line = replacement.to_string();
+        let mut next = lines.join("\n");
+        if contents.ends_with('\n') {
+            next.push('\n');
+        }
+        let tmp = item.path.with_extension(format!(
+            "{}.tmp",
+            item.path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("md")
+        ));
+        fs::write(&tmp, next).map_err(|err| format!("Flow edit write failed: {err}"))?;
+        fs::rename(&tmp, &item.path).map_err(|err| format!("Flow edit replace failed: {err}"))?;
+        let updated = fs::read_to_string(&item.path)
+            .map_err(|err| format!("Flow edit reindex read failed: {err}"))?;
+        flow::update_flow_index_for_file(
+            scope,
+            &Self::flow_sqlite_path_for_root(scope)?,
+            &item.path,
+            &updated,
+        )?;
+        Ok(())
+    }
+
+    fn append_flow_token_to_file(
+        scope: &Path,
+        item: &AgendaItem,
+        token: &str,
+    ) -> Result<(), String> {
+        let contents = fs::read_to_string(&item.path)
+            .map_err(|err| format!("Flow organization read failed: {err}"))?;
+        let mut lines = contents.lines().map(str::to_string).collect::<Vec<_>>();
+        let Some(line) = lines.get_mut(item.line_index) else {
+            return Err("Flow organization line not found".to_string());
+        };
+        if line
+            .split_whitespace()
+            .any(|word| word.eq_ignore_ascii_case(token))
+        {
+            return Ok(());
+        }
+        line.push(' ');
+        line.push_str(token);
+        let mut next = lines.join("\n");
+        if contents.ends_with('\n') {
+            next.push('\n');
+        }
+        let tmp = item.path.with_extension(format!(
+            "{}.tmp",
+            item.path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("md")
+        ));
+        fs::write(&tmp, next).map_err(|err| format!("Flow organization write failed: {err}"))?;
+        fs::rename(&tmp, &item.path)
+            .map_err(|err| format!("Flow organization replace failed: {err}"))?;
+        let updated = fs::read_to_string(&item.path)
+            .map_err(|err| format!("Flow organization reindex read failed: {err}"))?;
+        flow::update_flow_index_for_file(
+            scope,
+            &Self::flow_sqlite_path_for_root(scope)?,
+            &item.path,
+            &updated,
+        )?;
+        Ok(())
+    }
+
+    fn jump_to_agenda_item_index(&mut self, index: usize) {
+        let Some(item) = self.agenda_items.get(index).cloned() else {
+            self.status = "No agenda item selected".to_string();
+            return;
+        };
+        if self.standalone_agenda {
+            self.open_agenda_item_in_main_slate(&item);
+            return;
+        }
+        if self.path.as_ref() != Some(&item.path) {
+            if self.dirty {
+                self.status = "Save current buffer before agenda jump".to_string();
+                return;
+            }
+            self.open_path(item.path.clone());
+        }
+        let line = item
+            .line_index
+            .min(self.buffer.line_count().saturating_sub(1));
+        self.buffer.set_cursor(self.buffer.line_end(line));
+        self.editor_view.request_scroll_to_cursor(&self.buffer);
+        self.agenda_open = false;
+        self.focus_editor_once = true;
+        self.status = format!("Jumped to agenda item on line {}", line + 1);
+    }
+
+    fn open_agenda_item_in_main_slate(&mut self, item: &AgendaItem) {
+        if self.flow_item_is_active_in_live_editor(item) {
+            if append_flow_open_request(
+                &self.flow_scope_root(),
+                &item.relative_path,
+                item.line_index,
+            )
+            .is_ok()
+            {
+                self.status = format!(
+                    "Jumping existing Slate window to {}:{}",
+                    item.relative_path, item.line_number
+                );
+                self.agenda_open = false;
+                self.focus_editor_once = false;
+                return;
+            }
+        }
+
+        let line_number = item.line_index.saturating_add(1).to_string();
+        let slate_bin = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(".local/bin/slate"))
+            .filter(|path| path.exists())
+            .unwrap_or_else(|| PathBuf::from("slate"));
+        match ProcessCommand::new(&slate_bin)
+            .arg(&item.path)
+            .arg("--line")
+            .arg(&line_number)
+            .spawn()
+        {
+            Ok(_) => {
+                self.status = format!("Opening {}:{}", item.path.display(), line_number);
+                self.agenda_open = false;
+                self.focus_editor_once = false;
+            }
+            Err(err) => {
+                self.status = format!("Agenda open failed: {err}");
+            }
+        }
+    }
+
+    fn cycle_selected_agenda_item(&mut self) {
+        let Some(index) = self.selected_agenda_task_index() else {
+            self.status = "Select an agenda task before cycling it".to_string();
+            return;
+        };
+        let Some(item) = self.agenda_items.get(index).cloned() else {
+            self.status = "No agenda item selected".to_string();
+            return;
+        };
+        if item.kind != "task" {
+            self.status = format!("Agenda cycle only applies to tasks, not {}", item.kind);
+            return;
+        }
+        if self.dirty {
+            self.status = "Save current buffer before agenda cycle".to_string();
+            return;
+        }
+
+        if self.path.as_ref() == Some(&item.path) {
+            let line = item
+                .line_index
+                .min(self.buffer.line_count().saturating_sub(1));
+            if !Self::cycle_flow_buffer_line(&mut self.buffer, line, item.line_number) {
+                self.status = format!("Agenda cycle failed: no checkbox on line {}", line + 1);
+                return;
+            }
+            self.search_state = None;
+            self.dirty = true;
+            self.save_path(item.path.clone());
+        } else {
+            let text = match fs::read_to_string(&item.path) {
+                Ok(text) => text,
+                Err(err) => {
+                    self.status = format!("Agenda cycle failed: {err}");
+                    return;
+                }
+            };
+            let mut buffer = EditorBuffer::from_text(text);
+            let line = item.line_index.min(buffer.line_count().saturating_sub(1));
+            if !Self::cycle_flow_buffer_line(&mut buffer, line, item.line_number) {
+                self.status = format!("Agenda cycle failed: no checkbox on line {}", line + 1);
+                return;
+            }
+            if let Err(err) = fs::write(&item.path, buffer.as_str()) {
+                self.status = format!("Agenda cycle failed: {err}");
+                return;
+            }
+            if let Err(err) = self.refresh_flow_index_for_path(&item.path, buffer.as_str()) {
+                self.status = err;
+                return;
+            }
+        }
+
+        match self.load_agenda_items() {
+            Ok(items) => {
+                self.agenda_items = items;
+                self.clamp_agenda_selection();
+                self.agenda_scroll_to_selected = true;
+                let state = self
+                    .agenda_items
+                    .iter()
+                    .find(|candidate| {
+                        candidate.path == item.path && candidate.line_index == item.line_index
+                    })
+                    .map(|item| agenda::state_marker(&item.state))
+                    .unwrap_or("[ ]");
+                self.status = format!(
+                    "Cycled agenda task to {state} on {}:{}",
+                    item.relative_path, item.line_number
+                );
+            }
+            Err(err) => {
+                self.status = format!("Agenda cycle updated source but reload failed: {err}");
+            }
+        }
+    }
+
+    fn cycle_flow_buffer_line(
+        buffer: &mut EditorBuffer,
+        line_index: usize,
+        line_number: usize,
+    ) -> bool {
+        if EditorView::cycle_checkbox_at_line(buffer, line_index) {
+            return true;
+        }
+        let fallback = line_number.saturating_sub(1);
+        fallback != line_index && EditorView::cycle_checkbox_at_line(buffer, fallback)
+    }
+
     fn project_root(&self) -> PathBuf {
         self.path
             .as_ref()
@@ -2118,100 +4801,6 @@ impl SlateApp {
             .or_else(|| std::env::current_dir().ok())
             .or_else(dirs_next::home_dir)
             .unwrap_or_else(|| PathBuf::from("."))
-    }
-
-    fn should_skip_file_dir(name: &str) -> bool {
-        matches!(
-            name,
-            ".git"
-                | "target"
-                | "node_modules"
-                | ".threadwell"
-                | ".idea"
-                | ".vscode"
-                | "dist"
-                | "build"
-        )
-    }
-
-    fn format_file_size(bytes: u64) -> String {
-        const KB: f64 = 1024.0;
-        const MB: f64 = KB * 1024.0;
-        const GB: f64 = MB * 1024.0;
-        let bytes = bytes as f64;
-        if bytes >= GB {
-            format!("{:.1}G", bytes / GB)
-        } else if bytes >= MB {
-            format!("{:.1}M", bytes / MB)
-        } else if bytes >= KB {
-            format!("{:.1}K", bytes / KB)
-        } else {
-            format!("{}B", bytes as u64)
-        }
-    }
-
-    fn format_modified_time(modified: SystemTime) -> String {
-        let Ok(elapsed) = SystemTime::now().duration_since(modified) else {
-            return "now".to_string();
-        };
-        let seconds = elapsed.as_secs();
-        let minute = 60;
-        let hour = minute * 60;
-        let day = hour * 24;
-        let week = day * 7;
-        let month = day * 30;
-        let year = day * 365;
-
-        if seconds < minute {
-            "now".to_string()
-        } else if seconds < hour {
-            format!("{}m ago", seconds / minute)
-        } else if seconds < day {
-            format!("{}h ago", seconds / hour)
-        } else if seconds < week {
-            format!("{}d ago", seconds / day)
-        } else if seconds < month {
-            format!("{}w ago", seconds / week)
-        } else if seconds < year {
-            format!("{}mo ago", seconds / month)
-        } else {
-            format!("{}y ago", seconds / year)
-        }
-    }
-
-    fn file_metadata_labels(path: &std::path::Path) -> (String, String) {
-        let Ok(metadata) = fs::metadata(path) else {
-            return ("?".to_string(), "?".to_string());
-        };
-        let size = Self::format_file_size(metadata.len());
-        let modified = metadata
-            .modified()
-            .map(Self::format_modified_time)
-            .unwrap_or_else(|_| "?".to_string());
-        (size, modified)
-    }
-
-    fn scan_directory_entries(dir: &Path) -> Vec<PathBuf> {
-        let Ok(entries) = fs::read_dir(dir) else {
-            return Vec::new();
-        };
-        let mut entries = entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                let name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("");
-                if path.is_dir() {
-                    !Self::should_skip_file_dir(name)
-                } else {
-                    path.is_file()
-                }
-            })
-            .collect::<Vec<_>>();
-        entries.sort_by_key(|path| (!path.is_dir(), path.file_name().map(|name| name.to_owned())));
-        entries
     }
 
     fn open_file_picker_for_open(&mut self) {
@@ -2235,81 +4824,34 @@ impl SlateApp {
         self.file_picker_mode = mode;
         self.file_picker_dir = dir;
         self.file_query.clear();
-        self.project_files = Self::scan_directory_entries(&self.file_picker_dir);
+        self.project_files = file_dialogs::scan_directory_entries(
+            &self.file_picker_dir,
+            file_dialogs::default_should_skip_dir,
+        );
         self.selected_project_file = self.project_file_indices().first().copied().unwrap_or(0);
         self.status = format!("Files: {}", self.file_picker_dir.display());
         self.focus_editor_once = false;
     }
 
     fn project_file_indices(&self) -> Vec<usize> {
-        let query = self.file_query.trim().to_lowercase();
-        let mut indices = if query.is_empty() {
-            (0..self.project_files.len()).collect::<Vec<_>>()
-        } else {
-            let mut scored = self
-                .project_files
-                .iter()
-                .enumerate()
-                .filter_map(|(index, path)| {
-                    let relative = path
-                        .strip_prefix(&self.file_picker_dir)
-                        .unwrap_or(path)
-                        .display()
-                        .to_string();
-                    let name = path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("");
-                    let relative_score = Self::fuzzy_score(&relative, &query);
-                    let name_score = Self::fuzzy_score(name, &query).map(|score| score / 2);
-                    relative_score
-                        .into_iter()
-                        .chain(name_score)
-                        .min()
-                        .map(|score| (score, index))
-                })
-                .collect::<Vec<_>>();
-            scored.sort_by_key(|(score, index)| (*score, *index));
-            scored
-                .into_iter()
-                .map(|(_, index)| index)
-                .collect::<Vec<_>>()
-        };
-        indices.sort_by_key(|index| !self.project_files[*index].is_dir());
-        indices
+        file_dialogs::picker_entry_indices(
+            &self.project_files,
+            &self.file_picker_dir,
+            &self.file_query,
+        )
     }
 
     fn move_project_file_selection(&mut self, delta: isize) {
         let indices = self.project_file_indices();
-        if indices.is_empty() {
-            self.selected_project_file = 0;
-            return;
-        }
-        let current_position = indices
-            .iter()
-            .position(|index| *index == self.selected_project_file)
-            .unwrap_or(0);
-        let next_position = current_position
-            .saturating_add_signed(delta)
-            .min(indices.len().saturating_sub(1));
-        self.selected_project_file = indices[next_position];
-    }
-
-    fn centered_window_start(
-        selected_position: usize,
-        visible_rows: usize,
-        total_rows: usize,
-    ) -> usize {
-        if total_rows <= visible_rows {
-            return 0;
-        }
-        selected_position
-            .saturating_sub(visible_rows / 2)
-            .min(total_rows.saturating_sub(visible_rows))
+        self.selected_project_file =
+            file_dialogs::move_selected_index(&indices, self.selected_project_file, delta);
     }
 
     fn refresh_file_picker_entries(&mut self) {
-        self.project_files = Self::scan_directory_entries(&self.file_picker_dir);
+        self.project_files = file_dialogs::scan_directory_entries(
+            &self.file_picker_dir,
+            file_dialogs::default_should_skip_dir,
+        );
         self.selected_project_file = self.project_file_indices().first().copied().unwrap_or(0);
         self.status = format!("Files: {}", self.file_picker_dir.display());
     }
@@ -2376,9 +4918,13 @@ impl SlateApp {
         }
         match self.file_picker_mode {
             FilePickerMode::InsertMarkdownLink => {
-                let target = self.markdown_link_target_for_file(&path);
+                let target = link_ui::markdown_link_target_for_file(&path, self.path.as_deref());
                 self.file_picker_open = false;
                 self.open_link_heading_picker_or_insert(&path, target);
+            }
+            FilePickerMode::Refile => {
+                self.file_picker_open = false;
+                self.open_refile_heading_picker_or_finish(path);
             }
             FilePickerMode::OpenBuffer => {
                 self.file_picker_open = false;
@@ -2495,65 +5041,6 @@ impl SlateApp {
         self.refresh_periscope_results();
     }
 
-    fn command_available(name: &str) -> bool {
-        ProcessCommand::new("sh")
-            .arg("-lc")
-            .arg(format!("command -v {} >/dev/null 2>&1", name))
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    }
-
-    fn collect_project_files(root: &Path, out: &mut Vec<PathBuf>, limit: usize) {
-        if out.len() >= limit {
-            return;
-        }
-        let Ok(entries) = fs::read_dir(root) else {
-            return;
-        };
-        for entry in entries.filter_map(Result::ok) {
-            if out.len() >= limit {
-                return;
-            }
-            let path = entry.path();
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("");
-            if path.is_dir() {
-                if name == ".git" {
-                    continue;
-                }
-                Self::collect_project_files(&path, out, limit);
-            } else if path.is_file() {
-                out.push(path);
-            }
-        }
-    }
-
-    fn periscope_project_results(&self, root: &Path, query: &str) -> Vec<PathBuf> {
-        let mut files = Vec::new();
-        if Self::command_available("fd") {
-            if let Ok(output) = ProcessCommand::new("fd")
-                .args(["--type", "f", "--hidden", "--no-ignore", "."])
-                .arg(root)
-                .output()
-            {
-                if output.status.success() {
-                    files = String::from_utf8_lossy(&output.stdout)
-                        .lines()
-                        .take(20_000)
-                        .map(PathBuf::from)
-                        .collect();
-                }
-            }
-        }
-        if files.is_empty() {
-            Self::collect_project_files(root, &mut files, 20_000);
-        }
-        Self::rank_paths(files, root, query, PERISCOPE_RESULT_LIMIT)
-    }
-
     fn start_periscope_global_index_load(&mut self) {
         if self.periscope_global_loading || !self.periscope_global_paths.is_empty() {
             return;
@@ -2567,40 +5054,7 @@ impl SlateApp {
         self.periscope_global_loading = true;
         self.periscope_backend_status = format!("Home index: {} · loading…", home.display());
         thread::spawn(move || {
-            let mut seen = HashSet::new();
-            let mut files = Vec::new();
-            if Self::command_available("fd") {
-                if let Ok(output) = ProcessCommand::new("fd")
-                    .args(["--type", "f", "."])
-                    .arg(&home)
-                    .output()
-                {
-                    if output.status.success() {
-                        files = String::from_utf8_lossy(&output.stdout)
-                            .lines()
-                            .map(PathBuf::from)
-                            .collect();
-                    }
-                }
-            }
-            if files.is_empty() {
-                Self::collect_project_files(&home, &mut files, 200_000);
-            }
-            let paths = files
-                .into_iter()
-                .filter_map(|path| {
-                    let display = path.display().to_string();
-                    if !seen.insert(display.clone()) {
-                        return None;
-                    }
-                    Some(PeriscopeIndexedPath {
-                        path,
-                        lower: display.to_lowercase(),
-                        is_file: true,
-                    })
-                })
-                .collect::<Vec<_>>();
-            let _ = tx.send(paths);
+            let _ = tx.send(periscope::load_global_index(&home));
         });
     }
 
@@ -2618,8 +5072,11 @@ impl SlateApp {
                     self.periscope_global_paths.len()
                 );
                 if self.periscope_mode == PeriscopeMode::Global {
-                    self.periscope_results =
-                        self.periscope_global_cached_results(&self.periscope_query);
+                    self.periscope_results = periscope::cached_results(
+                        &self.periscope_global_paths,
+                        &self.periscope_query,
+                        PERISCOPE_RESULT_LIMIT,
+                    );
                     self.selected_periscope_result = 0;
                 }
             }
@@ -2630,139 +5087,6 @@ impl SlateApp {
                 self.periscope_backend_status = "Home index load failed".to_string();
             }
         }
-    }
-
-    fn periscope_query_tokens(query: &str) -> Vec<&str> {
-        query
-            .split(|ch: char| ch.is_whitespace() || ch == '/')
-            .filter(|token| !token.is_empty())
-            .collect()
-    }
-
-    fn periscope_path_score_lower(
-        path_lower: &str,
-        name_lower: &str,
-        query_lower: &str,
-    ) -> Option<usize> {
-        let tokens = Self::periscope_query_tokens(query_lower);
-        if tokens.len() <= 1 {
-            let query = query_lower;
-            let components = path_lower
-                .split('/')
-                .filter(|component| !component.is_empty())
-                .collect::<Vec<_>>();
-
-            if name_lower == query {
-                return Some(0);
-            }
-
-            let mut best_component = None;
-            for (component_index, component) in components.iter().enumerate() {
-                if *component == query {
-                    let tail_depth = components.len().saturating_sub(component_index + 1);
-                    best_component = Some(
-                        best_component
-                            .unwrap_or(usize::MAX)
-                            .min(20 + component_index * 16 + tail_depth * 4 + name_lower.len()),
-                    );
-                }
-            }
-            if best_component.is_some() {
-                return best_component;
-            }
-
-            if name_lower.starts_with(query) {
-                return Some(120 + name_lower.len().saturating_sub(query.len()));
-            }
-
-            for (component_index, component) in components.iter().enumerate() {
-                if component.starts_with(query) {
-                    let tail_depth = components.len().saturating_sub(component_index + 1);
-                    best_component = Some(best_component.unwrap_or(usize::MAX).min(
-                        220 + component_index * 16
-                            + tail_depth * 4
-                            + component.len().saturating_sub(query.len()),
-                    ));
-                }
-            }
-            if best_component.is_some() {
-                return best_component;
-            }
-
-            if name_lower.contains(query) {
-                return Some(420 + name_lower.find(query).unwrap_or(0));
-            }
-            if let Some(position) = path_lower.find(query) {
-                return Some(620 + position + path_lower.len().saturating_sub(query.len()));
-            }
-
-            let path_score = Self::fuzzy_score_lower(path_lower, query).map(|score| score + 2_000);
-            let name_score = Self::fuzzy_score_lower(name_lower, query).map(|score| score + 1_500);
-            return path_score.into_iter().chain(name_score).min();
-        }
-
-        let mut search_start = 0usize;
-        let mut previous_end = 0usize;
-        let mut score = 0usize;
-        for token in tokens {
-            let mut found_position = None;
-            let mut offset = search_start;
-            while let Some(relative) = path_lower[offset..].find(token) {
-                let position = offset + relative;
-                let at_boundary = position == 0
-                    || matches!(
-                        path_lower.as_bytes().get(position.saturating_sub(1)),
-                        Some(b'/') | Some(b'-') | Some(b'_') | Some(b'.')
-                    );
-                if at_boundary {
-                    found_position = Some(position);
-                    break;
-                }
-                offset = position + 1;
-            }
-            let position = found_position?;
-            let gap = position.saturating_sub(previous_end);
-            score += gap;
-            search_start = position + token.len();
-            previous_end = search_start;
-        }
-        Some(score + path_lower.len().saturating_sub(query_lower.len()))
-    }
-
-    fn periscope_global_cached_results(&self, query: &str) -> Vec<PathBuf> {
-        let query = query.trim().to_lowercase();
-        if query.is_empty() {
-            return Vec::new();
-        }
-        let mut best: BinaryHeap<(usize, usize)> = BinaryHeap::new();
-        for (index, path) in self.periscope_global_paths.iter().enumerate() {
-            if !path.is_file {
-                continue;
-            }
-            let name_lower = path
-                .path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-            let Some(score) = Self::periscope_path_score_lower(&path.lower, &name_lower, &query)
-            else {
-                continue;
-            };
-            let candidate = (score, index);
-            if best.len() < PERISCOPE_RESULT_LIMIT {
-                best.push(candidate);
-            } else if best.peek().is_some_and(|worst| candidate < *worst) {
-                best.pop();
-                best.push(candidate);
-            }
-        }
-        let mut scored = best.into_vec();
-        scored.sort_by_key(|(score, index)| (*score, *index));
-        scored
-            .into_iter()
-            .map(|(_, index)| self.periscope_global_paths[index].path.clone())
-            .collect()
     }
 
     fn periscope_global_results(&mut self, query: &str) -> Vec<PathBuf> {
@@ -2787,110 +5111,29 @@ impl SlateApp {
             "Home index: {} files · in-memory fuzzy · capped at 100 results",
             self.periscope_global_paths.len()
         );
-        self.periscope_global_cached_results(query)
-    }
-
-    fn rank_paths(mut paths: Vec<PathBuf>, root: &Path, query: &str, limit: usize) -> Vec<PathBuf> {
-        let query = query.trim().to_lowercase();
-        if query.is_empty() {
-            paths.sort();
-            paths.truncate(limit);
-            return paths;
-        }
-        let mut scored = paths
-            .into_iter()
-            .filter_map(|path| {
-                let relative = path
-                    .strip_prefix(root)
-                    .unwrap_or(&path)
-                    .display()
-                    .to_string();
-                let name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("");
-                let relative_lower = relative.to_lowercase();
-                let name_lower = name.to_lowercase();
-                Self::periscope_path_score_lower(&relative_lower, &name_lower, &query)
-                    .map(|score| (score, path))
-            })
-            .collect::<Vec<_>>();
-        scored.sort_by_key(|(score, path)| (*score, path.clone()));
-        scored
-            .into_iter()
-            .take(limit)
-            .map(|(_, path)| path)
-            .collect()
-    }
-
-    fn periscope_group_folder_for_path(&self, path: &Path) -> Option<PathBuf> {
-        let query = self.periscope_query.trim().to_lowercase();
-        if query.is_empty() {
-            return None;
-        }
-        let tokens = Self::periscope_query_tokens(&query);
-        let target = tokens.last().copied()?;
-        if target.is_empty() {
-            return None;
-        }
-        let components = path.components().collect::<Vec<_>>();
-        for (index, component) in components.iter().enumerate() {
-            let text = component.as_os_str().to_string_lossy().to_lowercase();
-            if text == target || text.starts_with(target) {
-                let mut folder = PathBuf::new();
-                for component in components.iter().take(index + 1) {
-                    folder.push(component.as_os_str());
-                }
-                if folder != path && path.starts_with(&folder) {
-                    return Some(folder);
-                }
-            }
-        }
-        None
+        periscope::cached_results(&self.periscope_global_paths, query, PERISCOPE_RESULT_LIMIT)
     }
 
     fn periscope_rows(&self) -> Vec<PeriscopeRow> {
-        let mut rows = Vec::new();
-        let mut seen_folders = HashSet::new();
-        for path in &self.periscope_results {
-            if let Some(folder) = self.periscope_group_folder_for_path(path) {
-                if seen_folders.insert(folder.clone()) {
-                    let expanded = self.periscope_expanded_folders.contains(&folder);
-                    rows.push(PeriscopeRow::Folder {
-                        path: folder.clone(),
-                        expanded,
-                    });
-                }
-                if self.periscope_expanded_folders.contains(&folder) {
-                    rows.push(PeriscopeRow::File {
-                        path: path.clone(),
-                        group: Some(folder),
-                    });
-                }
-            } else {
-                rows.push(PeriscopeRow::File {
-                    path: path.clone(),
-                    group: None,
-                });
-            }
-        }
-        rows
+        periscope::rows(
+            &self.periscope_results,
+            &self.periscope_query,
+            &self.periscope_expanded_folders,
+        )
     }
 
     fn selected_periscope_row(&self) -> Option<PeriscopeRow> {
-        self.periscope_rows()
-            .get(self.selected_periscope_result)
-            .cloned()
+        periscope::selected_row(
+            &self.periscope_results,
+            &self.periscope_query,
+            &self.periscope_expanded_folders,
+            self.selected_periscope_result,
+        )
     }
 
     fn toggle_selected_periscope_folder(&mut self) -> bool {
-        let Some(PeriscopeRow::Folder { path, .. }) = self.selected_periscope_row() else {
-            return false;
-        };
-        if !self.periscope_expanded_folders.remove(&path) {
-            self.periscope_expanded_folders.insert(path);
-        }
-        true
+        let row = self.selected_periscope_row();
+        periscope::toggle_folder(&mut self.periscope_expanded_folders, row)
     }
 
     fn refresh_periscope_results(&mut self) {
@@ -2898,7 +5141,9 @@ impl SlateApp {
             PeriscopeMode::Project => self
                 .periscope_project_root
                 .clone()
-                .map(|root| self.periscope_project_results(&root, &self.periscope_query))
+                .map(|root| {
+                    periscope::project_results(&root, &self.periscope_query, PERISCOPE_RESULT_LIMIT)
+                })
                 .unwrap_or_default(),
             PeriscopeMode::Global => {
                 let query = self.periscope_query.clone();
@@ -2911,15 +5156,11 @@ impl SlateApp {
     }
 
     fn move_periscope_selection(&mut self, delta: isize) {
-        let row_count = self.periscope_rows().len();
-        if row_count == 0 {
-            self.selected_periscope_result = 0;
-            return;
-        }
-        self.selected_periscope_result = self
-            .selected_periscope_result
-            .saturating_add_signed(delta)
-            .min(row_count.saturating_sub(1));
+        self.selected_periscope_result = periscope::move_selection(
+            self.periscope_rows().len(),
+            self.selected_periscope_result,
+            delta,
+        );
     }
 
     fn open_selected_periscope_result(&mut self) {
@@ -2996,7 +5237,10 @@ impl SlateApp {
             .and_then(|name| name.to_str())
             .unwrap_or("untitled.md")
             .to_string();
-        self.save_as_entries = Self::scan_directory_entries(&self.save_as_dir);
+        self.save_as_entries = file_dialogs::scan_directory_entries(
+            &self.save_as_dir,
+            file_dialogs::default_should_skip_dir,
+        );
         self.selected_save_as_entry = self.save_as_entry_indices().first().copied().unwrap_or(0);
         self.save_as_open = true;
         self.focus_editor_once = false;
@@ -3004,52 +5248,22 @@ impl SlateApp {
     }
 
     fn save_as_entry_indices(&self) -> Vec<usize> {
-        let query = self.save_as_filename.trim().to_lowercase();
-        let mut indices = if query.is_empty() {
-            (0..self.save_as_entries.len()).collect::<Vec<_>>()
-        } else {
-            let mut scored = self
-                .save_as_entries
-                .iter()
-                .enumerate()
-                .filter_map(|(index, path)| {
-                    let name = path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("");
-                    Self::fuzzy_score(name, &query).map(|score| (score, index))
-                })
-                .collect::<Vec<_>>();
-            scored.sort_by_key(|(score, index)| (*score, *index));
-            scored
-                .into_iter()
-                .map(|(_, index)| index)
-                .collect::<Vec<_>>()
-        };
-        indices.sort_by_key(|index| !self.save_as_entries[*index].is_dir());
-        indices
+        file_dialogs::named_entry_indices(&self.save_as_entries, &self.save_as_filename)
     }
 
     fn refresh_save_as_entries(&mut self) {
-        self.save_as_entries = Self::scan_directory_entries(&self.save_as_dir);
+        self.save_as_entries = file_dialogs::scan_directory_entries(
+            &self.save_as_dir,
+            file_dialogs::default_should_skip_dir,
+        );
         self.selected_save_as_entry = self.save_as_entry_indices().first().copied().unwrap_or(0);
         self.status = format!("Save as: {}", self.save_as_dir.display());
     }
 
     fn move_save_as_selection(&mut self, delta: isize) {
         let indices = self.save_as_entry_indices();
-        if indices.is_empty() {
-            self.selected_save_as_entry = 0;
-            return;
-        }
-        let current_position = indices
-            .iter()
-            .position(|index| *index == self.selected_save_as_entry)
-            .unwrap_or(0);
-        let next_position = current_position
-            .saturating_add_signed(delta)
-            .min(indices.len().saturating_sub(1));
-        self.selected_save_as_entry = indices[next_position];
+        self.selected_save_as_entry =
+            file_dialogs::move_selected_index(&indices, self.selected_save_as_entry, delta);
     }
 
     fn save_as_enter_selected_dir(&mut self) {
@@ -3136,7 +5350,7 @@ impl SlateApp {
             match key.trim() {
                 "command_history_limit" => {
                     if let Ok(limit) = value.trim().parse::<usize>() {
-                        self.command_history_limit = limit.clamp(1, 50);
+                        self.command_history_limit = clamp_history_limit(limit);
                     }
                 }
                 "line_number_mode" => {
@@ -3169,6 +5383,26 @@ impl SlateApp {
                         self.markdown_live_rendering = enabled;
                     }
                 }
+                "virtual_references_enabled" => {
+                    if let Some(enabled) = Self::parse_config_bool(value) {
+                        self.virtual_references_enabled = enabled;
+                    }
+                }
+                "virtual_references_collapsed" => {
+                    if let Some(enabled) = Self::parse_config_bool(value) {
+                        self.virtual_references_collapsed = enabled;
+                    }
+                }
+                "virtual_backlinks_collapsed" => {
+                    if let Some(enabled) = Self::parse_config_bool(value) {
+                        self.virtual_backlinks_collapsed = enabled;
+                    }
+                }
+                "virtual_mentions_collapsed" => {
+                    if let Some(enabled) = Self::parse_config_bool(value) {
+                        self.virtual_mentions_collapsed = enabled;
+                    }
+                }
                 "last_opened_path" => {
                     let value = Self::parse_config_string(value);
                     if !value.is_empty() {
@@ -3183,8 +5417,12 @@ impl SlateApp {
                 }
                 "command_history" => {
                     let value = Self::parse_config_string(value);
-                    if !value.is_empty() && self.command_history.last() != Some(&value) {
-                        self.command_history.push(value);
+                    if !value.is_empty() {
+                        commands::push_command_history(
+                            &mut self.command_history,
+                            &value,
+                            self.command_history_limit,
+                        );
                     }
                 }
                 "recent_file" => {
@@ -3225,54 +5463,18 @@ impl SlateApp {
                 }
                 "command_usage" => {
                     let value = Self::parse_config_string(value);
-                    let mut parts = value.split('|');
-                    let Some(name) = parts.next() else {
-                        continue;
-                    };
-                    let Some(count) = parts.next().and_then(|value| value.parse::<usize>().ok())
-                    else {
-                        continue;
-                    };
-                    let Some(last_used) = parts.next().and_then(|value| value.parse::<i64>().ok())
-                    else {
-                        continue;
-                    };
-                    let Some(name) = Self::canonical_command_name(name) else {
-                        continue;
-                    };
-                    if let Some(existing) = self
-                        .command_usage
-                        .iter_mut()
-                        .find(|usage| usage.name == name)
-                    {
-                        existing.count = existing.count.max(count);
-                        existing.last_used = existing.last_used.max(last_used);
-                    } else {
-                        self.command_usage.push(CommandUsage {
-                            name: name.to_string(),
-                            count,
-                            last_used,
-                        });
+                    if let Some(usage) = commands::parse_command_usage(&value) {
+                        commands::merge_command_usage(&mut self.command_usage, usage);
                     }
                 }
                 _ => {}
             }
         }
-        if self.command_history.len() > self.command_history_limit {
-            let keep_from = self.command_history.len() - self.command_history_limit;
-            self.command_history.drain(0..keep_from);
-        }
+        commands::trim_command_history(&mut self.command_history, self.command_history_limit);
         self.recent_files.truncate(20);
         self.lance_files.truncate(10);
         self.file_cursor_positions.truncate(100);
-        self.command_usage.sort_by_key(|usage| {
-            (
-                std::cmp::Reverse(usage.last_used),
-                std::cmp::Reverse(usage.count),
-                usage.name.clone(),
-            )
-        });
-        self.command_usage.truncate(100);
+        commands::sort_command_usage(&mut self.command_usage);
     }
 
     fn parse_config_bool(value: &str) -> Option<bool> {
@@ -3333,7 +5535,7 @@ impl SlateApp {
             .ok_or_else(|| "invalid config path".to_string())?;
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
         let mut contents = format!(
-            "command_history_limit = {}\nline_number_mode = \"{}\"\nword_wrap = {}\npreview_mode = {}\nctrl_shift_move_mode = \"{}\"\nreopen_last_file_on_startup = {}\nmarkdown_live_rendering = {}\nlast_opened_path = \"{}\"\nlast_open_dir = \"{}\"\n",
+            "command_history_limit = {}\nline_number_mode = \"{}\"\nword_wrap = {}\npreview_mode = {}\nctrl_shift_move_mode = \"{}\"\nreopen_last_file_on_startup = {}\nmarkdown_live_rendering = {}\nvirtual_references_enabled = {}\nvirtual_references_collapsed = {}\nvirtual_backlinks_collapsed = {}\nvirtual_mentions_collapsed = {}\nlast_opened_path = \"{}\"\nlast_open_dir = \"{}\"\n",
             self.command_history_limit,
             self.line_number_mode.config_value(),
             self.wrap,
@@ -3341,6 +5543,10 @@ impl SlateApp {
             self.ctrl_shift_move_mode.config_value(),
             self.reopen_last_file_on_startup,
             self.markdown_live_rendering,
+            self.virtual_references_enabled,
+            self.virtual_references_collapsed,
+            self.virtual_backlinks_collapsed,
+            self.virtual_mentions_collapsed,
             Self::escape_config_string(
                 &self
                     .last_opened_path
@@ -3417,7 +5623,7 @@ impl SlateApp {
     }
 
     fn set_command_history_limit(&mut self, limit: usize) {
-        self.command_history_limit = limit.clamp(1, 50);
+        self.command_history_limit = clamp_history_limit(limit);
         match self.save_settings() {
             Ok(_) => self.status = format!("History length: {}", self.command_history_limit),
             Err(err) => self.status = format!("Settings save failed: {err}"),
@@ -3502,33 +5708,50 @@ impl SlateApp {
         }
     }
 
-    fn command_name(command: Command) -> &'static str {
-        match command {
-            Command::New => "new",
-            Command::Open => "open",
-            Command::OpenBuffer => "open-buffer",
-            Command::Periscope => "periscope",
-            Command::Lance => "lance",
-            Command::LanceAdd => "lance-add",
-            Command::LanceNext => "lance-next",
-            Command::LancePrev => "lance-prev",
-            Command::Save => "save",
-            Command::SaveAs => "save-as",
-            Command::Scratch => "scratch",
-            Command::ScratchEntries => "scratch-entries",
-            Command::Capture => "capture",
-            Command::TogglePreview => "preview",
-            Command::ToggleWrap => "wrap",
-            Command::Settings => "settings",
-            Command::LineNumbersAbsolute => "line-numbers-absolute",
-            Command::LineNumbersRelative => "line-numbers-relative",
-            Command::WrapOn => "wrap-on",
-            Command::WrapOff => "wrap-off",
-            Command::PreviewOn => "preview-on",
-            Command::PreviewOff => "preview-off",
-            Command::DocTasks => "doc-tasks",
-            Command::OpenLink => "open-link",
-            Command::Quit => "quit",
+    fn set_virtual_references_enabled(&mut self, enabled: bool) {
+        self.virtual_references_enabled = enabled;
+        match self.save_settings() {
+            Ok(_) => {
+                self.status = if self.virtual_references_enabled {
+                    "Virtual backlinks/mentions on"
+                } else {
+                    "Virtual backlinks/mentions hidden"
+                }
+                .to_string()
+            }
+            Err(err) => self.status = format!("Settings save failed: {err}"),
+        }
+    }
+
+    fn save_virtual_reference_collapse_state(&mut self, status: &str) {
+        match self.save_settings() {
+            Ok(_) => self.status = status.to_string(),
+            Err(err) => self.status = format!("Settings save failed: {err}"),
+        }
+    }
+
+    fn handle_virtual_reference_click(&mut self, line: &str) {
+        if line.contains("Backlinks") {
+            self.virtual_backlinks_collapsed = !self.virtual_backlinks_collapsed;
+            self.save_virtual_reference_collapse_state(if self.virtual_backlinks_collapsed {
+                "Backlinks collapsed"
+            } else {
+                "Backlinks expanded"
+            });
+        } else if line.contains("Mentions") {
+            self.virtual_mentions_collapsed = !self.virtual_mentions_collapsed;
+            self.save_virtual_reference_collapse_state(if self.virtual_mentions_collapsed {
+                "Mentions collapsed"
+            } else {
+                "Mentions expanded"
+            });
+        } else {
+            self.virtual_references_collapsed = !self.virtual_references_collapsed;
+            self.save_virtual_reference_collapse_state(if self.virtual_references_collapsed {
+                "Virtual references collapsed"
+            } else {
+                "Virtual references expanded"
+            });
         }
     }
 
@@ -3539,74 +5762,27 @@ impl SlateApp {
             .unwrap_or_default()
     }
 
-    fn canonical_command_name(token: &str) -> Option<&'static str> {
-        let token = token.trim_start_matches(':');
-        COMMAND_SPECS
-            .iter()
-            .find(|spec| spec.name == token || spec.aliases.contains(&token))
-            .map(|spec| spec.name)
-    }
-
     fn record_command_usage(&mut self, token: &str) {
-        let Some(name) = Self::canonical_command_name(token) else {
-            return;
-        };
-        let now = Self::now_timestamp();
-        if let Some(usage) = self
-            .command_usage
-            .iter_mut()
-            .find(|usage| usage.name == name)
-        {
-            usage.count = usage.count.saturating_add(1);
-            usage.last_used = now;
-        } else {
-            self.command_usage.push(CommandUsage {
-                name: name.to_string(),
-                count: 1,
-                last_used: now,
-            });
+        if commands::record_command_usage(&mut self.command_usage, token, Self::now_timestamp()) {
+            let _ = self.save_settings();
         }
-        self.command_usage.sort_by_key(|usage| {
-            (
-                std::cmp::Reverse(usage.last_used),
-                std::cmp::Reverse(usage.count),
-                usage.name.clone(),
-            )
-        });
-        self.command_usage.truncate(100);
-        let _ = self.save_settings();
-    }
-
-    fn command_usage(&self, name: &str) -> Option<&CommandUsage> {
-        self.command_usage.iter().find(|usage| usage.name == name)
     }
 
     fn command_usage_boost(&self, name: &str) -> usize {
-        let Some(usage) = self.command_usage(name) else {
-            return 0;
-        };
-        let count_boost = usage.count.min(30);
-        let age_seconds = Self::now_timestamp().saturating_sub(usage.last_used);
-        let recency_boost = if age_seconds <= 60 * 60 {
-            30
-        } else if age_seconds <= 24 * 60 * 60 {
-            20
-        } else if age_seconds <= 7 * 24 * 60 * 60 {
-            10
-        } else {
-            0
-        };
-        count_boost + recency_boost
+        commands::command_usage_boost(&self.command_usage, name, Self::now_timestamp())
     }
 
     fn run_command(&mut self, command: Command, ctx: &egui::Context) {
-        self.record_command_usage(Self::command_name(command));
+        self.record_command_usage(command_name(command));
         self.palette_open = false;
         self.recent_picker_open = false;
         self.file_picker_open = false;
         if command != Command::Periscope {
             self.periscope_open = false;
             self.periscope_prompt_open = false;
+        }
+        if command != Command::FindNote {
+            self.find_note_open = false;
         }
         self.save_as_open = false;
         if command != Command::Scratch {
@@ -3620,6 +5796,9 @@ impl SlateApp {
         }
         if command != Command::DocTasks {
             self.doc_tasks_open = false;
+        }
+        if command != Command::Agenda {
+            self.agenda_open = false;
         }
         if command != Command::Lance {
             self.lance_open = false;
@@ -3652,6 +5831,11 @@ impl SlateApp {
             Command::LanceAdd => self.lance_add_current(),
             Command::LanceNext => self.open_next_lance_file(1),
             Command::LancePrev => self.open_next_lance_file(-1),
+            Command::FlowRescan => self.flow_rescan_current_scope(false),
+            Command::FlowRebuild => self.flow_rescan_current_scope(true),
+            Command::Daily => self.open_daily_with_target(""),
+            Command::Refile => self.start_refile_current_line(),
+            Command::QuickAdd => self.open_scratch_modal(),
             Command::Save => self.save(),
             Command::SaveAs => self.open_save_as_modal(),
             Command::Scratch => self.open_scratch_modal(),
@@ -3664,6 +5848,10 @@ impl SlateApp {
             Command::PreviewOn => self.set_preview_mode(true),
             Command::PreviewOff => self.set_preview_mode(false),
             Command::DocTasks => self.open_doc_tasks(),
+            Command::Agenda => self.open_agenda(),
+            Command::Backlinks => self.open_reference_results(ReferenceResultKind::Backlinks),
+            Command::Mentions => self.open_reference_results(ReferenceResultKind::Mentions),
+            Command::FindNote => self.open_find_note_results(""),
             Command::OpenLink => self.open_link_under_cursor(),
             Command::LineNumbersAbsolute => self.set_line_number_mode(LineNumberMode::Absolute),
             Command::LineNumbersRelative => self.set_line_number_mode(LineNumberMode::Relative),
@@ -3677,15 +5865,7 @@ impl SlateApp {
     }
 
     fn command_line_command_prefix(&self) -> Option<&str> {
-        let input = self
-            .command_line
-            .trim_start()
-            .strip_prefix(':')
-            .unwrap_or(self.command_line.trim_start());
-        if input.is_empty() || input.contains(char::is_whitespace) {
-            return None;
-        }
-        Some(input)
+        command_prefix(&self.command_line)
     }
 
     fn command_line_suggestions(&self) -> Vec<&'static CommandSpec> {
@@ -3698,7 +5878,7 @@ impl SlateApp {
     fn command_line_completion(&self) -> Option<&'static str> {
         let prefix = self.command_line_command_prefix()?;
         let spec = self.matching_command_specs(prefix, 1).into_iter().next()?;
-        Self::best_command_token(spec, prefix)
+        best_command_token(spec, prefix)
             .filter(|candidate| candidate.len() > prefix.len())
             .map(|candidate| &candidate[prefix.len()..])
     }
@@ -3717,7 +5897,7 @@ impl SlateApp {
         else {
             return false;
         };
-        let Some(candidate) = Self::best_command_token(spec, &prefix) else {
+        let Some(candidate) = best_command_token(spec, &prefix) else {
             return false;
         };
         if candidate.len() <= prefix.len() {
@@ -3730,109 +5910,7 @@ impl SlateApp {
     }
 
     fn matching_command_specs(&self, prefix: &str, limit: usize) -> Vec<&'static CommandSpec> {
-        let query = prefix.trim_start_matches(':').to_lowercase();
-        if query.is_empty() {
-            let mut specs = COMMAND_SPECS.iter().collect::<Vec<_>>();
-            specs.sort_by_key(|spec| {
-                let boost = self.command_usage_boost(spec.name);
-                (std::cmp::Reverse(boost), spec.name.len(), spec.name)
-            });
-            return specs.into_iter().take(limit).collect();
-        }
-
-        let mut scored = COMMAND_SPECS
-            .iter()
-            .filter_map(|spec| Self::command_spec_score(spec, &query).map(|score| (score, spec)))
-            .collect::<Vec<_>>();
-        scored.sort_by_key(|(score, spec)| {
-            let boost = self.command_usage_boost(spec.name);
-            let adjusted_score = (*score as isize * 100) - boost as isize;
-            (*score / 100, adjusted_score, spec.name.len(), spec.name)
-        });
-        scored
-            .into_iter()
-            .map(|(_, spec)| spec)
-            .take(limit)
-            .collect()
-    }
-
-    fn command_spec_score(spec: &CommandSpec, query: &str) -> Option<usize> {
-        let mut best = Self::fuzzy_score(spec.name, query);
-        for alias in spec.aliases {
-            best = best
-                .into_iter()
-                .chain(Self::fuzzy_score(alias, query))
-                .min();
-        }
-        best
-    }
-
-    fn best_command_token(spec: &CommandSpec, prefix: &str) -> Option<&'static str> {
-        let query = prefix.to_lowercase();
-        std::iter::once(spec.name)
-            .chain(spec.aliases.iter().copied())
-            .filter_map(|token| Self::fuzzy_score(token, &query).map(|score| (score, token)))
-            .min_by_key(|(score, token)| (*score, token.len()))
-            .map(|(_, token)| token)
-    }
-
-    fn fuzzy_score_lower(candidate: &str, query: &str) -> Option<usize> {
-        if query.is_empty() {
-            return Some(0);
-        }
-        if candidate == query {
-            return Some(0);
-        }
-        if candidate.starts_with(query) {
-            return Some(1 + candidate.len().saturating_sub(query.len()));
-        }
-        if candidate.contains(query) {
-            return Some(100 + candidate.find(query).unwrap_or(0));
-        }
-
-        let mut score = 200usize;
-        let mut last_match = None;
-        let mut chars = candidate.char_indices();
-        for query_ch in query.chars() {
-            let Some((index, _)) = chars.find(|(_, candidate_ch)| *candidate_ch == query_ch) else {
-                return None;
-            };
-            if let Some(last) = last_match {
-                score += index.saturating_sub(last + 1);
-            }
-            last_match = Some(index);
-        }
-        Some(score + candidate.len().saturating_sub(query.len()))
-    }
-
-    fn fuzzy_score(candidate: &str, query: &str) -> Option<usize> {
-        if query.is_empty() {
-            return Some(0);
-        }
-        let candidate = candidate.to_lowercase();
-        if candidate == query {
-            return Some(0);
-        }
-        if candidate.starts_with(query) {
-            return Some(1 + candidate.len().saturating_sub(query.len()));
-        }
-        if candidate.contains(query) {
-            return Some(100 + candidate.find(query).unwrap_or(0));
-        }
-
-        let mut score = 200usize;
-        let mut last_match = None;
-        let mut chars = candidate.char_indices();
-        for query_ch in query.chars() {
-            let Some((index, _)) = chars.find(|(_, candidate_ch)| *candidate_ch == query_ch) else {
-                return None;
-            };
-            if let Some(last) = last_match {
-                score += index.saturating_sub(last + 1);
-            }
-            last_match = Some(index);
-        }
-        Some(score + candidate.len().saturating_sub(query.len()))
+        commands::matching_command_specs(prefix, limit, |name| self.command_usage_boost(name))
     }
 
     fn run_command_line(&mut self, ctx: &egui::Context) {
@@ -3851,43 +5929,26 @@ impl SlateApp {
             return;
         }
 
-        if self.command_history.last().is_none_or(|last| last != input) {
-            self.command_history.push(input.to_string());
-            if self.command_history.len() > self.command_history_limit {
-                let keep_from = self.command_history.len() - self.command_history_limit;
-                self.command_history.drain(0..keep_from);
-            }
+        if commands::push_command_history(
+            &mut self.command_history,
+            input,
+            self.command_history_limit,
+        ) {
             let _ = self.save_settings();
         }
 
-        let mut parts = input.split_whitespace();
-        let Some(command) = parts.next() else {
-            self.status = "Command cancelled".to_string();
-            return;
-        };
-
-        match command {
-            "w" | "write" | "save" => self.run_command(Command::Save, ctx),
-            "save-as" | "saveas" | "write-as" => self.run_command(Command::SaveAs, ctx),
-            "scratch" | "sc" => self.run_command(Command::Scratch, ctx),
-            "scratch-entries" | "scratch-log" | "scl" => {
-                self.run_command(Command::ScratchEntries, ctx)
-            }
-            "capture" | "cap" => self.run_command(Command::Capture, ctx),
-            "q" | "quit" | "exit" => self.run_command(Command::Quit, ctx),
-            "wq" | "x" => {
+        match parse_command_line(input) {
+            CommandLineAction::Empty => self.status = "Command cancelled".to_string(),
+            CommandLineAction::Run(command) => self.run_command(command, ctx),
+            CommandLineAction::SaveQuit => {
                 self.record_command_usage("wq");
                 self.save();
                 if !self.dirty {
                     self.run_command(Command::Quit, ctx);
                 }
             }
-            "new" | "enew" => self.run_command(Command::New, ctx),
-            "open" | "edit" | "e" => {
-                let path = parts.collect::<Vec<_>>().join(" ");
-                if path.is_empty() {
-                    self.run_command(Command::Open, ctx);
-                } else if self.dirty {
+            CommandLineAction::OpenPath(path) => {
+                if self.dirty {
                     self.status = "Save or discard changes before opening another file".to_string();
                 } else {
                     self.record_command_usage("open");
@@ -3895,38 +5956,33 @@ impl SlateApp {
                     self.open_path(expanded);
                 }
             }
-            "open-buffer" | "ob" | "buffer-open" => {
-                let path = parts.collect::<Vec<_>>().join(" ");
-                if path.is_empty() {
-                    self.run_command(Command::OpenBuffer, ctx);
+            CommandLineAction::OpenBufferPath(path) => {
+                self.record_command_usage("open-buffer");
+                let expanded = Self::resolve_command_path(&path);
+                self.open_link_preview(expanded, None);
+            }
+            CommandLineAction::QuickAdd(text) => {
+                self.record_command_usage("quickadd");
+                if let Some(text) = text {
+                    self.quickadd_flow_task(&text);
                 } else {
-                    self.record_command_usage("open-buffer");
-                    let expanded = Self::resolve_command_path(&path);
-                    self.open_link_preview(expanded, None);
+                    self.open_scratch_modal();
+                    self.status = "Scratch quickadd: start a line with :task text".to_string();
                 }
             }
-            "periscope" | "ps" | "fzf" => self.run_command(Command::Periscope, ctx),
-            "lance" | "lc" | "marks" => {
-                let arg = parts.next();
-                if let Some(slot) = arg.and_then(|value| value.parse::<usize>().ok()) {
-                    self.record_command_usage("lance");
-                    self.open_lance_slot(slot);
-                } else {
-                    self.run_command(Command::Lance, ctx);
-                }
+            CommandLineAction::Daily { target } => {
+                self.record_command_usage("daily");
+                self.open_daily_with_target(&target);
             }
-            "lance-add" | "la" | "mark-buffer" => {
-                let path = parts.collect::<Vec<_>>().join(" ");
-                if path.is_empty() {
-                    self.run_command(Command::LanceAdd, ctx);
-                } else {
-                    self.record_command_usage("lance-add");
-                    self.add_lance_file(Self::resolve_command_path(&path));
-                }
+            CommandLineAction::LanceSlot(slot) => {
+                self.record_command_usage("lance");
+                self.open_lance_slot(slot);
             }
-            "lance-next" | "lnext" => self.run_command(Command::LanceNext, ctx),
-            "lance-prev" | "lpv" => self.run_command(Command::LancePrev, ctx),
-            "open-last" | "last" | "ol" => {
+            CommandLineAction::LanceAddPath(path) => {
+                self.record_command_usage("lance-add");
+                self.add_lance_file(Self::resolve_command_path(&path));
+            }
+            CommandLineAction::OpenLast => {
                 self.record_command_usage("open-last");
                 if self.dirty {
                     self.confirm(PendingAction::OpenLast);
@@ -3934,129 +5990,107 @@ impl SlateApp {
                     self.open_last();
                 }
             }
-            "recent" | "rec" => {
+            CommandLineAction::Recent { query } => {
                 self.record_command_usage("recent");
-                let query = parts.collect::<Vec<_>>().join(" ");
                 self.open_recent_picker_with_query(query);
             }
-            "preview" | "md" => {
-                let arg = parts.next();
-                match arg.and_then(Self::parse_config_bool) {
-                    Some(enabled) => {
-                        self.record_command_usage(if enabled {
-                            "preview-on"
-                        } else {
-                            "preview-off"
-                        });
-                        self.set_preview_mode(enabled);
-                    }
-                    None => self.run_command(Command::TogglePreview, ctx),
+            CommandLineAction::SetPreview(enabled) => match enabled {
+                Some(enabled) => {
+                    self.record_command_usage(if enabled { "preview-on" } else { "preview-off" });
+                    self.set_preview_mode(enabled);
                 }
+                None => self.run_command(Command::TogglePreview, ctx),
+            },
+            CommandLineAction::Agenda { filter } => {
+                self.record_command_usage("agenda");
+                self.open_agenda_with_filter(filter);
             }
-            "preview-on" | "md-on" => self.run_command(Command::PreviewOn, ctx),
-            "preview-off" | "md-off" => self.run_command(Command::PreviewOff, ctx),
-            "doc-tasks" | "tasks" => self.run_command(Command::DocTasks, ctx),
-            "open-link" | "olink" | "follow-link" => self.run_command(Command::OpenLink, ctx),
-            "wrap" => {
-                let arg = parts.next();
-                match arg.and_then(Self::parse_config_bool) {
-                    Some(enabled) => {
-                        self.record_command_usage(if enabled { "wrap-on" } else { "wrap-off" });
-                        self.set_wrap_mode(enabled);
-                    }
-                    None => self.run_command(Command::ToggleWrap, ctx),
+            CommandLineAction::FindNote { query } => {
+                self.record_command_usage("find-note");
+                self.open_find_note_results(&query);
+            }
+            CommandLineAction::SetWrap(enabled) => match enabled {
+                Some(enabled) => {
+                    self.record_command_usage(if enabled { "wrap-on" } else { "wrap-off" });
+                    self.set_wrap_mode(enabled);
                 }
-            }
-            "wrap-on" | "wrap-enable" => self.run_command(Command::WrapOn, ctx),
-            "wrap-off" | "nowrap" | "wrap-disable" => self.run_command(Command::WrapOff, ctx),
-            "find" | "f" => {
+                None => self.run_command(Command::ToggleWrap, ctx),
+            },
+            CommandLineAction::Find { query } => {
                 self.record_command_usage("find");
-                let query = parts.collect::<Vec<_>>().join(" ");
                 self.start_search(query);
             }
-            "goto" | "g" | "line" | "l" => {
+            CommandLineAction::Goto { target } => {
                 self.record_command_usage("goto");
-                let target = parts.collect::<Vec<_>>().join(" ");
                 self.goto_target(&target);
             }
-            "select-word" | "sw" => {
+            CommandLineAction::SelectWord => {
                 self.record_command_usage("select-word");
                 self.select_word();
             }
-            "select-line" | "sl" => {
+            CommandLineAction::SelectLine => {
                 self.record_command_usage("select-line");
                 self.select_line();
             }
-            "delete-word" | "dw" => {
+            CommandLineAction::DeleteWord => {
                 self.record_command_usage("delete-word");
                 self.delete_word();
             }
-            "delete-line" | "dl" => {
+            CommandLineAction::DeleteLine => {
                 self.record_command_usage("delete-line");
                 self.delete_current_line();
             }
-            "duplicate-line" | "dup" => {
+            CommandLineAction::DuplicateLine => {
                 self.record_command_usage("duplicate-line");
                 self.duplicate_current_line();
             }
-            "duplicate-place" | "dupp" => {
+            CommandLineAction::DuplicatePlace => {
                 self.record_command_usage("duplicate-place");
                 self.start_duplicate_placement();
             }
-            "move-line-up" | "mlu" => {
+            CommandLineAction::MoveLineUp => {
                 self.record_command_usage("move-line-up");
                 self.move_current_line_up();
             }
-            "move-line-down" | "mld" => {
+            CommandLineAction::MoveLineDown => {
                 self.record_command_usage("move-line-down");
                 self.move_current_line_down();
             }
-            "move-line-to-paragraph-start" | "mlps" => {
+            CommandLineAction::MoveLineToParagraphStart => {
                 self.record_command_usage("move-line-to-paragraph-start");
                 self.move_current_line_to_paragraph_start();
             }
-            "move-line-to-paragraph-end" | "mlpe" => {
+            CommandLineAction::MoveLineToParagraphEnd => {
                 self.record_command_usage("move-line-to-paragraph-end");
                 self.move_current_line_to_paragraph_end();
             }
-            "top" | "go-top" | "gt" => {
+            CommandLineAction::Top => {
                 self.record_command_usage("top");
                 self.go_to_top();
             }
-            "bottom" | "go-bottom" | "gb" => {
+            CommandLineAction::Bottom => {
                 self.record_command_usage("bottom");
                 self.go_to_bottom();
             }
-            "line-numbers" | "ln" | "linenumbers" => {
-                let Some(mode) = parts.next() else {
-                    self.status = format!("Line numbers: {}", self.line_number_mode.label());
-                    return;
-                };
-                match LineNumberMode::from_config_value(mode) {
-                    Some(LineNumberMode::Absolute) => {
-                        self.record_command_usage("line-numbers-absolute");
-                        self.set_line_number_mode(LineNumberMode::Absolute);
-                    }
-                    Some(LineNumberMode::Relative) => {
-                        self.record_command_usage("line-numbers-relative");
-                        self.set_line_number_mode(LineNumberMode::Relative);
-                    }
-                    None => self.status = "Usage: :line-numbers absolute|relative".to_string(),
+            CommandLineAction::LineNumbers { mode, had_arg } => match mode {
+                Some(CommandLineNumberMode::Absolute) => {
+                    self.record_command_usage("line-numbers-absolute");
+                    self.set_line_number_mode(LineNumberMode::Absolute);
                 }
-            }
-            "line-numbers-absolute" | "ln-abs" => {
-                self.run_command(Command::LineNumbersAbsolute, ctx)
-            }
-            "line-numbers-relative" | "ln-rel" => {
-                self.run_command(Command::LineNumbersRelative, ctx)
-            }
-            "settings" | "set" | "prefs" | "preferences" => {
-                self.run_command(Command::Settings, ctx)
-            }
-            _ => self.status = format!("Unknown command: {input}"),
+                Some(CommandLineNumberMode::Relative) => {
+                    self.record_command_usage("line-numbers-relative");
+                    self.set_line_number_mode(LineNumberMode::Relative);
+                }
+                None if had_arg => {
+                    self.status = "Usage: :line-numbers absolute|relative".to_string();
+                }
+                None => {
+                    self.status = format!("Line numbers: {}", self.line_number_mode.label());
+                }
+            },
+            CommandLineAction::Unknown(input) => self.status = format!("Unknown command: {input}"),
         }
     }
-
     fn select_word(&mut self) {
         if self.buffer.select_word() {
             self.search_state = None;
@@ -4400,16 +6434,22 @@ impl SlateApp {
                     let heading_fragment = self.pending_open_heading_fragment.take();
                     self.open_path(path);
                     if let Some(fragment) = heading_fragment {
-                        self.jump_to_markdown_heading_fragment(&fragment);
+                        self.jump_to_markdown_fragment(&fragment);
                     }
                 }
+            }
+            PendingAction::OpenDaily => {
+                let target = self.pending_daily_target.take().unwrap_or_default();
+                self.open_daily_with_target(&target);
             }
             PendingAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
     }
 
     fn request_close(&mut self, ctx: &egui::Context) {
-        if self.dirty && !self.scratch {
+        if self.scratch {
+            self.close_scratch_with_feedback(ctx);
+        } else if self.dirty {
             self.confirm(PendingAction::Quit);
         } else {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -4417,10 +6457,50 @@ impl SlateApp {
     }
 
     fn handle_window_close_request(&mut self, ctx: &egui::Context) {
-        if ctx.input(|i| i.viewport().close_requested()) && self.dirty && !self.scratch {
+        if !ctx.input(|i| i.viewport().close_requested()) {
+            return;
+        }
+        if self.standalone_agenda {
+            self.agenda_open = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        if self.scratch_close_after.is_some() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            return;
+        }
+        if self.scratch && self.dirty {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_scratch_with_feedback(ctx);
+        } else if self.dirty {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.confirm(PendingAction::Quit);
         }
+    }
+
+    fn close_standalone_agenda_if_requested(&mut self, ctx: &egui::Context) -> bool {
+        if !self.standalone_agenda {
+            return false;
+        }
+        let should_close = ctx.input_mut(|i| {
+            if self.flow_item_edit.is_some() && i.consume_key(egui::Modifiers::NONE, Key::Escape) {
+                self.flow_item_edit = None;
+                return false;
+            }
+            if self.agenda_org_mode.is_some() && i.consume_key(egui::Modifiers::NONE, Key::Escape) {
+                self.close_agenda_org_autocomplete();
+                return false;
+            }
+            i.consume_key(egui::Modifiers::NONE, Key::Escape)
+                || i.consume_key(egui::Modifiers::CTRL, Key::Q)
+                || i.viewport().close_requested()
+        });
+        if should_close {
+            self.agenda_open = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return true;
+        }
+        false
     }
 
     fn layer_allowed(&self) -> bool {
@@ -4431,9 +6511,11 @@ impl SlateApp {
             && !self.recent_picker_open
             && !self.lance_open
             && !self.doc_tasks_open
+            && !self.agenda_open
             && !self.file_picker_open
             && !self.periscope_open
             && !self.periscope_prompt_open
+            && !self.find_note_open
             && !self.link_heading_picker_open
             && !self.link_preview_open
             && !self.save_as_open
@@ -4831,6 +6913,7 @@ impl SlateApp {
             && !self.recent_picker_open
             && !self.lance_open
             && !self.doc_tasks_open
+            && !self.agenda_open
             && !self.file_picker_open
             && !self.periscope_open
             && !self.periscope_prompt_open
@@ -5161,6 +7244,196 @@ impl SlateApp {
         self.focus_editor_once = false;
     }
 
+    fn handle_link_inline_keyboard(&mut self, ctx: &egui::Context) -> bool {
+        if self.link_inline_anchor.is_none() {
+            return false;
+        }
+        let mut handled = false;
+        let mut cancel = false;
+        let mut confirm = false;
+        let mut previous = false;
+        let mut next = false;
+        let mut open_headings = false;
+        ctx.input_mut(|i| {
+            previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
+            next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
+            open_headings |= i.consume_key(egui::Modifiers::NONE, Key::Tab);
+            open_headings |= i.consume_key(egui::Modifiers::SHIFT, Key::Enter);
+            confirm |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
+            cancel |= i.consume_key(egui::Modifiers::NONE, Key::Escape);
+        });
+        let len = self.link_inline_suggestions().len().max(1);
+        if previous {
+            self.selected_link_inline_suggestion =
+                self.selected_link_inline_suggestion.saturating_sub(1);
+            handled = true;
+        }
+        if next {
+            self.selected_link_inline_suggestion =
+                (self.selected_link_inline_suggestion + 1).min(len.saturating_sub(1));
+            handled = true;
+        }
+        if open_headings {
+            self.open_selected_link_inline_headings();
+            handled = true;
+        }
+        if cancel {
+            self.close_link_inline_autocomplete();
+            self.pending_bidirectional_link_source_line = None;
+            self.link_heading_target_path = None;
+            handled = true;
+        }
+        if confirm {
+            self.confirm_link_inline_autocomplete();
+            handled = true;
+        }
+        handled
+    }
+
+    fn handle_flow_inline_org_keyboard(&mut self, ctx: &egui::Context) -> bool {
+        if self.flow_inline_org_mode.is_none() {
+            return false;
+        }
+        let mut handled = false;
+        let mut previous = false;
+        let mut next = false;
+        let mut tab_next = false;
+        let mut tab_previous = false;
+        let mut confirm = false;
+        let mut cancel = false;
+        ctx.input_mut(|input| {
+            previous |= input.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
+            next |= input.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
+            tab_next |= input.consume_key(egui::Modifiers::NONE, Key::Tab);
+            tab_previous |= input.consume_key(egui::Modifiers::SHIFT, Key::Tab);
+            confirm |= input.consume_key(egui::Modifiers::NONE, Key::Enter);
+            cancel |= input.consume_key(egui::Modifiers::NONE, Key::Escape);
+        });
+        let len = self.flow_inline_org_suggestions().len().max(1);
+        if previous {
+            self.selected_flow_inline_org_suggestion =
+                self.selected_flow_inline_org_suggestion.saturating_sub(1);
+            handled = true;
+        }
+        if next {
+            self.selected_flow_inline_org_suggestion =
+                (self.selected_flow_inline_org_suggestion + 1).min(len.saturating_sub(1));
+            handled = true;
+        }
+        if tab_next {
+            self.selected_flow_inline_org_suggestion =
+                (self.selected_flow_inline_org_suggestion + 1) % len;
+            handled = true;
+        }
+        if tab_previous {
+            self.selected_flow_inline_org_suggestion =
+                if self.selected_flow_inline_org_suggestion == 0 {
+                    len.saturating_sub(1)
+                } else {
+                    self.selected_flow_inline_org_suggestion.saturating_sub(1)
+                };
+            handled = true;
+        }
+        if cancel {
+            self.close_flow_inline_org_autocomplete();
+            handled = true;
+        }
+        if confirm {
+            self.confirm_flow_inline_org_autocomplete(ctx);
+            handled = true;
+        }
+        handled
+    }
+
+    fn handle_agenda_org_keyboard(&mut self, ctx: &egui::Context) -> bool {
+        if !self.agenda_open || self.agenda_org_mode.is_none() {
+            return false;
+        }
+        let mut handled = false;
+        let mut confirm = false;
+        let mut cancel = false;
+        let mut previous = false;
+        let mut next = false;
+        let mut tab_next = false;
+        let mut tab_previous = false;
+        let mut backspace = false;
+        let mut typed = String::new();
+        ctx.input_mut(|input| {
+            previous |= input.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
+            next |= input.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
+            tab_next |= input.consume_key(egui::Modifiers::NONE, Key::Tab);
+            tab_previous |= input.consume_key(egui::Modifiers::SHIFT, Key::Tab);
+            confirm |= input.consume_key(egui::Modifiers::NONE, Key::Enter);
+            confirm |= input.consume_key(egui::Modifiers::NONE, Key::Space);
+            cancel |= input.consume_key(egui::Modifiers::NONE, Key::Escape);
+            backspace |= input.consume_key(egui::Modifiers::NONE, Key::Backspace);
+            for event in &input.events {
+                if let egui::Event::Text(text) = event {
+                    typed.push_str(text);
+                }
+            }
+            if !typed.is_empty() {
+                input
+                    .events
+                    .retain(|event| !matches!(event, egui::Event::Text(_)));
+            }
+        });
+        if previous {
+            self.selected_agenda_org_suggestion =
+                self.selected_agenda_org_suggestion.saturating_sub(1);
+            handled = true;
+        }
+        if next {
+            let len = self.agenda_org_suggestions().len().max(1);
+            self.selected_agenda_org_suggestion =
+                (self.selected_agenda_org_suggestion + 1).min(len.saturating_sub(1));
+            handled = true;
+        }
+        if tab_next {
+            let len = self.agenda_org_suggestions().len().max(1);
+            self.selected_agenda_org_suggestion = (self.selected_agenda_org_suggestion + 1) % len;
+            handled = true;
+        }
+        if tab_previous {
+            let len = self.agenda_org_suggestions().len().max(1);
+            self.selected_agenda_org_suggestion = if self.selected_agenda_org_suggestion == 0 {
+                len.saturating_sub(1)
+            } else {
+                self.selected_agenda_org_suggestion.saturating_sub(1)
+            };
+            handled = true;
+        }
+        if backspace {
+            self.agenda_org_query.pop();
+            self.selected_agenda_org_suggestion = 0;
+            handled = true;
+        }
+        if !typed.is_empty() {
+            for ch in typed.chars() {
+                if ch.is_alphanumeric() || matches!(ch, '-' | '_' | '/' | '.') {
+                    self.agenda_org_query.push(ch);
+                }
+            }
+            self.selected_agenda_org_suggestion = 0;
+            handled = true;
+        }
+        if cancel {
+            self.close_agenda_org_autocomplete();
+            handled = true;
+        }
+        if confirm {
+            self.confirm_agenda_org_autocomplete(ctx);
+            handled = true;
+        }
+        if self.agenda_org_mode.is_some() {
+            let len = self.agenda_org_suggestions().len().max(1);
+            self.selected_agenda_org_suggestion = self
+                .selected_agenda_org_suggestion
+                .min(len.saturating_sub(1));
+        }
+        handled
+    }
+
     fn focus_find_command_line(&mut self) {
         self.shortcut_help_open = false;
         self.palette_open = false;
@@ -5179,6 +7452,22 @@ impl SlateApp {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        if self.scratch_close_after.is_some() {
+            return;
+        }
+
+        if self.handle_agenda_org_keyboard(ctx) {
+            return;
+        }
+
+        if self.handle_link_inline_keyboard(ctx) {
+            return;
+        }
+
+        if self.flow_item_edit.is_some() {
+            return;
+        }
+
         if self.handle_duplicate_placement(ctx) {
             return;
         }
@@ -5225,6 +7514,22 @@ impl SlateApp {
         let mut doc_task_open = false;
         let mut doc_task_cycle = false;
         let mut doc_task_backspace = false;
+        let mut agenda_previous = false;
+        let mut agenda_next = false;
+        let mut agenda_open = false;
+        let mut agenda_cycle = false;
+        let mut agenda_edit = false;
+        let mut agenda_refile = false;
+        let mut agenda_previous_day = false;
+        let mut agenda_next_day = false;
+        let mut agenda_previous_week = false;
+        let mut agenda_next_week = false;
+        let mut agenda_today = false;
+        let mut agenda_toggle_focus = false;
+        let mut agenda_cycle_tab = false;
+        let mut agenda_toggle_done = false;
+        let mut agenda_org_tag = false;
+        let mut agenda_org_project = false;
         let mut file_previous = false;
         let mut file_next = false;
         let mut file_open = false;
@@ -5238,6 +7543,13 @@ impl SlateApp {
         let mut periscope_toggle_mode = false;
         let mut periscope_expand_folder = false;
         let mut periscope_backspace = false;
+        let mut find_note_previous = false;
+        let mut find_note_next = false;
+        let mut find_note_open = false;
+        let mut find_note_open_modal = false;
+        let mut find_note_toggle = false;
+        let mut find_note_backspace = false;
+        let mut find_note_cancel = false;
         let mut periscope_prompt_yes = false;
         let mut periscope_prompt_no = false;
         let mut save_as_previous = false;
@@ -5287,7 +7599,9 @@ impl SlateApp {
             && !self.recent_picker_open
             && !self.lance_open
             && !self.doc_tasks_open
+            && !self.agenda_open
             && !self.file_picker_open
+            && !self.find_note_open
             && !self.link_heading_picker_open
             && !self.link_preview_open
             && !self.save_as_open
@@ -5364,6 +7678,116 @@ impl SlateApp {
                 }
                 doc_task_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
             }
+            if self.agenda_open && !self.file_picker_open && !self.link_heading_picker_open {
+                agenda_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
+                agenda_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
+                agenda_previous_day |= i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft);
+                agenda_next_day |= i.consume_key(egui::Modifiers::NONE, Key::ArrowRight);
+                agenda_previous_week |= i.consume_key(egui::Modifiers::NONE, Key::PageUp);
+                agenda_next_week |= i.consume_key(egui::Modifiers::NONE, Key::PageDown);
+                agenda_today |= i.consume_key(egui::Modifiers::NONE, Key::Home);
+                agenda_toggle_done |= i.consume_key(egui::Modifiers::NONE, Key::X);
+                agenda_refile |= i.consume_key(egui::Modifiers::NONE, Key::R);
+                agenda_org_tag |= i.events.iter().any(|event| {
+                    matches!(event, egui::Event::Text(text) if text == "#")
+                });
+                agenda_org_project |= i.events.iter().any(|event| {
+                    matches!(event, egui::Event::Text(text) if text == "@")
+                });
+                if agenda_org_tag || agenda_org_project {
+                    i.events.retain(|event| {
+                        !matches!(event, egui::Event::Text(text) if text == "#" || text == "@")
+                    });
+                }
+                agenda_cycle_tab |= i.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key {
+                            key: Key::Tab,
+                            pressed: true,
+                            repeat: false,
+                            modifiers,
+                            ..
+                        } if !modifiers.ctrl && !modifiers.command && !modifiers.alt && modifiers.shift
+                    )
+                });
+                agenda_toggle_focus |= i.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key {
+                            key: Key::Tab,
+                            pressed: true,
+                            repeat: false,
+                            modifiers,
+                            ..
+                        } if !modifiers.ctrl && !modifiers.command && !modifiers.alt && !modifiers.shift
+                    )
+                });
+                if agenda_toggle_focus || agenda_cycle_tab {
+                    i.events.retain(|event| {
+                        !matches!(
+                            event,
+                            egui::Event::Key {
+                                key: Key::Tab,
+                                pressed: true,
+                                ..
+                            }
+                        )
+                    });
+                }
+                let ctrl_held = i.modifiers.ctrl || i.modifiers.command;
+                agenda_cycle |= i.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key {
+                            key: Key::Enter,
+                            pressed: true,
+                            repeat: false,
+                            modifiers,
+                            ..
+                        } if ctrl_held || modifiers.ctrl || modifiers.command
+                    )
+                });
+                agenda_edit |= i.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key {
+                            key: Key::Enter,
+                            pressed: true,
+                            repeat: false,
+                            modifiers,
+                            ..
+                        } if !modifiers.ctrl && !modifiers.command && !modifiers.alt && modifiers.shift
+                    )
+                });
+                agenda_open |= !agenda_cycle && !agenda_edit
+                    && i.events.iter().any(|event| {
+                        matches!(
+                            event,
+                            egui::Event::Key {
+                                key: Key::Enter,
+                                pressed: true,
+                                repeat: false,
+                                modifiers,
+                                ..
+                            } if !ctrl_held && !modifiers.ctrl && !modifiers.command && !modifiers.alt && !modifiers.shift
+                        )
+                    });
+                agenda_open |= i.consume_key(egui::Modifiers::NONE, Key::Space);
+                if agenda_cycle || agenda_edit || agenda_open {
+                    i.events.retain(|event| {
+                        !matches!(
+                            event,
+                            egui::Event::Key {
+                                key: Key::Enter,
+                                pressed: true,
+                                repeat: false,
+                                ..
+                            }
+                        )
+                    });
+                }
+            }
             if self.file_picker_open {
                 file_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
                 file_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
@@ -5380,6 +7804,17 @@ impl SlateApp {
                 periscope_toggle_mode |= i.consume_key(egui::Modifiers::NONE, Key::Tab);
                 periscope_expand_folder |= i.consume_key(egui::Modifiers::NONE, Key::ArrowRight);
                 periscope_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
+            }
+            if self.find_note_open {
+                find_note_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
+                find_note_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
+                find_note_open_modal |= i.consume_key(egui::Modifiers::SHIFT, Key::Enter);
+                find_note_open |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
+                find_note_toggle |= i.consume_key(egui::Modifiers::NONE, Key::Tab);
+                find_note_toggle |= i.consume_key(egui::Modifiers::NONE, Key::ArrowRight);
+                find_note_toggle |= i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft);
+                find_note_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
+                find_note_cancel |= i.consume_key(egui::Modifiers::NONE, Key::Escape);
             }
             if self.periscope_prompt_open {
                 periscope_prompt_yes |= i.consume_key(egui::Modifiers::NONE, Key::Y);
@@ -5495,6 +7930,7 @@ impl SlateApp {
                 self.file_picker_open = false;
                 self.periscope_open = false;
                 self.periscope_prompt_open = false;
+                self.find_note_open = false;
                 self.link_heading_picker_open = false;
                 if !self.link_preview_dirty {
                     self.link_preview_open = false;
@@ -5528,6 +7964,7 @@ impl SlateApp {
                 self.file_picker_open = false;
                 self.periscope_open = false;
                 self.periscope_prompt_open = false;
+                self.find_note_open = false;
                 self.link_heading_picker_open = false;
                 if !self.link_preview_dirty {
                     self.link_preview_open = false;
@@ -5649,6 +8086,13 @@ impl SlateApp {
                 } else if self.doc_tasks_open {
                     self.doc_tasks_open = false;
                     self.focus_editor_once = true;
+                } else if self.agenda_open {
+                    if self.standalone_agenda {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        return;
+                    }
+                    self.agenda_open = false;
+                    self.focus_editor_once = true;
                 } else if self.file_picker_open {
                     self.file_picker_open = false;
                     self.pending_project_file_path = None;
@@ -5656,12 +8100,19 @@ impl SlateApp {
                     if self.file_picker_mode == FilePickerMode::InsertMarkdownLink {
                         self.cancel_link_assist();
                     }
+                    if self.file_picker_mode == FilePickerMode::Refile {
+                        self.pending_refile = None;
+                        self.pending_refile_destination = None;
+                    }
                     self.focus_editor_once = true;
                 } else if self.periscope_open {
                     self.periscope_open = false;
                     self.focus_editor_once = true;
                 } else if self.periscope_prompt_open {
                     self.periscope_prompt_open = false;
+                    self.focus_editor_once = true;
+                } else if self.find_note_open {
+                    self.find_note_open = false;
                     self.focus_editor_once = true;
                 } else if self.link_heading_picker_open {
                     self.cancel_link_assist();
@@ -5685,9 +8136,11 @@ impl SlateApp {
                     self.focus_editor_once = true;
                 } else if self.pending_action.is_some() {
                     self.pending_action = None;
+                    self.pending_daily_target = None;
                     self.focus_editor_once = true;
                 } else if self.scratch {
-                    command = Some(Command::Quit);
+                    self.close_scratch_with_feedback(ctx);
+                    return;
                 }
             }
         });
@@ -5773,12 +8226,20 @@ impl SlateApp {
             self.handle_periscope_text_input(ctx);
         }
 
+        if self.find_note_open {
+            self.handle_find_note_text_input(ctx);
+        }
+
         if self.link_assist_web_open {
             self.handle_link_assist_web_text_input(ctx);
         }
 
         if self.save_as_open {
             self.handle_save_as_text_input(ctx);
+        }
+
+        if self.handle_flow_inline_org_keyboard(ctx) {
+            return;
         }
 
         if link_assist_cancel || link_web_cancel || link_heading_cancel {
@@ -5889,6 +8350,45 @@ impl SlateApp {
 
         if periscope_prompt_no {
             self.open_global_periscope();
+            return;
+        }
+
+        if find_note_cancel {
+            self.find_note_open = false;
+            self.focus_editor_once = true;
+            return;
+        }
+
+        if find_note_backspace {
+            self.find_note_query.pop();
+            self.find_note_expanded_files.clear();
+            self.selected_find_note_row = 0;
+            self.refresh_find_note_results();
+            return;
+        }
+
+        if find_note_previous {
+            self.move_find_note_selection(-1);
+            return;
+        }
+
+        if find_note_next {
+            self.move_find_note_selection(1);
+            return;
+        }
+
+        if find_note_toggle {
+            self.toggle_selected_find_note_file();
+            return;
+        }
+
+        if find_note_open_modal {
+            self.open_selected_find_note(true);
+            return;
+        }
+
+        if find_note_open {
+            self.open_selected_find_note(false);
             return;
         }
 
@@ -6049,13 +8549,96 @@ impl SlateApp {
             return;
         }
 
+        if agenda_org_tag {
+            self.open_agenda_org_autocomplete(AgendaOrgMode::Tag);
+            return;
+        }
+
+        if agenda_org_project {
+            self.open_agenda_org_autocomplete(AgendaOrgMode::Project);
+            return;
+        }
+
+        if agenda_previous {
+            self.move_agenda_selection(-1);
+            return;
+        }
+
+        if agenda_next {
+            self.move_agenda_selection(1);
+            return;
+        }
+
+        if agenda_previous_day {
+            self.move_agenda_week_window(-1);
+            return;
+        }
+
+        if agenda_next_day {
+            self.move_agenda_week_window(1);
+            return;
+        }
+
+        if agenda_previous_week {
+            self.move_agenda_week_window(-1);
+            return;
+        }
+
+        if agenda_next_week {
+            self.move_agenda_week_window(1);
+            return;
+        }
+
+        if agenda_today {
+            self.jump_agenda_to_today();
+            return;
+        }
+
+        if agenda_cycle_tab {
+            self.cycle_agenda_tab();
+            return;
+        }
+
+        if agenda_toggle_focus {
+            self.toggle_agenda_focus();
+            return;
+        }
+
+        if agenda_toggle_done {
+            self.toggle_agenda_done_visibility();
+            return;
+        }
+
+        if agenda_edit {
+            self.open_selected_flow_item_edit();
+            return;
+        }
+
+        if agenda_refile {
+            self.start_refile_selected_agenda_item();
+            return;
+        }
+
+        if agenda_cycle {
+            self.cycle_selected_agenda_item();
+            return;
+        }
+
+        if agenda_open {
+            self.activate_selected_agenda_row();
+            if self.standalone_agenda && !self.agenda_open {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            return;
+        }
+
         if settings_previous {
             self.selected_setting = self.selected_setting.saturating_sub(1);
             return;
         }
 
         if settings_next {
-            self.selected_setting = (self.selected_setting + 1).min(6);
+            self.selected_setting = (self.selected_setting + 1).min(7);
             return;
         }
 
@@ -6067,7 +8650,8 @@ impl SlateApp {
                 3 => self.set_wrap_mode(false),
                 4 => self.set_preview_mode(false),
                 5 => self.set_markdown_live_rendering(false),
-                6 => self.set_reopen_last_file_on_startup(false),
+                6 => self.set_virtual_references_enabled(false),
+                7 => self.set_reopen_last_file_on_startup(false),
                 _ => {}
             }
             return;
@@ -6087,7 +8671,8 @@ impl SlateApp {
                 3 => self.set_wrap_mode(!self.wrap),
                 4 => self.set_preview_mode(!self.preview),
                 5 => self.set_markdown_live_rendering(!self.markdown_live_rendering),
-                6 => self.set_reopen_last_file_on_startup(!self.reopen_last_file_on_startup),
+                6 => self.set_virtual_references_enabled(!self.virtual_references_enabled),
+                7 => self.set_reopen_last_file_on_startup(!self.reopen_last_file_on_startup),
                 _ => {}
             }
             return;
@@ -6401,6 +8986,7 @@ impl SlateApp {
         }
         if go_back {
             self.pending_action = None;
+            self.pending_daily_target = None;
             self.focus_editor_once = true;
             return;
         }
@@ -6945,7 +9531,47 @@ impl SlateApp {
                                     });
 
                                 ui.add_space(6.0);
-                                let reopen_selected = self.selected_setting == 6;
+                                let virtual_refs_selected = self.selected_setting == 6;
+                                egui::Frame::new()
+                                    .fill(if virtual_refs_selected { selected_fill } else { normal_fill })
+                                    .inner_margin(6.0)
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new(if virtual_refs_selected { ">" } else { " " })
+                                                    .font(FontId::new(14.0, FontFamily::Monospace))
+                                                    .color(Color32::from_rgb(136, 192, 208)),
+                                            );
+                                            ui.label(
+                                                RichText::new("Virtual backlinks/mentions")
+                                                    .font(FontId::new(14.0, FontFamily::Monospace))
+                                                    .color(Color32::from_rgb(216, 222, 233)),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if ui
+                                                        .button(if self.virtual_references_enabled { "show" } else { "hide" })
+                                                        .on_hover_text("Render the virtual Backlinks/Mentions section at the end of saved Markdown files")
+                                                        .clicked()
+                                                    {
+                                                        self.set_virtual_references_enabled(
+                                                            !self.virtual_references_enabled,
+                                                        );
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        ui.add_space(4.0);
+                                        ui.label(
+                                            RichText::new("Shows a non-saved end-of-file references section. Click the virtual header, Backlinks, or Mentions to collapse/expand.")
+                                                .font(FontId::new(13.0, FontFamily::Monospace))
+                                                .color(Color32::from_rgb(136, 154, 176)),
+                                        );
+                                    });
+
+                                ui.add_space(6.0);
+                                let reopen_selected = self.selected_setting == 7;
                                 egui::Frame::new()
                                     .fill(if reopen_selected { selected_fill } else { normal_fill })
                                     .inner_margin(6.0)
@@ -7075,21 +9701,31 @@ impl SlateApp {
 
                         if self.link_heading_picker_open {
                             ui.set_width(520.0);
-                            ui.label(
-                                RichText::new("insert link heading")
-                                    .font(title_font)
-                                    .color(accent),
-                            );
-                            ui.label(
-                                RichText::new("Enter on first option links the whole file")
-                                    .font(font.clone())
-                                    .color(dim),
-                            );
+                            let title = match self.link_heading_picker_mode {
+                                LinkHeadingPickerMode::InsertLink => "insert link heading",
+                                LinkHeadingPickerMode::BidirectionalLink => {
+                                    "bidirectional link heading"
+                                }
+                                LinkHeadingPickerMode::Refile => "refile heading",
+                            };
+                            let hint = match self.link_heading_picker_mode {
+                                LinkHeadingPickerMode::InsertLink => {
+                                    "Enter on first option links the whole file"
+                                }
+                                LinkHeadingPickerMode::BidirectionalLink => {
+                                    "Enter chooses where to write the reciprocal link"
+                                }
+                                LinkHeadingPickerMode::Refile => {
+                                    "Enter on first option appends to the end of the file"
+                                }
+                            };
+                            ui.label(RichText::new(title).font(title_font).color(accent));
+                            ui.label(RichText::new(hint).font(font.clone()).color(dim));
                             ui.add_space(8.0);
 
                             let total = self.link_heading_options.len() + 1;
                             let visible_rows = 12usize;
-                            let start = Self::centered_window_start(
+                            let start = file_dialogs::centered_window_start(
                                 self.selected_link_heading,
                                 visible_rows,
                                 total,
@@ -7098,7 +9734,17 @@ impl SlateApp {
                             for index in start..end {
                                 let selected = index == self.selected_link_heading;
                                 let label = if index == 0 {
-                                    "No usar headers · linkear archivo entero".to_string()
+                                    match self.link_heading_picker_mode {
+                                        LinkHeadingPickerMode::InsertLink => {
+                                            "No usar headers · linkear archivo entero".to_string()
+                                        }
+                                        LinkHeadingPickerMode::BidirectionalLink => {
+                                            "No usar headers · backlink al final".to_string()
+                                        }
+                                        LinkHeadingPickerMode::Refile => {
+                                            "No usar headers · append al final".to_string()
+                                        }
+                                    }
                                 } else {
                                     let heading = &self.link_heading_options[index - 1];
                                     format!(
@@ -7311,6 +9957,7 @@ impl SlateApp {
                                 true,
                                 target_line,
                                 self.markdown_live_rendering,
+                                None,
                             );
                             if self.focus_link_preview_once {
                                 self.focus_link_preview_once = false;
@@ -7401,7 +10048,7 @@ impl SlateApp {
                             .iter()
                             .position(|index| *index == self.selected_lance_file)
                             .unwrap_or(0);
-                        let start = Self::centered_window_start(selected_position, visible_rows, indices.len());
+                        let start = file_dialogs::centered_window_start(selected_position, visible_rows, indices.len());
                         let end = (start + visible_rows).min(indices.len());
                         if indices.is_empty() {
                             ui.add_space(20.0);
@@ -7496,6 +10143,7 @@ impl SlateApp {
                     FilePickerMode::AddLance => "add lance",
                     FilePickerMode::Browse => "files",
                     FilePickerMode::InsertMarkdownLink => "insert link file",
+                    FilePickerMode::Refile => "refile target",
                     FilePickerMode::SetPeriscopeProject => "set periscope project",
                 };
                 (
@@ -7541,7 +10189,7 @@ impl SlateApp {
             ),
         };
 
-        let start = Self::centered_window_start(selected_index, visible_rows, total_len);
+        let start = file_dialogs::centered_window_start(selected_index, visible_rows, total_len);
         let end = (start + visible_rows).min(total_len);
 
         egui::Area::new("slate_picker_dialog".into())
@@ -7717,7 +10365,7 @@ impl SlateApp {
                                         let (size, modified) = if path.is_dir() {
                                             ("dir".to_string(), "".to_string())
                                         } else {
-                                            Self::file_metadata_labels(path)
+                                            file_dialogs::file_metadata_labels(path)
                                         };
                                         (
                                             index,
@@ -7936,7 +10584,7 @@ impl SlateApp {
         let selected = self
             .selected_periscope_result
             .min(rows.len().saturating_sub(1));
-        let start = Self::centered_window_start(selected, visible_rows, rows.len());
+        let start = file_dialogs::centered_window_start(selected, visible_rows, rows.len());
         let end = (start + visible_rows).min(rows.len());
         let mode_label = match self.periscope_mode {
             PeriscopeMode::Project => "project",
@@ -8203,6 +10851,276 @@ impl SlateApp {
             });
     }
 
+    fn find_note_dialog(&mut self, ctx: &egui::Context) {
+        if !self.find_note_open {
+            return;
+        }
+        let root = self.project_root();
+        let visible_rows = 16usize;
+        let selected = self
+            .selected_find_note_row
+            .min(self.find_note_rows.len().saturating_sub(1));
+        let start =
+            file_dialogs::centered_window_start(selected, visible_rows, self.find_note_rows.len());
+        let end = (start + visible_rows).min(self.find_note_rows.len());
+
+        egui::Area::new("find_note_dialog".into())
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, -16.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(25, 31, 40))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
+                    .corner_radius(0.0)
+                    .inner_margin(14.0)
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 10],
+                        blur: 24,
+                        spread: 0,
+                        color: Color32::from_black_alpha(150),
+                    })
+                    .show(ui, |ui| {
+                        ui.set_width(860.0);
+                        let font = FontId::new(13.0, FontFamily::Monospace);
+                        let title_font = FontId::new(16.0, FontFamily::Monospace);
+                        let accent = Color32::from_rgb(136, 192, 208);
+                        let text = Color32::from_rgb(216, 222, 233);
+                        let dim = Color32::from_rgb(136, 154, 176);
+                        let faint = Color32::from_rgb(94, 105, 126);
+                        let warn = Color32::from_rgb(235, 203, 139);
+
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Find note").font(title_font).color(accent));
+                            ui.label(
+                                RichText::new(root.display().to_string())
+                                    .font(font.clone())
+                                    .color(faint),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new("[esc] close").font(font.clone()).color(warn),
+                                    );
+                                },
+                            );
+                        });
+                        ui.add_space(8.0);
+
+                        let input_height = 30.0;
+                        let (input_rect, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), input_height),
+                            egui::Sense::hover(),
+                        );
+                        let painter = ui.painter_at(input_rect);
+                        painter.rect_filled(input_rect, 0.0, Color32::from_rgb(30, 36, 48));
+                        painter.rect_stroke(
+                            input_rect,
+                            0.0,
+                            Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
+                            egui::StrokeKind::Outside,
+                        );
+                        let query = if self.find_note_query.is_empty() {
+                            "type to filter notes".to_string()
+                        } else {
+                            self.find_note_query.clone()
+                        };
+                        let query_color = if self.find_note_query.is_empty() {
+                            faint
+                        } else {
+                            text
+                        };
+                        painter.text(
+                            egui::pos2(input_rect.left() + 10.0, input_rect.center().y - 0.5),
+                            egui::Align2::LEFT_CENTER,
+                            ">",
+                            font.clone(),
+                            accent,
+                        );
+                        let query_rect = painter.text(
+                            egui::pos2(input_rect.left() + 32.0, input_rect.center().y - 0.5),
+                            egui::Align2::LEFT_CENTER,
+                            query,
+                            font.clone(),
+                            query_color,
+                        );
+                        let cursor_x = if self.find_note_query.is_empty() {
+                            input_rect.left() + 32.0
+                        } else {
+                            query_rect.right() + 2.0
+                        };
+                        painter.line_segment(
+                            [
+                                egui::pos2(cursor_x, input_rect.top() + 7.0),
+                                egui::pos2(cursor_x, input_rect.bottom() - 7.0),
+                            ],
+                            Stroke::new(1.0, accent),
+                        );
+
+                        ui.add_space(8.0);
+                        let row_height = 24.0;
+                        let list_height = (visible_rows as f32 + 1.0) * row_height;
+                        let (list_rect, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), list_height),
+                            egui::Sense::hover(),
+                        );
+                        let painter = ui.painter_at(list_rect).with_clip_rect(list_rect);
+                        painter.rect_filled(list_rect, 0.0, Color32::from_rgb(22, 28, 37));
+                        painter.rect_stroke(
+                            list_rect,
+                            0.0,
+                            Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
+                            egui::StrokeKind::Outside,
+                        );
+                        painter.text(
+                            egui::pos2(list_rect.left() + 32.0, list_rect.top() + row_height * 0.5),
+                            egui::Align2::LEFT_CENTER,
+                            "note",
+                            font.clone(),
+                            faint,
+                        );
+                        painter.text(
+                            egui::pos2(
+                                list_rect.right() - 260.0,
+                                list_rect.top() + row_height * 0.5,
+                            ),
+                            egui::Align2::LEFT_CENTER,
+                            "match",
+                            font.clone(),
+                            faint,
+                        );
+
+                        if self.find_note_rows.is_empty() {
+                            painter.text(
+                                list_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "no notes found",
+                                font.clone(),
+                                faint,
+                            );
+                        }
+
+                        for (row, index) in (start..end).enumerate() {
+                            let row_top = list_rect.top() + (row as f32 + 1.0) * row_height;
+                            let row_rect = egui::Rect::from_min_size(
+                                egui::pos2(list_rect.left() + 4.0, row_top),
+                                Vec2::new(list_rect.width() - 8.0, row_height),
+                            );
+                            let selected = index == self.selected_find_note_row;
+                            if selected {
+                                painter.rect_filled(row_rect, 0.0, Color32::from_rgb(38, 47, 61));
+                            }
+                            let (label, hint, has_headings, expanded, is_heading) = match &self
+                                .find_note_rows[index]
+                            {
+                                FindNoteRow::File { path, match_hint } => {
+                                    let label = path
+                                        .strip_prefix(&root)
+                                        .unwrap_or(path)
+                                        .display()
+                                        .to_string();
+                                    let has_headings = fs::read_to_string(path)
+                                        .map(|contents| {
+                                            contents
+                                                .lines()
+                                                .any(|line| parse_heading_line(line).is_some())
+                                        })
+                                        .unwrap_or(false);
+                                    (
+                                        label,
+                                        match_hint.clone(),
+                                        has_headings,
+                                        self.find_note_expanded_files.contains(path),
+                                        false,
+                                    )
+                                }
+                                FindNoteRow::Heading {
+                                    line, title, level, ..
+                                } => (
+                                    format!("{}# {}", "  ".repeat(level.saturating_sub(1)), title),
+                                    format!("line {line}"),
+                                    false,
+                                    false,
+                                    true,
+                                ),
+                            };
+                            let prefix = if is_heading {
+                                "  "
+                            } else if has_headings && expanded {
+                                "▾ "
+                            } else if has_headings {
+                                "▸ "
+                            } else {
+                                "  "
+                            };
+                            let y = row_rect.center().y - 0.5;
+                            painter.text(
+                                egui::pos2(row_rect.left() + 8.0, y),
+                                egui::Align2::LEFT_CENTER,
+                                if selected { ">" } else { " " },
+                                font.clone(),
+                                accent,
+                            );
+                            painter.text(
+                                egui::pos2(row_rect.left() + 28.0, y),
+                                egui::Align2::LEFT_CENTER,
+                                Self::text_for_width(
+                                    &format!("{prefix}{label}"),
+                                    list_rect.width() - 340.0,
+                                    13.0,
+                                ),
+                                font.clone(),
+                                if selected {
+                                    text
+                                } else if is_heading {
+                                    dim
+                                } else {
+                                    accent
+                                },
+                            );
+                            painter.text(
+                                egui::pos2(list_rect.right() - 260.0, y),
+                                egui::Align2::LEFT_CENTER,
+                                Self::text_for_width(&hint, 245.0, 13.0),
+                                font.clone(),
+                                faint,
+                            );
+                            let response = ui.interact(
+                                row_rect,
+                                ui.id().with(("find_note", index)),
+                                egui::Sense::click(),
+                            );
+                            if response.clicked() || response.double_clicked() {
+                                self.selected_find_note_row = index;
+                            }
+                            if response.double_clicked() {
+                                self.open_selected_find_note(false);
+                            }
+                        }
+
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            for (key, label) in [
+                                ("↑↓", "select"),
+                                ("type", "filter"),
+                                ("Tab/→", "expand"),
+                                ("←", "collapse"),
+                                ("Enter", "open main"),
+                                ("Shift+Enter", "front modal"),
+                            ] {
+                                ui.label(
+                                    RichText::new(format!("[{key}]"))
+                                        .font(font.clone())
+                                        .color(warn),
+                                );
+                                ui.label(RichText::new(label).font(font.clone()).color(dim));
+                                ui.add_space(8.0);
+                            }
+                        });
+                    });
+            });
+    }
+
     #[allow(dead_code)]
     fn file_picker_dialog(&mut self, ctx: &egui::Context) {
         if !self.file_picker_open {
@@ -8216,7 +11134,8 @@ impl SlateApp {
             .iter()
             .position(|index| *index == self.selected_project_file)
             .unwrap_or(0);
-        let start = Self::centered_window_start(selected_position, visible_rows, matches.len());
+        let start =
+            file_dialogs::centered_window_start(selected_position, visible_rows, matches.len());
         let end = (start + visible_rows).min(matches.len());
 
         egui::Area::new("file_picker_dialog".into())
@@ -8251,6 +11170,7 @@ impl SlateApp {
                                 FilePickerMode::AddLance => "add lance",
                                 FilePickerMode::Browse => "files",
                                 FilePickerMode::InsertMarkdownLink => "insert link file",
+                                FilePickerMode::Refile => "refile target",
                                 FilePickerMode::SetPeriscopeProject => "set periscope project",
                             };
                             ui.label(RichText::new(title).font(title_font).color(accent));
@@ -8402,7 +11322,7 @@ impl SlateApp {
                             let (size_label, modified_label) = if path.is_dir() {
                                 ("dir".to_string(), "".to_string())
                             } else {
-                                Self::file_metadata_labels(path)
+                                file_dialogs::file_metadata_labels(path)
                             };
                             let y = row_rect.center().y - 0.5;
                             painter.text(
@@ -8547,6 +11467,7 @@ impl SlateApp {
                                     true,
                                     None,
                                     false,
+                                    None,
                                 );
                                 response.request_focus();
                                 if changed {
@@ -8762,7 +11683,7 @@ impl SlateApp {
                             let selected = self
                                 .selected_scratch_entry
                                 .min(self.scratch_entries.len().saturating_sub(1));
-                            let start = Self::centered_window_start(
+                            let start = file_dialogs::centered_window_start(
                                 selected,
                                 visible_rows,
                                 self.scratch_entries.len(),
@@ -8941,7 +11862,8 @@ impl SlateApp {
             .iter()
             .position(|index| *index == self.selected_save_as_entry)
             .unwrap_or(0);
-        let start = Self::centered_window_start(selected_position, visible_rows, matches.len());
+        let start =
+            file_dialogs::centered_window_start(selected_position, visible_rows, matches.len());
         let end = (start + visible_rows).min(matches.len());
 
         egui::Area::new("save_as_dialog".into())
@@ -9107,7 +12029,7 @@ impl SlateApp {
                             let (size_label, modified_label) = if path.is_dir() {
                                 ("dir".to_string(), "".to_string())
                             } else {
-                                Self::file_metadata_labels(path)
+                                file_dialogs::file_metadata_labels(path)
                             };
                             let y = row_rect.center().y - 0.5;
                             painter.text(
@@ -9594,6 +12516,14 @@ impl SlateApp {
             let link_text = Color32::from_rgb(136, 192, 208);
             let link_target = Color32::from_rgb(163, 190, 140);
             let link_heading = Color32::from_rgb(235, 203, 139);
+            let label_line_start = line[span.text_start..span.text_end]
+                .rfind(':')
+                .map(|offset| span.text_start + offset)
+                .filter(|line_start| {
+                    line[line_start + 1..span.text_end]
+                        .chars()
+                        .all(|ch| ch.is_ascii_digit())
+                });
             let mut link_sections = vec![
                 (
                     byte,
@@ -9602,10 +12532,17 @@ impl SlateApp {
                     false,
                 ),
                 (span.marker_start, span.text_start, link_dim, false),
-                (span.text_start, span.text_end, link_text, true),
+            ];
+            if let Some(line_start) = label_line_start {
+                link_sections.push((span.text_start, line_start, link_target, true));
+                link_sections.push((line_start, span.text_end, link_heading, true));
+            } else {
+                link_sections.push((span.text_start, span.text_end, link_text, true));
+            }
+            link_sections.extend([
                 (span.text_end, span.target_start, link_dim, false),
                 (span.target_start, target_path_end, link_target, false),
-            ];
+            ]);
             if let Some(fragment_start) = fragment_start {
                 link_sections.push((fragment_start, span.target_end, link_heading, false));
             }
@@ -9978,6 +12915,1012 @@ impl SlateApp {
     }
 }
 
+impl SlateApp {
+    fn link_inline_suggestion_popup(&mut self, ctx: &egui::Context) {
+        if self.link_inline_anchor.is_none() {
+            return;
+        }
+        let Some(query) = self.current_link_inline_query() else {
+            return;
+        };
+        let suggestions = self.link_inline_suggestions();
+        if suggestions.is_empty() {
+            return;
+        }
+        let root = self.project_root();
+        let row_font = FontId::new(13.0, FontFamily::Monospace);
+        let small_font = FontId::new(11.0, FontFamily::Monospace);
+        let text = Color32::from_rgb(218, 224, 235);
+        let muted = Color32::from_rgb(126, 136, 157);
+        let accent = Color32::from_rgb(163, 190, 140);
+        let path_color = Color32::from_rgb(136, 192, 208);
+        let screen = ctx.content_rect();
+        let popup_width = (screen.width() * 0.34).clamp(260.0, 460.0);
+        let row_count = suggestions.len().min(8) as f32;
+        let popup_height = 36.0 + row_count * 24.0;
+        let cursor_pos = self
+            .editor_view
+            .last_cursor_pos()
+            .unwrap_or_else(|| egui::pos2(screen.left() + 44.0, screen.bottom() - 54.0));
+        let mut popup_pos = cursor_pos + Vec2::new(10.0, 8.0);
+        if popup_pos.x + popup_width > screen.right() - 12.0 {
+            popup_pos.x = (screen.right() - popup_width - 12.0).max(screen.left() + 12.0);
+        }
+        if popup_pos.y + popup_height > screen.bottom() - 34.0 {
+            popup_pos.y = (cursor_pos.y - popup_height - 8.0).max(screen.top() + 12.0);
+        }
+        egui::Area::new("link_inline_suggestions".into())
+            .fixed_pos(popup_pos)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(13, 17, 24))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(53, 66, 86)))
+                    .corner_radius(7.0)
+                    .inner_margin(egui::Margin::symmetric(7, 6))
+                    .show(ui, |ui| {
+                        ui.set_width(popup_width);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("link").font(small_font.clone()).color(muted));
+                            ui.label(
+                                RichText::new(format!("[{query}"))
+                                    .font(small_font.clone())
+                                    .color(accent),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new("↑↓ · Enter file · Tab headings")
+                                            .font(small_font.clone())
+                                            .color(muted),
+                                    );
+                                },
+                            );
+                        });
+                        ui.add_space(4.0);
+                        for (index, path) in suggestions.iter().take(8).enumerate() {
+                            let selected = index == self.selected_link_inline_suggestion;
+                            let (rect, response) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), 24.0),
+                                egui::Sense::click(),
+                            );
+                            if response.clicked() {
+                                self.selected_link_inline_suggestion = index;
+                                self.confirm_link_inline_autocomplete();
+                                break;
+                            }
+                            let painter = ui.painter_at(rect);
+                            if selected {
+                                painter.rect_filled(rect, 4.0, Color32::from_rgb(42, 56, 76));
+                            }
+                            let name = path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("untitled");
+                            let relative = path
+                                .strip_prefix(&root)
+                                .unwrap_or(path)
+                                .display()
+                                .to_string();
+                            let has_headings = Self::link_target_has_headings(path);
+                            painter.text(
+                                egui::pos2(rect.left() + 7.0, rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                if has_headings { "▸" } else { " " },
+                                row_font.clone(),
+                                if has_headings { accent } else { muted },
+                            );
+                            painter.text(
+                                egui::pos2(rect.left() + 24.0, rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                name,
+                                row_font.clone(),
+                                if selected { text } else { path_color },
+                            );
+                            painter.text(
+                                egui::pos2(rect.left() + 190.0, rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                relative,
+                                small_font.clone(),
+                                muted,
+                            );
+                        }
+                    });
+            });
+    }
+
+    fn flow_inline_org_suggestion_popup(&mut self, ctx: &egui::Context) {
+        let Some(active_mode) = self.flow_inline_org_mode else {
+            return;
+        };
+        let Some((mode, query)) = self.current_flow_inline_org_token() else {
+            return;
+        };
+        if mode != active_mode
+            || self.current_flow_inline_org_token_global_start(mode) != self.flow_inline_org_anchor
+        {
+            return;
+        }
+        let suggestions = self.flow_inline_org_suggestions();
+        if suggestions.is_empty() {
+            return;
+        }
+        let prefix = match mode {
+            AgendaOrgMode::Tag => "#",
+            AgendaOrgMode::Project => "@",
+        };
+        let title = match mode {
+            AgendaOrgMode::Tag => "tag",
+            AgendaOrgMode::Project => "project",
+        };
+        let row_font = FontId::new(13.0, FontFamily::Monospace);
+        let small_font = FontId::new(11.0, FontFamily::Monospace);
+        let text = Color32::from_rgb(218, 224, 235);
+        let muted = Color32::from_rgb(126, 136, 157);
+        let accent = Color32::from_rgb(154, 185, 235);
+        let screen = ctx.content_rect();
+        let popup_width = (screen.width() * 0.28).clamp(220.0, 340.0);
+        let row_count = suggestions.len().min(7) as f32;
+        let popup_height = 36.0 + row_count * 22.0;
+        let cursor_pos = self
+            .editor_view
+            .last_cursor_pos()
+            .unwrap_or_else(|| egui::pos2(screen.left() + 44.0, screen.bottom() - 54.0));
+        let mut popup_pos = cursor_pos + Vec2::new(10.0, 8.0);
+        if popup_pos.x + popup_width > screen.right() - 12.0 {
+            popup_pos.x = (screen.right() - popup_width - 12.0).max(screen.left() + 12.0);
+        }
+        if popup_pos.y + popup_height > screen.bottom() - 34.0 {
+            popup_pos.y = (cursor_pos.y - popup_height - 8.0).max(screen.top() + 12.0);
+        }
+        egui::Area::new("flow_inline_org_suggestions".into())
+            .fixed_pos(popup_pos)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(13, 17, 24))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(53, 66, 86)))
+                    .corner_radius(7.0)
+                    .inner_margin(egui::Margin::symmetric(7, 6))
+                    .show(ui, |ui| {
+                        ui.set_width(popup_width);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(title).font(small_font.clone()).color(muted));
+                            ui.label(
+                                RichText::new(format!("{prefix}{query}"))
+                                    .font(small_font.clone())
+                                    .color(accent),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new("↑↓/Tab · Enter")
+                                            .font(small_font.clone())
+                                            .color(muted),
+                                    );
+                                },
+                            );
+                        });
+                        ui.add_space(4.0);
+                        for (index, suggestion) in suggestions.iter().take(7).enumerate() {
+                            let selected = index == self.selected_flow_inline_org_suggestion;
+                            let (rect, response) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), 22.0),
+                                egui::Sense::click(),
+                            );
+                            if response.clicked() {
+                                self.selected_flow_inline_org_suggestion = index;
+                                self.confirm_flow_inline_org_autocomplete(ctx);
+                                break;
+                            }
+                            let painter = ui.painter_at(rect);
+                            if selected {
+                                painter.rect_filled(rect, 4.0, Color32::from_rgb(42, 56, 76));
+                            }
+                            painter.text(
+                                egui::pos2(rect.left() + 7.0, rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                format!("{prefix}{suggestion}"),
+                                row_font.clone(),
+                                if selected { text } else { muted },
+                            );
+                        }
+                    });
+            });
+    }
+
+    fn flow_item_edit_dialog(&mut self, ctx: &egui::Context) {
+        if self.flow_item_edit.is_none() {
+            return;
+        }
+
+        let mut save = false;
+        let mut cancel = false;
+        let mut open_org = None;
+        let mut confirm_org = false;
+        let mut org_next = false;
+        let mut org_previous = false;
+        let mut org_backspace = false;
+        let mut org_typed = String::new();
+
+        ctx.input_mut(|input| {
+            if input.consume_key(egui::Modifiers::CTRL, Key::Enter) {
+                save = true;
+            }
+            if input.consume_key(egui::Modifiers::NONE, Key::Escape) {
+                if self
+                    .flow_item_edit
+                    .as_ref()
+                    .is_some_and(|edit| edit.org_mode.is_some())
+                {
+                    if let Some(edit) = self.flow_item_edit.as_mut() {
+                        edit.close_org();
+                    }
+                } else {
+                    cancel = true;
+                }
+            }
+            let org_open = self
+                .flow_item_edit
+                .as_ref()
+                .is_some_and(|edit| edit.org_mode.is_some());
+            if org_open && input.consume_key(egui::Modifiers::NONE, Key::Tab) {
+                org_next = true;
+            }
+            if org_open && input.consume_key(egui::Modifiers::SHIFT, Key::Tab) {
+                org_previous = true;
+            }
+            if org_open
+                && (input.consume_key(egui::Modifiers::NONE, Key::Enter)
+                    || input.consume_key(egui::Modifiers::NONE, Key::Space))
+            {
+                confirm_org = true;
+            }
+            if org_open && input.consume_key(egui::Modifiers::NONE, Key::Backspace) {
+                org_backspace = true;
+            }
+            for event in &input.events {
+                if let egui::Event::Text(text) = event {
+                    if text == "#" {
+                        open_org = Some(AgendaOrgMode::Tag);
+                    } else if text == "@" {
+                        open_org = Some(AgendaOrgMode::Project);
+                    } else if self
+                        .flow_item_edit
+                        .as_ref()
+                        .is_some_and(|edit| edit.org_mode.is_some())
+                    {
+                        org_typed.push_str(text);
+                    }
+                }
+            }
+        });
+
+        let all_values = |mode: AgendaOrgMode, items: &[AgendaItem]| -> Vec<String> {
+            items
+                .iter()
+                .flat_map(move |item| match mode {
+                    AgendaOrgMode::Tag => item.tags.clone(),
+                    AgendaOrgMode::Project => item.projects.clone(),
+                })
+                .collect()
+        };
+
+        if let Some(edit) = self.flow_item_edit.as_mut() {
+            if let Some(mode) = open_org {
+                edit.open_org(mode);
+            }
+            if let Some(mode) = edit.org_mode {
+                if org_backspace {
+                    edit.org_query.pop();
+                    edit.selected_org_suggestion = 0;
+                }
+                if !org_typed.is_empty() {
+                    for ch in org_typed.chars() {
+                        if ch.is_alphanumeric() || matches!(ch, '-' | '_' | '/' | '.') {
+                            edit.org_query.push(ch);
+                        }
+                    }
+                    edit.selected_org_suggestion = 0;
+                }
+                let suggestions =
+                    organization_suggestions(all_values(mode, &self.agenda_items), &edit.org_query);
+                let len = suggestions.len().max(1);
+                if org_next {
+                    edit.selected_org_suggestion = (edit.selected_org_suggestion + 1) % len;
+                }
+                if org_previous {
+                    edit.selected_org_suggestion = if edit.selected_org_suggestion == 0 {
+                        len.saturating_sub(1)
+                    } else {
+                        edit.selected_org_suggestion.saturating_sub(1)
+                    };
+                }
+                edit.selected_org_suggestion =
+                    edit.selected_org_suggestion.min(len.saturating_sub(1));
+                if confirm_org {
+                    let value = suggestions
+                        .get(edit.selected_org_suggestion)
+                        .cloned()
+                        .unwrap_or_else(|| edit.org_query.trim().to_string());
+                    if let Some(token) = organization_token(mode, &value) {
+                        edit.cursor_char_index = replace_org_token_at_cursor(
+                            &mut edit.text,
+                            edit.cursor_char_index,
+                            mode,
+                            &token,
+                        );
+                    }
+                    edit.close_org();
+                }
+            }
+        }
+
+        let screen_rect = ctx.content_rect();
+        ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            "flow_item_edit_scrim".into(),
+        ))
+        .rect_filled(screen_rect, 0.0, Color32::from_black_alpha(90));
+
+        let mut commit_payload = None;
+        egui::Area::new("flow_item_edit_dialog".into())
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(13, 17, 24))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(105, 117, 148)))
+                    .corner_radius(9.0)
+                    .inner_margin(egui::Margin::symmetric(12, 10))
+                    .show(ui, |ui| {
+                        ui.set_min_width(720.0);
+                        let row_font = FontId::new(14.0, FontFamily::Monospace);
+                        let small_font = FontId::new(12.0, FontFamily::Monospace);
+                        let title_font = FontId::new(15.0, FontFamily::Monospace);
+                        let accent = Color32::from_rgb(154, 185, 235);
+                        let accent_soft = Color32::from_rgb(42, 56, 76);
+                        let text = Color32::from_rgb(218, 224, 235);
+                        let muted = Color32::from_rgb(126, 136, 157);
+                        let panel = Color32::from_rgb(17, 22, 31);
+                        let field = Color32::from_rgb(10, 15, 22);
+                        let line = Color32::from_rgb(43, 53, 68);
+
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("Flow item")
+                                    .font(title_font.clone())
+                                    .color(text),
+                            );
+                            ui.add_space(8.0);
+                            egui::Frame::new()
+                                .fill(Color32::from_rgb(24, 30, 42))
+                                .corner_radius(999.0)
+                                .inner_margin(egui::Margin::symmetric(7, 2))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new("Ctrl+Enter save")
+                                            .font(small_font.clone())
+                                            .color(accent),
+                                    );
+                                });
+                            ui.label(
+                                RichText::new("Esc cancel · #/@ autocomplete")
+                                    .font(small_font.clone())
+                                    .color(muted),
+                            );
+                        });
+                        ui.add_space(10.0);
+                        if let Some(edit) = self.flow_item_edit.as_mut() {
+                            let output = egui::Frame::new()
+                                .fill(field)
+                                .stroke(Stroke::new(1.0, line))
+                                .corner_radius(5.0)
+                                .inner_margin(egui::Margin::symmetric(8, 4))
+                                .show(ui, |ui| {
+                                    TextEdit::singleline(&mut edit.text)
+                                        .font(row_font.clone())
+                                        .desired_width(ui.available_width())
+                                        .show(ui)
+                                })
+                                .inner;
+                            if let Some(cursor) =
+                                output.cursor_range.and_then(|range| range.single())
+                            {
+                                edit.cursor_char_index = cursor.index;
+                            }
+                            if edit.focus_once {
+                                output.response.request_focus();
+                                edit.focus_once = false;
+                            }
+                            if let Some(mode) = edit.org_mode {
+                                if let Some(query) =
+                                    org_query_at_cursor(&edit.text, edit.cursor_char_index, mode)
+                                {
+                                    edit.org_query = query;
+                                }
+                            }
+                            if let Some(mode) = edit.org_mode {
+                                ui.add_space(9.0);
+                                let prefix = match mode {
+                                    AgendaOrgMode::Tag => "#",
+                                    AgendaOrgMode::Project => "@",
+                                };
+                                let mode_label = match mode {
+                                    AgendaOrgMode::Tag => "tags",
+                                    AgendaOrgMode::Project => "projects",
+                                };
+                                let suggestions = organization_suggestions(
+                                    self.agenda_items.iter().flat_map(|item| match mode {
+                                        AgendaOrgMode::Tag => item.tags.clone(),
+                                        AgendaOrgMode::Project => item.projects.clone(),
+                                    }),
+                                    &edit.org_query,
+                                );
+                                egui::Frame::new()
+                                    .fill(panel)
+                                    .stroke(Stroke::new(1.0, Color32::from_rgb(29, 37, 50)))
+                                    .corner_radius(6.0)
+                                    .inner_margin(egui::Margin::symmetric(9, 7))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new(mode_label)
+                                                    .font(small_font.clone())
+                                                    .color(muted),
+                                            );
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{prefix}{}",
+                                                    edit.org_query
+                                                ))
+                                                .font(row_font.clone())
+                                                .color(accent),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.label(
+                                                        RichText::new(
+                                                            "Tab cycle · Enter add · Esc close",
+                                                        )
+                                                        .font(small_font.clone())
+                                                        .color(muted),
+                                                    );
+                                                },
+                                            );
+                                        });
+                                        ui.add_space(6.0);
+                                        ui.horizontal_wrapped(|ui| {
+                                            for (index, suggestion) in
+                                                suggestions.iter().take(8).enumerate()
+                                            {
+                                                let selected =
+                                                    index == edit.selected_org_suggestion;
+                                                egui::Frame::new()
+                                                    .fill(if selected {
+                                                        accent_soft
+                                                    } else {
+                                                        Color32::from_rgb(23, 29, 39)
+                                                    })
+                                                    .stroke(Stroke::new(
+                                                        1.0,
+                                                        if selected {
+                                                            Color32::from_rgb(91, 124, 170)
+                                                        } else {
+                                                            Color32::from_rgb(28, 35, 47)
+                                                        },
+                                                    ))
+                                                    .corner_radius(999.0)
+                                                    .inner_margin(egui::Margin::symmetric(8, 3))
+                                                    .show(ui, |ui| {
+                                                        ui.label(
+                                                            RichText::new(format!(
+                                                                "{prefix}{suggestion}"
+                                                            ))
+                                                            .font(small_font.clone())
+                                                            .color(if selected {
+                                                                text
+                                                            } else {
+                                                                muted
+                                                            }),
+                                                        );
+                                                    });
+                                            }
+                                        });
+                                    });
+                            }
+                            if save {
+                                commit_payload = Some((edit.item_index, edit.text.clone()));
+                            }
+                        }
+                    });
+            });
+
+        if cancel {
+            self.flow_item_edit = None;
+            self.status = "Flow item edit cancelled".to_string();
+        }
+        if let Some((index, replacement)) = commit_payload {
+            self.confirm_flow_item_edit(index, replacement, ctx);
+        }
+    }
+
+    fn agenda_dialog(&mut self, ctx: &egui::Context) {
+        if !self.agenda_open {
+            return;
+        }
+
+        let today = Local::now().date_naive();
+        let week_start = self.agenda_week_start();
+        let week_end = week_start + Duration::days(6);
+        let title = format!("week-agenda (W{}):", week_start.iso_week().week());
+        let mut clicked_dated_row = None;
+        let mut clicked_inbox_row = None;
+        let mut clicked_flat_row = None;
+        let mut clicked_task_index = None;
+        let mut open_clicked = false;
+        let mut toggle_clicked_day = None;
+        let mut org_anchor_rect = None;
+        let scroll_to_selected = self.agenda_scroll_to_selected;
+
+        egui::Area::new("agenda_dialog".into())
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let rect = ui.ctx().content_rect();
+                let (width, height) = if self.standalone_agenda {
+                    (
+                        (rect.width() * 0.96).clamp(620.0, 1200.0),
+                        (rect.height() * 0.94).clamp(420.0, 900.0),
+                    )
+                } else {
+                    (
+                        (rect.width() * 0.78).clamp(560.0, 920.0),
+                        (rect.height() * 0.82).clamp(420.0, 760.0),
+                    )
+                };
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(19, 23, 31))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(67, 76, 94)))
+                    .corner_radius(8.0)
+                    .inner_margin(egui::Margin::same(14))
+                    .show(ui, |ui| {
+                        ui.set_min_size(Vec2::new(width, height));
+                        ui.set_max_size(Vec2::new(width, height));
+                        let title_font = FontId::new(16.0, FontFamily::Monospace);
+                        let row_font = FontId::new(14.0, FontFamily::Monospace);
+                        let accent = Color32::from_rgb(180, 160, 235);
+                        let dim = Color32::from_rgb(118, 112, 150);
+                        let text = Color32::from_rgb(216, 222, 233);
+                        let muted = Color32::from_rgb(143, 151, 170);
+                        let today_bg = Color32::from_rgb(38, 47, 61);
+                        let selected_bg = Color32::from_rgb(49, 61, 79);
+                        let inactive_bg = Color32::from_rgb(27, 32, 42);
+                        let separator = Color32::from_rgb(49, 56, 72);
+
+                        ui.horizontal(|ui| {
+                            for tab in AgendaTab::ALL {
+                                let active = self.agenda_tab == tab;
+                                let label = format!(" {} ", tab.label());
+                                let tab_text = RichText::new(label)
+                                    .font(row_font.clone())
+                                    .color(if active { text } else { muted });
+                                let response = egui::Frame::new()
+                                    .fill(if active { selected_bg } else { inactive_bg })
+                                    .stroke(Stroke::new(
+                                        1.0,
+                                        if active {
+                                            accent
+                                        } else {
+                                            Color32::from_rgb(37, 44, 58)
+                                        },
+                                    ))
+                                    .corner_radius(4.0)
+                                    .inner_margin(egui::Margin::symmetric(8, 3))
+                                    .show(ui, |ui| ui.label(tab_text))
+                                    .response;
+                                let _ = response;
+                                ui.add_space(4.0);
+                            }
+                            ui.label(
+                                RichText::new("Shift+Tab cambia vista")
+                                    .font(row_font.clone())
+                                    .color(dim),
+                            );
+                        });
+                        ui.add_space(8.0);
+
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(title).font(title_font).color(text));
+                            ui.label(
+                                RichText::new(format!(
+                                    "{}–{}",
+                                    week_start.format("%-d %B"),
+                                    week_end.format("%-d %B %Y")
+                                ))
+                                .font(row_font.clone())
+                                .color(dim),
+                            );
+                            ui.label(
+                                RichText::new(match self.agenda_focus {
+                                    AgendaFocus::Dated => "focus: dated week",
+                                    AgendaFocus::Inbox => "focus: no-date",
+                                })
+                                .font(row_font.clone())
+                                .color(accent),
+                            );
+                            ui.label(
+                                RichText::new(if self.agenda_show_done {
+                                    "done: shown"
+                                } else {
+                                    "done: hidden"
+                                })
+                                .font(row_font.clone())
+                                .color(muted),
+                            );
+                            if !self.agenda_filter.is_empty() {
+                                ui.label(
+                                    RichText::new(format!("filter: {}", self.agenda_filter))
+                                        .font(row_font.clone())
+                                        .color(accent),
+                                );
+                            }
+                        });
+                        ui.add_space(8.0);
+
+                        if self.agenda_tab == AgendaTab::Agenda {
+                            let dated_rows = self.agenda_dated_rows();
+                            let dated_panel_height = (height * 0.42).clamp(160.0, 310.0);
+                            let dated_title_rect = ui
+                                .allocate_exact_size(
+                                    Vec2::new(ui.available_width(), 22.0),
+                                    egui::Sense::hover(),
+                                )
+                                .0;
+                            let dated_active = self.agenda_focus == AgendaFocus::Dated;
+                            ui.painter().rect_filled(
+                                dated_title_rect,
+                                0.0,
+                                if dated_active { today_bg } else { inactive_bg },
+                            );
+                            ui.painter().text(
+                                egui::pos2(
+                                    dated_title_rect.left() + 6.0,
+                                    dated_title_rect.center().y,
+                                ),
+                                egui::Align2::LEFT_CENTER,
+                                "Dated tasks · ↑↓ row · Enter expand/open · ←→ week",
+                                row_font.clone(),
+                                if dated_active { text } else { muted },
+                            );
+
+                            egui::ScrollArea::vertical()
+                                .id_salt("agenda_dated_scroll")
+                                .max_height(dated_panel_height)
+                                .show(ui, |ui| {
+                                    for (row_index, row) in dated_rows.iter().copied().enumerate() {
+                                        let selected = self.agenda_focus == AgendaFocus::Dated
+                                            && self.agenda_selected_dated_row == row_index;
+                                        match row {
+                                            AgendaDatedRow::Day(date) => {
+                                                let count = self.agenda_items_for_date(date).len();
+                                                let response = agenda::day_row(
+                                                    ui,
+                                                    row_index,
+                                                    date,
+                                                    count,
+                                                    self.agenda_expanded_dates.contains(&date),
+                                                    date == today,
+                                                    selected,
+                                                    scroll_to_selected && selected,
+                                                    selected_bg,
+                                                    today_bg,
+                                                    row_font.clone(),
+                                                    text,
+                                                    muted,
+                                                    accent,
+                                                );
+                                                if response.clicked() {
+                                                    clicked_dated_row = Some(row_index);
+                                                    open_clicked = false;
+                                                }
+                                                if response.double_clicked() {
+                                                    clicked_dated_row = Some(row_index);
+                                                    toggle_clicked_day = Some(date);
+                                                }
+                                            }
+                                            AgendaDatedRow::Task(index) => {
+                                                let response = agenda::task_row(
+                                                    ui,
+                                                    index,
+                                                    selected,
+                                                    scroll_to_selected && selected,
+                                                    selected_bg,
+                                                    row_font.clone(),
+                                                    text,
+                                                    accent,
+                                                    &self.agenda_items[index],
+                                                );
+                                                if selected && self.agenda_org_mode.is_some() {
+                                                    org_anchor_rect = Some(response.rect);
+                                                }
+                                                if response.clicked() {
+                                                    clicked_dated_row = Some(row_index);
+                                                    clicked_task_index = Some(index);
+                                                    open_clicked = false;
+                                                }
+                                                if response.double_clicked() {
+                                                    clicked_dated_row = Some(row_index);
+                                                    clicked_task_index = Some(index);
+                                                    open_clicked = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                });
+
+                            ui.add_space(8.0);
+                            let (rule_rect, _) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), 1.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().rect_filled(rule_rect, 0.0, separator);
+                            ui.add_space(8.0);
+
+                            let inbox_indices = self.agenda_inbox_item_indices();
+                            let inbox_title_rect = ui
+                                .allocate_exact_size(
+                                    Vec2::new(ui.available_width(), 22.0),
+                                    egui::Sense::hover(),
+                                )
+                                .0;
+                            let inbox_active = self.agenda_focus == AgendaFocus::Inbox;
+                            ui.painter().rect_filled(
+                                inbox_title_rect,
+                                0.0,
+                                if inbox_active { today_bg } else { inactive_bg },
+                            );
+                            ui.painter().text(
+                            egui::pos2(inbox_title_rect.left() + 6.0, inbox_title_rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            format!(
+                                "No-date tasks · {} item{} · Tab switches segment · x toggles done",
+                                inbox_indices.len(),
+                                if inbox_indices.len() == 1 { "" } else { "s" }
+                            ),
+                            row_font.clone(),
+                            if inbox_active { text } else { muted },
+                        );
+
+                            let inbox_height = (ui.available_height() - 4.0).max(80.0);
+                            egui::ScrollArea::vertical()
+                                .id_salt("agenda_inbox_scroll")
+                                .max_height(inbox_height)
+                                .show(ui, |ui| {
+                                    if inbox_indices.is_empty() {
+                                        ui.add_space(14.0);
+                                        ui.label(
+                                            RichText::new("No tasks without date.")
+                                                .font(row_font.clone())
+                                                .color(dim),
+                                        );
+                                    }
+                                    for (position, index) in
+                                        inbox_indices.iter().copied().enumerate()
+                                    {
+                                        let selected = self.agenda_focus == AgendaFocus::Inbox
+                                            && self.agenda_selected_inbox_item == position;
+                                        let response = agenda::task_row(
+                                            ui,
+                                            index,
+                                            selected,
+                                            scroll_to_selected && selected,
+                                            selected_bg,
+                                            row_font.clone(),
+                                            text,
+                                            accent,
+                                            &self.agenda_items[index],
+                                        );
+                                        if selected && self.agenda_org_mode.is_some() {
+                                            org_anchor_rect = Some(response.rect);
+                                        }
+                                        if response.clicked() {
+                                            clicked_inbox_row = Some(position);
+                                            clicked_task_index = Some(index);
+                                            open_clicked = false;
+                                        }
+                                        if response.double_clicked() {
+                                            clicked_inbox_row = Some(position);
+                                            clicked_task_index = Some(index);
+                                            open_clicked = true;
+                                        }
+                                    }
+                                });
+                        } else {
+                            let flat_indices = self.agenda_flat_item_indices();
+                            let tab_index = self.agenda_tab.index();
+                            let title_rect = ui
+                                .allocate_exact_size(
+                                    Vec2::new(ui.available_width(), 22.0),
+                                    egui::Sense::hover(),
+                                )
+                                .0;
+                            ui.painter().rect_filled(title_rect, 0.0, today_bg);
+                            ui.painter().text(
+                                egui::pos2(title_rect.left() + 6.0, title_rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                format!(
+                                    "{} · {} item{} · ↑↓ row · Enter open · Shift+Tab tab",
+                                    self.agenda_tab.label(),
+                                    flat_indices.len(),
+                                    if flat_indices.len() == 1 { "" } else { "s" }
+                                ),
+                                row_font.clone(),
+                                text,
+                            );
+
+                            let flat_height = (ui.available_height() - 4.0).max(120.0);
+                            egui::ScrollArea::vertical()
+                                .id_salt(format!("agenda_{}_scroll", self.agenda_tab.label()))
+                                .max_height(flat_height)
+                                .show(ui, |ui| {
+                                    if flat_indices.is_empty() {
+                                        ui.add_space(14.0);
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "No {} items.",
+                                                self.agenda_tab.label().to_ascii_lowercase()
+                                            ))
+                                            .font(row_font.clone())
+                                            .color(dim),
+                                        );
+                                    }
+                                    for (position, index) in
+                                        flat_indices.iter().copied().enumerate()
+                                    {
+                                        let selected =
+                                            self.agenda_selected_tab_items[tab_index] == position;
+                                        let response = agenda::task_row(
+                                            ui,
+                                            index,
+                                            selected,
+                                            scroll_to_selected && selected,
+                                            selected_bg,
+                                            row_font.clone(),
+                                            text,
+                                            accent,
+                                            &self.agenda_items[index],
+                                        );
+                                        if selected && self.agenda_org_mode.is_some() {
+                                            org_anchor_rect = Some(response.rect);
+                                        }
+                                        if response.clicked() {
+                                            clicked_flat_row = Some(position);
+                                            clicked_task_index = Some(index);
+                                            open_clicked = false;
+                                        }
+                                        if response.double_clicked() {
+                                            clicked_flat_row = Some(position);
+                                            clicked_task_index = Some(index);
+                                            open_clicked = true;
+                                        }
+                                    }
+                                });
+                        }
+                    });
+            });
+
+        if let (Some(mode), Some(anchor_rect)) = (self.agenda_org_mode, org_anchor_rect) {
+            let screen_rect = ctx.content_rect();
+            let popup_width = 380.0;
+            let popup_height = 82.0;
+            let x = (anchor_rect.left() + anchor_rect.width() * 0.48)
+                .min(screen_rect.right() - popup_width - 18.0)
+                .max(screen_rect.left() + 18.0);
+            let mut y = anchor_rect.bottom() + 4.0;
+            if y + popup_height > screen_rect.bottom() - 18.0 {
+                y = (anchor_rect.top() - popup_height - 4.0).max(screen_rect.top() + 18.0);
+            }
+            ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                "agenda_org_scrim".into(),
+            ))
+            .rect_filled(screen_rect, 0.0, Color32::from_black_alpha(72));
+
+            let prefix = match mode {
+                AgendaOrgMode::Tag => "#",
+                AgendaOrgMode::Project => "@",
+            };
+            let suggestions = self.agenda_org_suggestions();
+            egui::Area::new("agenda_org_autocomplete".into())
+                .fixed_pos(egui::pos2(x, y))
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    let row_font = FontId::new(14.0, FontFamily::Monospace);
+                    let accent = Color32::from_rgb(180, 160, 235);
+                    let text = Color32::from_rgb(216, 222, 233);
+                    let muted = Color32::from_rgb(143, 151, 170);
+                    let dim = Color32::from_rgb(118, 112, 150);
+                    let selected_bg = Color32::from_rgb(49, 61, 79);
+                    let inactive_bg = Color32::from_rgb(27, 32, 42);
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(15, 19, 27))
+                        .stroke(Stroke::new(1.0, accent))
+                        .corner_radius(6.0)
+                        .inner_margin(egui::Margin::symmetric(8, 6))
+                        .show(ui, |ui| {
+                            ui.set_min_width(popup_width);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!("{prefix}{}", self.agenda_org_query))
+                                        .font(row_font.clone())
+                                        .color(accent),
+                                );
+                                ui.label(
+                                    RichText::new("Tab cycle · ↑↓ select · Enter add · Esc cancel")
+                                        .font(row_font.clone())
+                                        .color(dim),
+                                );
+                            });
+                            ui.add_space(4.0);
+                            ui.horizontal_wrapped(|ui| {
+                                for (index, suggestion) in suggestions.iter().take(8).enumerate() {
+                                    let selected = index == self.selected_agenda_org_suggestion;
+                                    let chip = RichText::new(format!(" {prefix}{suggestion} "))
+                                        .font(row_font.clone())
+                                        .color(if selected { text } else { muted });
+                                    egui::Frame::new()
+                                        .fill(if selected { selected_bg } else { inactive_bg })
+                                        .corner_radius(4.0)
+                                        .inner_margin(egui::Margin::symmetric(4, 2))
+                                        .show(ui, |ui| {
+                                            ui.label(chip);
+                                        });
+                                    ui.add_space(4.0);
+                                }
+                            });
+                        });
+                });
+        }
+
+        self.flow_item_edit_dialog(ctx);
+
+        if let Some(row) = clicked_dated_row {
+            self.agenda_focus = AgendaFocus::Dated;
+            self.agenda_selected_dated_row = row;
+            self.agenda_scroll_to_selected = false;
+        }
+        if let Some(row) = clicked_inbox_row {
+            self.agenda_focus = AgendaFocus::Inbox;
+            self.agenda_selected_inbox_item = row;
+            self.agenda_scroll_to_selected = false;
+        }
+        if let Some(row) = clicked_flat_row {
+            self.agenda_selected_tab_items[self.agenda_tab.index()] = row;
+            self.agenda_scroll_to_selected = false;
+        }
+        if let Some(index) = clicked_task_index {
+            self.selected_agenda_item = index;
+            if open_clicked {
+                self.jump_to_agenda_item_index(index);
+                if self.standalone_agenda && !self.agenda_open {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+        if let Some(date) = toggle_clicked_day {
+            if !self.agenda_expanded_dates.insert(date) {
+                self.agenda_expanded_dates.remove(&date);
+            }
+            self.clamp_agenda_selection();
+        }
+        self.agenda_scroll_to_selected = false;
+    }
+}
+
 impl eframe::App for SlateApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.remember_current_cursor_position();
@@ -9991,8 +13934,50 @@ impl eframe::App for SlateApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title()));
+        self.publish_active_flow_buffer_heartbeat();
+        self.poll_flow_background_rescan();
+        self.poll_flow_open_requests();
+        self.poll_flow_completion_requests(&ctx);
+        self.poll_flow_organization_requests(&ctx);
+        self.poll_flow_edit_requests(&ctx);
+        self.poll_pending_flow_agenda_sync(&ctx);
+        if self.flow_background_loading {
+            ctx.request_repaint();
+        }
+        if let Some(close_after) = self.scratch_close_after {
+            let now = ctx.input(|input| input.time);
+            if now >= close_after {
+                self.scratch_close_after = None;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+        }
+        if let Some(toast_until) = self.agenda_updated_toast_until {
+            let now = ctx.input(|input| input.time);
+            if now >= toast_until {
+                self.agenda_updated_toast_until = None;
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+        }
         self.handle_window_close_request(&ctx);
+        if self.close_standalone_agenda_if_requested(&ctx) {
+            return;
+        }
         self.shortcuts(&ctx);
+
+        if self.standalone_agenda {
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(30, 36, 48))
+                        .inner_margin(0.0),
+                )
+                .show_inside(ui, |_ui| {});
+            self.agenda_dialog(&ctx);
+            return;
+        }
 
         if self.pending_action.is_some() {
             egui::CentralPanel::default()
@@ -10083,9 +14068,11 @@ impl eframe::App for SlateApp {
                     && !self.recent_picker_open
                     && !self.lance_open
                     && !self.doc_tasks_open
+                    && !self.agenda_open
                     && !self.file_picker_open
                     && !self.periscope_open
                     && !self.periscope_prompt_open
+                    && !self.find_note_open
                     && !self.link_assist_open
                     && !self.link_assist_web_open
                     && !self.link_heading_picker_open
@@ -10118,6 +14105,7 @@ impl eframe::App for SlateApp {
                                     false,
                                     active_line_text_highlight,
                                     false,
+                                    None,
                                 );
                                 if self.focus_editor_once
                                     && !self.palette_open
@@ -10125,9 +14113,11 @@ impl eframe::App for SlateApp {
                                     && !self.recent_picker_open
                                     && !self.lance_open
                                     && !self.doc_tasks_open
+                                    && !self.agenda_open
                                     && !self.file_picker_open
                                     && !self.periscope_open
                                     && !self.periscope_prompt_open
+                                    && !self.find_note_open
                                     && !self.link_heading_picker_open
                                     && !self.link_preview_open
                                     && !self.save_as_open
@@ -10142,13 +14132,27 @@ impl eframe::App for SlateApp {
                                 if changed {
                                     self.dirty = true;
                                     self.search_state = None;
+                                    if self.editor_view.take_flow_agenda_update_request() {
+                                        self.schedule_current_flow_buffer_agenda_sync(&ctx);
+                                    }
                                 }
                                 if let Some(byte) = self.editor_view.take_link_click_byte() {
                                     self.open_markdown_link_at_byte(byte);
                                 }
+                                if let Some(target) = self.editor_view.take_link_click_target() {
+                                    self.open_markdown_link_target(&target);
+                                }
+                                if let Some(line) = self.editor_view.take_virtual_line_click() {
+                                    self.handle_virtual_reference_click(&line);
+                                }
                                 if let Some(trigger_start) = self.editor_view.take_link_assist_trigger_start() {
                                     self.open_link_assist(trigger_start);
                                 }
+                                let typed = self.editor_view.take_last_text_input();
+                                if !self.detect_inline_bidirectional_link_command(typed.as_deref()) {
+                                    self.refresh_link_inline_state(typed.as_deref());
+                                }
+                                self.refresh_flow_inline_org_state(typed.as_deref());
                                 columns[1].vertical(|ui| self.preview_ui(ui));
                             });
                         } else {
@@ -10162,6 +14166,7 @@ impl eframe::App for SlateApp {
                                 false,
                                 active_line_text_highlight,
                                 self.markdown_live_rendering,
+                                None,
                             );
                             if self.focus_editor_once
                                 && !self.palette_open
@@ -10169,9 +14174,11 @@ impl eframe::App for SlateApp {
                                 && !self.recent_picker_open
                                 && !self.lance_open
                                 && !self.doc_tasks_open
+                                && !self.agenda_open
                                 && !self.file_picker_open
                                 && !self.periscope_open
                                 && !self.periscope_prompt_open
+                                && !self.find_note_open
                                 && !self.link_heading_picker_open
                                 && !self.link_preview_open
                                 && !self.save_as_open
@@ -10186,16 +14193,33 @@ impl eframe::App for SlateApp {
                             if changed {
                                 self.dirty = true;
                                 self.search_state = None;
+                                if self.editor_view.take_flow_agenda_update_request() {
+                                    self.schedule_current_flow_buffer_agenda_sync(&ctx);
+                                }
                             }
                             if let Some(byte) = self.editor_view.take_link_click_byte() {
                                 self.open_markdown_link_at_byte(byte);
                             }
+                            if let Some(target) = self.editor_view.take_link_click_target() {
+                                self.open_markdown_link_target(&target);
+                            }
+                            if let Some(line) = self.editor_view.take_virtual_line_click() {
+                                self.handle_virtual_reference_click(&line);
+                            }
                             if let Some(trigger_start) = self.editor_view.take_link_assist_trigger_start() {
                                 self.open_link_assist(trigger_start);
                             }
+                            let typed = self.editor_view.take_last_text_input();
+                            if !self.detect_inline_bidirectional_link_command(typed.as_deref()) {
+                                self.refresh_link_inline_state(typed.as_deref());
+                            }
+                            self.refresh_flow_inline_org_state(typed.as_deref());
                         }
                     },
                 );
+
+                self.flow_inline_org_suggestion_popup(&ctx);
+                self.link_inline_suggestion_popup(&ctx);
 
                 let filename = self
                     .path
@@ -10669,10 +14693,19 @@ impl eframe::App for SlateApp {
                         ("files  type filter · ↑↓ select · → enter folder · ← parent · Enter open · Esc close".to_string(), footer_accent)
                     } else if self.periscope_open {
                         ("periscope  type search · ↑↓ select · Tab project/home · Enter open · Ctrl+Enter modal".to_string(), footer_accent)
+                    } else if self.find_note_open {
+                        ("find-note  type filter · ↑↓ select · Tab/←/→ headings · Enter main · Shift+Enter front modal".to_string(), footer_accent)
                     } else if self.periscope_prompt_open {
                         ("periscope  Y/Enter project folder · N global · Esc cancel".to_string(), footer_accent)
+                    } else if self.link_inline_anchor.is_some() {
+                        ("link  type fuzzy · ↑↓ select · Enter file · Tab/Shift+Enter headings · ] cancel/manual".to_string(), footer_accent)
                     } else if self.link_heading_picker_open {
-                        ("link heading  ↑↓ select · Enter insert · Esc cancel · first option = whole file".to_string(), footer_accent)
+                        let action = match self.link_heading_picker_mode {
+                            LinkHeadingPickerMode::InsertLink => "insert",
+                            LinkHeadingPickerMode::BidirectionalLink => "link both ways",
+                            LinkHeadingPickerMode::Refile => "refile",
+                        };
+                        (format!("link heading  ↑↓ select · Enter {action} · Esc cancel · first option = whole file/end"), footer_accent)
                     } else if self.link_preview_open {
                         ("modal buffer  Tab swap · Ctrl+Enter promote · Ctrl+S save · Esc close".to_string(), footer_accent)
                     } else if self.save_as_open {
@@ -10683,6 +14716,8 @@ impl eframe::App for SlateApp {
                         ("scratch entries  ↑↓ select · Ctrl+D/Delete delete · Esc close".to_string(), footer_accent)
                     } else if self.capture_modal_open {
                         ("capture  type optional title · Enter archive · Esc cancel".to_string(), footer_accent)
+                    } else if self.agenda_open {
+                        ("agenda  Tab segment · ↑↓ move · ←→ week · Enter open · Ctrl+Enter cycle · r refile · x show done · Esc close".to_string(), footer_accent)
                     } else {
                         (
                             "command  Ctrl+. enter · Ctrl+H help · Ctrl+P palette · w · q · wq"
@@ -10703,11 +14738,36 @@ impl eframe::App for SlateApp {
         self.slate_picker_dialog(&ctx);
         self.periscope_prompt_dialog(&ctx);
         self.periscope_dialog(&ctx);
+        self.find_note_dialog(&ctx);
         self.save_as_dialog(&ctx);
         self.scratch_modal_dialog(&ctx);
         self.capture_dialog(&ctx);
         self.scratch_entries_dialog(&ctx);
+        self.agenda_dialog(&ctx);
+        self.scratch_feedback_toast(&ctx);
     }
+}
+
+fn split_cache_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn non_empty_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn parse_cache_date(value: &str) -> Option<NaiveDate> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()
 }
 
 fn setup_style(ctx: &egui::Context) {

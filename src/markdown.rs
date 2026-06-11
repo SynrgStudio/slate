@@ -288,19 +288,20 @@ pub(crate) fn parse_checkbox_line(line: &str) -> Option<ParsedCheckboxLine<'_>> 
     } else {
         ("", rest)
     };
-    let (marker, state, text) = if let Some(text) = rest.strip_prefix("[ ] ") {
+    let (marker, state, text) = if let Some(text) = rest.strip_prefix("[ ]") {
         ("[ ]", CheckboxState::Empty, text)
-    } else if let Some(text) = rest.strip_prefix("[] ") {
+    } else if let Some(text) = rest.strip_prefix("[]") {
         ("[]", CheckboxState::Empty, text)
-    } else if let Some(text) = rest.strip_prefix("[/] ") {
+    } else if let Some(text) = rest.strip_prefix("[/]") {
         ("[/]", CheckboxState::Doing, text)
-    } else if let Some(text) = rest.strip_prefix("[x] ") {
+    } else if let Some(text) = rest.strip_prefix("[x]") {
         ("[x]", CheckboxState::Done, text)
-    } else if let Some(text) = rest.strip_prefix("[X] ") {
+    } else if let Some(text) = rest.strip_prefix("[X]") {
         ("[X]", CheckboxState::Done, text)
     } else {
         return None;
     };
+    let text = text.strip_prefix(' ').unwrap_or(text);
 
     Some(ParsedCheckboxLine {
         indent,
@@ -325,6 +326,17 @@ mod tests {
         let compact_empty = parse_checkbox_line("[] todo").unwrap();
         assert_eq!(compact_empty.marker, "[]");
         assert_eq!(compact_empty.state, CheckboxState::Empty);
+        assert_eq!(compact_empty.text, "todo");
+
+        let compact_empty_without_space = parse_checkbox_line("[]todo").unwrap();
+        assert_eq!(compact_empty_without_space.marker, "[]");
+        assert_eq!(compact_empty_without_space.state, CheckboxState::Empty);
+        assert_eq!(compact_empty_without_space.text, "todo");
+
+        let compact_empty_bare = parse_checkbox_line("[]").unwrap();
+        assert_eq!(compact_empty_bare.marker, "[]");
+        assert_eq!(compact_empty_bare.state, CheckboxState::Empty);
+        assert_eq!(compact_empty_bare.text, "");
 
         let subtask = parse_checkbox_line("- [ ] subtask").unwrap();
         assert_eq!(subtask.task_prefix, "- ");
@@ -340,9 +352,16 @@ mod tests {
         assert_eq!(doing.state, CheckboxState::Doing);
         assert_eq!(doing.text, "doing");
 
+        let compact_doing = parse_checkbox_line("[/]doing").unwrap();
+        assert_eq!(compact_doing.marker, "[/]");
+        assert_eq!(compact_doing.state, CheckboxState::Doing);
+        assert_eq!(compact_doing.text, "doing");
+
         let done = parse_checkbox_line("[x] done").unwrap();
         assert_eq!(done.state, CheckboxState::Done);
-        assert!(parse_checkbox_line("[]todo").is_none());
+        let compact_done = parse_checkbox_line("[x]done").unwrap();
+        assert_eq!(compact_done.state, CheckboxState::Done);
+        assert_eq!(compact_done.text, "done");
         assert!(parse_checkbox_line("text [] todo").is_none());
     }
 

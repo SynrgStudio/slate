@@ -25,3 +25,6 @@ Archivo simple para probar tablas Markdown en el preview de Slate.
 | `Ctrl+P` | Paleta |
 | `Ctrl+.` | Commandline |
 | `Ctrl+LeftClick` | Preview de link |
+
+:idea algo #idea
+  - source: [slatetest.md:15](./slatetest.md#L15)

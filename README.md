@@ -1,93 +1,121 @@
 # Slate
 
-Slate is a small, fast, local-first text editor for writing, editing, and eventually organizing plain Markdown notes.
+Slate is a small, fast, local-first text editor and Markdown workspace.
 
-It is not trying to be Vim, Emacs, Obsidian, Logseq, or a full IDE. Slate borrows the parts that feel good — command palettes, minibuffers, transient key layers, plain text, fast navigation — and leaves the rest behind.
+It starts as a normal editor: open a file, type, save, quit. Then, when you want more, Slate gives you a terminal-inspired command line, fuzzy pickers, scratch capture, Markdown affordances, project search, marked files, daily logs, agenda views, backlinks, and local-first knowledge workflows — without turning your notes into a database or surrounding your text with dashboards.
 
-The goal is simple:
+> A quiet terminal-like editor for writing, thinking, capturing, and navigating plain text.
 
-> A normal text editor first. A powerful personal knowledge workspace when you want it.
+Slate is **not** trying to be Vim, Emacs, Obsidian, Logseq, VS Code, or a full IDE. It borrows the good parts — command palettes, minibuffers, quick key layers, plain files, fuzzy navigation, and durable local workflows — and leaves the rest behind.
 
-For the project philosophy and feature decision rules, see [`PHILOSOPHY.md`](PHILOSOPHY.md).
-
----
-
-## Credits and inspiration
-
-Slate's `Lance` marked-buffer / quick-file workflow is inspired by [Harpoon 2](https://github.com/ThePrimeagen/harpoon/tree/harpoon2). Full credit to [ThePrimeagen](https://github.com/ThePrimeagen) for the original idea.
+For the product/design charter, see [`PHILOSOPHY.md`](PHILOSOPHY.md). For the knowledge-work roadmap and file model, see [`SLATE_FLOW.md`](SLATE_FLOW.md).
 
 ---
 
-## What Slate does today
+## Why you might want Slate
 
-Slate currently provides a minimal native GUI editor with a terminal-inspired interface:
+Use Slate if you want:
 
-- plain text / Markdown editing
-- native editor buffer and renderer, not `egui::TextEdit` for the main document
-- save, open, new, quit
-- simple Markdown preview
-- command palette
-- command line / minibuffer
-- persistent settings
-- absolute and relative line numbers
-- goto line/column commands
-- native find with highlights and match navigation
-- richer statusbar with file state, active mode, cursor position, line/word/char counts
-- Ctrl-hold command layer for short editing commands
-- configurable Ctrl+Shift live movement using either Vim-style `h/j/k/l` or Slate-style `i/j/k/l`
-- modal shortcut and command reference
+- a normal text editor first, not a lifestyle change
+- local Markdown files as the source of truth
+- commandline-first workflows without living in Vim
+- quick capture that gets out of your way
+- fuzzy file/open/recent/mark navigation without sidebars
+- inline Markdown help while keeping raw text editable
+- a small agenda/task layer over plain Markdown checkboxes
+- backlinks, mentions, daily logs, and refile workflows without a graph dashboard
+- minimal UI: no menubar, no toolbar, no permanent project sidebar
 
-Slate keeps the UI intentionally sparse: no menubar, no toolbar, no permanent sidebars.
+Slate should feel like opening a clean terminal and writing.
 
 ---
 
-## Why Slate exists
+## Current feature snapshot
 
-Most writing tools eventually become either:
+### Editor core
 
-1. too modal,
-2. too mouse-heavy,
-3. too database-heavy,
-4. too configurable,
-5. or too visually busy.
+- Native Rust GUI editor using `eframe`/`egui`.
+- Slate-owned main editor; it does **not** rely on `egui::TextEdit` for the document.
+- Plain text and Markdown editing.
+- New/open/save/save-as/quit.
+- Dirty-state tracking.
+- Per-file cursor position persistence.
+- Mouse text selection.
+- System clipboard copy/paste.
+- Word wrap toggle.
+- Absolute and relative line numbers.
+- Goto line/column, including relative jumps.
+- Find mode with highlights and next/previous navigation.
+- Rich status bar with file state, active mode, line/column, line count, word count, char count, wrap state, and shortcut hints.
+- Bottom command line/minibuffer instead of popover-heavy UI.
 
-Slate is an experiment in a different direction:
+### Commands and discovery
 
-- **normal typing is always the default**
-- commands are discoverable but not intrusive
-- Markdown files remain the source of truth
-- power features should feel temporary, not like switching personalities
-- organization should be progressive: capture first, structure later
-- the interface should feel closer to a terminal editor than a productivity dashboard
+- `Ctrl+.` opens Slate's command line.
+- `Ctrl+P` opens the command palette.
+- Commands are stored in a real command registry shared by command line, palette, fuzzy suggestions, usage ranking, and help.
+- Live terminal-style command completion while typing.
+- Fuzzy command suggestions below the command line.
+- Command history and command usage persistence.
+- Vim-like aliases where useful: `:w`, `:q`, `:wq`, `:x`, `:e`, `:g`, etc.
 
-Slate wants the useful ideas from Vim and Emacs without requiring you to live inside Vim or Emacs.
+### File navigation
+
+- Slate-owned file open modal; no dependency on desktop-native file dialogs for the main workflow.
+- Save-as modal.
+- Recent files picker.
+- Open last file command.
+- Project-root file opening.
+- Shared Slate Picker surface for open/recent/open-buffer/Lance workflows.
+- Periscope: fzf-style project/home file search.
+- Lance: marked-file quick navigation inspired by Harpoon.
+- Editable modal buffer workflow for opening another file on top of the current file.
+
+### Markdown editing and preview
+
+- Markdown preview split.
+- Optional live inline Markdown render layer in the editor.
+- Preview split forces source on the left and rendered Markdown on the right.
+- Headings, lists, blockquotes, inline code, fenced code, links, separators, and checkboxes receive lightweight visual affordances.
+- Markdown tables render in preview.
+- Markdown links can be opened contextually.
+- `Ctrl+LeftClick` opens web links in the browser and local Markdown links in Slate.
+- Compact checkbox input: typing `[] ` expands to `[ ] `.
+- Checkbox states: `[ ]`, `[/]`, `[x]`.
+- `Ctrl+Enter` cycles checkbox state on the current line.
+- `:doc-tasks` browses current-document checkboxes and can cycle them in-place.
+
+### Capture and scratch
+
+- `slate --scratch` launches a quick scratch window that appends to `~/.local/share/slate/scratch.md` on exit.
+- `:scratch` opens an in-app scratch modal.
+- Scratch modal supports multiline editing with Slate's native editor.
+- `Ctrl+S` archives scratch content.
+- `Ctrl+E` opens scratch entries.
+- `:capture` captures the current selection, or the current line if there is no selection, with optional context/title.
+- `:scratch-entries` reviews and deletes archived scratch entries.
+
+### Slate Flow knowledge-work lane
+
+Slate Flow is the local-first knowledge layer over ordinary Markdown files.
+
+Current commands and workflows include:
+
+- `:agenda` — task agenda over Markdown tasks.
+- `:quickadd` / `:qa` / `:inbox` — append a task to the current Flow inbox.
+- `:daily` — open monthly daily reflection log; supports today, yesterday, explicit dates, and refresh.
+- `:refile` — copy the current Flow line to another Markdown file and write bidirectional links.
+- `:flow-rescan` — rescan the current Flow scope into `.slate` and agenda cache.
+- `:flow-rebuild` — rebuild the current Flow scope index/cache.
+- `:backlinks` — show Markdown links pointing to the current file.
+- `:mentions` — show textual mentions of the current file.
+- `:find-note` — find Markdown notes by file, heading, or content.
+
+Flow remains plain-text first: Markdown files are authoritative, `.slate` metadata is rebuildable, and cache/index files are derived.
 
 ---
 
-## How Slate works
-
-Slate is written in Rust using `eframe`/`egui`, but the main editor is Slate-owned:
-
-- `EditorBuffer` owns the text, cursor, selection, line index, and edit primitives.
-- `EditorView` paints the document, cursor, selections, line numbers, wrapping, and highlights.
-- Search, goto, selection, and command actions operate on Slate's own editor primitives.
-- `egui::TextEdit` is kept only for small inputs such as the command line and settings fields.
-
-This matters because Slate can reliably implement things like:
-
-- find highlights
-- scroll-to-cursor
-- line/column jumps
-- custom selections
-- future wiki-link navigation
-- result buffers
-- editor commands
-
-without fighting a black-box text widget.
-
----
-
-## Run
+## Install and run
 
 From source:
 
@@ -96,7 +124,7 @@ cargo run --release
 cargo run --release -- ~/notes.md
 ```
 
-Or after local install:
+After installing a local `slate` binary:
 
 ```bash
 slate
@@ -109,50 +137,50 @@ Scratch mode:
 slate --scratch
 ```
 
-In-app scratch capture:
+---
 
-```text
-:scratch
-:sc
-```
+## First five minutes
 
-The in-app scratch modal archives with `Ctrl+S`, opens archived entries with `Ctrl+E`, hides with `Esc`, and resumes with `:scratch` if it still has pending text.
+1. Open Slate:
 
-Capture selection/current line:
+   ```bash
+   slate ~/notes.md
+   ```
 
-```text
-:capture
-:cap
-```
+2. Type normally.
+3. Save with `Ctrl+S` or `:w`.
+4. Open the command line with `Ctrl+.` and try:
 
-The capture modal focuses the optional title field automatically. Press `Enter` empty to archive without a title, or type context first and press `Enter`.
+   ```text
+   :open
+   :recent
+   :scratch
+   :periscope
+   :settings
+   ```
 
-Scratch entries review:
-
-```text
-:scratch-entries
-:scratch-log
-:scl
-```
-
-Use `↑↓` to select an archived entry and `Ctrl+D` or `Delete` to delete it from `~/.local/share/slate/scratch.md`.
+5. Press `Ctrl+H` for the in-app shortcut and command reference.
 
 ---
 
-## Core shortcuts
+## Main shortcuts
 
 | Shortcut | Action |
 | --- | --- |
 | `Ctrl+P` | Command palette |
-| `Ctrl+H` | Modal shortcut and command reference, including Ctrl-layer, Alt layer, Shift+Alt jumps, duplicate placement, and all registered commands |
+| `Ctrl+.` | Command line / minibuffer |
+| `Ctrl+H` | Shortcut and command help |
 | `Ctrl+S` | Save |
 | `Ctrl+Alt+S` | Save As |
 | `Ctrl+O` | Open file |
 | `Ctrl+N` | New buffer |
 | `Ctrl+M` | Toggle Markdown preview |
 | `Ctrl+F` | Find |
-| `Ctrl+.` | Command line |
+| `Ctrl+Enter` | Cycle checkbox state on current line/task |
+| `Ctrl+LeftClick` | Open Markdown/web link under pointer |
 | `Ctrl+Q` | Quit |
+| `Alt+1` … `Alt+9`, `Alt+0` | Open Lance slots 1 through 10 |
+| `Alt+Up` / `Alt+Down` | Move current line up/down |
 
 Find mode:
 
@@ -167,113 +195,166 @@ Find mode:
 
 ---
 
-## Command line
+## Command line examples
 
-Open the command line with:
+Open the command line with `Ctrl+.`. Commands may be typed with or without the leading `:` in most contexts, but the examples use `:` for clarity.
 
-```text
-Ctrl+.
-```
-
-The command line is Slate's fastest primary interface. While typing the command token, Slate shows a live terminal-style completion inline in dim text and a small fuzzy suggestion list sourced from the real command registry. Press `Tab` to accept the current completion, or `Enter` to run.
-
-Slate persists command history and recent/frequent command usage in `~/.config/slate/config.toml`. Usage acts as a conservative ranking boost for commandline suggestions and the command palette. Fuzzy match quality still comes first, so this should improve discovery without making the commandline feel noisy or heavy.
-
-Examples:
+### File/session commands
 
 ```text
-:w
-:q
-:wq
-:x
-:open              # Slate-owned file modal
-:open ~/notes/todo.md
-:e ~/notes/todo.md
-:save-as           # Slate-owned save-as modal
-:scratch           # In-app quick capture modal
-:capture           # Capture selection/current line to scratch with optional title
-:scratch-entries   # Review and clean archived scratch entries
-:new
-:preview
-:preview on
-:preview off
-:wrap
-:wrap on
-:wrap off
-:line-numbers relative
-:line-numbers absolute
-:settings
-:recent
-:recent notes
-:periscope         # fzf-style project/home file search
-:ps / :fzf         # periscope aliases
-:open-buffer       # open another file as editable modal buffer
-:ob README.md
-:lance             # Lance marked files modal
-:lc                # alias
-:marks             # alias
-:lance-add         # mark current file
-:la ~/notes/ref.md # add a file manually
-:lance 1           # jump to mark slot 1
-:lance-next
-:lance-prev
-Alt+1..Alt+9/0    # direct jump to Lance slots 1 through 10
+:w                         save
+:q                         quit
+:wq / :x                   save and quit
+:new / :enew               new buffer
+:open / :e                 open file picker
+:open ~/notes/todo.md      open explicit path
+:save-as                   save current buffer to a new path
+:open-last / :last / :ol   open last file
+:recent / :rec             recent files picker
+:recent notes              recent files filtered by query
 ```
 
-Slate Picker modal:
+### View/settings commands
 
 ```text
-:open, :open-buffer, :recent, and :lance share the same picker surface.
-type filter · ↑↓ select · Enter open · Esc close
-files also support → enter folder and ← parent
-lance also supports Ctrl+Enter modal, Ctrl+A add, Delete remove
+:preview / :md             toggle Markdown preview
+:preview on|off            set preview state
+:preview-on / :preview-off explicit preview commands
+:wrap                      toggle word wrap
+:wrap on|off               set wrap state
+:wrap-on / :wrap-off       explicit wrap commands
+:line-numbers absolute     absolute line numbers
+:line-numbers relative     relative line numbers
+:ln absolute|relative      short form
+:settings                  settings modal
 ```
 
-Periscope:
+### Navigation and editing commands
 
 ```text
-:periscope / :ps / :fzf
-Project mode searches the nearest .git root.
-If no .git root exists, Slate asks whether to choose a project folder or jump to Home mode.
-Home mode indexes `$HOME` in the background and searches that local file list in memory.
-Path-aware queries work in order: `descargas rmenu main`, `lua periscope readme`, or `etc/ssh config`.
-Folder matches can expand inline: `→` or `Enter` on a folder row shows `---/child` file rows in the same result list.
-Tab toggles project/home · Enter opens or expands · Ctrl+Enter opens files as modal buffer.
+:find text                 find text
+:g 10                      go to line 10
+:g 10:4                    go to line 10, column 4
+:g +5                      move five lines down
+:g -5                      move five lines up
+:top / :gt                 top of file
+:bottom / :gb              bottom of file
+:select-word / :sw         select word under cursor
+:select-line / :sl         select current line
+:delete-word / :dw         delete word under cursor
+:delete-line / :dl         delete current line
+:duplicate-line / :dup     duplicate current line
+:duplicate-place / :dupp   duplicate current line, then place it interactively
+:move-line-up / :mlu       move current line up
+:move-line-down / :mld     move current line down
+:move-line-to-paragraph-start / :mlps
+:move-line-to-paragraph-end / :mlpe
 ```
 
-Goto:
+### Picker/navigation commands
 
 ```text
-:g 10       # absolute line 10
-:g 10:4     # line 10, column 4
-:g +5       # five lines down
-:g -5       # five lines up
+:open-buffer / :ob         open a file in editable modal buffer
+:periscope / :ps / :fzf    project/home file search
+:lance / :lc / :marks      marked files picker
+:lance-add / :la           mark current file
+:lance-add ~/notes/ref.md  add file manually
+:lance 1                   jump to Lance slot 1
+:lance-next / :lnext       next Lance mark
+:lance-prev / :lpv         previous Lance mark
 ```
 
-Editing/navigation commands:
+### Scratch/capture commands
 
 ```text
-:select-word    :sw
-:select-line    :sl
-:delete-word    :dw
-:delete-line    :dl
-:duplicate-line :dup
-:duplicate-place :dupp
-:move-line-up   :mlu
-:move-line-down :mld
-:move-line-to-paragraph-start :mlps
-:move-line-to-paragraph-end   :mlpe
-:top            :gt
-:bottom         :gb
-:open-last      :ol
-:recent         :rec
+:scratch / :sc             in-app scratch modal
+:capture / :cap            capture selection/current line to scratch
+:scratch-entries           review scratch archive
+:scratch-log / :scl        aliases
 ```
+
+### Markdown/knowledge commands
+
+```text
+:open-link / :olink / :follow-link    open Markdown link under cursor
+:doc-tasks / :tasks                   current-document task picker
+:agenda / :ag                         Slate Flow agenda
+:agenda #tag                          agenda filtered by tag
+:agenda @project                      agenda filtered by project
+:agenda overdue                       overdue agenda items
+:quickadd comprar pan #casa ALTA      append task to inbox
+:qa revisar README @slate             quickadd alias
+:daily                                open today's monthly daily log
+:daily yesterday                      open yesterday
+:daily 2026-06-11                     open explicit date
+:daily refresh                        refresh daily view/log
+:refile                               refile current Flow line
+:backlinks / :bl                      links pointing to current file
+:mentions / :refs                     textual mentions of current file
+:find-note / :fn query                find Markdown notes
+:flow-rescan / :flow-index            rescan Flow scope
+:flow-rebuild / :flow-reindex         rebuild Flow scope
+```
+
+---
+
+## Slate Picker
+
+`:open`, `:open-buffer`, `:recent`, and `:lance` share the same picker surface:
+
+```text
+type to filter
+↑ / ↓ select
+Enter open selected item
+Esc close
+→ enter folder
+← parent folder
+```
+
+Additional Lance actions:
+
+```text
+Ctrl+Enter   open selected mark as modal buffer
+Ctrl+A       add current file
+Delete       remove selected mark
+Alt+1..0     jump directly to mark slots 1..10
+```
+
+---
+
+## Periscope file search
+
+Periscope is Slate's fzf-style file search.
+
+```text
+:periscope
+:ps
+:fzf
+```
+
+Behavior:
+
+- Project mode searches the nearest `.git` root.
+- If no `.git` root exists, Slate can choose a project folder or jump to Home mode.
+- Home mode indexes `$HOME` in the background and searches the local file list in memory.
+- Path-aware queries match components in order:
+
+  ```text
+  descargas rmenu main
+  lua periscope readme
+  etc/ssh config
+  ```
+
+- Folder results can expand inline.
+- `Tab` toggles project/home search.
+- `Enter` opens or expands.
+- `Ctrl+Enter` opens files as modal buffers.
 
 ---
 
 ## Ctrl-hold command layer
 
-Slate has an experimental transient command layer:
+Slate has a transient command layer for fast commands without entering a permanent modal mode:
 
 1. hold `Ctrl`
 2. type a short sequence
@@ -283,26 +364,26 @@ Examples:
 
 | Sequence | Action |
 | --- | --- |
-| `Ctrl` hold → `s` → release | Save |
-| `Ctrl` hold → `o` → release | Open |
-| `Ctrl` hold → `o l` → release | Open last file |
-| `Ctrl` hold → `d l` → release | Delete line |
-| `Ctrl` hold → `d u p` → release | Duplicate line |
-| `Ctrl` hold → `d u p p` → release | Duplicate placement mode |
-| `Ctrl` hold → `d w` → release | Delete word |
-| `Ctrl` hold → `s w` → release | Select word |
-| `Ctrl` hold → `s l` → release | Select line |
-| `Ctrl` hold → `g t` → release | Go to top |
-| `Ctrl` hold → `g b` → release | Go to bottom |
-| `Ctrl` hold → `h` → release | Shortcut help |
+| hold `Ctrl`, `s`, release | Save |
+| hold `Ctrl`, `o`, release | Open |
+| hold `Ctrl`, `o l`, release | Open last file |
+| hold `Ctrl`, `d l`, release | Delete line |
+| hold `Ctrl`, `d w`, release | Delete word |
+| hold `Ctrl`, `d u p`, release | Duplicate line |
+| hold `Ctrl`, `d u p p`, release | Duplicate placement mode |
+| hold `Ctrl`, `s w`, release | Select word |
+| hold `Ctrl`, `s l`, release | Select line |
+| hold `Ctrl`, `g t`, release | Go to top |
+| hold `Ctrl`, `g b`, release | Go to bottom |
+| hold `Ctrl`, `h`, release | Shortcut help |
 
-This gives Slate some of the speed of modal editors without requiring a permanent mode switch.
+This gives Slate some of the speed of modal editors while keeping normal typing as the default.
 
 ---
 
 ## Duplicate placement
 
-For a movable duplicate, use:
+Use:
 
 ```text
 :duplicate-place
@@ -312,28 +393,26 @@ For a movable duplicate, use:
 Slate duplicates the current line and enters a transient placement mode:
 
 ```text
-Alt movement or Ctrl+Shift movement = move duplicate
-Enter / Space                    = place
-Esc                              = cancel
+Alt movement or Ctrl+Shift movement   move duplicate
+Enter / Space                         place
+Esc                                   cancel
 ```
 
 ---
 
 ## Alt structural editing
 
-`Alt` is reserved for structural text manipulation and quick Lance slot jumps. It does not move the cursor directly; `Ctrl+Shift` already covers live cursor movement.
+`Alt` is reserved for structural text operations and quick Lance slot jumps.
 
-Current batch:
-
-| Shortcut | Slate movement mode | Vim movement mode |
+| Action | Slate movement mode | Vim movement mode |
 | --- | --- | --- |
-| Move current line up | `Alt+i` / `Alt+Up` | `Alt+k` / `Alt+Up` |
-| Move current line down | `Alt+k` / `Alt+Down` | `Alt+j` / `Alt+Down` |
+| Move line up | `Alt+i` / `Alt+Up` | `Alt+k` / `Alt+Up` |
+| Move line down | `Alt+k` / `Alt+Down` | `Alt+j` / `Alt+Down` |
 | Move line to paragraph start | repeat up key, e.g. `Alt+i i` | repeat up key, e.g. `Alt+k k` |
 | Move line to paragraph end | repeat down key, e.g. `Alt+k k` | repeat down key, e.g. `Alt+j j` |
 | Extend word selection left | `Alt+j` repeatedly | `Alt+h` repeatedly |
 | Extend word selection right | `Alt+l` repeatedly | `Alt+l` repeatedly |
-| Open Lance slot | `Alt+1` … `Alt+9`, `Alt+0` for 10 | `Alt+1` … `Alt+9`, `Alt+0` for 10 |
+| Open Lance slot | `Alt+1` … `Alt+9`, `Alt+0` | same |
 
 A paragraph is a contiguous block of non-empty lines separated by blank lines.
 
@@ -343,9 +422,7 @@ A paragraph is a contiguous block of non-empty lines separated by blank lines.
 
 For movement that should happen immediately, Slate supports a live movement layer while holding `Ctrl+Shift`.
 
-Two modes are available in Settings:
-
-### Vim movement
+Vim movement:
 
 ```text
 h left
@@ -354,7 +431,7 @@ k up
 l right
 ```
 
-### Slate movement
+Slate movement:
 
 ```text
 i up
@@ -363,42 +440,203 @@ k down
 l right
 ```
 
-Fast structural cursor jumps use the same movement mode with `Shift+Alt` double-key sequences:
+Fast structural cursor jumps use the same movement preference with `Shift+Alt` double-key sequences:
 
 ```text
 Slate mode: Shift+Alt+i i paragraph start, k k paragraph end, j j word start, l l word end, j l line end, l j line start
 Vim mode:   Shift+Alt+k k paragraph start, j j paragraph end, h h word start, l l word end, h l line end, l h line start
 ```
 
-The selected mode is persisted in:
+The movement mode is persisted in `~/.config/slate/config.toml`.
+
+---
+
+## Markdown conventions
+
+Slate keeps Markdown plain. It adds conveniences, not a new format.
+
+Supported lightweight affordances include:
+
+- headings: `#`, `##`, `###`, etc.
+- unordered and ordered lists
+- blockquotes: `> quote`
+- fenced code blocks: <code>```rust</code>
+- inline code: `` `code` ``
+- Markdown links: `[text](target)`
+- horizontal separators: `---` alone on a line
+- preview-only simple tables
+- checkboxes:
+
+  ```md
+  [ ] todo
+  [/] doing
+  [x] done
+  - [ ] subtask
+  -- [/] subsubtask
+  ```
+
+Compact checkbox input:
 
 ```text
-~/.config/slate/config.toml
+[] task
+```
+
+is normalized to:
+
+```md
+[ ] task
 ```
 
 ---
 
-## Settings
+## Slate Flow task grammar
 
-Open settings with:
+Slate Flow understands simple Markdown tasks:
+
+```md
+- [ ] Task text #tag @project ALTA
+```
+
+States:
+
+```text
+[ ] todo
+[/] doing
+[x] done
+```
+
+Inline metadata:
+
+```text
+#tag
+@project
+ALTA / MEDIA / BAJA
+```
+
+Nearby child metadata can be used for dates and related context:
+
+```md
+- [ ] Ship README @slate ALTA
+  - due: 2026-06-12
+  - scheduled: 2026-06-11
+  - related: [Slate Flow](SLATE_FLOW.md)
+  - note: keep the file readable and local-first
+```
+
+Agenda/cache data is derived from Markdown. Editing or completing items should update the source Markdown where possible.
+
+---
+
+## Scratch and capture details
+
+Scratch archive path:
+
+```text
+~/.local/share/slate/scratch.md
+```
+
+In-app scratch:
+
+```text
+:scratch
+:sc
+```
+
+Controls:
+
+```text
+Ctrl+S   archive scratch content
+Ctrl+E   open scratch entries
+Esc      hide scratch modal
+```
+
+Capture selection/current line:
+
+```text
+:capture
+:cap
+```
+
+Scratch archive review:
+
+```text
+:scratch-entries
+:scratch-log
+:scl
+```
+
+Controls:
+
+```text
+↑ / ↓             select archived entry
+Ctrl+D / Delete   delete selected entry
+Esc               close
+```
+
+---
+
+## Settings and persistence
+
+Open settings:
 
 ```text
 :settings
+:set
+:prefs
+:preferences
 ```
 
-Current settings include:
-
-- command history length
-- line number mode: absolute / relative
-- Ctrl+Shift movement mode: Vim / Slate
-
-Config lives at:
+Slate persists lightweight human-readable configuration in:
 
 ```text
 ~/.config/slate/config.toml
 ```
 
-Current config is intentionally small and human-readable.
+Current persisted state includes:
+
+- command history limit
+- command history
+- recent/frequent command usage
+- line number mode
+- word wrap
+- Markdown preview mode
+- last opened file
+- recent files
+- per-file cursor positions
+- Ctrl+Shift movement mode
+- reopen-last-file preference
+
+Project/local derived Flow metadata may live under `.slate/`. Cache/index files are rebuildable and are not the source of truth.
+
+---
+
+## Architecture
+
+Slate is written in Rust using `eframe`/`egui`, but the main document editor is Slate-owned:
+
+- `EditorBuffer` owns text, cursor, selection, line index, and edit primitives.
+- `EditorView` paints text, cursor, selections, line numbers, wrapping, highlights, Markdown affordances, and link affordances.
+- Search, goto, selection, task cycling, commands, and navigation operate on Slate primitives.
+- `egui::TextEdit` is reserved for small inputs such as command fields and settings fields.
+
+Important source modules:
+
+| Path | Purpose |
+| --- | --- |
+| `src/main.rs` | Application shell, UI state, command routing, modals |
+| `src/editor_buffer.rs` | Text model, cursor/selection/edit primitives |
+| `src/editor_view.rs` | Native editor rendering and input handling |
+| `src/commands.rs` | Command registry, aliases, commandline parsing, fuzzy command matching |
+| `src/markdown.rs` | Lightweight line-based Markdown parsing |
+| `src/file_dialogs.rs` | Slate-owned open/save picker behavior |
+| `src/periscope.rs` | Project/home file search and path scoring |
+| `src/scratch.rs` | Scratch/capture/archive helpers |
+| `src/flow.rs` | Flow task/index data model |
+| `src/flow_runtime.rs` | Flow runtime paths/cache helpers |
+| `src/flow_edit.rs` | Flow source-edit helpers |
+| `src/agenda.rs` | Agenda query/cache helpers |
+| `src/daily.rs` | Daily log/reflection helpers |
+| `src/link_ui.rs` | Link/backlink/mention/find-note UI helpers |
 
 ---
 
@@ -412,79 +650,66 @@ Slate should remain:
 - command-oriented
 - visually minimal
 - normal-editor-first
-- optional-knowledge-workspace-later
+- capture-first
+- progressively organized
 
-Slate should avoid, especially early:
+Slate should avoid:
 
 - mandatory databases
-- heavy sidebars
+- heavy permanent sidebars
 - graph-view-first UX
-- plugin complexity
+- plugin complexity before the core is excellent
 - infinite settings
 - cloning Vim/Emacs/Obsidian wholesale
+- project-management cosplay
 
 ---
 
 ## Roadmap
 
-Slate's roadmap is intentionally staged. The idea is to build stable editor foundations first, then layer knowledge workflows on top.
+### Done / active foundation
 
-### Completed foundation
+- Native editor architecture.
+- Native buffer and renderer.
+- Native input, selection, cursor jumps, scroll-to-position.
+- Search/find on native editor primitives.
+- Status bar and command line/minibuffer layout.
+- Command registry, fuzzy command suggestions, and palette integration.
+- Persistent config basics.
+- Recent files workflow.
+- Slate-owned open/save-as pickers.
+- Ctrl-hold command layer.
+- Ctrl+Shift movement layer.
+- Scratch, capture, and scratch archive review.
+- Markdown affordance layer and preview split.
+- Periscope file search.
+- Lance marked files.
+- Slate Flow task syntax/index/agenda/daily/refile/link lanes.
 
-- Native editor architecture
-- Native text buffer
-- Native renderer
-- Native input landling
-- Selection, cursor jumps, and scroll-to-position
-- Native find/highlight flow
-- Statusbar + minibuffer layout
-- Command line basics
-- Persistent config basics
-- Ctrl-hold command layer
-- Ctrl+Shift live movement modes
+### Next likely work
 
-### Near-term
+- Buffer/multi-file workflow polish.
+- Optional auto-save.
+- Theme system.
+- Richer Flow metadata without bloat.
+- Global notes search language.
+- Wiki-link parser/resolver/follow-link navigation.
+- Textual result buffers for search/backlinks/tasks.
+- Optional sync/checkpoint lane.
+- Literate Markdown configuration.
 
-- Finish find regression/performance larness
-- Duplicate line and move line up/down
-- `Alt+Up` / `Alt+Down` for moving lines
-- Better command discovery and fuzzy command matching
-- Real recent-files list and `:recent`
-- Slate-owned Open and Save As modals; no native Linux/Desktop file dialogs
-- Open modal includes fuzzy filtering, folder navigation, and size/modified metadata
-- Persist more editor preferences such as theme and vault location
-- Minimal project/vault file opener
+---
 
-### Knowledge-work layer
+## Credits and inspiration
 
-- Scratch buffer and quick capture inbox
-- Daily notes
-- Optional vault/root notes folder
-- Global notes search
-- Wiki links like `[[Note]]`
-- Link resolver triggered by `[[`
-- Follow-link navigation
-- Deep links to exact file/line/column
-- Backlinks and most-linked notes
-- Tags and lightweight metadata
-- Task/checklist commands
+Slate's `Lance` marked-buffer / quick-file workflow is inspired by [Harpoon 2](https://github.com/ThePrimeagen/harpoon/tree/harpoon2). Full credit to [ThePrimeagen](https://github.com/ThePrimeagen) for the original idea.
 
-### Later experiments
-
-- Rebuildable SQLite/FTS index for vault search and links
-- Textual result buffers for search, backlinks, tasks, and diagnostics
-- Templates
-- Theme system
-- Optional auto-save
-- Repeatable edits / lightweight macros
-- Literate Markdown config
+Slate also takes broad inspiration from terminal editors, command palettes, minibuffers, Org-style agendas, local-first note systems, and tools that make text feel fast without making the interface loud.
 
 ---
 
 ## Current vibe
 
-Slate should feel like opening a quiet terminal and writing.
+No dashboard. No ceremony. No permanent sidebar yelling for attention.
 
-No dashboard. No ceremony. No project management cosplay.
-
-Just text, commands, and enough structure to make thinking easier.
+Just text, commands, capture, and enough structure to make thinking easier.

@@ -79,6 +79,10 @@ Scope:
 - Done: move current line up/down commands and `Alt+Up` / `Alt+Down` shortcuts.
 - Done: Alt structural vertical batch for current-line movement and paragraph-boundary movement.
 - Done: duplicate line command.
+- Done: support mouse text selection in the native editor with left-button drag.
+- Done: support copying the current native editor selection to the system clipboard with `Ctrl+C` / OS copy events.
+- Done: support pasting text from the system clipboard into the native editor, replacing the selection when one exists.
+- Done: normalize Slate cursor-size environment before eframe starts so X11/XWayland does not choose a giant client-side mouse cursor only inside Slate.
 - Continue adding useful Vim-inspired text operations without requiring a full Vim mode.
 
 ### T008 — Lightweight Markdown improvements
@@ -150,7 +154,11 @@ Scope:
 - Mark current/modal file into a numbered slot; selecting a slot opens/promotes that file quickly.
 - Keep the Lance idea small and Slate-native: marked files are a fast local navigation set, not a full tab bar or project manager.
 - Add switch-buffer and close-buffer commands.
-- Prefer command-palette-driven buffers before visible tabs.
+- Prefer command-palette-driven buffers before heavy tab-driven navigation.
+- Pending: add a tiny visual buffer strip at the top of the editor that looks tab-like but behaves as context/status, not as the primary workflow. It should show the current file plus a few open buffers, dirty markers, and support quick click/keyboard switching without becoming a full browser UI.
+- Pending: support a two-focus buffer workflow: keep many buffers loaded in the background, but allow choosing one secondary buffer to open "on top" of the current main buffer, reusing the modal-buffer/Lance mental model.
+- Pending: when a secondary buffer is active above the main buffer, `Tab` should quickly swap/jump between the main and secondary buffers so the user can compare/check two files without losing the rest of the buffer set.
+- Pending: background buffers remain loaded and selectable, but the fast working set is the current pair: main buffer + secondary overlay buffer.
 - Borrow the useful Emacs concept of buffers without adopting Emacs complexity.
 
 ### T012 — Optional auto-save
@@ -230,15 +238,17 @@ Scope:
 - Search/filter notes by tags.
 - Avoid complex frontmatter requirements unless clearly useful.
 
-### T024 — Link resolver trigger for `[[`
+### T024 — Link resolver trigger for `[`
 
-Status: pending
+Status: in_progress
 Scope:
-- Detect when the user types `[[` in the editor.
-- Open an inline fzf-like resolver/modal without disrupting normal writing.
-- Keep filtering live as the user types inside the unfinished link.
-- Support Escape to cancel and Enter to insert the selected result.
-- Make the resolver available as a command too, not only through automatic trigger.
+- Done: detect when the user types `[` in the editor.
+- Done: open an inline fzf-like file dropdown without disrupting normal writing.
+- Done: keep filtering live as the user types inside the unfinished Markdown label.
+- Done: support Escape to cancel and Enter to insert the selected result.
+- Done: typing `]` cancels the dropdown so checkbox/manual Markdown stays natural.
+- Pending: make the resolver available as a command too, not only through automatic trigger.
+- Decision: prefer standard Markdown links from the start (`[label](target.md)`), not persistent `[[wiki]]` syntax.
 
 ### T025 — Link resolver ranking and result groups
 
@@ -482,13 +492,15 @@ Scope:
 
 Status: completed
 Scope:
-- Done: add an assisted Markdown link flow triggered by typing `[[`, while preserving normal manual `[text](target)` editing.
-- Done: show a small picker with `Archivo` and `Web`, navigable with `↑↓`, `Enter`, and `Esc`.
-- Done: for `Archivo`, reuse Slate-owned file selection to pick a local target and insert standard Markdown `[](relative/path.md)`.
+- Done: add an assisted Markdown link flow triggered by typing `[`, while preserving normal manual `[text](target)` editing.
+- Done: single-`[` now opens a compact vertical IDE-style file dropdown, with recent files first for an empty query and fuzzy project-file matching as the user types.
+- Done: the dropdown is navigable with `↑↓`/`Tab`, `Enter`, and `Esc`; typing `]` cancels it so checkbox/manual Markdown flows like `[]` and `[ ]` remain natural.
+- Done: confirming a file inserts standard Markdown `[](relative/path.md)` and places the cursor inside the label.
 - Done: when selected file is Markdown and has headings, show a second heading picker; first option always links the whole file, while selected headings insert `[](relative/path.md#heading)`.
 - Done: local Markdown links with heading fragments open the file and jump to the matching heading.
 - Done: for `Web`, show a focused mini input for the URL and insert standard Markdown `[](https://...)` on `Enter`.
 - Done: after insertion, place the cursor inside the `[]` label so the user can immediately type the link text.
+- Done: pressing `Enter` on an empty local Markdown-file label fills it with the file stem, e.g. `[](docs/periscope.md)` becomes `[periscope](docs/periscope.md)`; web links keep the old behavior of moving after the link with a space.
 - Done: resolve file targets relative to the current buffer when possible; fall back to project/current directory when the buffer has no path.
 - Done: keep the final document plain Markdown; `[[` is only the assist trigger, not a persistent custom link syntax.
 
@@ -516,6 +528,624 @@ Scope:
 - Done: folder expansion stays transient and scoped to the current Periscope query/results; query/mode changes clear expansion state.
 - Pending optimization: debounce Project Periscope query updates, cancel stale backend processes where still applicable, and keep polishing indexing lifecycle/status.
 - Future but not part of the first pass: content search, custom indexes, Everything-like daemon/indexer, project-specific persisted roots, and search result buffers.
+
+### T050 — Slate Flow: Org-inspired Markdown agenda lane
+
+Status: in_progress
+Scope:
+- Started: initial design contract documented in `SLATE_FLOW.md`.
+- Build a new Slate-native lane inspired by Org/Org-roam/Agenda, without turning Slate into Emacs or a heavyweight PKM.
+- Principle: plain Markdown files remain the source of truth. Slate may maintain caches/indexes for speed, but every cache must be rebuildable from local files.
+- Principle: tasks may live in any Markdown file touched by Slate, not only in a special vault or agenda file.
+- Principle: keep the workflow local-first and commandline-first: capture fast, write normally, agenda scans/indexes, refile/link later.
+- Principle: do not require graph views or visual PKM surfaces; backlinks, mentions, link insertion, and reliable navigation matter more than graph cosmetics.
+- Treat this lane as related to scratch/capture, Markdown links, document tasks, Lance/Periscope navigation, and future rtasks/rmenu/thread-daemon integration.
+
+### T051 — Slate Flow task syntax and metadata grammar
+
+Status: completed
+Scope:
+- Done: added `src/flow.rs` with a Slate Flow task parser and unit tests.
+- Done: parse checkbox state, clean title, tags, project/context markers, Spanish priority markers, heading context, and child metadata (`due`, `scheduled`, `related`, `note`).
+- Done: checkbox metadata child lines are treated as parent metadata instead of independent agenda tasks when the key is known.
+- Prefer Markdown-compatible checkbox tasks with inline tags, project markers, and priority markers:
+  ```md
+  - [ ] Arreglar selección con mouse #editor #input @slate ALTA
+    - [ ] due: 2026-06-10
+    - [ ] scheduled: 2026-06-08
+  ```
+- Parse task state from Slate checkbox markers:
+  ```text
+  [ ] todo
+  [/] doing
+  [x] done
+  ```
+- Parse tags from `#tag` tokens on the task line; examples: `#editor`, `#input`.
+- Parse project/context from `@project` tokens on the task line; examples: `@slate`, `@home`, `@work`. This should map cleanly to rtasks project/context concepts later.
+- Parse priority from curated Spanish priority tokens at the end or near the end of the task line:
+  ```text
+  ALTA
+  MEDIA
+  BAJA
+  ```
+- Prefer curated priorities over arbitrary custom priority schemes for now.
+- Parse child metadata lines for dates:
+  ```md
+  - [ ] due: 2026-06-10
+  - [ ] scheduled: 2026-06-08
+  ```
+- Metadata child lines may use checkbox syntax so they can remain visible/compatible with rtasks-style tooling, but Slate should understand `due:` and `scheduled:` as metadata for the parent task rather than independent agenda tasks by default.
+- Also accept non-checkbox child metadata for convenience and less visual bloat:
+  ```md
+  - due: 2026-06-10
+  - scheduled: 2026-06-08
+  - related: [README](README.md)
+  - note: revisar con selección Unicode
+  ```
+- Support a middle-ground between inline-only tasks and heavy task objects: richer per-task metadata is useful, but should stay close to the task and readable as normal Markdown.
+- Keep all syntax readable and useful without Slate; no hidden proprietary task objects.
+
+### T052 — Slate Flow task index/cache
+
+Status: completed
+Scope:
+- Done: Markdown files opened/saved by Slate are parsed with `src/flow.rs` and indexed when they have a Markdown-like extension.
+- Done: write a readable project-local `.slate/index.tsv` known-files index with path, seen/mtime, task count, and task/link/tag hints.
+- Done: write a derived SQLite agenda cache at the Slate data dir using the system `sqlite3` command, with `files` and `tasks` tables.
+- Done: status line reports how many Flow tasks were indexed when opening/saving a Markdown file.
+- Done: added `:flow-rescan` / `:flow-index` to rescan the current Flow scope into `.slate/index.tsv` and the SQLite cache.
+- Done: added `:flow-rebuild` / `:flow-reindex` to remove the current scope's readable index and rebuild the SQLite cache from Markdown files in the current scope.
+- Add a scope-local SQLite agenda/task cache for fast agenda views, e.g. under:
+  ```text
+  ~/.local/share/slate/flow/scope-<hash>/agenda.db
+  ```
+- The SQLite cache stores derived data only; it is never the source of truth.
+- Also maintain a Slate-readable project/file index, inspired by `nb` but Slate-native, such as `.slate` or `.slate/index.md` / `.slate/index.toml`, for files touched by Slate that contain valuable structured information.
+- The readable `.slate` index should be auditable and rebuildable, not a hidden proprietary source of truth. It can list known files, last-seen metadata, discovered task/link/tag presence, and cache hints.
+- Agenda should primarily read fast derived data from SQLite, while the readable `.slate` index documents and scopes what Slate believes is worth indexing.
+- Minimum cached fields:
+  ```text
+  path
+  line number / byte range
+  task text
+  checkbox state
+  due date
+  scheduled date
+  tags
+  @project
+  priority
+  parent heading / document context
+  related links / source references
+  mtime/hash/revision
+  source snippet
+  ```
+- Update the cache incrementally when Slate opens, edits, saves, or otherwise touches a file.
+- Maintain a known-files set: any file opened/edited/saved by Slate can contribute tasks to the agenda.
+- Provide rebuild/rescan commands for both SQLite cache and readable `.slate` index.
+- First pass can index files touched by Slate instead of scanning the entire filesystem.
+- Cache should be robust against line-number drift by refreshing on save/open; line numbers are navigation hints, not permanent identity.
+- Future identity may use stable task IDs only if needed; avoid forcing IDs into Markdown in the first pass.
+
+### T053 — Slate Flow agenda
+
+Status: completed
+Scope:
+- Done: added `:agenda` / `:ag` command backed by the Flow SQLite cache.
+- Done: agenda opens as a Slate-native modal with an Org-style 10-day agenda layout, overdue section, dated rows, later section, inbox/no-date section, task metadata, and keyboard/mouse navigation.
+- Done: `Enter` on an agenda task jumps to the source file and line.
+- Done: `Ctrl+Enter` cycles the selected task state in source Markdown and refreshes the Flow cache; Slate asks for a clean buffer first to avoid overwriting unsaved edits.
+- Done: commandline filters via `:agenda #tag`, `:agenda @project`, `:agenda ALTA`, `:agenda overdue`, `:agenda today`, `:agenda due`, `:agenda scheduled`, `:agenda inbox`, `:agenda doing`, `:agenda done`, and text/path/heading terms.
+- Done: agenda split into two keyboard segments: dated week tasks above and no-date tasks below; `Tab` moves focus between segments.
+- Done: dated segment shows only the current week as day rows; `←`/`→` changes week, `Home` returns to current week, and each day shows a task-count marker.
+- Done: `Enter` on a day expands/collapses only that day; `Enter` on a task jumps to source.
+- Done: selected agenda rows scroll into view inside their own segment; moving through no-date tasks does not move the dated week segment.
+- Done: `x` toggles visibility of done tasks in agenda.
+- Done: opening a Markdown file now refreshes that file and starts a background Flow scan of the file's project/folder, so `:agenda` no longer depends on a manual `:flow-rescan` for the opened scope.
+- Done: Flow task lines in the editor get a subtle parsed-task affordance, with checkbox state bar plus colored `#tags`, `@projects`, priority markers, and known metadata keys.
+- Done: `Shift+Enter` on a Flow task starts metadata entry with an indented `scheduled:` child line; empty `scheduled:` Enter becomes `due:`, and empty `due:` Enter exits back to a plain blank line.
+- Done: Flow date metadata entry has inline dark autocomplete for day/month shorthands; `Enter` accepts the suggested ISO date and moves through `scheduled:` → `due:` → plain line, while `↑`/`↓` adjusts the suggested month.
+- Done: agenda hides stale/global cache rows whose resolved source file does not exist in the current Flow scope.
+- Done: standalone `slate --agenda` / rmenu `Slate Agenda` opens Flow agenda as its own floating window; `Enter` on a task opens a normal Slate window at that task line and closes the agenda window.
+- Done: standalone agenda renders as its own focused agenda surface, without the normal Slate editor/status/commandline chrome behind it.
+- Future: expose a small local Flow agenda surface/API for Waybar calendar integration, backed by the same Markdown-derived index rather than a separate task database.
+- Future: richer boolean agenda/search belongs in T061 Slate search language.
+- Add `:agenda` as the main view for tasks discovered across files touched by Slate.
+- Agenda should group tasks into useful sections such as:
+  ```text
+  Today
+  Scheduled
+  Due soon
+  Overdue
+  Inbox / no date
+  By project
+  ```
+- Agenda rows should show enough context without becoming noisy:
+  ```text
+  [ ] Arreglar selección con mouse   @slate ALTA   due 2026-06-10   path:line
+  ```
+- Pending visual polish: Agenda, Daily, and related Flow views should share Slate's editor color language. Tags, projects, priorities, file paths, source references, and link-like values should be colorized consistently across editor, agenda, daily, scratch/review surfaces, and future link/backlink views.
+- `Enter` on an agenda item jumps to the source file and line.
+- `Ctrl+Enter` cycles task state in the source file, matching existing checkbox behavior.
+- Agenda should support filtering by:
+  ```text
+  #tag
+  @project
+  ALTA/MEDIA/BAJA
+  due/scheduled/today/overdue
+  ```
+- Agenda is a view over Markdown, not a separate task database. Editing/completing tasks should update the source file.
+- Avoid graph/PKM UI here; agenda should be fast, textual, keyboard-friendly, and commandline-first.
+
+### T054 — Slate Flow capture, inbox, and quickadd
+
+Status: in_progress
+Scope:
+- Extend existing scratch/capture into Org-like capture templates without making a mandatory PKM/vault.
+- Done: add `:quickadd` / `:qa` / `:inbox` command for appending `- [ ] ...` Flow tasks to the current Flow scope inbox.
+- Done: default inbox is plain Markdown at `inbox.md` inside the current Flow scope/project.
+- Done: quickadded tasks are indexed immediately and refresh `:agenda` when it is open.
+- Done: scratch/quickadd task normalization now applies Flow default tags, so plain quickadd tasks become `#task #inbox` and show in tag-driven Tasks/Inbox views; contextual quickadds with `#tag`, `@project`, priority, `due:`, or `scheduled:` get `#task` only. Scratch also treats raw checkbox lines like `[] tarea` / `[ ] tarea` / `- [ ] tarea` as Flow quickadds instead of archiving them only.
+- Done: `:quickadd` with no arguments opens scratch with quickadd guidance.
+- Done: scratch modal and standalone `slate --scratch` support special Flow quickadd lines: any line starting with `:` becomes a quickadd task, with optional `:quickadd ...`, `:qa ...`, or `:inbox ...`; non-command scratch lines still archive normally.
+- Done: standalone `slate --scratch` shows a quiet centered `Agenda updated` toast for about 0.4s before closing after a saved quickadd/archive, without writing that message to the command line.
+- Pending: richer Flow item parsing for non-task agenda entries, without expanding `:capture` beyond selected-text capture.
+- Decision: `:capture` keeps its current meaning: capture the selected text. Do not overload it into template commands for idea/note/task.
+- Decision: tasks remain normal checkbox syntax (`[ ]`, `[/]`, `[x]`); no separate `:task` syntax is needed.
+- Decision: notes and ideas are written directly in the document as plain text Flow items, without requiring hand-written bullets:
+  ```md
+  :note Esto es una nota #tag @project
+  :idea Esto es una idea #tag @project
+  ```
+- Decision: avoid making bullets feel mandatory for Markdown workflows. Canonical note/idea syntax is non-bullet intradocument text.
+- Done: parse and index `:note` and `:idea` lines as first-class Flow items with kind `note` / `idea`, title/body text, tags, project/context, source path, line, and heading.
+- Done: render `:note` and `:idea` with Flow syntax coloring in the editor, similar to task affordances: the marker is visually parsed/recognized, and inline `#tags` / `@projects` keep their existing colored treatment.
+- Done: include notes and ideas in global agenda/Flow views, because agenda is the global place where everything actionable/reference-like lands.
+- Done: note/idea lines participate in live Flow agenda publishing when committed/edited near Flow context, so standalone/rmenu agenda can see them from the derived cache without requiring an explicit file save after pressing Enter/committing the line.
+- Pending: add timestamps to note/idea metadata when available or when Daily log lands.
+- Done: agenda tabs/sections in this order: `Agenda` (global) | `Inbox` | `Tasks` | `Ideas` | `Notes`, switching tabs with `Shift+Tab` so plain `Tab` remains available for existing in-modal focus/navigation.
+- Done: non-global agenda tabs are flat lists without the weekly calendar; each tab remembers its cursor while the agenda is open and resets on reopen.
+- Decision: Flow tabs are tag-driven. `:idea` gets `#idea`, `:note`/`:nota` gets `#note`, checkbox tasks get `#task`, plain `: text` quickadd gets `#inbox`, and plain tasks with no extra context get `#task #inbox`.
+- Done: add inline agenda organization autocomplete for tagging/projecting items without a modal. While a Flow item is selected in agenda/inbox tabs, pressing `@` opens a non-blocking project autocomplete/dropdown and pressing `#` opens a non-blocking tag autocomplete/dropdown; typing filters suggestions and confirming appends the selected `@project` or `#tag` to the source line. Plain `Enter` must keep opening/jumping to the source line, and `Ctrl+Enter` remains task state cycle.
+- Done: reusable Flow item edit mini-modal and editor inline organization autocomplete. In agenda, `Shift+Enter` on the selected item opens a compact editor prepopulated with the full source item line; `Ctrl+Enter` saves, `Esc` cancels, and `#`/`@` open autocomplete using the shared project/tag suggestion engine. Standalone agenda can send edit requests to an already-open Slate buffer via `edit-requests.tsv`; otherwise it edits disk and reindexes. Modal styling is compact/Slate-like. Token replacement is cursor-aware inside the mini editor. Normal Slate editing reuses Flow `#tag` / `@project` autocomplete on Flow lines with a compact vertical IDE-style suggestion list/dropdown. Final validated behavior: `#` and `@` explicitly call the popup; known complete tokens do not reopen it; known incomplete tokens show matching suggestions; unknown tokens show no suggestions. Manual GUI validation passed. Design decision: inside the normal Slate editor, suggestions render vertically, not as horizontal chips; horizontal/wrapped chips remain acceptable in Agenda/modal contexts.
+- Pending: define inbox as a first-class agenda view for uncategorized/no-date Flow items, including tasks, notes, and ideas.
+- Pending: alternate destinations later: current file, daily log, choose file, project note.
+- Pending: configurable/default local-data inbox option if project-local inbox is not desired.
+- Capture should preserve plain Markdown output and use the task metadata grammar from T051 when capturing tasks.
+- Future: allow rmenu/thread-daemon quickadd to append into the same inbox/daily/task paths.
+
+### T055 — Slate Flow daily log
+
+Status: completed
+Scope:
+- Daily is not another inbox and not another capture syntax. `:note`, `:idea`, plain `:` inbox items, checkbox tasks, Scratch, and Agenda remain the live capture/organization surface.
+- Daily is a monthly chronological reflection/backup of what changed in Slate Flow: captures, edits, completions, refile events, organization changes, and notable agenda state transitions.
+- Prefer one monthly text file over one tiny note per day, so a whole month is searchable/readable as one chronological artifact.
+- Candidate monthly path:
+  ```text
+  ~/.local/share/slate/daily/2026-06.md
+  ```
+- Candidate format:
+  ```md
+  # Slate Daily Log — 2026-06
+
+  ## 2026-06-07
+
+  ### Captured
+  - 09:30 idea — mejorar Periscope #idea @slate
+  - 10:12 task — revisar selección con mouse #task @slate
+
+  ### Completed
+  - 10:45 done — Arreglar selección con mouse #task @slate
+
+  ### Organized
+  - 11:05 refile — "revisar selección" -> project/slate.md#editor
+
+  ## 2026-06-08
+  ...
+  ```
+- The source of truth remains the original Markdown item/source file. Daily entries are an append-only/monthly audit trail and human-readable backup, not the canonical task/note storage.
+- Daily should be updated by agenda/Flow events rather than freeform daily capture. If a user wants to record a thought, they should use existing Flow syntax (`:note`, `:idea`, `:`, or `- [ ]`) and the daily can reflect that event.
+- Refile should write a daily event: when something is sent to a new home, the daily entry keeps a link/reference to where it went.
+- Daily `source:` references should eventually be real navigable links back to the original file and line, not inert text. The current textual `path:line` format is acceptable as an intermediate representation, but link/navigation behavior belongs in the Daily/linking integration.
+- Do not erase daily history when organizing; daily is the chronological trail of what happened.
+- Support command(s):
+  ```text
+  :daily
+  :daily-log
+  :daily refresh
+  ```
+- `:daily` / `:daily-log` should open the current monthly daily at today's section. `:daily refresh` can rebuild/repair the monthly reflection from available Flow cache/history where possible.
+- Explicitly avoid adding `:log` or `:daily text` as new capture surfaces for now, because `:note` already covers that role and duplicate capture paths create confusion.
+Progress:
+- First implementation pass added `src/daily.rs` as the Daily reflection backend. It creates monthly files under `~/.local/share/slate/daily/YYYY-MM.md`, ensures day/section structure, appends deduplicated events, and has focused tests for document creation, section grouping, and duplicate prevention.
+- Normal Flow agenda publishing now records Daily events from current-buffer agenda diffs: newly indexed Flow items become `Captured`, and tasks transitioning to done become `Completed`. `Organized` is reserved for explicit refile/organization flows so normal typing/tagging does not spam the Daily. Source Markdown remains canonical; Daily is append-only reflection/audit trail.
+- Validation after first pass: `cargo fmt --all`, `cargo check`, `cargo test` (118 passed), and `cargo build --release`.
+- Daily polish pass started: new Daily `source:` references are now emitted as standard Markdown links like `[slatetest.md:24](/home/nd/slate/slatetest.md#L24)`, so they inherit Slate's link colors in the editor/preview surfaces. Slate Markdown link fragments now understand `#L123` / `#line-123` and jump to that line when promoted/opened, while existing heading-anchor fragments keep working. Current local Daily file was migrated to the new source-link shape. Validation: `cargo fmt --all`, `cargo check`, `cargo test` (120 passed), and `cargo build --release`.
+
+### T056 — Slate Flow refile with bidirectional links
+
+Status: in_progress
+Scope:
+- Add `:refile` to organize selected text, current task, current line, or capture entries.
+- Refile destinations:
+  ```text
+  inbox
+  daily log
+  current file heading
+  another heading in current file
+  chosen file
+  chosen file heading
+  project note
+  ```
+- Use a picker for destination file/heading selection.
+- Default behavior should be non-destructive or link-preserving: never lose the original source without explicit user intent.
+- When refiling from daily/inbox to a destination, keep the daily/inbox entry as history and add a link to the new home.
+- Destination content should include a backlink/reference to the source when useful.
+- This creates bidirectional navigation:
+  ```text
+  source daily/inbox entry -> destination note/task
+  destination note/task -> original source/context
+  ```
+- Future optional modes may include move/delete/archive, but first pass should prefer copy/link/refile over destructive moves.
+- Decision: default refile is explicitly non-destructive. It must never delete the original item by default; instead the original gets a `refiled to:` link and the destination copy gets a `source:` backlink.
+Progress:
+- First implementation pass added `:refile` / `:rf`. It takes the current non-empty line from a saved clean buffer, opens the normal Slate file picker in refile mode, appends a copy to the chosen destination Markdown file with `source: [file:line](source#Lline)`, and inserts `refiled to: [target](target)` under the original line. The original remains in place and the current buffer becomes dirty so the user controls saving the backlink.
+- Refile writes an `Organized` Daily event with a source link, so Daily remains the audit trail for organization actions without treating normal typing/tagging as organized events.
+- Refile heading pass added: after choosing a Markdown destination with headings, Slate now opens the shared heading picker in `refile heading` mode. First option appends to the end of the file; selecting a heading inserts the copied item under that section and writes the original `refiled to:` link with the heading fragment. The destination copy still gets a `source:` backlink, and Daily `Organized` remains the audit trail.
+- Agenda refile pass added: pressing `r` on a selected Agenda/Inbox/Tasks/Ideas/Notes item starts the same non-destructive refile flow directly from Agenda. It reads the source line, opens the destination file picker, optionally opens the heading picker, writes the destination copy/backlink, and adds `refiled to:` to the original source. If the source is the current dirty buffer, Slate asks the user to save first to avoid losing in-memory edits. File/heading pickers take keyboard focus over Agenda while active.
+- Daily Organized polish added: refile events now render as explicit audit entries with `refile — ...`, `from: ...`, and `to: ...` Markdown links instead of folding the target into the title. Destination heading anchors are preserved in the Daily `to:` link.
+- Interactive single-`[` Markdown link autocomplete added: typing `[` opens a compact file dropdown with recent files first and fuzzy project-file matching; files with headings show a `▸` affordance. `Enter` inserts `[](target)` for the whole file with the cursor inside the label; `Tab` or `Shift+Enter` opens the heading picker so the link can target a heading directly; `]` cancels for checkbox/manual Markdown; pressing `Enter` on an empty local Markdown-file label fills the file stem.
+- Flow metadata start now applies default task tags before adding `scheduled:`. This fixes `[] task` + metadata skip flow so the parent becomes `[] task #task #inbox` even when the user presses through empty scheduled/due fields.
+- First-pass `:backlinks` / `:mentions` implemented for the current file. Results are textual Markdown modal buffers with clickable file:line links.
+- Virtual end-of-document backlink/mention sections implemented for saved Markdown files. They render after the real buffer as non-saved Markdown (`---`, `## Backlinks`, `## Mentions`, `<!-- virtual: not saved to file -->`), cap inline results to 8 per section, and their result links are clickable.
+- Virtual references are now configurable in Settings with a persisted `Virtual backlinks/mentions` show/hide toggle.
+- Virtual references are clickable/collapsible: clicking the virtual header collapses/expands the whole section; clicking `Backlinks` or `Mentions` collapses/expands that subsection. Collapse state is persisted in settings.
+- Virtual end-of-document references were removed from the editor surface after visual review; `:backlinks` / `:mentions` modal commands remain the supported reference views for now. Revisit the virtual section later with a cleaner Slate-native design.
+- Validation after latest pass: `cargo fmt --all`, `cargo check`, `cargo test` (122 passed), and `cargo build --release`.
+
+### T057 — Slate Flow links, backlinks, and roam-ish navigation
+
+Status: in_progress
+Scope:
+- Keep using standard Markdown links as the final document syntax.
+- Decision update: single `[` is the primary inline Markdown link resolver trigger; `[[wiki]]` is not persistent syntax for now.
+- Done: add first-pass backlink/mention commands for the current file:
+  ```text
+  :backlinks
+  :bl
+  :mentions
+  :refs
+  ```
+- Done: `:backlinks` scans project Markdown links and shows external links that resolve to the current file, including heading/line fragments.
+- Done: `:mentions` scans project Markdown text for current file name/stem/path mentions, including unlinked mentions.
+- Done: results render as a textual modal Markdown buffer with clickable `[path:line](absolute#Lline)` result links and preview snippets.
+- Done: add virtual end-of-document references section, not physically written to the source file:
+  ```md
+  ---
+  ## Backlinks
+  ...
+  ## Mentions
+  ...
+  ```
+- Done: add Settings toggle for showing/hiding virtual Backlinks/Mentions sections.
+- Done: make the virtual references section and each Backlinks/Mentions subsection click-to-collapse/click-to-expand.
+- Done: `:find-note` / `:fn` / `:note-find` command.
+  - Searches Markdown notes by file name, heading, and content.
+  - Results are textual/keyboard-first in a modal Markdown buffer with clickable `path:line` links.
+- Deferred/removed for now: `:notes` and `:insert-note-link`; user does not see enough value while normal text insertion and `[` autocomplete already exist.
+- Done: bidirectional automatic linking inline command:
+  ```text
+  :link 
+  ```
+  - This is written in the file like `:idea` / `:note`, not run from the commandline.
+  - Typing the space after `:link` turns the line into the existing `[` autocomplete/file+heading picker flow.
+  - Slate uses that line as the source location.
+  - User chooses target file and optional heading.
+  - Slate inserts a normal Markdown link at the source line.
+  - Slate also writes a reciprocal Markdown backlink into the target file at the chosen heading or file end:
+    ```md
+    - linked from: [source:50](source.md#L50)
+    ```
+  - Keep source of truth plain Markdown; no hidden database-only relationships.
+- Support unlinked mentions later, but keep it textual and practical.
+- No graph view for now; user explicitly does not want graph/canvas PKM UI.
+- Link resolver should work across daily logs, inbox, project notes, task sources, and normal Markdown files.
+- Daily `source:` entries should become first-class link targets: clicking/activating a source reference should open the original Markdown file and jump to the original line.
+- The goal is a useful network of links: agenda items, refile events, captures, daily entries, and notes should be able to reference each other reliably.
+
+### T058 — Slate Flow integration with rtasks, rmenu, Waybar calendar, and thread daemon
+
+Status: in_progress
+Scope:
+- Future integration goal: tasks written anywhere in Slate appear in Slate agenda and can also appear in rtasks/calendar workflows.
+- Current Waybar calendar evidence:
+  ```text
+  ~/.config/waybar/config.jsonc -> custom/date -> ~/.local/bin/waybar-date-thread
+  ~/.local/bin/thread-calendar-gtk-popup -> socket wrapper
+  ~/.local/bin/thread-calendar-gtk-popupd -> GTK popup
+  calendar events source -> ~/.threadwell/calendar/collections/collection-root/thread/Tareas/*.ics
+  thread tasks source -> ~/.threadwell/tasks/tasks.jsonl
+  rtasks quick add -> ~/.local/bin/rtasks-quick-add -> rtasks quick-add
+  ```
+- Calendar popup currently has two task lanes: ICS calendar/habits/medication on the left and actionable Thread tasks from `tasks.jsonl` on the right.
+- Integration design decision: do **not** copy Slate Flow tasks into `tasks.jsonl` as the primary sync mechanism. Instead expose a small local Slate Flow API/surface that the calendar can read alongside rtasks, with completion routed back to the original Markdown source.
+- First-pass API should be CLI/file based, not a long-running web service:
+  ```text
+  slate flow-api list --json --days 45 [--scope PATH]
+  slate flow-api complete <id>
+  slate flow-api open <id>
+  slate flow-api rescan [--scope PATH]
+  ```
+- JSON task shape should be stable enough for GTK/Waybar:
+  ```json
+  {
+    "id": "slate:<scope-hash>:<path>:<line-number>:<title-hash>",
+    "source": "slate",
+    "title": "Revisar agenda",
+    "status": "todo|doing|done",
+    "priority": "high|medium|low|null",
+    "project": "slate",
+    "tags": ["flow"],
+    "dueIso": "2026-06-10",
+    "scheduledAtIso": "2026-06-09",
+    "path": "inbox.md",
+    "lineNumber": 4,
+    "heading": "Inbox"
+  }
+  ```
+- Field mapping:
+  ```text
+  Slate title -> calendar/rtasks title
+  due: YYYY-MM-DD -> dueIso
+  scheduled: YYYY-MM-DD -> scheduledAtIso
+  @project -> project
+  #tags -> tags
+  ALTA/MEDIA/BAJA -> high/medium/low
+  [] / [/] / [x] -> todo/doing/done
+  path:line -> source reference for open/complete
+  ```
+- Calendar should aggregate sources, not own them:
+  ```text
+  ICS events/habits/medication
+  + Thread/rtasks tasks.jsonl
+  + Slate Flow API tasks
+  -> one popup list
+  ```
+- Completion from calendar/thread daemon should call back into the source owner:
+  ```text
+  rtasks item -> update tasks.jsonl
+  Slate item -> slate flow-api complete <id> -> edit Markdown checkbox
+  ICS event -> update ICS STATUS/EXDATE
+  ```
+- Conflict rule: Slate completion only updates Markdown if the source path and expected task line/snippet still match; otherwise refuse with a clear conflict status and require opening Slate.
+- Later pass can add a Unix socket daemon for faster refresh, but the contract should remain local and scriptable.
+- Desired dream loop:
+  ```text
+  write []task in any Slate-touched file
+  -> Slate agenda indexes it
+  -> Waybar calendar sees it through Slate Flow API
+  -> rmenu / Telegram / thread daemon can show or complete it
+  -> completion syncs back to the original Markdown checkbox when safe
+  ```
+- Keep this integration as the bridge between tools while preserving Markdown as Slate's source of truth.
+Progress:
+- Added first-pass local CLI Flow API:
+  ```bash
+  slate flow-api list --json --days 45 --scope /home/nd/slate
+  slate flow-api complete <id> --scope /home/nd/slate
+  slate flow-api open <id> --scope /home/nd/slate
+  slate flow-api rescan --scope /home/nd/slate
+  ```
+- Flow API emits JSON tasks from the derived Slate agenda cache and auto-rescans when the cache is missing.
+- Flow API task IDs are generated from scope/path/line/title hash and keep `source: "slate"` so calendar/rmenu/thread can route actions back to Slate.
+- `flow-api complete` edits the original Markdown checkbox to `[x]`, then refreshes the derived cache.
+- Completion has a conflict guard: it refuses if the cached source snippet no longer matches the Markdown line.
+- Updated `thread-calendar-gtk-popupd` to aggregate Slate tasks with Thread/rtasks tasks using:
+  ```text
+  SLATE_BIN=/home/nd/slate/target/release/slate
+  SLATE_FLOW_SCOPE=/home/nd/slate
+  ```
+- Calendar task completion now routes by source:
+  ```text
+  source=thread -> tasks.jsonl
+  source=slate  -> slate flow-api complete <id>
+  ```
+- Waybar calendar now treats Slate `#task` as first-class calendar tasks: the GTK popup Tasks lane includes all pending Slate Flow items tagged `#task`, unprojected Slate tasks are grouped under `#task` instead of `Inbox`, dated Slate `#task` items are merged into day/event views, `waybar-date-thread` lights the task dot for today's dated Slate `#task`, and the terminal `thread-calendar-view` includes dated Slate tasks.
+- Flow parser now skips fenced code blocks so documentation examples do not flood the calendar/agenda as real tasks.
+- Added live Slate-buffer agenda publishing: when a task block is committed from the normal editor with Enter/Shift+Enter/Ctrl+Enter, Slate refreshes the derived Flow agenda cache from the current in-memory buffer even before the file is saved.
+- Normal Slate editor now shows the same centered `Agenda updated` toast as Scratch for about 0.4s after task/metadata/checkbox commits.
+- This lets Waybar calendar see tasks/checkmarks quickly from Slate without waiting for an explicit save; source Markdown is still authoritative.
+- Added bilateral completion requests for calendar -> Slate:
+  ```text
+  flow-api complete <id>
+  -> writes Markdown/cache when disk source still matches
+  -> always appends a local completion request under the Slate Flow scope cache
+  -> any open Slate editor polls that request and applies `[x]` to the matching in-memory buffer line
+  -> Slate republishes the in-memory buffer to agenda/cache and shows `Agenda updated`
+  ```
+- Reliability rule: external completion no longer overwrites mismatched disk text. If the task is currently dirty/unsaved in Slate, the running Slate window owns the in-memory edit; if Slate is closed and disk does not match, the request remains harmlessly pending instead of corrupting Markdown.
+- Added direct Threadwell agenda hook:
+  ```bash
+  /home/nd/.local/bin/slate-agenda-context
+  ```
+  It prints live Markdown-ish context from Slate Flow with `Today`, `Dated / upcoming`, and `No-date / inbox` sections, backed by `slate flow-api list --json --days 45 --scope /home/nd/slate`.
+- Added hook note for agents:
+  ```text
+  /home/nd/.threadwell/slate-agenda-hook.md
+  ```
+  When the user asks about agenda/tareas de hoy/cosas pendientes, Threadwell should run/read this hook first instead of rediscovering what Slate agenda means.
+- Promoted the hook direction into local Threadwell core at `/home/nd/threadwell/packages/daemon`: added first-party daemon tools `slate_agenda_list` and `slate_agenda_complete`, included `slate_agenda_list` in readonly daemon policy, included `slate_agenda_complete` in calendar/local mutation policies, and updated the daemon prompt so agenda questions use Slate agenda directly.
+
+### T059 — Slate Flow rich task metadata without bloat
+
+Status: pending
+Scope:
+- Do not limit Slate Flow to inline-only tasks, but also avoid heavyweight task objects.
+- Support a middle-ground task shape: concise inline tasks for normal writing, plus optional nearby metadata lines for richer task detail.
+- Keep the canonical lightweight form:
+  ```md
+  - [ ] Arreglar selección con mouse #editor #input @slate ALTA
+    - due: 2026-06-10
+    - scheduled: 2026-06-08
+    - related: [Periscope](README.md#periscope)
+    - note: revisar comportamiento con selección Unicode
+  ```
+- Consider accepting section-style task notes for larger tasks, inspired by `nb` todos, but only as an optional expanded form:
+  ```md
+  # [ ] Preparar release @slate ALTA
+
+  ## Due
+  2026-06-10
+
+  ## Related
+  - [README](README.md)
+
+  ## Notes
+  Revisar Periscope y buffers antes.
+  ```
+- Agenda/indexing should understand both forms where practical, but inline Markdown tasks remain the normal/default writing flow.
+- Rich metadata should add information to each task without making documents feel bloated.
+
+### T060 — Slate selector/resolver grammar, nice-to-have
+
+Status: pending
+Scope:
+- Nice-to-have lane inspired by `nb` selectors, but Slate-native and intentionally cautious because universal selectors can become sensitive/complex.
+- Explore a common resolver for paths, titles, recent files, buffers, Lance slots, headings, daily/inbox targets, tags, projects, and future agenda items.
+- Potential selector examples to discuss before implementing:
+  ```text
+  README
+  README.md
+  src/main.rs
+  project:README
+  home:notes/todo
+  recent:3
+  lance:1
+  buffer:2
+  daily:2026-06-07
+  inbox:
+  @slate
+  #editor
+  ```
+- Use it only if it improves existing Slate workflows such as `:open`, `:buffer`, `:agenda`, `:insert-link`, `:capture`, `:refile`, and `:backlinks`.
+- Do not introduce rigid `nb`-style notebooks or replace Slate's project/home model.
+
+### T061 — Slate search language
+
+Status: pending
+Scope:
+- Add a Slate-native search/filter language for future notes search, agenda, tags, backlinks, and textual result buffers.
+- Start with practical operators inspired by `nb`, adapted to Slate:
+  ```text
+  foo bar                  # AND
+  foo --or bar             # OR
+  foo --not target         # NOT
+  #editor @slate ALTA      # tag/project/priority filters
+  due:today
+  due:overdue
+  scheduled:this-week
+  type:task
+  path:src
+  ```
+- Reuse the language in `:search`, `:agenda`, `:backlinks`, `:mentions`, and maybe Periscope if Periscope becomes formalized beyond an idea.
+- Keep Periscope primarily as fast path/file search for now; do not over-formalize it before real usage proves it belongs.
+- Results should flow into Slate-native pickers or textual result buffers, not a web UI.
+
+### T062 — Slate Daily navigation and monthly reflection workflow
+
+Status: completed
+Scope:
+- Keep Slate's preferred monthly daily log design rather than adopting `nb`'s one-file-per-day default.
+- Do not add quick append as a second capture surface. Daily should reflect agenda/Flow changes; capture remains `:note`, `:idea`, plain `:`, checkbox tasks, Scratch, and Agenda.
+- Add commands/workflows for navigating and maintaining the monthly reflection:
+  ```text
+  :daily                 # open current monthly daily at today's section
+  :daily-log             # alias/open current monthly daily
+  :daily yesterday       # jump to previous day's section
+  :daily YYYY-MM-DD      # jump to a specific day in the monthly log
+  :daily refresh         # rebuild/repair daily entries from Flow cache/history where possible
+  ```
+- Add a simple previous-day/month picker or command for browsing recent daily entries.
+- Daily should remain the chronological backup/trail for agenda changes, completions, captures, and refile history, not a replacement for agenda, inbox, or project notes.
+Progress:
+- First implementation pass added command catalog/parser support for `:daily`, `:daily-log`, and `:journal` with targets `today`/empty, `yesterday`/`ayer`, `YYYY-MM-DD`, and `refresh`/`rebuild`.
+- Command execution now ensures the monthly Daily file exists, opens it in Slate, and jumps the cursor to the requested day heading. Dirty buffers are protected: Slate asks the user to save/discard before opening Daily.
+- `:daily refresh` currently opens/ensures today's monthly Daily and is reserved as the UX entry point for deeper rebuild/repair once more Flow history is persisted.
+- Daily source links now use standard Markdown link syntax and line fragments, so Daily navigation is already aligned with the future linking/backlink lane.
+- Validation after first pass: `cargo fmt --all`, `cargo check`, `cargo test` (120 passed), and `cargo build --release`.
+
+### T063 — Optional sync/checkpoint lane
+
+Status: pending
+Scope:
+- Future lane only; do not implement until Slate Flow/index/refile behavior is useful locally.
+- Explore optional history/checkpoint/sync workflows inspired by `nb`, but Slate should not require Git or remote sync.
+- Possible options:
+  ```text
+  git checkpoints
+  rclone sync
+  Syncthing-friendly folder layout
+  manual export/import
+  status/history textual buffers
+  ```
+- Keep Markdown/local files as source of truth and avoid surprise auto-sync by default.
+- Any conflict handling must be explicit, textual, and safe.
+- This lane is for user-chosen backup/sync/history, not plugin infrastructure.
+
+### T064 — Main.rs modular refactor
+
+Status: completed
+Scope:
+- Reduce `src/main.rs` from a 13k+ line mixed app file into focused modules without a disruptive rewrite.
+- Keep behavior unchanged while moving code; prefer compileable incremental batches over a big-bang refactor.
+- Preserve local-first/plain-text architecture and avoid introducing framework or plugin abstractions.
+
+Plan:
+1. Stabilize seams first:
+   - add/keep small public methods on `SlateApp` only where modules need to coordinate;
+   - avoid changing command names, shortcuts, Flow cache formats, or runtime request files during extraction;
+   - run `cargo fmt --all`, `cargo check`, and focused tests after every batch.
+2. Create reusable Flow edit/autocomplete module:
+   - add `src/flow_edit.rs` for the upcoming reusable Flow item edit mini-modal;
+   - centralize `#tag` / `@project` suggestion state and rendering there;
+   - reuse it from agenda first, then from normal editor Flow-line typing.
+3. Extract Flow runtime plumbing:
+   - add `src/flow_runtime.rs` for active-buffer heartbeat, open requests, completion requests, organization requests, and runtime path helpers;
+   - keep request file formats compatible:
+     `active-buffers.tsv`, `open-requests.tsv`, `completion-requests.tsv`, `organization-requests.tsv`.
+4. Extract agenda UI/actions:
+   - add `src/agenda.rs` for agenda tabs, row rendering, selection movement, open/cycle/tag/project actions, and standalone agenda behavior;
+   - keep `Enter`, `Ctrl+Enter`, `Shift+Tab`, `#`, `@`, and `Esc` behavior unchanged.
+5. Extract scratch/capture:
+   - add `src/scratch.rs` for scratch modal, scratch archive, quick capture, and scratch standalone close behavior.
+6. Extract command surfaces:
+   - add `src/commands.rs` for command definitions, command palette metadata, command execution, command history/suggestions, and command-line dispatch.
+7. Extract picker/dialog families only after agenda is stable:
+   - `src/file_dialogs.rs` for open/save/save-as/recent;
+   - `src/periscope.rs` for project/global file search;
+   - `src/link_ui.rs` for link assist, heading picker, and link preview.
+8. Leave `src/main.rs` as orchestration:
+   - app bootstrap;
+   - `SlateApp` construction/wiring if still needed;
+   - `eframe::App` update flow;
+   - cross-module state fields until a later, smaller state split is obviously safe.
+9. Optional final cleanup:
+   - split `SlateApp` state into nested structs only when module boundaries are stable, e.g. `AgendaState`, `ScratchState`, `PickerState`;
+   - update README/SLATE_FLOW docs only for user-visible behavior, not internal file movement.
+
+Suggested batch order:
+- Batch A: create `flow_edit.rs` with the new mini-modal/autocomplete; no existing behavior removed. In progress: extracted reusable Flow organization mode, suggestion filtering, token creation, token append helper, and `FlowItemEditState` into `src/flow_edit.rs`; agenda now uses this for `#`/`@` autocomplete and the `Shift+Enter` edit mini-modal.
+- Batch B: move runtime request helpers to `flow_runtime.rs`. In progress: added `src/flow_runtime.rs`; moved reusable runtime path/request append helpers for completion, organization, edit, and open requests; moved active-buffer heartbeat/active-buffer lookup helpers; moved shared relative path formatting; moved request parsing/draining for open, completion, organization, and edit requests. `main.rs` still owns applying requests because that mutates editor/UI state.
+- Batch C: move agenda rendering/actions to `agenda.rs`. Completed first extraction pass: added `src/agenda.rs`; moved core agenda types (`AgendaItem`, `AgendaFocus`, `AgendaTab`, `AgendaDatedRow`), cache loading/cache-row parsing, Flow-task-to-agenda-item conversion, live-buffer overlay, agenda sorting, week/date row helpers, selection clamp/move/selected-index helpers, task-line/state-marker formatting, row rendering helpers, and pure visibility/filter/tab matching helpers out of `main.rs`. Remaining agenda code in `main.rs` is mostly app-state orchestration and editor/standalone side effects.
+- Batch D: move scratch/capture to `scratch.rs`. Completed first extraction pass after Batch C compiled and tests passed: added `src/scratch.rs`; moved `ScratchEntry`, scratch archive path/append helper, quickadd normalization/splitting, capture-entry formatting, scratch archive parse/serialize, scratch feedback toast rendering, and focused scratch module tests. Remaining scratch code in `main.rs` is app-state orchestration, editor-buffer interaction, and modal wiring.
+- Batch E: move command palette/command line to `commands.rs`. Completed: added `src/commands.rs`; moved `Command`, `CommandSpec`, `COMMAND_SPECS`, command-name/canonical-alias lookup, command prefix parsing, fuzzy command scoring, best completion token selection, ranked command suggestion helpers, pure `CommandLineAction` / `CommandLineNumberMode` parsing for `:command args`, command history limit/trim/push helpers, and command usage parse/merge/record/ranking/boost helpers with focused module tests. `main.rs` now keeps only command execution and app-state/UI side effects. Validated with `cargo fmt --all`, `cargo check`, `cargo test` (107 passed), and `cargo build --release`.
+- Batch F: move pickers/link/periscope modules. Completed: added `src/file_dialogs.rs`, `src/link_ui.rs`, and `src/periscope.rs`; moved file picker modes, picker/ranking/window helpers, file metadata labels, directory scanning skip policy, link assist choice/heading options, Markdown link target/path/heading-anchor helpers, web-target detection, Periscope modes/index rows, project/home indexing, fuzzy path scoring, cached result ranking, folder grouping, row selection, and focused tests. `main.rs` keeps picker/link/periscope UI orchestration, modal wiring, editor-buffer mutations, and dirty/open side effects. Validated with `cargo fmt --all`, `cargo check`, `cargo test` (113 passed), and `cargo build --release`.
+- Completion note: first-stage modular refactor is done. Flow edit/autocomplete polish was validated manually, including cursor-aware `#tag` / `@project` replacement and normal-editor vertical suggestions. Optional future cleanup remains separate work: nested state structs such as `AgendaState`, `ScratchState`, `PickerState`, and module docs/manual UI checklist.
+
+Validation:
+- After every batch: `cargo fmt --all && cargo check`.
+- After behavior-moving batches: `cargo test` plus focused Flow/agenda/editor buffer tests.
+- After UI/shortcut-moving batches: manually verify agenda, standalone agenda, scratch, commandline, and editor navigation.
 
 Command groups worth considering:
 
@@ -673,13 +1303,18 @@ Follow-up — Duplicate placement transient mode: done.
 26. T022 — Tags and lightweight metadata.
 27. T035 — Append/capture side effects from normal editing.
 28. T036 — Textual result buffers.
-30. T009 — Theme system.
-31. T008 — Lightweight Markdown preview improvements.
-32. T011 — Buffers / multi-file workflow.
-33. T012 — Optional auto-save.
-34. T034 — Repeatable edits and lightweight macros.
-35. T037 — Curated defaults instead of infinite configurability.
-36. T038 — Literate Markdown configuration polish.
+29. T050–T059 — Slate Flow agenda, rich task metadata, SQLite cache, readable `.slate` index, daily/refile/link workflows.
+30. T060 — Nice-to-have universal selector/resolver grammar; discuss carefully before implementing.
+31. T061 — Slate search language for notes, agenda, tags, backlinks, and maybe future Periscope formalization.
+32. T062 — Slate Daily quick append and previous-day workflow.
+33. T063 — Optional future sync/checkpoint lane with git/rclone/Syncthing possibilities.
+34. T009 — Theme system.
+35. T008 — Lightweight Markdown preview improvements.
+36. T011 — Buffers / multi-file workflow.
+37. T012 — Optional auto-save.
+38. T034 — Repeatable edits and lightweight macros.
+39. T037 — Curated defaults instead of infinite configurability.
+40. T038 — Literate Markdown configuration polish.
 
 <!-- THREADSUITE:START -->
 # ACTIVE_QUEUE.md
