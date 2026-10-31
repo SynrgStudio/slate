@@ -24,6 +24,7 @@ impl SlateApp {
                     ("Ctrl+Tab", "next tab (Shift: previous)"),
                     ("Ctrl+1…9", "go to tab (9 = last)"),
                     ("Ctrl+Shift+T", "reopen closed tab"),
+                    ("double-click tab", "alias (name inside Slate)"),
                     ("Ctrl+wheel", "next / previous tab"),
                     ("Ctrl+Q", "close window (stays in tray)"),
                 ],

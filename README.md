@@ -140,7 +140,12 @@ instantly instead of starting a new one. Use `slate --new-window file.md`
 
 Files open in tabs: opening a file that is already open switches to its tab,
 and `slate file.md` adds a tab to the running window. Drag tabs to reorder
-them; files with the same name show their folder (`README.md · notas`). Tabs survive closing the
+them; files with the same name show their folder (`README.md · notas`).
+
+Double-click a tab (or run `:alias Weekly meeting`) to give its file an alias:
+a name shown only inside Slate — in tabs, the window title, Lance and recent
+files — while the file keeps its real name on disk. Periscope finds files by
+alias too (`Weekly meeting · 2026-10-31-notes.md`). `:alias` alone removes it. Tabs survive closing the
 window and restarting Slate.
 
 Closing the window keeps Slate running in the tray, so opening it again is
@@ -236,6 +241,7 @@ Open the command line with `Ctrl+.`. Commands may be typed with or without the l
 :q                         close the window (Slate stays in the tray)
 :wq / :x                   save and close the window
 :close / :bd               close the current tab
+:alias NAME                name the current file inside Slate (:alias clears)
 :quit-all / :exit-all      quit Slate completely
 :new / :enew               new buffer
 :open / :e                 open file picker

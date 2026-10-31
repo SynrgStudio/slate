@@ -51,5 +51,9 @@ document keeps its own durable checkpoint.
    tooltips. External changes to an inactive tab's file are flagged when the
    tab is shown again (switching re-checks the file at once), and the agenda
    overlays unsaved tasks from every tab.
-3. Aliases: rename by double click, show everywhere, Periscope search.
+3. Aliases (done 2026-10-31): double click a tab (or `:alias NAME`) to
+   rename it inline; `aliases.json` next to the settings; shown in tabs,
+   the window title, Lance and recent files; Periscope matches every word
+   of the query against aliases and lists those files first. App shortcuts
+   pause while an alias is being typed.
 4. Drag a tab out to a new window.

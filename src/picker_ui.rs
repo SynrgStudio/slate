@@ -345,10 +345,7 @@ impl SlateApp {
                                         ActivePicker::Lance => {
                                             let index = lance_matches[match_position];
                                             let path = &self.lance_files[index];
-                                            let name = path
-                                                .file_name()
-                                                .and_then(|name| name.to_str())
-                                                .unwrap_or("unknown");
+                                            let name = self.aliases.labeled(path);
                                             (
                                                 index,
                                                 format!("{} {}", index + 1, name),
@@ -361,10 +358,7 @@ impl SlateApp {
                                         ActivePicker::Recent => {
                                             let index = recent_matches[match_position];
                                             let path = &self.recent_files[index];
-                                            let name = path
-                                                .file_name()
-                                                .and_then(|name| name.to_str())
-                                                .unwrap_or("unknown");
+                                            let name = self.aliases.labeled(path);
                                             (
                                                 index,
                                                 name.to_string(),

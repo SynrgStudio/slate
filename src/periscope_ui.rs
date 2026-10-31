@@ -217,6 +217,10 @@ impl SlateApp {
                             } else {
                                 path.display().to_string()
                             };
+                            let label = match self.aliases.get(path) {
+                                Some(alias) => format!("{alias} · {label}"),
+                                None => label,
+                            };
                             (path, label, false)
                         }
                     };

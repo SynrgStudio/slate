@@ -65,6 +65,7 @@ mod preview_ui;
 mod periscope_ui;
 mod picker_ui;
 mod agenda_ui;
+mod aliases;
 mod save_as_ui;
 mod help_ui;
 mod settings_ui;
@@ -843,6 +844,7 @@ struct SlateApp {
     start_with_windows: bool,
     flow_worker: flow_worker::FlowWorker,
     tabs: tabs::Tabs,
+    aliases: aliases::Aliases,
     /// An open action that continues in a freshly opened tab this frame.
     pending_tab_action: Option<PendingAction>,
     /// Ctrl+wheel accumulator so touchpads switch one tab per gesture step.
@@ -1071,6 +1073,16 @@ impl SlateApp {
             start_with_windows: resident::autostart_enabled(),
             flow_worker: flow_worker::FlowWorker::start(cc.egui_ctx.clone()),
             tabs: tabs::Tabs::default(),
+            // Tests never read the user's aliases.
+            aliases: if cfg!(test) {
+                aliases::Aliases::default()
+            } else {
+                aliases::Aliases::load(
+                    Self::settings_path()
+                        .and_then(|p| p.parent().map(|dir| dir.join("aliases.json")))
+                        .as_deref(),
+                )
+            },
             pending_tab_action: None,
             tab_wheel: 0.0,
             markdown_live_rendering: true,
@@ -1235,9 +1247,8 @@ impl SlateApp {
     fn title(&self) -> String {
         let name = self
             .path
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .and_then(|s| s.to_str())
+            .as_deref()
+            .and_then(|p| self.aliases.get(p).or_else(|| p.file_name()?.to_str()))
             .unwrap_or("untitled");
         if self.scratch && self.path.is_none() {
             format!("{}Slate Scratch", if self.dirty { "*" } else { "" })
@@ -5569,6 +5580,7 @@ impl SlateApp {
             }
             let selected_path = self.selected_periscope_row();
             self.periscope_results = result.paths;
+            self.add_alias_matches_to_periscope();
             self.periscope_backend_status = result.status;
             self.periscope_global_loading = false;
             self.selected_periscope_result = selected_path
@@ -6539,6 +6551,10 @@ impl SlateApp {
                     self.record_command_usage("open");
                     self.open_path(expanded);
                 }
+            }
+            CommandLineAction::Alias(alias) => {
+                self.record_command_usage("alias");
+                self.rename_tab(self.tabs.active, Some(&alias));
             }
             CommandLineAction::BrowsePath(path) => {
                 self.record_command_usage("cd");
@@ -9799,7 +9815,9 @@ impl SlateApp {
         if self.close_standalone_agenda_if_requested(&ctx) {
             return;
         }
-        self.shortcuts(&ctx);
+        if !window_ui::renaming_tab(&ctx) {
+            self.shortcuts(&ctx);
+        }
         let labels = if self.scratch || self.standalone_agenda {
             Vec::new()
         } else {
@@ -9810,6 +9828,9 @@ impl SlateApp {
             Some(window_ui::TabAction::Close(index)) => self.close_tab(index),
             Some(window_ui::TabAction::New) => self.new_tab(),
             Some(window_ui::TabAction::Move { from, to }) => self.move_tab(from, to),
+            Some(window_ui::TabAction::Rename { index, alias }) => {
+                self.rename_tab(index, Some(&alias))
+            }
             None => {}
         }
         if self.recovery_open || self.file_conflict.is_some() {

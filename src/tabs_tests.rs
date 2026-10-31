@@ -423,3 +423,48 @@ fn the_agenda_sees_unsaved_tasks_of_every_tab() {
     titles.sort();
     assert_eq!(titles, ["comprar pan", "llamar a Ana"]);
 }
+
+fn run_command_line(f: &mut Fixture, line: &str) {
+    f.app.command_line = line.to_string();
+    let app = &mut f.app;
+    let _ = f.ctx.run_ui(egui::RawInput::default(), |ui| {
+        app.run_command_line(&ui.ctx().clone())
+    });
+}
+
+#[test]
+fn an_alias_names_the_file_in_tabs_title_lance_and_periscope_only() {
+    let mut f = Fixture::new();
+    let note = f.file("2026-10-31-notas.md", "x\n");
+    let other = f.file("otro.md", "y\n");
+    f.open(&note);
+    run_command_line(&mut f, ":alias Reunión semanal");
+    assert_eq!(f.labels(), ["Reunión semanal"]);
+    assert!(f.app.title().starts_with("Reunión semanal — Slate"));
+    assert_eq!(
+        f.app.aliases.labeled(&note),
+        "Reunión semanal · 2026-10-31-notas.md"
+    );
+    assert!(note.exists(), "the file keeps its real name");
+    assert!(f.root.join("aliases.json").exists(), "saved");
+
+    f.app.periscope_query = "semanal".into();
+    f.app.periscope_results = vec![other.clone(), note.clone()];
+    f.app.add_alias_matches_to_periscope();
+    assert!(
+        tabs::same_file(&f.app.periscope_results[0], &note),
+        "alias match first"
+    );
+    assert_eq!(f.app.periscope_results.len(), 2, "no duplicate");
+
+    run_command_line(&mut f, ":alias");
+    assert_eq!(
+        f.labels(),
+        ["2026-10-31-notas.md"],
+        "blank alias removes it"
+    );
+
+    f.app.new_tab();
+    run_command_line(&mut f, ":alias Borrador");
+    assert_eq!(f.app.status, "Save the file first to give it an alias");
+}

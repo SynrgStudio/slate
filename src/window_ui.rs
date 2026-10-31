@@ -77,15 +77,30 @@ pub fn titlebar(ui: &mut egui::Ui, title: &str) {
 }
 
 /// What the user did on the tab strip this frame.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum TabAction {
     Activate(usize),
     Close(usize),
-    Move { from: usize, to: usize },
+    Move {
+        from: usize,
+        to: usize,
+    },
+    /// Double click, type, Enter: the tab's alias (blank removes it).
+    Rename {
+        index: usize,
+        alias: String,
+    },
     New,
 }
 
 const TAB_FONT: f32 = 12.0;
+const RENAMING_TAB: &str = "slate_tab_renaming";
+
+/// True while a tab's alias is being typed: app shortcuts must not take its keys.
+pub fn renaming_tab(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<(u64, bool)>(egui::Id::new(RENAMING_TAB)))
+        .is_some()
+}
 
 /// Draws the tabs from the left edge of the title bar and returns where the
 /// strip ends (the rest of the bar stays draggable).
@@ -232,6 +247,56 @@ fn draw_tabs(
         } else {
             Color32::from_rgb(136, 154, 176)
         };
+        // Inline rename (alias): double click turns the label into a text field.
+        let rename_id = egui::Id::new(RENAMING_TAB);
+        let rename_text_id = egui::Id::new("slate_tab_rename_text");
+        if response.double_clicked() {
+            ui.ctx().data_mut(|d| {
+                d.insert_temp(rename_id, (tab.id, true));
+                d.insert_temp(rename_text_id, tab.text.clone());
+            });
+        }
+        if let Some((renaming, first_frame)) =
+            ui.ctx().data(|d| d.get_temp::<(u64, bool)>(rename_id))
+            && renaming == tab.id
+        {
+            let mut text: String = ui
+                .ctx()
+                .data(|d| d.get_temp(rename_text_id))
+                .unwrap_or_else(|| tab.text.clone());
+            let field = egui::Rect::from_min_max(
+                egui::pos2(rect.left() + 6.0, rect.top() + 3.0),
+                egui::pos2(rect.right() - 24.0, rect.bottom() - 3.0),
+            );
+            let edit = ui.put(
+                field,
+                egui::TextEdit::singleline(&mut text)
+                    .font(font.clone())
+                    .text_color(Color32::from_rgb(216, 222, 233))
+                    .background_color(Color32::from_rgb(30, 37, 48))
+                    .hint_text("alias"),
+            );
+            if first_frame {
+                edit.request_focus();
+                ui.ctx()
+                    .data_mut(|d| d.insert_temp(rename_id, (tab.id, false)));
+            }
+            if edit.lost_focus() {
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    *action = Some(TabAction::Rename {
+                        index,
+                        alias: text.clone(),
+                    });
+                }
+                ui.ctx().data_mut(|d| {
+                    d.remove::<(u64, bool)>(rename_id);
+                    d.remove::<String>(rename_text_id);
+                });
+            } else {
+                ui.ctx().data_mut(|d| d.insert_temp(rename_text_id, text));
+            }
+            continue;
+        }
         let mut job =
             egui::text::LayoutJob::simple_singleline(tab.text.clone(), font.clone(), text_color);
         job.wrap.max_width = (rect.width() - 34.0).max(8.0);
@@ -642,6 +707,63 @@ mod tests {
                 "active {active} visible: {rect:?}"
             );
         }
+    }
+    #[test]
+    fn double_clicking_a_tab_edits_its_alias_and_enter_commits() {
+        let ctx = egui::Context::default();
+        let tabs = vec![crate::tabs::TabLabel {
+            id: 7,
+            text: "nota.md".into(),
+            dirty: false,
+            tooltip: String::new(),
+        }];
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(900.0, 560.0));
+        let mut frame = |time: f64, events: Vec<egui::Event>| {
+            let mut action = None;
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ui| action = titlebar_with_tabs(ui, "Slate", &tabs, 0),
+            );
+            action
+        };
+        frame(0.0, vec![]);
+        let tab = ctx
+            .data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("tab_rect", 0))))
+            .unwrap();
+        let at = tab.left_center() + Vec2::new(20.0, 0.0);
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(0.1, vec![egui::Event::PointerMoved(at)]);
+        frame(0.2, vec![button(true)]);
+        frame(0.25, vec![button(false)]);
+        frame(0.3, vec![button(true)]);
+        frame(0.35, vec![button(false)]);
+        frame(0.4, vec![]);
+        frame(0.5, vec![egui::Event::Text(" · plan".into())]);
+        let enter = egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let action = frame(0.6, vec![enter]);
+        assert_eq!(
+            action,
+            Some(TabAction::Rename {
+                index: 0,
+                alias: "nota.md · plan".into()
+            })
+        );
     }
     #[test]
     fn title_is_centered_on_window_and_never_overlaps_controls() {

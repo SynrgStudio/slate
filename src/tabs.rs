@@ -170,6 +170,15 @@ impl SlateApp {
             .map(|index| self.tab_path(index))
             .collect();
         let names = disambiguated_names(&paths);
+        let names: Vec<String> = names
+            .into_iter()
+            .zip(&paths)
+            .map(|(name, path)| {
+                path.and_then(|path| self.aliases.get(path))
+                    .map(str::to_owned)
+                    .unwrap_or(name)
+            })
+            .collect();
         self.tabs
             .list
             .iter()
@@ -179,7 +188,11 @@ impl SlateApp {
                 let dirty = tab.doc.as_ref().map_or(self.dirty, |doc| doc.dirty);
                 let tooltip = match path {
                     Some(path) => format!(
-                        "{}{}",
+                        "{}{}{}",
+                        self.aliases
+                            .get(path)
+                            .map(|alias| format!("{alias} → "))
+                            .unwrap_or_default(),
                         path.display(),
                         if dirty { " · unsaved changes" } else { "" }
                     ),
@@ -207,6 +220,59 @@ impl SlateApp {
                 agenda::overlay_live_buffer_items(items, path, &root, doc.buffer.as_str());
             }
         }
+    }
+
+    fn aliases_path(&self) -> Option<PathBuf> {
+        #[cfg(test)]
+        return self
+            .settings_path_override
+            .as_ref()
+            .and_then(|path| path.parent().map(|dir| dir.join("aliases.json")));
+        #[cfg(not(test))]
+        Self::settings_path()?
+            .parent()
+            .map(|dir| dir.join("aliases.json"))
+    }
+
+    /// Names the tab's file inside Slate (the file on disk keeps its name).
+    /// A blank alias, or the file's own name, removes it.
+    pub(super) fn rename_tab(&mut self, index: usize, alias: Option<&str>) {
+        let Some(path) = self.tab_path(index).map(Path::to_path_buf) else {
+            self.status = "Save the file first to give it an alias".into();
+            return;
+        };
+        let file_name = file_label(Some(&path));
+        let alias = alias
+            .map(str::trim)
+            .filter(|alias| !alias.is_empty() && *alias != file_name);
+        let file = self.aliases_path();
+        self.status = match self.aliases.set(file.as_deref(), &path, alias) {
+            Ok(()) => match alias {
+                Some(alias) => format!("Alias: {alias} · {file_name} stays its real name"),
+                None => format!("Alias removed · {file_name}"),
+            },
+            Err(err) => format!("Alias set for this session; not saved: {err}"),
+        };
+    }
+
+    /// Periscope also finds files by alias; those matches come first.
+    pub(super) fn add_alias_matches_to_periscope(&mut self) {
+        let project = (self.periscope_mode == PeriscopeMode::Project)
+            .then(|| self.periscope_project_root.clone())
+            .flatten();
+        let mut matches: Vec<PathBuf> = self
+            .aliases
+            .matching(&self.periscope_query)
+            .into_iter()
+            .filter(|path| project.as_ref().is_none_or(|root| path.starts_with(root)))
+            .collect();
+        if matches.is_empty() {
+            return;
+        }
+        self.periscope_results
+            .retain(|path| !matches.iter().any(|alias_path| same_file(alias_path, path)));
+        matches.append(&mut self.periscope_results);
+        self.periscope_results = matches;
     }
 
     /// Moves a tab in the strip; the active tab stays active.

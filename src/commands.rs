@@ -706,6 +706,8 @@ pub(crate) enum CommandLineAction {
     SaveQuit,
     OpenPath(String),
     BrowsePath(String),
+    /// `:alias NAME` names the current file inside Slate; `:alias` clears it.
+    Alias(String),
     OpenBufferPath(String),
     QuickAdd(Option<String>),
     Daily {
@@ -783,6 +785,7 @@ pub(crate) fn parse_command_line(raw: &str) -> CommandLineAction {
             }
         }
         "cd" | "chdir" => CommandLineAction::BrowsePath(remaining_args(parts)),
+        "alias" | "tab-name" => CommandLineAction::Alias(remaining_args(parts)),
         "open-buffer" | "ob" | "buffer-open" => {
             let path = remaining_args(parts);
             if path.is_empty() {
