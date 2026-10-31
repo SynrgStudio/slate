@@ -40,6 +40,18 @@ pub(crate) fn instance_file() -> Option<PathBuf> {
 /// Tries to hand `request` to a running Slate. Returns true only when the
 /// running instance acknowledged it.
 pub(crate) fn forward(instance_file: &Path, request: &OpenRequest) -> bool {
+    // The running (possibly hidden) window is about to show itself; let it take
+    // the foreground that this freshly launched process owns.
+    crate::resident::allow_foreground_handoff();
+    send(instance_file, |token| encode_request(token, request))
+}
+
+/// True when a running Slate answers; it does not show or open anything.
+pub(crate) fn is_running(instance_file: &Path) -> bool {
+    send(instance_file, |token| format!("{token}\nPING\n"))
+}
+
+fn send(instance_file: &Path, encode: impl FnOnce(&str) -> String) -> bool {
     let Ok(contents) = std::fs::read_to_string(instance_file) else {
         return false;
     };
@@ -52,10 +64,7 @@ pub(crate) fn forward(instance_file: &Path, request: &OpenRequest) -> bool {
     };
     let _ = stream.set_read_timeout(Some(REPLY_TIMEOUT));
     let _ = stream.set_write_timeout(Some(REPLY_TIMEOUT));
-    if stream
-        .write_all(encode_request(&token, request).as_bytes())
-        .is_err()
-    {
+    if stream.write_all(encode(&token).as_bytes()).is_err() {
         return false;
     }
     let mut reply = String::new();
@@ -130,16 +139,30 @@ fn handle_connection(stream: TcpStream, token: &str) -> Option<OpenRequest> {
     let mut writer = stream.try_clone().ok()?;
     let mut reader = BufReader::new(std::io::Read::take(stream, MAX_REQUEST_BYTES));
     let mut message = String::new();
-    // Exactly two lines: token, then the OPEN record.
+    // Exactly two lines: token, then the OPEN or PING record.
     for _ in 0..2 {
         if reader.read_line(&mut message).ok()? == 0 {
             break;
         }
     }
-    let request = decode_request(token, &message);
-    let reply = if request.is_some() { "OK\n" } else { "ERR\n" };
+    let ping = is_ping(token, &message);
+    let request = if ping {
+        None
+    } else {
+        decode_request(token, &message)
+    };
+    let reply = if ping || request.is_some() {
+        "OK\n"
+    } else {
+        "ERR\n"
+    };
     let _ = writer.write_all(reply.as_bytes());
     request
+}
+
+fn is_ping(token: &str, message: &str) -> bool {
+    let mut lines = message.lines();
+    lines.next() == Some(token) && lines.next() == Some("PING")
 }
 
 fn parse_instance_file(contents: &str) -> Option<(u16, String)> {
@@ -204,10 +227,8 @@ mod tests {
     use std::sync::mpsc;
 
     fn temp_instance_file(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "slate-instance-test-{name}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("slate-instance-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("instance")
@@ -251,6 +272,21 @@ mod tests {
 
         drop(server);
         assert!(!file.exists(), "instance file is removed on shutdown");
+    }
+
+    #[test]
+    fn ping_answers_without_queuing_or_waking() {
+        let file = temp_instance_file("ping");
+        assert!(!is_running(&file), "no instance yet");
+        let (woke_tx, woke_rx) = mpsc::channel();
+        let server = Server::start(file.clone(), move || {
+            let _ = woke_tx.send(());
+        })
+        .unwrap();
+
+        assert!(is_running(&file));
+        assert!(woke_rx.recv_timeout(Duration::from_millis(200)).is_err());
+        assert!(server.take_requests().is_empty());
     }
 
     #[test]

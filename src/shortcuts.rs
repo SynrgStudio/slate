@@ -1212,7 +1212,7 @@ impl SlateApp {
         }
 
         if settings_next {
-            self.selected_setting = (self.selected_setting + 1).min(9 + footer_ui::FIELDS.len());
+            self.selected_setting = (self.selected_setting + 1).min(11 + footer_ui::FIELDS.len());
             return;
         }
 
@@ -1229,6 +1229,8 @@ impl SlateApp {
                 8 => self.set_editor_font_size(self.editor_font_size - 1.0),
                 9..=18 => self.set_footer_option(self.selected_setting - 9, false),
                 19 => self.set_periscope_everything(false),
+                20 => self.set_resident(false),
+                21 => self.set_start_with_windows(false),
                 _ => {}
             }
             return;
@@ -1268,6 +1270,12 @@ impl SlateApp {
                 }
                 19 => self.set_periscope_everything(if settings_activate {
                     !self.periscope_everything
+                } else {
+                    true
+                }),
+                20 => self.set_resident(if settings_activate { !self.resident } else { true }),
+                21 => self.set_start_with_windows(if settings_activate {
+                    !self.start_with_windows
                 } else {
                     true
                 }),

@@ -7,6 +7,8 @@ mod commands;
 mod daily;
 #[cfg(test)]
 mod dialog_tests;
+#[cfg(test)]
+mod resident_tests;
 mod dialog_ui;
 mod document_safety;
 mod editor_buffer;
@@ -52,6 +54,7 @@ mod link_ui;
 mod markdown;
 mod perf_log;
 mod parallel;
+mod resident;
 mod single_instance;
 mod flow_api;
 mod flow_worker;
@@ -219,6 +222,7 @@ fn main() -> eframe::Result {
     let mut scratch = false;
     let mut standalone_agenda = false;
     let mut new_window = false;
+    let mut background = false;
     let mut path = None;
     let mut startup_line = None;
     let mut args = raw_args.into_iter().peekable();
@@ -228,6 +232,7 @@ fn main() -> eframe::Result {
             "--scratch" | "-s" => scratch = true,
             "--agenda" | "--ag" => standalone_agenda = true,
             "--new-window" | "-n" => new_window = true,
+            "--background" => background = true,
             "--line" | "-l" => {
                 startup_line = args.next().and_then(|value| value.parse::<usize>().ok());
             }
@@ -239,7 +244,18 @@ fn main() -> eframe::Result {
         && !standalone_agenda
         && !new_window
         && SlateApp::config_single_instance_enabled();
-    if use_single_instance {
+    if background {
+        // Start-with-Windows entry: only useful as the resident primary, and
+        // never shows anything when Slate is already running.
+        let running = single_instance::instance_file()
+            .is_some_and(|file| single_instance::is_running(&file));
+        if !use_single_instance || running {
+            perf_log::mark("startup.background_skipped", if running { "running" } else { "single instance off" });
+            perf_log::flush();
+            return Ok(());
+        }
+    }
+    if use_single_instance && !background {
         if let Some(file) = single_instance::instance_file() {
             let request = single_instance::OpenRequest {
                 path: path
@@ -305,6 +321,7 @@ fn main() -> eframe::Result {
                 let mut app = SlateApp::new(cc, path, scratch, standalone_agenda, startup_line);
                 if use_single_instance {
                     app.start_instance_server(&cc.egui_ctx);
+                    app.enable_resident(cc, background);
                 }
                 Ok(Box::new(app))
             }),
@@ -809,6 +826,15 @@ struct SlateApp {
     reopen_last_file_on_startup: bool,
     single_instance: bool,
     instance_server: Option<single_instance::Server>,
+    /// Config: closing the primary window hides it in the tray.
+    resident: bool,
+    /// Resident mode is running in this process (tray icon installed).
+    resident_active: bool,
+    window_hidden: bool,
+    hide_on_first_frame: bool,
+    /// Set by :quit-all / the tray menu: the next close really exits.
+    quit_for_real: bool,
+    start_with_windows: bool,
     flow_worker: flow_worker::FlowWorker,
     markdown_live_rendering: bool,
     virtual_references_enabled: bool,
@@ -1026,6 +1052,12 @@ impl SlateApp {
             reopen_last_file_on_startup: false,
             single_instance: true,
             instance_server: None,
+            resident: true,
+            resident_active: false,
+            window_hidden: false,
+            hide_on_first_frame: false,
+            quit_for_real: false,
+            start_with_windows: resident::autostart_enabled(),
             flow_worker: flow_worker::FlowWorker::start(cc.egui_ctx.clone()),
             markdown_live_rendering: true,
             virtual_references_enabled: true,
@@ -1207,13 +1239,138 @@ impl SlateApp {
             return;
         };
         let wake_ctx = ctx.clone();
-        match single_instance::Server::start(file, move || wake_ctx.request_repaint()) {
+        match single_instance::Server::start(file, move || {
+            // A hidden window would only notice the request on eframe's 100 ms
+            // throttled repaint; show it now, egui syncs on the next frame.
+            resident::show_now();
+            wake_ctx.request_repaint();
+        }) {
             Ok(server) => self.instance_server = Some(server),
             Err(err) => perf_log::mark("single_instance.unavailable", &err.to_string()),
         }
     }
 
     /// Opens files handed over by `slate <file>` launches while this window runs.
+    fn enable_resident(&mut self, cc: &eframe::CreationContext<'_>, background: bool) {
+        if !(self.resident || background) || self.instance_server.is_none() {
+            return;
+        }
+        resident::install(cc);
+        self.resident_active = true;
+        if background {
+            // eframe shows the window after its first paint; hide it right away.
+            self.window_hidden = true;
+            self.hide_on_first_frame = true;
+        }
+    }
+
+    fn poll_resident(&mut self, ctx: &egui::Context) {
+        if std::mem::take(&mut self.hide_on_first_frame) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+        if resident::take_quit_request() {
+            self.quit_for_real = true;
+            if self.window_hidden {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                self.request_close(ctx);
+            }
+        }
+        if resident::take_show_request() {
+            self.show_window(ctx, true);
+        }
+    }
+
+    /// Closing in resident mode: persist exactly what a real exit persists,
+    /// reset to a fresh session and hide the window.
+    fn hide_to_tray(&mut self, ctx: &egui::Context) {
+        self.observe_document_safety(0.0, true);
+        self.remember_current_cursor_position();
+        if !self.discard_on_exit
+            && (self.scratch_modal_open || !self.scratch_buffer.as_str().is_empty())
+        {
+            self.archive_scratch_modal();
+        }
+        self.discard_on_exit = false;
+        self.document_safety.flush();
+        let _ = self.save_settings();
+        for open in [
+            &mut self.palette_open,
+            &mut self.settings_open,
+            &mut self.shortcut_help_open,
+            &mut self.recent_picker_open,
+            &mut self.lance_open,
+            &mut self.doc_tasks_open,
+            &mut self.agenda_open,
+            &mut self.file_picker_open,
+            &mut self.periscope_open,
+            &mut self.periscope_prompt_open,
+            &mut self.find_note_open,
+            &mut self.link_assist_open,
+            &mut self.link_assist_web_open,
+            &mut self.link_heading_picker_open,
+            &mut self.link_preview_open,
+            &mut self.save_as_open,
+            &mut self.scratch_modal_open,
+            &mut self.scratch_entries_open,
+            &mut self.capture_modal_open,
+        ] {
+            *open = false;
+        }
+        self.new_buffer();
+        self.status = "Ready".to_string();
+        self.window_hidden = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        perf_log::mark("resident.hidden", "");
+    }
+
+    /// Shows the window (un-hides, un-minimizes, focuses). A hidden window shown
+    /// without a file to open behaves like a fresh launch.
+    fn show_window(&mut self, ctx: &egui::Context, fresh_launch: bool) {
+        if std::mem::take(&mut self.window_hidden) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            perf_log::mark("resident.shown", "");
+            if fresh_launch && self.reopen_last_file_on_startup && self.path.is_none() {
+                if let Some(last_path) = self.last_opened_path.clone() {
+                    self.open_path(last_path);
+                }
+            }
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        self.focus_editor_once = true;
+    }
+
+    fn set_resident(&mut self, enabled: bool) {
+        self.resident = enabled;
+        if !enabled && self.resident_active {
+            resident::remove_tray();
+            self.resident_active = false;
+        }
+        self.status = match self.save_settings() {
+            Ok(_) if enabled && !self.resident_active => {
+                "Resident mode on (from the next start)".to_string()
+            }
+            Ok(_) if enabled => "Resident mode on".to_string(),
+            Ok(_) => "Resident mode off: closing quits Slate".to_string(),
+            Err(err) => format!("Settings save failed: {err}"),
+        };
+    }
+
+    fn set_start_with_windows(&mut self, enabled: bool) {
+        self.status = match resident::set_autostart(enabled) {
+            Ok(()) => {
+                self.start_with_windows = enabled;
+                if enabled {
+                    "Slate starts hidden with Windows".to_string()
+                } else {
+                    "Slate no longer starts with Windows".to_string()
+                }
+            }
+            Err(err) => format!("Start with Windows failed: {err}"),
+        };
+    }
+
     fn poll_instance_requests(&mut self, ctx: &egui::Context) {
         let Some(server) = self.instance_server.as_ref() else {
             return;
@@ -1221,8 +1378,7 @@ impl SlateApp {
         let Some(request) = server.take_requests().into_iter().last() else {
             return;
         };
-        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        self.show_window(ctx, request.path.is_none());
         let Some(path) = request.path else {
             return;
         };
@@ -5716,6 +5872,11 @@ impl SlateApp {
                         self.single_instance = enabled;
                     }
                 }
+                "resident" => {
+                    if let Some(enabled) = Self::parse_config_bool(value) {
+                        self.resident = enabled;
+                    }
+                }
                 "markdown_live_rendering" => {
                     if let Some(enabled) = Self::parse_config_bool(value) {
                         self.markdown_live_rendering = enabled;
@@ -5876,7 +6037,7 @@ impl SlateApp {
             .ok_or_else(|| "invalid config path".to_string())?;
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
         let mut contents = format!(
-            "command_history_limit = {}\nline_number_mode = \"{}\"\nword_wrap = {}\npreview_mode = {}\nctrl_shift_move_mode = \"{}\"\nreopen_last_file_on_startup = {}\nsingle_instance = {}\nmarkdown_live_rendering = {}\nvirtual_references_enabled = {}\nvirtual_references_collapsed = {}\nvirtual_backlinks_collapsed = {}\nvirtual_mentions_collapsed = {}\nlast_opened_path = \"{}\"\nlast_open_dir = \"{}\"\n",
+            "command_history_limit = {}\nline_number_mode = \"{}\"\nword_wrap = {}\npreview_mode = {}\nctrl_shift_move_mode = \"{}\"\nreopen_last_file_on_startup = {}\nsingle_instance = {}\nresident = {}\nmarkdown_live_rendering = {}\nvirtual_references_enabled = {}\nvirtual_references_collapsed = {}\nvirtual_backlinks_collapsed = {}\nvirtual_mentions_collapsed = {}\nlast_opened_path = \"{}\"\nlast_open_dir = \"{}\"\n",
             self.command_history_limit,
             self.line_number_mode.config_value(),
             self.wrap,
@@ -5884,6 +6045,7 @@ impl SlateApp {
             self.ctrl_shift_move_mode.config_value(),
             self.reopen_last_file_on_startup,
             self.single_instance,
+            self.resident,
             self.markdown_live_rendering,
             self.virtual_references_enabled,
             self.virtual_references_collapsed,
@@ -6235,6 +6397,10 @@ impl SlateApp {
                 self.focus_editor_once = false;
             }
             Command::Quit => self.request_close(ctx),
+            Command::QuitAll => {
+                self.quit_for_real = true;
+                self.request_close(ctx);
+            }
         }
     }
 
@@ -6870,6 +7036,9 @@ impl SlateApp {
         } else if self.dirty || self.link_preview_dirty {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.confirm(PendingAction::Quit);
+        } else if self.resident_active && !self.quit_for_real {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.hide_to_tray(ctx);
         }
     }
 
@@ -9435,6 +9604,9 @@ impl eframe::App for SlateApp {
         self.observe_document_safety(0.0, true);
         self.document_safety.flush();
         let _ = self.save_settings();
+        if self.resident_active {
+            resident::remove_tray();
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -9496,6 +9668,7 @@ impl SlateApp {
         self.poll_pending_flow_agenda_sync(&ctx);
         self.poll_file_open(&ctx);
         self.poll_instance_requests(&ctx);
+        self.poll_resident(&ctx);
         self.poll_periscope_setup(&ctx);
         self.poll_periscope_global_index();
         if self.periscope_open {

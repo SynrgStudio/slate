@@ -408,6 +408,18 @@ impl SlateApp {
                                 });setting_rects.push(row.response.rect);
                                 ui.label(RichText::new("Otherwise: SQLite metadata index in the background. No service is installed.").font(FontId::monospace(13.0)).color(Color32::from_rgb(136,154,176)));
                                 ui.label(RichText::new(if self.periscope_roots.is_empty() {"Global scope: local fixed drives (Windows).".into()} else {format!("Global scope: {}",self.periscope_roots.iter().map(|root|root.display().to_string()).collect::<Vec<_>>().join(" · "))}).font(FontId::monospace(13.0)).color(Color32::from_rgb(136,154,176)));
+                                ui.add_space(10.0);
+                                ui.label(RichText::new("Window · resident mode").font(FontId::monospace(14.0)).color(Color32::from_rgb(136,192,208)));
+                                let row=egui::Frame::new().fill(if self.selected_setting==20 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
+                                    ui.set_width(ui.available_width());let mut enabled=self.resident;
+                                    if ui.checkbox(&mut enabled,RichText::new("Keep running in the tray when closed").font(FontId::monospace(14.0))).changed() {self.selected_setting=20;self.set_resident(enabled);}
+                                });setting_rects.push(row.response.rect);
+                                ui.label(RichText::new("Reopening is instant (~20 ms instead of ~300 ms). Quit for real from the tray icon or :quit-all.").font(FontId::monospace(13.0)).color(Color32::from_rgb(136,154,176)));
+                                let row=egui::Frame::new().fill(if self.selected_setting==21 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
+                                    ui.set_width(ui.available_width());let mut enabled=self.start_with_windows;
+                                    if ui.checkbox(&mut enabled,RichText::new("Start hidden with Windows").font(FontId::monospace(14.0))).changed() {self.selected_setting=21;self.set_start_with_windows(enabled);}
+                                });setting_rects.push(row.response.rect);
+                                ui.label(RichText::new("Makes the first open of the day instant too. Current user only; off by default.").font(FontId::monospace(13.0)).color(Color32::from_rgb(136,154,176)));
                                 if reveal_selected {
                                     if let Some(rect) = setting_rects.get(self.selected_setting) { ui.scroll_to_rect(*rect, Some(egui::Align::Min)); }
                                 }

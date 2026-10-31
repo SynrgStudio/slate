@@ -86,9 +86,24 @@ context: ~300–350 ms on this machine, Slate's own constructor < 0.5 ms.
   thread (with short retries while SQLite is busy). First frame after opening:
   ~51 ms → ~5 ms CPU.
 
-Not done: keeping Slate resident after its window closes (instant reopen from
-nothing running). It needs a tray/hidden-window lifecycle and exit semantics
-decided first.
+- **Resident mode.** Of the ~300 ms to a first frame, Slate's own code is
+  ~10 ms; the rest is Windows creating the window and the GPU driver setting up
+  Direct3D 12. Closing the primary window therefore hides it instead of
+  exiting (`src/resident.rs`): the same state a real exit persists is saved,
+  the session resets to a fresh buffer, and a tray icon (Open Slate / New
+  window / Quit Slate) shows that Slate is still running. A later `slate`
+  launch forwards to it and the window is visible **23–27 ms after the launch**
+  (was ~300 ms), measured on the hidden test desktop.
+  - eframe throttles repaints of invisible windows to one per 100 ms, which
+    first made reopening take ~120 ms; the window is now shown with
+    `ShowWindowAsync` the moment the request arrives (2 ms from the forwarding
+    process's acknowledgement to visible), and egui syncs on the next frame.
+  - Hidden cost: ~31 ms CPU per 5 s, ~165 MB working set.
+  - `:quit-all` or the tray's "Quit Slate" really exit. Settings → "Keep
+    running in the tray when closed" turns it off; "Start hidden with Windows"
+    adds `slate --background` to the current user's Run key (off by default).
+    `--background` exits at once when Slate is already running (new `PING`
+    record in the single-instance protocol).
 
 ## 6. Keystroke-to-photon latency
 

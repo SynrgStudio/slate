@@ -138,6 +138,11 @@ instantly instead of starting a new one. Use `slate --new-window file.md`
 (`-n`) for a separate window, or set `single_instance = false` in
 `config.toml`. See [`docs/speed-work.md`](docs/speed-work.md).
 
+Closing the window keeps Slate running in the tray, so opening it again is
+instant (~25 ms instead of ~300 ms). Quit for real from the tray icon or with
+`:quit-all`. In Settings you can turn this off, or start Slate hidden with
+Windows so the first open of the day is instant too (`slate --background`).
+
 Slate renders with wgpu (Direct3D 12 flip model on Windows) for the lowest
 keystroke latency, and falls back to OpenGL if that fails. Set
 `SLATE_RENDERER=glow` to force OpenGL.
@@ -217,8 +222,9 @@ Open the command line with `Ctrl+.`. Commands may be typed with or without the l
 
 ```text
 :w                         save
-:q                         quit
-:wq / :x                   save and quit
+:q                         close (Slate stays in the tray)
+:wq / :x                   save and close
+:quit-all / :exit-all      quit Slate completely
 :new / :enew               new buffer
 :open / :e                 open file picker
 :open ~/notes/todo.md      open explicit path

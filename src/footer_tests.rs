@@ -328,7 +328,7 @@ fn last_footer_checkbox_is_visible_in_small_settings_dialog() {
         .ctx
         .data(|d| d.get_temp::<settings_tests::SettingsDialogGeometry>("settings_geometry".into()))
         .unwrap();
-    assert_eq!(geo.rows.len(), 20);
+    assert_eq!(geo.rows.len(), 22);
     assert!(geo.body.contains_rect(geo.rows[18]), "{geo:?}");
     assert!(geo.frame.contains_rect(geo.footer));
 }

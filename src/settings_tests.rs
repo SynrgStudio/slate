@@ -74,7 +74,7 @@ fn settings_bounds_fixed_chrome_and_selection_reveal_at_small_and_large_sizes() 
         assert!(before.frame.contains_rect(before.footer));
         assert!(before.body.top() >= before.header.bottom());
         assert!(before.body.bottom() <= before.footer.top());
-        assert_eq!(before.rows.len(), 10 + footer_ui::FIELDS.len());
+        assert_eq!(before.rows.len(), 12 + footer_ui::FIELDS.len());
         assert!(
             before.rows[0].width() >= before.body.width() - 2.0,
             "unused right column: {:?}",
@@ -96,6 +96,16 @@ fn settings_bounds_fixed_chrome_and_selection_reveal_at_small_and_large_sizes() 
         assert!(
             after.rows[8].top() >= after.body.top() - 1.0,
             "selected controls clipped: {:?}",
+            after
+        );
+        // The last row (start with Windows) is reachable too.
+        app.selected_setting = 21;
+        for n in 25..40 {
+            after = draw(&mut app, &ctx, size, n as f64 * 0.05, vec![]);
+        }
+        assert!(
+            after.body.contains_rect(after.rows[21]),
+            "last row invisible: {:?}",
             after
         );
     }

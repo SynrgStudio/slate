@@ -36,6 +36,7 @@ pub(crate) enum Command {
     FindNote,
     OpenLink,
     Quit,
+    QuitAll,
 }
 
 pub(crate) struct CommandSpec {
@@ -64,9 +65,16 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
         name: "quit",
         aliases: &["q", "exit"],
-        summary: "Quit Slate",
+        summary: "Close the window (Slate stays in the tray when resident)",
         hint: "Ctrl+Q",
         palette_command: Some(Command::Quit),
+    },
+    CommandSpec {
+        name: "quit-all",
+        aliases: &["exit-all"],
+        summary: "Quit Slate completely, including the tray",
+        hint: "tray: Quit",
+        palette_command: Some(Command::QuitAll),
     },
     CommandSpec {
         name: "wq",
@@ -500,6 +508,7 @@ pub(crate) fn command_name(command: Command) -> &'static str {
         Command::FindNote => "find-note",
         Command::OpenLink => "open-link",
         Command::Quit => "quit",
+        Command::QuitAll => "quit-all",
     }
 }
 
@@ -752,6 +761,7 @@ pub(crate) fn parse_command_line(raw: &str) -> CommandLineAction {
         }
         "capture" | "cap" => CommandLineAction::Run(Command::Capture),
         "q" | "quit" | "exit" => CommandLineAction::Run(Command::Quit),
+        "quit-all" | "exit-all" => CommandLineAction::Run(Command::QuitAll),
         "wq" | "x" => CommandLineAction::SaveQuit,
         "new" | "enew" => CommandLineAction::Run(Command::New),
         "open" | "edit" | "e" => {
