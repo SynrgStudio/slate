@@ -259,7 +259,7 @@ fn draw_tabs(
         if response.double_clicked() {
             ui.ctx().data_mut(|d| {
                 d.insert_temp(rename_id, (tab.id, true));
-                d.insert_temp(rename_text_id, tab.text.clone());
+                d.insert_temp(rename_text_id, tab.rename_text.clone());
             });
         }
         if let Some((renaming, first_frame)) =
@@ -269,7 +269,7 @@ fn draw_tabs(
             let mut text: String = ui
                 .ctx()
                 .data(|d| d.get_temp(rename_text_id))
-                .unwrap_or_else(|| tab.text.clone());
+                .unwrap_or_else(|| tab.rename_text.clone());
             let field = egui::Rect::from_min_max(
                 egui::pos2(rect.left() + 6.0, rect.top() + 3.0),
                 egui::pos2(rect.right() - 24.0, rect.bottom() - 3.0),
@@ -651,6 +651,7 @@ mod tests {
                     text: format!("documento-{n}-con-nombre-largo.md"),
                     dirty: n % 2 == 0,
                     tooltip: String::new(),
+                    rename_text: String::new(),
                 })
                 .collect();
             let _ = ctx.run_ui(
@@ -693,6 +694,7 @@ mod tests {
                 text: format!("nota-{n}.md"),
                 dirty: false,
                 tooltip: String::new(),
+                rename_text: String::new(),
             })
             .collect();
         for active in [39, 0, 20] {
@@ -736,6 +738,7 @@ mod tests {
             text: "nota.md".into(),
             dirty: false,
             tooltip: String::new(),
+            rename_text: "nota.md".into(),
         }];
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(900.0, 560.0));
         let mut frame = |time: f64, events: Vec<egui::Event>| {
@@ -794,6 +797,7 @@ mod tests {
                 text: format!("nota-{n}.md"),
                 dirty: false,
                 tooltip: String::new(),
+                rename_text: String::new(),
             })
             .collect();
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(900.0, 560.0));

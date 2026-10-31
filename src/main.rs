@@ -1273,6 +1273,7 @@ impl SlateApp {
             .path
             .as_deref()
             .and_then(|p| self.aliases.get(p).or_else(|| p.file_name()?.to_str()))
+            .or_else(|| self.active_tab_alias())
             .unwrap_or("untitled");
         if self.scratch && self.path.is_none() {
             format!("{}Slate Scratch", if self.dirty { "*" } else { "" })
@@ -3927,6 +3928,7 @@ impl SlateApp {
                 self.last_open_dir = path.parent().map(PathBuf::from);
                 self.dirty = false;
                 self.remember_recent_file(path.clone());
+                self.adopt_tab_alias(&path);
                 // The Flow index refresh runs on the Flow writer thread; the
                 // task count is appended to the status when it reports back.
                 self.queue_flow_index_after_save(&path);

@@ -61,6 +61,8 @@ pub(crate) struct Tab {
     pub(crate) id: u64,
     /// `None` for the active tab, whose document lives in `SlateApp`.
     doc: Option<DocumentState>,
+    /// Alias of an untitled tab; it becomes the file's alias when saved.
+    alias: Option<String>,
 }
 
 pub(crate) struct Tabs {
@@ -76,7 +78,11 @@ const MAX_CLOSED_TABS: usize = 25;
 impl Default for Tabs {
     fn default() -> Self {
         Self {
-            list: vec![Tab { id: 1, doc: None }],
+            list: vec![Tab {
+                id: 1,
+                doc: None,
+                alias: None,
+            }],
             active: 0,
             next_id: 2,
             closed: Vec::new(),
@@ -100,6 +106,9 @@ pub(crate) struct TabLabel {
     pub(crate) text: String,
     pub(crate) dirty: bool,
     pub(crate) tooltip: String,
+    /// What the rename field starts with: the alias, the file name, or
+    /// nothing for an untitled tab.
+    pub(crate) rename_text: String,
 }
 
 /// Saved between runs: the files of the open tabs and which one was active.
@@ -183,21 +192,38 @@ impl SlateApp {
             .map(|index| self.tab_path(index))
             .collect();
         let names = disambiguated_names(&paths);
+        let aliases: Vec<Option<String>> = self
+            .tabs
+            .list
+            .iter()
+            .zip(&paths)
+            .map(|(tab, path)| match path {
+                Some(path) => self.aliases.get(path).map(str::to_owned),
+                None => tab.alias.clone(),
+            })
+            .collect();
+        let rename_texts: Vec<String> = aliases
+            .iter()
+            .zip(&paths)
+            .map(|(alias, path)| {
+                alias
+                    .clone()
+                    .or_else(|| path.map(|path| file_label(Some(path))))
+                    .unwrap_or_default()
+            })
+            .collect();
         let names: Vec<String> = names
             .into_iter()
-            .zip(&paths)
-            .map(|(name, path)| {
-                path.and_then(|path| self.aliases.get(path))
-                    .map(str::to_owned)
-                    .unwrap_or(name)
-            })
+            .zip(&aliases)
+            .map(|(name, alias)| alias.clone().unwrap_or(name))
             .collect();
         self.tabs
             .list
             .iter()
             .zip(names)
             .zip(&paths)
-            .map(|((tab, text), path)| {
+            .zip(rename_texts)
+            .map(|(((tab, text), path), rename_text)| {
                 let dirty = tab.doc.as_ref().map_or(self.dirty, |doc| doc.dirty);
                 let tooltip = match path {
                     Some(path) => format!(
@@ -217,6 +243,7 @@ impl SlateApp {
                     text,
                     dirty,
                     tooltip,
+                    rename_text,
                 }
             })
             .collect()
@@ -251,7 +278,18 @@ impl SlateApp {
     /// A blank alias, or the file's own name, removes it.
     pub(super) fn rename_tab(&mut self, index: usize, alias: Option<&str>) {
         let Some(path) = self.tab_path(index).map(Path::to_path_buf) else {
-            self.status = "Save the file first to give it an alias".into();
+            // Untitled: the alias lives on the tab until the file is saved.
+            let alias = alias
+                .map(str::trim)
+                .filter(|alias| !alias.is_empty())
+                .map(str::to_owned);
+            self.status = match &alias {
+                Some(alias) => format!("Alias: {alias} · kept for the file when you save it"),
+                None => "Alias removed".into(),
+            };
+            if let Some(tab) = self.tabs.list.get_mut(index) {
+                tab.alias = alias;
+            }
             return;
         };
         let file_name = file_label(Some(&path));
@@ -266,6 +304,25 @@ impl SlateApp {
             },
             Err(err) => format!("Alias set for this session; not saved: {err}"),
         };
+    }
+
+    /// The active untitled tab's alias, if it has one.
+    pub(super) fn active_tab_alias(&self) -> Option<&str> {
+        self.tabs.list.get(self.tabs.active)?.alias.as_deref()
+    }
+
+    /// After the first save, an untitled tab's alias becomes the file's alias.
+    pub(super) fn adopt_tab_alias(&mut self, path: &Path) {
+        let Some(alias) = self
+            .tabs
+            .list
+            .get_mut(self.tabs.active)
+            .and_then(|tab| tab.alias.take())
+        else {
+            return;
+        };
+        let file = self.aliases_path();
+        let _ = self.aliases.set(file.as_deref(), path, Some(&alias));
     }
 
     /// Periscope also finds files by alias; those matches come first.
@@ -494,6 +551,7 @@ impl SlateApp {
             Tab {
                 id,
                 doc: Some(DocumentState::blank(self.editor_font_size)),
+                alias: None,
             },
         );
         self.activate_tab(index);
@@ -504,7 +562,11 @@ impl SlateApp {
         let id = self.tabs.allocate_id();
         let mut doc = DocumentState::blank(self.editor_font_size);
         doc.lazy_path = Some(path);
-        self.tabs.list.push(Tab { id, doc: Some(doc) });
+        self.tabs.list.push(Tab {
+            id,
+            doc: Some(doc),
+            alias: None,
+        });
     }
 
     pub(super) fn cycle_tab(&mut self, step: isize) {

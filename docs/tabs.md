@@ -55,7 +55,8 @@ document keeps its own durable checkpoint.
    rename it inline; `aliases.json` next to the settings; shown in tabs,
    the window title, Lance and recent files; Periscope matches every word
    of the query against aliases and lists those files first. App shortcuts
-   pause while an alias is being typed.
+   pause while an alias is being typed. An untitled tab keeps its alias on
+   the tab and hands it to the file on the first save.
 4. Drag out (done 2026-10-31): dropping a saved tab outside the window opens
    `slate --new-window --position X,Y file` under the pointer and closes the
    tab here; unsaved and untitled tabs stay (save first). Only the primary

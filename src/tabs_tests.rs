@@ -466,7 +466,24 @@ fn an_alias_names_the_file_in_tabs_title_lance_and_periscope_only() {
 
     f.app.new_tab();
     run_command_line(&mut f, ":alias Borrador");
-    assert_eq!(f.app.status, "Save the file first to give it an alias");
+    assert_eq!(f.labels(), ["2026-10-31-notas.md", "Borrador"]);
+    assert!(f.app.title().starts_with("Borrador — Slate"));
+    assert_eq!(f.app.tab_labels()[1].rename_text, "Borrador");
+
+    // Saving the untitled tab turns its alias into the file's alias.
+    f.app.buffer.type_text("idea");
+    f.app.dirty = true;
+    let saved = f.root.join("borrador.md");
+    f.app.save_path(saved.clone());
+    assert_eq!(f.app.aliases.get(&saved), Some("Borrador"));
+    assert_eq!(f.labels(), ["2026-10-31-notas.md", "Borrador"]);
+}
+
+#[test]
+fn renaming_an_untitled_tab_starts_from_an_empty_field() {
+    let f = Fixture::new();
+    assert_eq!(f.app.tab_labels()[0].text, "untitled");
+    assert_eq!(f.app.tab_labels()[0].rename_text, "");
 }
 
 #[test]
