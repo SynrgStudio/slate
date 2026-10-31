@@ -4,6 +4,7 @@ pub(crate) enum Command {
     Open,
     OpenBuffer,
     Periscope,
+    CreateProject,
     Lance,
     LanceAdd,
     LanceNext,
@@ -21,6 +22,7 @@ pub(crate) enum Command {
     TogglePreview,
     ToggleWrap,
     Settings,
+    PerfHud,
     LineNumbersAbsolute,
     LineNumbersRelative,
     WrapOn,
@@ -88,6 +90,13 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
         palette_command: Some(Command::Open),
     },
     CommandSpec {
+        name: "cd",
+        aliases: &["chdir"],
+        summary: "Browse a directory or Windows drive",
+        hint: ":cd C:\\",
+        palette_command: None,
+    },
+    CommandSpec {
         name: "lance",
         aliases: &["lc", "marks"],
         summary: "Open Lance-style marked files",
@@ -123,9 +132,16 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
         palette_command: Some(Command::OpenBuffer),
     },
     CommandSpec {
+        name: "create-project",
+        aliases: &["project", "new-project"],
+        summary: "Create project · assign current document to an existing folder",
+        hint: ":project",
+        palette_command: Some(Command::CreateProject),
+    },
+    CommandSpec {
         name: "periscope",
         aliases: &["ps", "fzf"],
-        summary: "Open Periscope project/home file search",
+        summary: "Open Periscope project/global indexed file search",
         hint: ":periscope",
         palette_command: Some(Command::Periscope),
     },
@@ -416,6 +432,13 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
         hint: ":settings",
         palette_command: Some(Command::Settings),
     },
+    CommandSpec {
+        name: "perf",
+        aliases: &["perf-hud", "hud", "timings"],
+        summary: "Toggle the timing overlay",
+        hint: "F12",
+        palette_command: Some(Command::PerfHud),
+    },
 ];
 
 pub(crate) fn clamp_history_limit(limit: usize) -> usize {
@@ -445,6 +468,7 @@ pub(crate) fn command_name(command: Command) -> &'static str {
         Command::Open => "open",
         Command::OpenBuffer => "open-buffer",
         Command::Periscope => "periscope",
+        Command::CreateProject => "create-project",
         Command::Lance => "lance",
         Command::LanceAdd => "lance-add",
         Command::LanceNext => "lance-next",
@@ -462,6 +486,7 @@ pub(crate) fn command_name(command: Command) -> &'static str {
         Command::TogglePreview => "preview",
         Command::ToggleWrap => "wrap",
         Command::Settings => "settings",
+        Command::PerfHud => "perf",
         Command::LineNumbersAbsolute => "line-numbers-absolute",
         Command::LineNumbersRelative => "line-numbers-relative",
         Command::WrapOn => "wrap-on",
@@ -662,6 +687,7 @@ pub(crate) enum CommandLineAction {
     Run(Command),
     SaveQuit,
     OpenPath(String),
+    BrowsePath(String),
     OpenBufferPath(String),
     QuickAdd(Option<String>),
     Daily {
@@ -736,6 +762,7 @@ pub(crate) fn parse_command_line(raw: &str) -> CommandLineAction {
                 CommandLineAction::OpenPath(path)
             }
         }
+        "cd" | "chdir" => CommandLineAction::BrowsePath(remaining_args(parts)),
         "open-buffer" | "ob" | "buffer-open" => {
             let path = remaining_args(parts);
             if path.is_empty() {
@@ -745,6 +772,9 @@ pub(crate) fn parse_command_line(raw: &str) -> CommandLineAction {
             }
         }
         "periscope" | "ps" | "fzf" => CommandLineAction::Run(Command::Periscope),
+        "project" | "create-project" | "new-project" => {
+            CommandLineAction::Run(Command::CreateProject)
+        }
         "flow-rescan" | "flow-index" => CommandLineAction::Run(Command::FlowRescan),
         "flow-rebuild" | "flow-reindex" => CommandLineAction::Run(Command::FlowRebuild),
         "daily" | "daily-log" | "journal" => CommandLineAction::Daily {
@@ -823,6 +853,7 @@ pub(crate) fn parse_command_line(raw: &str) -> CommandLineAction {
         "line-numbers-absolute" | "ln-abs" => CommandLineAction::Run(Command::LineNumbersAbsolute),
         "line-numbers-relative" | "ln-rel" => CommandLineAction::Run(Command::LineNumbersRelative),
         "settings" | "set" | "prefs" | "preferences" => CommandLineAction::Run(Command::Settings),
+        "perf" | "perf-hud" | "hud" | "timings" => CommandLineAction::Run(Command::PerfHud),
         _ => CommandLineAction::Unknown(input.to_string()),
     }
 }
@@ -884,6 +915,14 @@ mod tests {
 
     #[test]
     fn parses_command_line_actions_with_arguments() {
+        assert_eq!(
+            parse_command_line(":cd C:"),
+            CommandLineAction::BrowsePath("C:".to_string())
+        );
+        assert_eq!(
+            parse_command_line(":chdir C:\\Users\\dnaon"),
+            CommandLineAction::BrowsePath("C:\\Users\\dnaon".to_string())
+        );
         assert_eq!(parse_command_line(":"), CommandLineAction::Empty);
         assert_eq!(
             parse_command_line(":w"),

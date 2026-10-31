@@ -473,6 +473,28 @@ Scope:
 - Prefer commands that map to clear editor operations and can be reused later by command palette, command line, Ctrl-hold grammar, and Alt structural editing.
 - Keep normal typing as the default; avoid a permanent Vim mode.
 - Treat Ctrl+Shift as live cursor movement, Ctrl-hold as command dispatch, and Alt as a structural text/line manipulation layer.
+- Native editor core batch 1 — expected basics:
+  - Done: `Ctrl+X` / cut selection, deleting the selected text after copying it to the clipboard.
+  - Done: `Ctrl+A` / select all.
+  - Pending: simple find/replace over the current buffer.
+  - Pending: insert newline above/below the current line without disrupting the current text flow.
+  - Pending: join lines: merge the current line with the next line, or merge selected lines, normalizing the boundary whitespace so paragraphs/list text do not get weird gaps.
+  - Pending: go to/highlight matching bracket for `[]`, `{}`, and `()`.
+- Native editor core batch 2 — editing cleanup and text transforms:
+  - Pending: `Ctrl+,` comment/uncomment current line or selection. Detect comment syntax from file extension/path through a small built-in language comment table; keep it plain and predictable before considering configuration.
+  - Pending: toggle case / uppercase / lowercase for selection or word/current line fallback.
+  - Pending: trim trailing whitespace command.
+  - Pending: ensure final newline command/setting: make sure saved text files end with exactly one final `\n` when enabled, avoiding noisy diffs and POSIX/tooling edge cases.
+  - Pending: sort selected lines.
+  - Nice-to-have: reverse selected lines.
+- Native editor core batch 3 — deeper native-editor polish:
+  - Pending: auto-indent on Enter based on the previous line.
+  - Pending: smart dedent when a line becomes empty or when indentation should step back.
+  - Pending: multi-cursor editing as a first-class native editor feature.
+  - Pending: rectangular/block selection, likely as an alternate mouse gesture such as Ctrl+right-button drag or another non-conflicting modifier rather than replacing normal drag selection.
+  - Pending: visible whitespace toggle.
+  - Pending: current-line highlight.
+  - Pending: bracket pair highlight for `[]`, `{}`, and `()`.
 
 ### T047 — Slate-owned file dialogs for open/save/save-as
 

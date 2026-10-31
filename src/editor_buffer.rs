@@ -1,17 +1,47 @@
-#[derive(Clone)]
-struct BufferSnapshot {
-    text: String,
+/// One reversible text change: `removed` was replaced by `inserted` at `start`.
+/// The cursor/selection are the state to restore when this entry is applied
+/// (pre-edit state on the undo stack, post-edit state on the redo stack).
+struct UndoEntry {
+    start: usize,
+    removed: String,
+    inserted: String,
     cursor: usize,
     selection: Option<(usize, usize)>,
+    typing: bool,
+    recorded_at: std::time::Instant,
 }
 
+impl UndoEntry {
+    fn heap_bytes(&self) -> usize {
+        self.removed.len() + self.inserted.len()
+    }
+}
+
+struct LayoutChange {
+    before: u64,
+    after: u64,
+    prefix_lines: usize,
+    suffix_lines: usize,
+}
+
+const MAX_UNDO_ENTRIES: usize = 10_000;
+const MAX_UNDO_BYTES: usize = 64 * 1024 * 1024;
+const TYPING_GROUP_PAUSE: std::time::Duration = std::time::Duration::from_millis(1000);
+const TYPING_GROUP_MAX_BYTES: usize = 256;
+
+static NEXT_BUFFER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub(crate) struct EditorBuffer {
+    pub(crate) identity: u64,
     text: String,
     line_starts: Vec<usize>,
+    layout_changes: std::collections::VecDeque<LayoutChange>,
     cursor: usize,
     selection: Option<(usize, usize)>,
-    undo_stack: Vec<BufferSnapshot>,
-    redo_stack: Vec<BufferSnapshot>,
+    undo_stack: std::collections::VecDeque<UndoEntry>,
+    redo_stack: Vec<UndoEntry>,
+    undo_bytes: usize,
+    typing_revision: Option<u64>,
     pub(crate) revision: u64,
 }
 
@@ -22,12 +52,16 @@ impl EditorBuffer {
 
     pub(crate) fn from_text(text: String) -> Self {
         let mut buffer = Self {
+            identity: NEXT_BUFFER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             text,
             line_starts: Vec::new(),
+            layout_changes: std::collections::VecDeque::new(),
             cursor: 0,
             selection: None,
-            undo_stack: Vec::new(),
+            undo_stack: std::collections::VecDeque::new(),
             redo_stack: Vec::new(),
+            undo_bytes: 0,
+            typing_revision: None,
             revision: 0,
         };
         buffer.rebuild_line_index();
@@ -38,52 +72,182 @@ impl EditorBuffer {
         &self.text
     }
 
-    fn snapshot(&self) -> BufferSnapshot {
-        BufferSnapshot {
-            text: self.text.clone(),
+    /// Bytes held by undo/redo history (deltas only, never whole-document copies).
+    #[allow(dead_code)]
+    pub(crate) fn undo_history_bytes(&self) -> usize {
+        self.undo_bytes
+            + self
+                .redo_stack
+                .iter()
+                .map(UndoEntry::heap_bytes)
+                .sum::<usize>()
+    }
+
+    fn push_undo(&mut self, entry: UndoEntry) {
+        self.undo_bytes += entry.heap_bytes();
+        self.undo_stack.push_back(entry);
+        while self.undo_stack.len() > MAX_UNDO_ENTRIES
+            || (self.undo_bytes > MAX_UNDO_BYTES && self.undo_stack.len() > 1)
+        {
+            if let Some(dropped) = self.undo_stack.pop_front() {
+                self.undo_bytes -= dropped.heap_bytes();
+            }
+        }
+    }
+
+    fn pop_undo(&mut self) -> Option<UndoEntry> {
+        let entry = self.undo_stack.pop_back()?;
+        self.undo_bytes -= entry.heap_bytes();
+        Some(entry)
+    }
+
+    fn clear_history(&mut self) {
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.undo_bytes = 0;
+        self.typing_revision = None;
+    }
+
+    /// Replaces `start..end` with `replacement`, records one undo delta and keeps
+    /// the line index/layout tracking incremental. Cursor placement is the caller's job.
+    fn edit(&mut self, start: usize, end: usize, replacement: &str) {
+        let entry = UndoEntry {
+            start,
+            removed: self.text[start..end].to_string(),
+            inserted: replacement.to_string(),
             cursor: self.cursor,
             selection: self.selection,
-        }
-    }
-
-    fn record_undo_snapshot(&mut self) {
-        const MAX_UNDO_SNAPSHOTS: usize = 256;
-        self.undo_stack.push(self.snapshot());
-        if self.undo_stack.len() > MAX_UNDO_SNAPSHOTS {
-            self.undo_stack.remove(0);
-        }
+            typing: false,
+            recorded_at: std::time::Instant::now(),
+        };
+        self.push_undo(entry);
         self.redo_stack.clear();
+        self.typing_revision = None;
+        self.splice_text(start, end, replacement);
     }
 
-    fn restore_snapshot(&mut self, snapshot: BufferSnapshot) {
-        self.text = snapshot.text;
-        self.cursor = self.clamp_to_char_boundary(snapshot.cursor);
-        self.selection = snapshot.selection.map(|(start, end)| {
+    /// Like [`Self::edit`] but derives the smallest changed range from a full new text.
+    fn edit_to(&mut self, new_text: String) {
+        if new_text == self.text {
+            return;
+        }
+        let (start, old_end) = Self::changed_old_byte_range(&self.text, &new_text);
+        let new_end = new_text.len() - (self.text.len() - old_end);
+        self.edit(start, old_end, &new_text[start..new_end]);
+    }
+
+    fn splice_text(&mut self, start: usize, end: usize, replacement: &str) {
+        let first = self.line_index_for_byte(start);
+        let last = self.line_index_for_byte(end);
+        let suffix = self.line_count() - last - 1;
+        let before = self.revision;
+        let delta = replacement.len() as isize - (end - start) as isize;
+        self.text.replace_range(start..end, replacement);
+        let inserted: Vec<_> = replacement
+            .bytes()
+            .enumerate()
+            .filter(|(_, b)| *b == b'\n')
+            .map(|(offset, _)| start + offset + 1)
+            .collect();
+        let tail = first + 1 + inserted.len();
+        self.line_starts.splice(first + 1..last + 1, inserted);
+        for position in &mut self.line_starts[tail..] {
+            *position = position
+                .checked_add_signed(delta)
+                .expect("valid edited line offset");
+        }
+        self.revision = self.revision.wrapping_add(1);
+        self.record_layout_change(before, first, suffix);
+    }
+
+    fn restore_cursor_state(&mut self, cursor: usize, selection: Option<(usize, usize)>) {
+        self.cursor = self.clamp_to_char_boundary(cursor);
+        self.selection = selection.map(|(start, end)| {
             (
                 self.clamp_to_char_boundary(start),
                 self.clamp_to_char_boundary(end),
             )
         });
-        self.revision = self.revision.wrapping_add(1);
-        self.rebuild_line_index();
     }
 
     pub(crate) fn undo(&mut self) -> bool {
-        let Some(snapshot) = self.undo_stack.pop() else {
+        let Some(mut entry) = self.pop_undo() else {
             return false;
         };
-        self.redo_stack.push(self.snapshot());
-        self.restore_snapshot(snapshot);
+        let (cursor, selection) = (self.cursor, self.selection);
+        let end = entry.start + entry.inserted.len();
+        let removed = std::mem::take(&mut entry.removed);
+        self.splice_text(entry.start, end, &removed);
+        entry.removed = removed;
+        self.restore_cursor_state(entry.cursor, entry.selection);
+        entry.cursor = cursor;
+        entry.selection = selection;
+        self.redo_stack.push(entry);
+        self.typing_revision = None;
         true
     }
 
     pub(crate) fn redo(&mut self) -> bool {
-        let Some(snapshot) = self.redo_stack.pop() else {
+        let Some(mut entry) = self.redo_stack.pop() else {
             return false;
         };
-        self.undo_stack.push(self.snapshot());
-        self.restore_snapshot(snapshot);
+        let (cursor, selection) = (self.cursor, self.selection);
+        let end = entry.start + entry.removed.len();
+        let inserted = std::mem::take(&mut entry.inserted);
+        self.splice_text(entry.start, end, &inserted);
+        entry.inserted = inserted;
+        self.restore_cursor_state(entry.cursor, entry.selection);
+        entry.cursor = cursor;
+        entry.selection = selection;
+        entry.typing = false;
+        self.push_undo(entry);
+        self.typing_revision = None;
         true
+    }
+
+    /// Inserts keyboard-typed text. Consecutive typing of a word is grouped into one
+    /// undo step; whitespace after a word, newlines, pauses, cursor moves or other
+    /// edits start a new group.
+    pub(crate) fn type_text(&mut self, text: &str) {
+        let mut chars = text.chars();
+        let single = match (chars.next(), chars.next()) {
+            (Some(ch), None) if ch != '\n' => Some(ch),
+            _ => None,
+        };
+        let can_group = single.is_some_and(|ch| {
+            self.selection.is_none()
+                && self.redo_stack.is_empty()
+                && self.typing_revision == Some(self.revision)
+                && self.undo_stack.back().is_some_and(|top| {
+                    let word_then_space =
+                        ch.is_whitespace() && !top.inserted.ends_with(char::is_whitespace);
+                    top.typing
+                        && top.start + top.inserted.len() == self.cursor
+                        && top.inserted.len() < TYPING_GROUP_MAX_BYTES
+                        && top.recorded_at.elapsed() < TYPING_GROUP_PAUSE
+                        && !word_then_space
+                })
+        });
+        if can_group {
+            let cursor = self.cursor;
+            self.splice_text(cursor, cursor, text);
+            self.cursor = cursor + text.len();
+            if let Some(top) = self.undo_stack.back_mut() {
+                top.inserted.push_str(text);
+                top.recorded_at = std::time::Instant::now();
+            }
+            self.undo_bytes += text.len();
+            self.typing_revision = Some(self.revision);
+            return;
+        }
+        let revision = self.revision;
+        self.insert_text(text);
+        if self.revision != revision && single.is_some() {
+            if let Some(top) = self.undo_stack.back_mut() {
+                top.typing = true;
+            }
+            self.typing_revision = Some(self.revision);
+        }
     }
 
     #[allow(dead_code)]
@@ -92,11 +256,11 @@ impl EditorBuffer {
     }
 
     pub(crate) fn set_text(&mut self, text: String) {
+        self.layout_changes.clear();
         self.text = text;
         self.cursor = self.cursor.min(self.text.len());
         self.selection = None;
-        self.undo_stack.clear();
-        self.redo_stack.clear();
+        self.clear_history();
         self.revision = self.revision.wrapping_add(1);
         self.rebuild_line_index();
     }
@@ -107,10 +271,10 @@ impl EditorBuffer {
 
     #[allow(dead_code)]
     pub(crate) fn mark_external_edit(&mut self) {
+        self.layout_changes.clear();
         self.cursor = self.cursor.min(self.text.len());
         self.selection = None;
-        self.undo_stack.clear();
-        self.redo_stack.clear();
+        self.clear_history();
         self.revision = self.revision.wrapping_add(1);
         self.rebuild_line_index();
     }
@@ -394,19 +558,26 @@ impl EditorBuffer {
             .map(|line| self.line_start(line))
             .collect::<Vec<_>>();
 
-        self.record_undo_snapshot();
-        self.selection = None;
-        for start in affected_starts.iter().rev() {
-            self.text.insert_str(*start, "    ");
+        let region_start = self.line_start(start_line);
+        let region_end = self.line_end(end_line);
+        let mut indented = String::with_capacity(
+            region_end - region_start + affected_starts.len() * 4,
+        );
+        for (index, line) in self.text[region_start..region_end].split('\n').enumerate() {
+            if index > 0 {
+                indented.push('\n');
+            }
+            indented.push_str("    ");
+            indented.push_str(line);
         }
+        self.edit(region_start, region_end, &indented);
+        self.selection = None;
         let cursor_shift = affected_starts
             .iter()
             .filter(|start| **start <= original_cursor)
             .count()
             * 4;
         self.cursor = original_cursor + cursor_shift;
-        self.revision = self.revision.wrapping_add(1);
-        self.rebuild_line_index();
 
         if had_selection {
             let selection_start = self.line_start(start_line);
@@ -456,14 +627,18 @@ impl EditorBuffer {
             })
             .sum::<usize>();
 
-        self.record_undo_snapshot();
-        self.selection = None;
-        for (start, len) in removals.iter().rev() {
-            self.text.replace_range(*start..(*start + *len), "");
+        let region_start = removals[0].0;
+        let (last_start, last_len) = removals[removals.len() - 1];
+        let region_end = last_start + last_len;
+        let mut dedented = String::with_capacity(region_end - region_start);
+        let mut copied_until = region_start;
+        for (start, len) in &removals {
+            dedented.push_str(&self.text[copied_until..*start]);
+            copied_until = start + len;
         }
+        self.edit(region_start, region_end, &dedented);
+        self.selection = None;
         self.cursor = self.clamp_to_char_boundary(original_cursor.saturating_sub(cursor_shift));
-        self.revision = self.revision.wrapping_add(1);
-        self.rebuild_line_index();
 
         if had_selection {
             let selection_start = self.line_start(start_line);
@@ -519,12 +694,9 @@ impl EditorBuffer {
         }
 
         if self.line_count() == 1 {
-            self.record_undo_snapshot();
-            self.text.clear();
+            self.edit(0, self.text.len(), "");
             self.cursor = 0;
             self.selection = None;
-            self.revision = self.revision.wrapping_add(1);
-            self.rebuild_line_index();
             return true;
         }
 
@@ -538,12 +710,9 @@ impl EditorBuffer {
             (self.line_start(line_index), self.line_start(line_index + 1))
         };
 
-        self.record_undo_snapshot();
+        self.edit(start, end, "");
         self.selection = None;
-        self.text.replace_range(start..end, "");
         self.cursor = self.clamp_to_char_boundary(start.min(self.text.len()));
-        self.revision = self.revision.wrapping_add(1);
-        self.rebuild_line_index();
         true
     }
 
@@ -562,11 +731,8 @@ impl EditorBuffer {
             self.text.len()
         };
 
-        self.record_undo_snapshot();
+        self.edit(insert_at, insert_at, &insertion);
         self.selection = None;
-        self.text.insert_str(insert_at, &insertion);
-        self.revision = self.revision.wrapping_add(1);
-        self.rebuild_line_index();
         self.cursor = self.line_col_to_byte(line_index + 2, column + 1);
         true
     }
@@ -794,7 +960,7 @@ impl EditorBuffer {
     ) {
         let mut start = self.clamp_to_char_boundary(start);
         let mut end = self.clamp_to_char_boundary(end);
-        if let Some((selection_start, selection_end)) = self.selection.take() {
+        if let Some((selection_start, selection_end)) = self.selection {
             start = selection_start;
             end = selection_end;
         }
@@ -809,12 +975,9 @@ impl EditorBuffer {
             return;
         }
 
-        self.record_undo_snapshot();
-        self.text.replace_range(start..end, replacement);
+        self.edit(start, end, replacement);
         self.cursor = start + replacement.len();
         self.selection = None;
-        self.revision = self.revision.wrapping_add(1);
-        self.rebuild_line_index();
     }
 
     pub(crate) fn clamp_to_char_boundary(&self, byte: usize) -> usize {
@@ -941,11 +1104,8 @@ impl EditorBuffer {
         let insert_at = target_start.min(lines.len());
         lines.splice(insert_at..insert_at, block);
 
-        self.record_undo_snapshot();
-        self.text = lines.concat();
+        self.edit_to(lines.concat());
         self.selection = None;
-        self.revision = self.revision.wrapping_add(1);
-        self.rebuild_line_index();
 
         let new_start = insert_at;
         let new_end = insert_at + block_len - 1;
@@ -980,11 +1140,8 @@ impl EditorBuffer {
         let line = lines.remove(line_index);
         let target_index = target_index.min(lines.len());
         lines.insert(target_index, line);
-        self.record_undo_snapshot();
-        self.text = lines.concat();
+        self.edit_to(lines.concat());
         self.selection = None;
-        self.revision = self.revision.wrapping_add(1);
-        self.rebuild_line_index();
         self.cursor = self.line_col_to_byte(target_index + 1, column + 1);
         true
     }
@@ -1144,6 +1301,60 @@ impl EditorBuffer {
 
     fn is_word_char(ch: char) -> bool {
         ch.is_alphanumeric() || ch == '_'
+    }
+
+    fn record_layout_change(&mut self, before: u64, prefix_lines: usize, suffix_lines: usize) {
+        const LIMIT: usize = 64;
+        self.layout_changes.push_back(LayoutChange {
+            before,
+            after: self.revision,
+            prefix_lines,
+            suffix_lines,
+        });
+        while self.layout_changes.len() > LIMIT {
+            self.layout_changes.pop_front();
+        }
+    }
+
+    pub(crate) fn unchanged_layout_edges(&self, revision: u64) -> Option<(usize, usize)> {
+        let mut expected = revision;
+        let mut prefix = usize::MAX;
+        let mut suffix = usize::MAX;
+        for change in self
+            .layout_changes
+            .iter()
+            .filter(|change| change.after > revision)
+        {
+            if change.before != expected {
+                return None;
+            }
+            prefix = prefix.min(change.prefix_lines);
+            suffix = suffix.min(change.suffix_lines);
+            expected = change.after;
+        }
+        (expected == self.revision && expected != revision).then_some((prefix, suffix))
+    }
+
+    fn changed_old_byte_range(old: &str, new: &str) -> (usize, usize) {
+        let mut prefix = old
+            .bytes()
+            .zip(new.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        while !old.is_char_boundary(prefix) || !new.is_char_boundary(prefix) {
+            prefix -= 1;
+        }
+        let mut suffix = old[prefix..]
+            .bytes()
+            .rev()
+            .zip(new[prefix..].bytes().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        while !old.is_char_boundary(old.len() - suffix) || !new.is_char_boundary(new.len() - suffix)
+        {
+            suffix -= 1;
+        }
+        (prefix, old.len() - suffix)
     }
 
     pub(crate) fn rebuild_line_index(&mut self) {
@@ -1732,5 +1943,99 @@ mod tests {
 
         assert!(buffer.move_to_word_start_left());
         assert_eq!(buffer.cursor(), 0);
+    }
+
+    #[test]
+    fn editor_buffer_groups_typed_word_into_one_undo_step() {
+        let mut buffer = EditorBuffer::new();
+        for ch in "hello world".chars() {
+            buffer.type_text(&ch.to_string());
+        }
+        assert_eq!(buffer.as_str(), "hello world");
+
+        assert!(buffer.undo());
+        assert_eq!(buffer.as_str(), "hello");
+        assert!(buffer.undo());
+        assert_eq!(buffer.as_str(), "");
+        assert!(!buffer.undo());
+
+        assert!(buffer.redo());
+        assert!(buffer.redo());
+        assert_eq!(buffer.as_str(), "hello world");
+        assert_eq!(buffer.cursor(), buffer.as_str().len());
+    }
+
+    #[test]
+    fn editor_buffer_typing_group_breaks_on_cursor_move_and_newline() {
+        let mut buffer = EditorBuffer::new();
+        buffer.type_text("a");
+        buffer.type_text("b");
+        buffer.move_left();
+        buffer.type_text("x");
+        assert_eq!(buffer.as_str(), "axb");
+        buffer.move_to_line_end();
+        buffer.type_text("\n");
+        buffer.type_text("c");
+        assert_eq!(buffer.as_str(), "axb\nc");
+
+        assert!(buffer.undo());
+        assert_eq!(buffer.as_str(), "axb\n");
+        assert!(buffer.undo());
+        assert_eq!(buffer.as_str(), "axb");
+        assert!(buffer.undo());
+        assert_eq!(buffer.as_str(), "ab");
+        assert!(buffer.undo());
+        assert_eq!(buffer.as_str(), "");
+    }
+
+    #[test]
+    fn editor_buffer_undo_history_stores_deltas_not_documents() {
+        let large = "line of text\n".repeat(400_000);
+        let mut buffer = EditorBuffer::from_text(large.clone());
+        buffer.set_cursor(large.len() / 2);
+        for _ in 0..300 {
+            buffer.insert_text("x");
+            buffer.move_right();
+        }
+        assert!(buffer.undo_history_bytes() < 4 * 1024);
+        while buffer.undo() {}
+        assert_eq!(buffer.as_str(), large);
+    }
+
+    #[test]
+    fn editor_buffer_undo_restores_replaced_selection() {
+        let mut buffer = EditorBuffer::from_text("alpha beta".to_string());
+        buffer.set_selection(0, 5);
+        buffer.insert_text("omega");
+        assert_eq!(buffer.as_str(), "omega beta");
+
+        assert!(buffer.undo());
+        assert_eq!(buffer.as_str(), "alpha beta");
+        assert_eq!(buffer.selection(), Some((0, 5)));
+    }
+
+    #[test]
+    fn editor_buffer_line_operations_round_trip_through_undo_redo() {
+        let original = "one\ntwo\nthree\nfour";
+        let mut buffer = EditorBuffer::from_text(original.to_string());
+        buffer.set_selection(4, 13);
+        assert!(buffer.indent_current_or_selected_lines());
+        let indented = buffer.as_str().to_string();
+        assert!(buffer.move_current_line_up());
+        let moved = buffer.as_str().to_string();
+        assert!(buffer.duplicate_current_line());
+        let duplicated = buffer.as_str().to_string();
+        assert!(buffer.delete_current_line());
+        let deleted = buffer.as_str().to_string();
+
+        for expected in [&duplicated, &moved, &indented, &original.to_string()] {
+            assert!(buffer.undo());
+            assert_eq!(buffer.as_str(), expected.as_str());
+            assert_eq!(buffer.line_count(), expected.split('\n').count());
+        }
+        for expected in [&indented, &moved, &duplicated, &deleted] {
+            assert!(buffer.redo());
+            assert_eq!(buffer.as_str(), expected.as_str());
+        }
     }
 }

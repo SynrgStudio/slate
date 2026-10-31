@@ -133,6 +133,15 @@ slate
 slate ~/notes.md
 ```
 
+If Slate is already running, `slate file.md` opens the file in that window
+instantly instead of starting a new one. Use `slate --new-window file.md`
+(`-n`) for a separate window, or set `single_instance = false` in
+`config.toml`. See [`docs/speed-work.md`](docs/speed-work.md).
+
+Slate renders with wgpu (Direct3D 12 flip model on Windows) for the lowest
+keystroke latency, and falls back to OpenGL if that fails. Set
+`SLATE_RENDERER=glow` to force OpenGL.
+
 Scratch mode:
 
 ```bash
@@ -182,6 +191,7 @@ slate --scratch
 | `Tab` | Indent current line or selected lines by 4 spaces |
 | `Shift+Tab` | Dedent current line or selected lines by up to 4 spaces |
 | `Ctrl+LeftClick` | Open Markdown/web link under pointer |
+| `F12` | Timing overlay (frame, keystroke, find, startup) |
 | `Ctrl+Q` | Quit |
 | `Alt+1` … `Alt+9`, `Alt+0` | Open Lance slots 1 through 10 |
 | `Alt+Up` / `Alt+Down` | Move current line up/down |
@@ -231,6 +241,7 @@ Open the command line with `Ctrl+.`. Commands may be typed with or without the l
 :line-numbers relative     relative line numbers
 :ln absolute|relative      short form
 :settings                  settings modal
+:perf / :hud               toggle the timing overlay (also F12)
 ```
 
 ### Navigation and editing commands

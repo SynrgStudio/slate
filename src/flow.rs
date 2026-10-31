@@ -3,9 +3,8 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::Write,
     path::{Path, PathBuf},
-    process::{Command as ProcessCommand, Stdio},
+    sync::{Mutex, atomic::{AtomicU64, Ordering}},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -243,6 +242,9 @@ pub(crate) fn should_index_flow_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+static INDEX_WRITE_LOCK: Mutex<()> = Mutex::new(());
+static NEXT_TEMP_INDEX: AtomicU64 = AtomicU64::new(1);
+
 pub(crate) fn update_flow_index_for_file(
     project_root: &Path,
     sqlite_path: &Path,
@@ -251,8 +253,9 @@ pub(crate) fn update_flow_index_for_file(
 ) -> Result<FlowIndexSummary, String> {
     let tasks = parse_flow_tasks(contents);
     let known_file = build_known_file(project_root, path, contents, &tasks);
-    let index_path = write_project_index_entry(project_root, known_file.clone())?;
     write_sqlite_cache(sqlite_path, &known_file, &tasks, contents)?;
+    let index_path = project_root.join(".slate").join("index.tsv");
+    crate::index_export::request(project_root, sqlite_path);
 
     Ok(FlowIndexSummary {
         project_root: project_root.to_path_buf(),
@@ -263,7 +266,7 @@ pub(crate) fn update_flow_index_for_file(
     })
 }
 
-fn build_known_file(
+pub(crate) fn build_known_file(
     project_root: &Path,
     path: &Path,
     contents: &str,
@@ -292,10 +295,12 @@ fn build_known_file(
     }
 }
 
+#[cfg(test)]
 fn write_project_index_entry(
     project_root: &Path,
     known_file: FlowKnownFile,
 ) -> Result<PathBuf, String> {
+    let _guard = INDEX_WRITE_LOCK.lock().map_err(|e| e.to_string())?;
     let slate_dir = project_root.join(".slate");
     fs::create_dir_all(&slate_dir).map_err(|err| err.to_string())?;
     let index_path = slate_dir.join("index.tsv");
@@ -305,6 +310,7 @@ fn write_project_index_entry(
     Ok(index_path)
 }
 
+#[cfg(test)]
 fn read_project_index_entries(index_path: &Path) -> BTreeMap<String, FlowKnownFile> {
     let Ok(contents) = fs::read_to_string(index_path) else {
         return BTreeMap::new();
@@ -320,7 +326,7 @@ fn write_project_index_entries(
     index_path: &Path,
     entries: &BTreeMap<String, FlowKnownFile>,
 ) -> Result<(), String> {
-    let tmp_path = index_path.with_extension("tsv.tmp");
+    let tmp_path = index_path.with_extension(format!("tsv.{}.{}.tmp", std::process::id(), NEXT_TEMP_INDEX.fetch_add(1, Ordering::Relaxed)));
     let mut contents = String::from(
         "# Slate Flow known files index\n\
          # Derived/rebuildable. Markdown files remain the source of truth.\n\
@@ -333,6 +339,7 @@ fn write_project_index_entries(
     fs::rename(&tmp_path, index_path).map_err(|err| err.to_string())
 }
 
+#[cfg(test)]
 fn parse_project_index_entry(line: &str) -> Option<FlowKnownFile> {
     if line.trim().is_empty() || line.starts_with('#') {
         return None;
@@ -369,155 +376,31 @@ fn write_sqlite_cache(
     tasks: &[FlowTask],
     contents: &str,
 ) -> Result<(), String> {
-    if let Some(dir) = sqlite_path.parent() {
-        fs::create_dir_all(dir).map_err(|err| err.to_string())?;
-    }
-
-    ensure_tasks_kind_column(sqlite_path)?;
-    let sql = sqlite_upsert_sql(known_file, tasks, contents);
-    let mut child = ProcessCommand::new("sqlite3")
-        .arg(sqlite_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("sqlite3 unavailable: {err}"))?;
-
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin
-            .write_all(sql.as_bytes())
-            .map_err(|err| err.to_string())?;
-    }
-
-    let output = child.wait_with_output().map_err(|err| err.to_string())?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-    }
+    let document = crate::flow_store::Document {
+        known_file: known_file.clone(), tasks: tasks.to_vec(), contents: contents.to_string(),
+    };
+    crate::flow_store::with_writer(sqlite_path, |writer| writer.write_batch(&[document]))
 }
 
-fn ensure_tasks_kind_column(sqlite_path: &Path) -> Result<(), String> {
-    let create_sql = "CREATE TABLE IF NOT EXISTS tasks (path TEXT NOT NULL, line_number INTEGER NOT NULL, line_index INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'task', state TEXT NOT NULL, title TEXT NOT NULL, raw_text TEXT NOT NULL, tags TEXT NOT NULL, projects TEXT NOT NULL, priority TEXT, due TEXT, scheduled TEXT, heading TEXT, related TEXT NOT NULL, notes TEXT NOT NULL, source_snippet TEXT NOT NULL, PRIMARY KEY(path, line_number, title));";
-    let create = ProcessCommand::new("sqlite3")
-        .arg(sqlite_path)
-        .arg(create_sql)
-        .output()
-        .map_err(|err| format!("sqlite3 unavailable: {err}"))?;
-    if !create.status.success() {
-        return Err(String::from_utf8_lossy(&create.stderr).trim().to_string());
-    }
-
-    let info = ProcessCommand::new("sqlite3")
-        .arg(sqlite_path)
-        .arg("PRAGMA table_info(tasks);")
-        .output()
-        .map_err(|err| format!("sqlite3 unavailable: {err}"))?;
-    if !info.status.success() {
-        return Err(String::from_utf8_lossy(&info.stderr).trim().to_string());
-    }
-    let has_kind = String::from_utf8_lossy(&info.stdout)
-        .lines()
-        .filter_map(|line| line.split('|').nth(1))
-        .any(|column| column == "kind");
-    if has_kind {
-        return Ok(());
-    }
-
-    let alter = ProcessCommand::new("sqlite3")
-        .arg(sqlite_path)
-        .arg("ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'task';")
-        .output()
-        .map_err(|err| format!("sqlite3 unavailable: {err}"))?;
-    if alter.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&alter.stderr).trim().to_string())
-    }
+/// Export the rebuildable TSV once after a scan, from committed DB rows rather
+/// than a stale snapshot. Serialize exporters with individual UI updates.
+pub(crate) fn export_cache_index(root: &Path, writer: &crate::flow_store::CacheWriter) -> Result<(), String> {
+    let _guard = INDEX_WRITE_LOCK.lock().map_err(|e| e.to_string())?;
+    let dir = root.join(".slate");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let entries = writer.known_files()?.into_iter().map(|file| (file.path.clone(), file)).collect();
+    write_project_index_entries(&dir.join("index.tsv"), &entries)
 }
 
-fn sqlite_upsert_sql(known_file: &FlowKnownFile, tasks: &[FlowTask], contents: &str) -> String {
-    let mut sql = String::from(
-        "PRAGMA journal_mode=WAL;\n\
-         CREATE TABLE IF NOT EXISTS files (\n\
-             path TEXT PRIMARY KEY,\n\
-             last_seen_unix INTEGER NOT NULL,\n\
-             mtime_unix INTEGER NOT NULL,\n\
-             task_count INTEGER NOT NULL,\n\
-             has_tasks INTEGER NOT NULL,\n\
-             has_links INTEGER NOT NULL,\n\
-             has_tags INTEGER NOT NULL\n\
-         );\n\
-         CREATE TABLE IF NOT EXISTS tasks (\n\
-             path TEXT NOT NULL,\n\
-             line_number INTEGER NOT NULL,\n\
-             line_index INTEGER NOT NULL,\n\
-             kind TEXT NOT NULL DEFAULT 'task',\n\
-             state TEXT NOT NULL,\n\
-             title TEXT NOT NULL,\n\
-             raw_text TEXT NOT NULL,\n\
-             tags TEXT NOT NULL,\n\
-             projects TEXT NOT NULL,\n\
-             priority TEXT,\n\
-             due TEXT,\n\
-             scheduled TEXT,\n\
-             heading TEXT,\n\
-             related TEXT NOT NULL,\n\
-             notes TEXT NOT NULL,\n\
-             source_snippet TEXT NOT NULL,\n\
-             PRIMARY KEY(path, line_number, title)\n\
-         );\n\
-         BEGIN;\n",
-    );
-
-    sql.push_str(&format!(
-        "INSERT OR REPLACE INTO files (path, last_seen_unix, mtime_unix, task_count, has_tasks, has_links, has_tags) VALUES ({}, {}, {}, {}, {}, {}, {});\n",
-        sql_string(&known_file.path),
-        known_file.last_seen_unix,
-        known_file.mtime_unix,
-        known_file.task_count,
-        sql_bool(known_file.has_tasks),
-        sql_bool(known_file.has_links),
-        sql_bool(known_file.has_tags),
-    ));
-    sql.push_str(&format!(
-        "DELETE FROM tasks WHERE path = {};\n",
-        sql_string(&known_file.path)
-    ));
-
-    let lines = contents.lines().collect::<Vec<_>>();
-    for task in tasks {
-        let priority = task.priority.map(FlowPriority::as_str);
-        let snippet = lines
-            .get(task.line_index)
-            .copied()
-            .unwrap_or(&task.raw_text);
-        sql.push_str(&format!(
-            "INSERT OR REPLACE INTO tasks (path, line_number, line_index, kind, state, title, raw_text, tags, projects, priority, due, scheduled, heading, related, notes, source_snippet) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {});\n",
-            sql_string(&known_file.path),
-            task.line_number,
-            task.line_index,
-            sql_string(task.kind.as_str()),
-            sql_string(flow_item_state_label(task)),
-            sql_string(&task.title),
-            sql_string(&task.raw_text),
-            sql_string(&task.tags.join(",")),
-            sql_string(&task.projects.join(",")),
-            sql_option(priority),
-            sql_option(task.metadata.due.as_deref()),
-            sql_option(task.metadata.scheduled.as_deref()),
-            sql_option(task.heading.as_deref()),
-            sql_string(&task.metadata.related.join("\n")),
-            sql_string(&task.metadata.notes.join("\n")),
-            sql_string(snippet),
-        ));
-    }
-
-    sql.push_str("COMMIT;\n");
-    sql
+pub(crate) fn export_database_index(root: &Path, database: &Path) -> Result<(), String> {
+    let _guard = INDEX_WRITE_LOCK.lock().map_err(|e| e.to_string())?;
+    let entries = crate::flow_store::read_known_files(database)?.into_iter().map(|file| (file.path.clone(), file)).collect();
+    let dir = root.join(".slate");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    write_project_index_entries(&dir.join("index.tsv"), &entries)
 }
 
-fn flow_item_state_label(item: &FlowTask) -> &'static str {
+pub(crate) fn flow_item_state_label(item: &FlowTask) -> &'static str {
     match item.kind {
         FlowItemKind::Task => checkbox_state_label(item.state),
         FlowItemKind::Note => "note",
@@ -534,22 +417,11 @@ fn checkbox_state_label(state: CheckboxState) -> &'static str {
     }
 }
 
-fn sql_string(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-fn sql_option(value: Option<&str>) -> String {
-    value.map(sql_string).unwrap_or_else(|| "NULL".to_string())
-}
-
-fn sql_bool(value: bool) -> u8 {
-    u8::from(value)
-}
-
 fn bool_field(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
 
+#[cfg(test)]
 fn parse_bool_field(value: &str) -> bool {
     matches!(value, "yes" | "true" | "1")
 }
@@ -858,40 +730,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_upsert_sql_contains_cache_schema_and_tasks() {
-        let known_file = FlowKnownFile {
-            path: "notes.md".to_string(),
-            last_seen_unix: 1,
-            mtime_unix: 2,
-            task_count: 1,
-            has_tasks: true,
-            has_links: false,
-            has_tags: true,
-        };
-        let tasks =
-            parse_flow_tasks("- [ ] Don't break parser #flow @slate ALTA\n  - due: 2026-06-10\n");
-        let sql = sqlite_upsert_sql(
-            &known_file,
-            &tasks,
-            "- [ ] Don't break parser #flow @slate ALTA\n  - due: 2026-06-10\n",
-        );
-
-        assert!(sql.contains("CREATE TABLE IF NOT EXISTS files"));
-        assert!(sql.contains("CREATE TABLE IF NOT EXISTS tasks"));
-        assert!(sql.contains("'Don''t break parser'"));
-        assert!(sql.contains("'2026-06-10'"));
-    }
-
-    #[test]
     fn update_flow_index_writes_readable_index_and_sqlite_cache() {
-        if ProcessCommand::new("sqlite3")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            return;
-        }
-
         let root = temp_test_dir("slate-flow-cache");
         let path = root.join("notes.md");
         let sqlite_path = root.join("agenda.db");
@@ -904,19 +743,14 @@ mod tests {
 
         assert_eq!(summary.known_file.path, "notes.md");
         assert_eq!(summary.tasks.len(), 1);
+        crate::index_export::flush();
         assert!(summary.index_path.exists());
         assert!(sqlite_path.exists());
 
-        let output = ProcessCommand::new("sqlite3")
-            .arg(&sqlite_path)
-            .arg(
-                "SELECT title || '|' || due || '|' || priority FROM tasks WHERE path = 'notes.md';",
-            )
-            .output()
-            .unwrap();
-        assert!(output.status.success());
+        let rows = crate::flow_store::read_tasks(&sqlite_path).unwrap();
+        assert_eq!(rows.len(), 1);
         assert_eq!(
-            String::from_utf8_lossy(&output.stdout).trim(),
+            format!("{}|{}|{}", rows[0].title, rows[0].due, rows[0].priority),
             "Cache this task|2026-06-10|ALTA"
         );
 

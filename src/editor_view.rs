@@ -10,7 +10,37 @@ use crate::{
     search::SearchState,
 };
 
-use std::path::Path;
+use std::{cell::RefCell, collections::HashMap, path::Path, sync::Arc};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RowLayoutKey {
+    identity: u64,
+    revision: u64,
+    font_size: u32,
+    width: u32,
+    scale: u32,
+    wrap: bool,
+}
+struct RowLayout {
+    key: RowLayoutKey,
+    rows: Arc<Vec<VisualRow>>,
+    line_count: usize,
+    text_len: usize,
+    #[cfg(test)]
+    recalculated_lines: usize,
+}
+struct FenceLayout {
+    identity: u64,
+    revision: u64,
+    ranges: Vec<(usize, usize)>,
+}
+
+#[cfg(test)]
+#[path = "editor_incremental_tests.rs"]
+mod incremental_tests;
+#[cfg(test)]
+#[path = "editor_layout_tests.rs"]
+mod layout_tests;
 
 use chrono::{Datelike, Local, NaiveDate};
 use eframe::egui::{self, Color32, FontFamily, FontId, Key, Pos2, Stroke};
@@ -55,7 +85,13 @@ impl LineNumberMode {
     pub(crate) fn number_for_line(self, line_index: usize, current_line_index: usize) -> usize {
         match self {
             LineNumberMode::Absolute => line_index + 1,
-            LineNumberMode::Relative => line_index.abs_diff(current_line_index) + 1,
+            LineNumberMode::Relative => {
+                if line_index == current_line_index {
+                    line_index + 1
+                } else {
+                    line_index.abs_diff(current_line_index)
+                }
+            }
         }
     }
 }
@@ -92,8 +128,24 @@ struct FlowMetadataLine {
     value: String,
 }
 
+pub(crate) const DEFAULT_EDITOR_FONT_SIZE: f32 = LINE_NUMBER_FONT_SIZE;
+pub(crate) const LINE_NUMBER_FONT_SIZE: f32 = 12.0;
+pub(crate) fn clamp_editor_font_size(size: f32) -> f32 {
+    if size.is_finite() {
+        size.clamp(8.0, 32.0)
+    } else {
+        DEFAULT_EDITOR_FONT_SIZE
+    }
+}
+
 pub(crate) struct EditorView {
+    font_size: f32,
+    font_size_changed: bool,
+    row_layout: RefCell<Option<RowLayout>>,
+    fence_layout: RefCell<Option<FenceLayout>>,
     scroll_y: f32,
+    scroll_geometry: (f32, f32),
+    pending_scroll_position: Option<crate::scroll_sync::Position>,
     target_cursor: Option<usize>,
     link_click_byte: Option<usize>,
     link_click_target: Option<String>,
@@ -124,7 +176,13 @@ fn virtual_tail_buffer(buffer: &EditorBuffer, tail: &str) -> EditorBuffer {
 impl EditorView {
     pub(crate) fn new() -> Self {
         Self {
+            font_size: DEFAULT_EDITOR_FONT_SIZE,
+            font_size_changed: false,
+            row_layout: RefCell::new(None),
+            fence_layout: RefCell::new(None),
             scroll_y: 0.0,
+            scroll_geometry: (1.0, 0.0),
+            pending_scroll_position: None,
             target_cursor: None,
             link_click_byte: None,
             link_click_target: None,
@@ -137,6 +195,56 @@ impl EditorView {
             last_cursor_pos: None,
             last_text_input: None,
         }
+    }
+
+    pub(crate) fn scroll_position(&self) -> crate::scroll_sync::Position {
+        let cache = self.row_layout.borrow();
+        let Some(layout) = cache.as_ref() else {
+            return Default::default();
+        };
+        let height = self.scroll_geometry.0;
+        let max = (layout.rows.len() as f32 * height - self.scroll_geometry.1).max(0.0);
+        let index = (self.scroll_y / height).floor().max(0.0) as usize;
+        let Some(row) = layout
+            .rows
+            .get(index.min(layout.rows.len().saturating_sub(1)))
+        else {
+            return Default::default();
+        };
+        let first = layout
+            .rows
+            .partition_point(|r| r.line_index < row.line_index);
+        let end = layout
+            .rows
+            .partition_point(|r| r.line_index <= row.line_index);
+        crate::scroll_sync::Position {
+            source: row.line_index as f32
+                + ((self.scroll_y / height - first as f32) / (end - first).max(1) as f32)
+                    .clamp(0.0, 1.0),
+            at_end: max > 0.0 && self.scroll_y >= max - 0.5,
+        }
+    }
+    pub(crate) fn set_scroll_position(&mut self, position: crate::scroll_sync::Position) {
+        self.pending_scroll_position = Some(position);
+        self.target_cursor = None;
+    }
+    fn apply_scroll_position(
+        &mut self,
+        rows: &[VisualRow],
+        position: crate::scroll_sync::Position,
+        line_height: f32,
+        max: f32,
+    ) {
+        if position.at_end {
+            self.scroll_y = max;
+            return;
+        }
+        let line = position.source.floor().max(0.0) as usize;
+        let first = rows.partition_point(|r| r.line_index < line);
+        let end = rows.partition_point(|r| r.line_index <= line);
+        self.scroll_y = ((first as f32 + position.source.fract().max(0.0) * (end - first) as f32)
+            * line_height)
+            .clamp(0.0, max);
     }
 
     pub(crate) fn take_flow_agenda_update_request(&mut self) -> bool {
@@ -155,6 +263,14 @@ impl EditorView {
 
     pub(crate) fn take_last_text_input(&mut self) -> Option<String> {
         self.last_text_input.take()
+    }
+
+    pub(crate) fn set_font_size(&mut self, size: f32) {
+        let size = clamp_editor_font_size(size);
+        if self.font_size != size {
+            self.font_size = size;
+            self.font_size_changed = true;
+        }
     }
 
     pub(crate) fn observe_buffer(&mut self, buffer: &EditorBuffer) {
@@ -206,12 +322,19 @@ impl EditorView {
         render_markdown: bool,
         virtual_tail: Option<&str>,
     ) -> (egui::Response, bool) {
+        let render_started = (buffer.as_str().len() >= 1_000_000).then(std::time::Instant::now);
         self.observe_buffer(buffer);
+        if self.font_size_changed {
+            self.target_cursor = Some(buffer.cursor());
+            self.font_size_changed = false;
+        }
         self.last_cursor_pos = None;
         self.last_text_input = None;
 
-        let font = FontId::new(15.0, FontFamily::Monospace);
-        let line_height = ui.fonts_mut(|fonts| fonts.row_height(&font)) + 2.0;
+        let font = FontId::new(self.font_size, FontFamily::Monospace);
+        let gutter_font = FontId::new(LINE_NUMBER_FONT_SIZE, FontFamily::Monospace);
+        let line_height =
+            ui.fonts_mut(|fonts| fonts.row_height(&font).max(fonts.row_height(&gutter_font))) + 2.0;
         let available = ui.available_size();
         let (rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
         let view_id = ui
@@ -229,13 +352,17 @@ impl EditorView {
         let mut has_keyboard_focus =
             force_keyboard_focus || response.has_focus() || requested_focus;
         let painter = ui.painter_at(rect);
-        let gutter_width = 22.0;
-        let text_x = rect.left() + gutter_width + 6.0;
-        let gutter_x = rect.left() + gutter_width - 4.0;
-        let wrap_width = (rect.right() - text_x - 8.0).max(40.0);
         let real_line_count = buffer.line_count();
+        let line_number_digits = real_line_count.max(1).to_string().len().max(2);
+        let digit_width = self.text_width(&painter, "0", &gutter_font);
+        let gutter_width = (line_number_digits as f32 * digit_width + 18.0).max(28.0);
+        let scrollbar_reserved_width = 12.0;
+        let content_right = rect.right() - scrollbar_reserved_width;
+        let text_x = rect.left() + gutter_width + 6.0;
+        let gutter_x = rect.left() + gutter_width - 6.0;
+        let wrap_width = (content_right - text_x - 8.0).max(40.0);
         let mut display_buffer_storage = virtual_tail.map(|tail| virtual_tail_buffer(buffer, tail));
-        let mut rows = self.visual_rows(
+        let mut rows = self.cached_visual_rows(
             &painter,
             display_buffer_storage.as_ref().unwrap_or(buffer),
             &font,
@@ -243,38 +370,54 @@ impl EditorView {
             wrap,
         );
         let mut max_scroll = (rows.len() as f32 * line_height - rect.height()).max(0.0);
+        self.scroll_geometry = (line_height, rect.height());
+        if let Some(position) = self.pending_scroll_position.take() {
+            self.apply_scroll_position(&rows, position, line_height, max_scroll);
+        }
+        let scrollbar_track_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.right() - 9.0, rect.top() + 4.0),
+            egui::pos2(rect.right() - 4.0, rect.bottom() - 4.0),
+        );
         let mut changed = false;
 
         if response.clicked() {
             response.request_focus();
             has_keyboard_focus = true;
             if let Some(pos) = response.interact_pointer_pos() {
-                let display_buffer = display_buffer_storage.as_ref().unwrap_or(buffer);
-                let row = self.row_for_pointer(display_buffer, &rows, rect, line_height, pos.y);
-                let byte = self.byte_for_x(&painter, display_buffer, row, pos.x - text_x, &font);
-                let clicked_link = markdown_link_target_at_byte(
-                    display_buffer.line(row.line_index),
-                    display_buffer.line_start(row.line_index),
-                    byte,
-                );
-                if let Some(target) = clicked_link {
-                    if row.line_index >= real_line_count {
-                        self.link_click_target = Some(target.to_string());
-                    } else {
-                        self.link_click_byte = Some(byte);
-                    }
-                } else if row.line_index >= real_line_count {
-                    let line = display_buffer.line(row.line_index).trim().to_string();
-                    if line.contains("SLATE REFERENCES")
-                        || line.contains("virtual references")
-                        || line.contains("Backlinks")
-                        || line.contains("Mentions")
-                    {
-                        self.virtual_line_click = Some(line);
-                    }
+                if max_scroll > 0.0 && scrollbar_track_rect.contains(pos) {
+                    let ratio = ((pos.y - scrollbar_track_rect.top())
+                        / scrollbar_track_rect.height())
+                    .clamp(0.0, 1.0);
+                    self.scroll_y = (ratio * max_scroll).clamp(0.0, max_scroll);
                 } else {
-                    buffer.set_cursor(byte);
-                    self.request_scroll_to_cursor(buffer);
+                    let display_buffer = display_buffer_storage.as_ref().unwrap_or(buffer);
+                    let row = self.row_for_pointer(display_buffer, &rows, rect, line_height, pos.y);
+                    let byte =
+                        self.byte_for_x(&painter, display_buffer, row, pos.x - text_x, &font);
+                    let clicked_link = markdown_link_target_at_byte(
+                        display_buffer.line(row.line_index),
+                        display_buffer.line_start(row.line_index),
+                        byte,
+                    );
+                    if let Some(target) = clicked_link {
+                        if row.line_index >= real_line_count {
+                            self.link_click_target = Some(target.to_string());
+                        } else {
+                            self.link_click_byte = Some(byte);
+                        }
+                    } else if row.line_index >= real_line_count {
+                        let line = display_buffer.line(row.line_index).trim().to_string();
+                        if line.contains("SLATE REFERENCES")
+                            || line.contains("virtual references")
+                            || line.contains("Backlinks")
+                            || line.contains("Mentions")
+                        {
+                            self.virtual_line_click = Some(line);
+                        }
+                    } else {
+                        buffer.set_cursor(byte);
+                        self.request_scroll_to_cursor(buffer);
+                    }
                 }
             }
         }
@@ -283,21 +426,35 @@ impl EditorView {
             response.request_focus();
             has_keyboard_focus = true;
             if let Some(pos) = response.interact_pointer_pos() {
-                let row = self.row_for_pointer(buffer, &rows, rect, line_height, pos.y);
-                let byte = self.byte_for_x(&painter, buffer, row, pos.x - text_x, &font);
-                self.mouse_selection_anchor = Some(byte);
-                buffer.set_cursor(byte);
+                if max_scroll > 0.0 && scrollbar_track_rect.contains(pos) {
+                    self.mouse_selection_anchor = None;
+                    let ratio = ((pos.y - scrollbar_track_rect.top())
+                        / scrollbar_track_rect.height())
+                    .clamp(0.0, 1.0);
+                    self.scroll_y = (ratio * max_scroll).clamp(0.0, max_scroll);
+                } else {
+                    let row = self.row_for_pointer(buffer, &rows, rect, line_height, pos.y);
+                    let byte = self.byte_for_x(&painter, buffer, row, pos.x - text_x, &font);
+                    self.mouse_selection_anchor = Some(byte);
+                    buffer.set_cursor(byte);
+                }
             }
         }
 
         if response.dragged() {
             has_keyboard_focus = true;
-            if let (Some(anchor), Some(pos)) =
-                (self.mouse_selection_anchor, response.interact_pointer_pos())
-            {
-                let row = self.row_for_pointer(buffer, &rows, rect, line_height, pos.y);
-                let byte = self.byte_for_x(&painter, buffer, row, pos.x - text_x, &font);
-                buffer.set_selection(anchor, byte);
+            if let Some(pos) = response.interact_pointer_pos() {
+                if max_scroll > 0.0 && scrollbar_track_rect.contains(pos) {
+                    self.mouse_selection_anchor = None;
+                    let ratio = ((pos.y - scrollbar_track_rect.top())
+                        / scrollbar_track_rect.height())
+                    .clamp(0.0, 1.0);
+                    self.scroll_y = (ratio * max_scroll).clamp(0.0, max_scroll);
+                } else if let Some(anchor) = self.mouse_selection_anchor {
+                    let row = self.row_for_pointer(buffer, &rows, rect, line_height, pos.y);
+                    let byte = self.byte_for_x(&painter, buffer, row, pos.x - text_x, &font);
+                    buffer.set_selection(anchor, byte);
+                }
             }
         }
 
@@ -305,7 +462,9 @@ impl EditorView {
             self.mouse_selection_anchor = None;
         }
 
-        if response.hovered() || has_keyboard_focus {
+        // Wheel ownership follows the pointer, not keyboard focus. Otherwise a
+        // focused editor also scrolls when the pointer is over the preview.
+        if response.hovered() {
             let scroll_delta = ui.input(|input| input.smooth_scroll_delta.y);
             if scroll_delta != 0.0 {
                 self.scroll_y = (self.scroll_y - scroll_delta).clamp(0.0, max_scroll);
@@ -330,7 +489,7 @@ impl EditorView {
             changed = self.handle_keyboard(ui, buffer) || changed;
             if changed {
                 display_buffer_storage = virtual_tail.map(|tail| virtual_tail_buffer(buffer, tail));
-                rows = self.visual_rows(
+                rows = self.cached_visual_rows(
                     &painter,
                     display_buffer_storage.as_ref().unwrap_or(buffer),
                     &font,
@@ -353,6 +512,24 @@ impl EditorView {
         self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
 
         painter.rect_filled(rect, 0.0, Color32::from_rgb(30, 36, 48));
+        if max_scroll > 0.0 && scrollbar_track_rect.height() > 0.0 {
+            painter.rect_filled(scrollbar_track_rect, 0.0, Color32::from_rgb(25, 31, 40));
+            let content_height = rows.len() as f32 * line_height;
+            let thumb_height = (rect.height() / content_height * scrollbar_track_rect.height())
+                .clamp(24.0, scrollbar_track_rect.height());
+            let thumb_range = (scrollbar_track_rect.height() - thumb_height).max(0.0);
+            let thumb_top = scrollbar_track_rect.top()
+                + if max_scroll > 0.0 {
+                    (self.scroll_y / max_scroll).clamp(0.0, 1.0) * thumb_range
+                } else {
+                    0.0
+                };
+            let thumb_rect = egui::Rect::from_min_size(
+                egui::pos2(scrollbar_track_rect.left(), thumb_top),
+                egui::vec2(scrollbar_track_rect.width(), thumb_height),
+            );
+            painter.rect_filled(thumb_rect, 0.0, Color32::from_rgb(136, 154, 176));
+        }
 
         let display_buffer = display_buffer_storage.as_ref().unwrap_or(buffer);
         let range = self.visible_row_range(rows.len(), rect.height(), line_height);
@@ -369,13 +546,13 @@ impl EditorView {
 
             let line_rect = egui::Rect::from_min_size(
                 egui::pos2(rect.left(), y),
-                egui::vec2(rect.width(), line_height),
+                egui::vec2(content_right - rect.left(), line_height),
             );
             let is_virtual_row = row.line_index >= real_line_count;
             if is_virtual_row {
                 let virtual_rect = egui::Rect::from_min_max(
                     egui::pos2(rect.left() + 2.0, y),
-                    egui::pos2(rect.right() - 2.0, y + line_height),
+                    egui::pos2(content_right - 2.0, y + line_height),
                 );
                 painter.rect_filled(virtual_rect, 0.0, Color32::from_rgb(25, 31, 42));
                 painter.line_segment(
@@ -383,28 +560,28 @@ impl EditorView {
                         egui::pos2(virtual_rect.left(), virtual_rect.top()),
                         egui::pos2(virtual_rect.right(), virtual_rect.top()),
                     ],
-                    Stroke::new(1.0, Color32::from_rgb(74, 89, 113)),
+                    Stroke::new(1.0_f32, Color32::from_rgb(74, 89, 113)),
                 );
                 painter.line_segment(
                     [
                         egui::pos2(virtual_rect.left(), virtual_rect.bottom()),
                         egui::pos2(virtual_rect.right(), virtual_rect.bottom()),
                     ],
-                    Stroke::new(1.0, Color32::from_rgb(44, 55, 72)),
+                    Stroke::new(1.0_f32, Color32::from_rgb(44, 55, 72)),
                 );
                 painter.line_segment(
                     [
                         egui::pos2(virtual_rect.left(), virtual_rect.top()),
                         egui::pos2(virtual_rect.left(), virtual_rect.bottom()),
                     ],
-                    Stroke::new(1.0, Color32::from_rgb(74, 89, 113)),
+                    Stroke::new(1.0_f32, Color32::from_rgb(74, 89, 113)),
                 );
                 painter.line_segment(
                     [
                         egui::pos2(virtual_rect.right(), virtual_rect.top()),
                         egui::pos2(virtual_rect.right(), virtual_rect.bottom()),
                     ],
-                    Stroke::new(1.0, Color32::from_rgb(74, 89, 113)),
+                    Stroke::new(1.0_f32, Color32::from_rgb(74, 89, 113)),
                 );
             } else if row.line_index % 2 == 0 {
                 painter.rect_filled(line_rect, 0.0, Color32::from_rgb(29, 35, 46));
@@ -418,7 +595,7 @@ impl EditorView {
                     text_x,
                     y,
                     line_height,
-                    rect.right(),
+                    content_right,
                     render_markdown,
                     &font,
                 );
@@ -426,12 +603,12 @@ impl EditorView {
             if active_line_text_highlight == Some(row.line_index) && !is_virtual_row {
                 let highlight_rect = egui::Rect::from_min_max(
                     egui::pos2(text_x - 8.0, y + 1.0),
-                    egui::pos2(rect.right() - 6.0, y + line_height - 1.0),
+                    egui::pos2(content_right - 6.0, y + line_height - 1.0),
                 );
                 painter.rect_stroke(
                     highlight_rect,
                     0.0,
-                    Stroke::new(1.0, Color32::from_rgb(235, 203, 139)),
+                    Stroke::new(1.0_f32, Color32::from_rgb(235, 203, 139)),
                     egui::StrokeKind::Inside,
                 );
             }
@@ -449,7 +626,7 @@ impl EditorView {
                     y,
                     line_height,
                     &font,
-                    rect.right(),
+                    content_right,
                 );
             }
 
@@ -464,12 +641,12 @@ impl EditorView {
                     y,
                     line_height,
                     &font,
-                    rect.right(),
+                    content_right,
                 );
             }
 
             painter.text(
-                egui::pos2(gutter_x, y + line_height * 0.5 + 2.0),
+                egui::pos2(gutter_x, y + line_height * 0.5),
                 egui::Align2::RIGHT_CENTER,
                 if is_virtual_row {
                     "·".to_string()
@@ -481,7 +658,7 @@ impl EditorView {
                 } else {
                     "·".to_string()
                 },
-                FontId::new(12.0, FontFamily::Monospace),
+                gutter_font.clone(),
                 Color32::from_rgb(94, 105, 126),
             );
             let text_color = if is_virtual_row {
@@ -519,7 +696,6 @@ impl EditorView {
 
         if keyboard_enabled && has_keyboard_focus {
             self.paint_cursor(
-                ui,
                 &painter,
                 buffer,
                 &rows,
@@ -530,7 +706,123 @@ impl EditorView {
             );
         }
 
+        if let Some(started) = render_started {
+            let elapsed = started.elapsed();
+            if elapsed.as_millis() >= 16 {
+                crate::perf_log::mark(
+                    "editor.render.slow",
+                    &format!(
+                        "bytes={} cpu_ms={:.3} wrap={wrap} changed={changed}",
+                        buffer.as_str().len(),
+                        elapsed.as_secs_f64() * 1000.0
+                    ),
+                );
+            }
+        }
         (response, changed)
+    }
+
+    fn cached_visual_rows(
+        &self,
+        painter: &egui::Painter,
+        buffer: &EditorBuffer,
+        font: &FontId,
+        wrap_width: f32,
+        wrap: bool,
+    ) -> Arc<Vec<VisualRow>> {
+        let key = RowLayoutKey {
+            identity: buffer.identity,
+            revision: buffer.revision,
+            font_size: font.size.to_bits(),
+            width: wrap_width.to_bits(),
+            scale: painter.ctx().pixels_per_point().to_bits(),
+            wrap,
+        };
+        if let Some(layout) = self
+            .row_layout
+            .borrow()
+            .as_ref()
+            .filter(|layout| layout.key == key)
+        {
+            return layout.rows.clone();
+        }
+        let started = std::time::Instant::now();
+        let previous = self.row_layout.borrow_mut().take();
+        let compatible = previous.as_ref().is_some_and(|old| {
+            old.key.identity == key.identity
+                && old.key.font_size == key.font_size
+                && old.key.width == key.width
+                && old.key.scale == key.scale
+                && old.key.wrap == key.wrap
+        });
+        let edges = if compatible {
+            buffer.unchanged_layout_edges(previous.as_ref().unwrap().key.revision)
+        } else {
+            None
+        };
+        let (rows, recalculated_lines) = if let (Some(old), Some((prefix, suffix))) =
+            (previous.as_ref(), edges)
+        {
+            let prefix = prefix.min(old.line_count).min(buffer.line_count());
+            let suffix = suffix
+                .min(old.line_count - prefix)
+                .min(buffer.line_count() - prefix);
+            let first = old.rows.partition_point(|row| row.line_index < prefix);
+            let last = old
+                .rows
+                .partition_point(|row| row.line_index < old.line_count - suffix);
+            let dirty = prefix..buffer.line_count() - suffix;
+            let recalculated = dirty.len();
+            let mut rows = Vec::with_capacity(old.rows.len());
+            rows.extend_from_slice(&old.rows[..first]);
+            rows.extend(self.visual_rows_for_lines(painter, buffer, font, wrap_width, wrap, dirty));
+            let byte_delta = buffer.as_str().len() as isize - old.text_len as isize;
+            let line_delta = buffer.line_count() as isize - old.line_count as isize;
+            rows.extend(old.rows[last..].iter().map(|row| {
+                VisualRow {
+                    line_index: row
+                        .line_index
+                        .checked_add_signed(line_delta)
+                        .expect("valid reused line"),
+                    start: row
+                        .start
+                        .checked_add_signed(byte_delta)
+                        .expect("valid reused row start"),
+                    end: row
+                        .end
+                        .checked_add_signed(byte_delta)
+                        .expect("valid reused row end"),
+                }
+            }));
+            (Arc::new(rows), recalculated)
+        } else {
+            (
+                Arc::new(self.visual_rows(painter, buffer, font, wrap_width, wrap)),
+                buffer.line_count(),
+            )
+        };
+        if buffer.as_str().len() >= 1_000_000 {
+            crate::perf_log::mark(
+                "editor.layout.rebuild",
+                &format!(
+                    "bytes={} lines={} rows={} recalculated_lines={} cpu_ms={:.3} wrap={wrap}",
+                    buffer.as_str().len(),
+                    buffer.line_count(),
+                    rows.len(),
+                    recalculated_lines,
+                    started.elapsed().as_secs_f64() * 1000.0
+                ),
+            );
+        }
+        *self.row_layout.borrow_mut() = Some(RowLayout {
+            key,
+            rows: rows.clone(),
+            line_count: buffer.line_count(),
+            text_len: buffer.as_str().len(),
+            #[cfg(test)]
+            recalculated_lines,
+        });
+        rows
     }
 
     pub(crate) fn visual_rows(
@@ -541,55 +833,71 @@ impl EditorView {
         wrap_width: f32,
         wrap: bool,
     ) -> Vec<VisualRow> {
-        let mut rows = Vec::new();
-        for line_index in 0..buffer.line_count() {
-            let line_start = buffer.line_start(line_index);
-            let line_end = buffer.line_end(line_index);
-            let line = buffer.line(line_index);
-            if !wrap || line.is_empty() {
-                rows.push(VisualRow {
-                    line_index,
-                    start: line_start,
-                    end: line_end,
-                });
-                continue;
-            }
+        self.visual_rows_for_lines(
+            painter,
+            buffer,
+            font,
+            wrap_width,
+            wrap,
+            0..buffer.line_count(),
+        )
+    }
 
-            let mut start_offset = 0;
-            while start_offset < line.len() {
-                let mut best_end = line.len();
-                let mut exceeded = false;
+    fn visual_rows_for_lines(
+        &self,
+        painter: &egui::Painter,
+        buffer: &EditorBuffer,
+        font: &FontId,
+        wrap_width: f32,
+        wrap: bool,
+        lines: std::ops::Range<usize>,
+    ) -> Vec<VisualRow> {
+        let mut rows = Vec::with_capacity(lines.len());
+        let mut widths = HashMap::new();
+        let mut ascii_widths = [None; 128];
+        painter.ctx().fonts_mut(|fonts| {
+            for line_index in lines {
+                let line_start = buffer.line_start(line_index);
+                let line_end = buffer.line_end(line_index);
+                let line = buffer.line(line_index);
+                if !wrap || line.is_empty() {
+                    rows.push(VisualRow {
+                        line_index,
+                        start: line_start,
+                        end: line_end,
+                    });
+                    continue;
+                }
 
-                for end_offset in line
-                    .char_indices()
-                    .map(|(offset, _)| offset)
-                    .filter(|offset| *offset > start_offset)
-                    .chain(std::iter::once(line.len()))
-                {
-                    let width = self.text_width(painter, &line[start_offset..end_offset], font);
-                    if width > wrap_width {
-                        exceeded = true;
-                        break;
+                let mut start_offset = 0;
+                let mut width = 0.0;
+                for (offset, ch) in line.char_indices() {
+                    let advance = if ch.is_ascii() {
+                        *ascii_widths[ch as usize]
+                            .get_or_insert_with(|| fonts.glyph_width(font, ch))
+                    } else {
+                        *widths
+                            .entry(ch)
+                            .or_insert_with(|| fonts.glyph_width(font, ch))
+                    };
+                    if offset > start_offset && width + advance > wrap_width {
+                        rows.push(VisualRow {
+                            line_index,
+                            start: line_start + start_offset,
+                            end: line_start + offset,
+                        });
+                        start_offset = offset;
+                        width = 0.0;
                     }
-                    best_end = end_offset;
+                    width += advance;
                 }
-
-                if exceeded && best_end == start_offset {
-                    best_end = line[start_offset..]
-                        .char_indices()
-                        .nth(1)
-                        .map(|(offset, _)| start_offset + offset)
-                        .unwrap_or(line.len());
-                }
-
                 rows.push(VisualRow {
                     line_index,
                     start: line_start + start_offset,
-                    end: line_start + best_end,
+                    end: line_end,
                 });
-                start_offset = best_end;
             }
-        }
+        });
         rows
     }
 
@@ -1194,7 +1502,7 @@ impl EditorView {
         text: &str,
     ) {
         let inserted_at = buffer.cursor();
-        buffer.insert_text(text);
+        buffer.type_text(text);
         if buffer.selection().is_none() && text == "[" {
             self.link_assist_trigger_start = Some(inserted_at);
         }
@@ -1355,23 +1663,13 @@ impl EditorView {
         buffer: &'a EditorBuffer,
         line_index: usize,
     ) -> Option<CodeLineKind<'a>> {
-        let mut in_code = false;
-        for index in 0..=line_index {
-            let line = buffer.line(index);
-            if let Some(fence) = parse_fenced_code_marker(line) {
-                if index == line_index {
-                    return Some(CodeLineKind::Fence {
-                        language: fence.language,
-                    });
-                }
-                in_code = !in_code;
-                continue;
-            }
-            if index == line_index && in_code {
-                return Some(CodeLineKind::Body);
-            }
+        if let Some(fence) = parse_fenced_code_marker(buffer.line(line_index)) {
+            return Some(CodeLineKind::Fence {
+                language: fence.language,
+            });
         }
-        None
+        self.code_block_range(buffer, line_index)
+            .map(|_| CodeLineKind::Body)
     }
 
     fn table_line_kind(&self, buffer: &EditorBuffer, line_index: usize) -> Option<TableLineKind> {
@@ -1444,26 +1742,36 @@ impl EditorView {
     }
 
     fn code_block_range(&self, buffer: &EditorBuffer, line_index: usize) -> Option<(usize, usize)> {
-        let mut block_start = None;
-        for index in 0..buffer.line_count() {
-            if parse_fenced_code_marker(buffer.line(index)).is_none() {
-                continue;
-            }
-
-            if let Some(start) = block_start {
-                let end = index;
-                if line_index >= start && line_index <= end {
-                    return Some((start, end));
+        let mut cache = self.fence_layout.borrow_mut();
+        if cache.as_ref().is_none_or(|layout| {
+            layout.identity != buffer.identity || layout.revision != buffer.revision
+        }) {
+            let mut ranges = Vec::new();
+            let mut start = None;
+            for index in 0..buffer.line_count() {
+                if parse_fenced_code_marker(buffer.line(index)).is_some() {
+                    if let Some(first) = start.take() {
+                        ranges.push((first, index));
+                    } else {
+                        start = Some(index);
+                    }
                 }
-                block_start = None;
-            } else {
-                block_start = Some(index);
             }
+            if let Some(first) = start {
+                ranges.push((first, buffer.line_count().saturating_sub(1)));
+            }
+            *cache = Some(FenceLayout {
+                identity: buffer.identity,
+                revision: buffer.revision,
+                ranges,
+            });
         }
-
-        block_start.and_then(|start| {
-            (line_index >= start).then(|| (start, buffer.line_count().saturating_sub(1)))
-        })
+        let ranges = &cache.as_ref().unwrap().ranges;
+        let index = ranges.partition_point(|(start, _)| *start <= line_index);
+        index
+            .checked_sub(1)
+            .and_then(|i| ranges.get(i).copied())
+            .filter(|(_, end)| line_index <= *end)
     }
 
     fn paint_markdown_line_background(
@@ -1520,14 +1828,14 @@ impl EditorView {
                     egui::pos2(table_left, top_y),
                     egui::pos2(table_left, bottom_y),
                 ],
-                Stroke::new(1.0, border),
+                Stroke::new(1.0_f32, border),
             );
             painter.line_segment(
                 [
                     egui::pos2(table_right, top_y),
                     egui::pos2(table_right, bottom_y),
                 ],
-                Stroke::new(1.0, border),
+                Stroke::new(1.0_f32, border),
             );
             if !previous_is_table {
                 painter.line_segment(
@@ -1535,7 +1843,7 @@ impl EditorView {
                         egui::pos2(table_left, top_y),
                         egui::pos2(table_right, top_y),
                     ],
-                    Stroke::new(1.0, border),
+                    Stroke::new(1.0_f32, border),
                 );
             }
             if !next_is_table {
@@ -1544,7 +1852,7 @@ impl EditorView {
                         egui::pos2(table_left, bottom_y),
                         egui::pos2(table_right, bottom_y),
                     ],
-                    Stroke::new(1.0, border),
+                    Stroke::new(1.0_f32, border),
                 );
             }
             if let Some((_, widths)) =
@@ -1555,7 +1863,7 @@ impl EditorView {
                     x += *width;
                     painter.line_segment(
                         [egui::pos2(x, top_y), egui::pos2(x, bottom_y)],
-                        Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
+                        Stroke::new(1.0_f32, Color32::from_rgb(46, 56, 72)),
                     );
                 }
             }
@@ -1565,7 +1873,7 @@ impl EditorView {
                         egui::pos2(table_left, bottom_y),
                         egui::pos2(table_right, bottom_y),
                     ],
-                    Stroke::new(1.0, strong_border),
+                    Stroke::new(1.0_f32, strong_border),
                 );
             }
         }
@@ -1823,7 +2131,7 @@ impl EditorView {
                             egui::pos2(text_x + indent_width + marker_width, underline_y),
                             egui::pos2(painter.clip_rect().right() - 8.0, underline_y),
                         ],
-                        Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
+                        Stroke::new(1.0_f32, Color32::from_rgb(46, 56, 72)),
                     );
                 }
                 return;
@@ -1849,7 +2157,7 @@ impl EditorView {
                     egui::pos2(text_x, separator_y),
                     egui::pos2(painter.clip_rect().right() - 8.0, separator_y),
                 ],
-                Stroke::new(1.0, Color32::from_rgb(76, 86, 106)),
+                Stroke::new(1.0_f32, Color32::from_rgb(76, 86, 106)),
             );
             return;
         }
@@ -1896,7 +2204,7 @@ impl EditorView {
                     };
                     painter.line_segment(
                         [egui::pos2(x, top), egui::pos2(x, bottom)],
-                        Stroke::new(1.0, Color32::from_rgb(136, 192, 208)),
+                        Stroke::new(1.0_f32, Color32::from_rgb(136, 192, 208)),
                     );
                 }
                 if row.end > marker_end {
@@ -2136,7 +2444,7 @@ impl EditorView {
         painter.rect_stroke(
             icon_rect,
             2.0,
-            Stroke::new(1.2, stroke),
+            Stroke::new(1.2_f32, stroke),
             egui::StrokeKind::Outside,
         );
         let glyph_rect = icon_rect.shrink(3.2);
@@ -2145,17 +2453,17 @@ impl EditorView {
             CheckboxState::Doing => {
                 painter.line_segment(
                     [glyph_rect.left_bottom(), glyph_rect.right_top()],
-                    Stroke::new(1.5, stroke),
+                    Stroke::new(1.5_f32, stroke),
                 );
             }
             CheckboxState::Done => {
                 painter.line_segment(
                     [glyph_rect.left_top(), glyph_rect.right_bottom()],
-                    Stroke::new(1.5, stroke),
+                    Stroke::new(1.5_f32, stroke),
                 );
                 painter.line_segment(
                     [glyph_rect.left_bottom(), glyph_rect.right_top()],
-                    Stroke::new(1.5, stroke),
+                    Stroke::new(1.5_f32, stroke),
                 );
             }
         }
@@ -2385,7 +2693,7 @@ impl EditorView {
                         egui::pos2(underline_start, underline_y),
                         egui::pos2(underline_end, underline_y),
                     ],
-                    Stroke::new(1.0, Color32::from_rgb(136, 192, 208)),
+                    Stroke::new(1.0_f32, Color32::from_rgb(136, 192, 208)),
                 );
             }
             byte = marker_end.max(row.start).min(row.end);
@@ -2549,7 +2857,6 @@ impl EditorView {
 
     pub(crate) fn paint_cursor(
         &mut self,
-        ui: &egui::Ui,
         painter: &egui::Painter,
         buffer: &EditorBuffer,
         rows: &[VisualRow],
@@ -2570,9 +2877,10 @@ impl EditorView {
         self.last_cursor_pos = Some(egui::pos2(x, y + line_height));
         painter.line_segment(
             [egui::pos2(x, y + 3.0), egui::pos2(x, y + line_height - 3.0)],
-            Stroke::new(1.5, Color32::from_rgb(236, 239, 244)),
+            Stroke::new(1.5_f32, Color32::from_rgb(236, 239, 244)),
         );
-        ui.ctx().request_repaint();
+        // The caret does not blink, so drawing it does not schedule another frame:
+        // an idle editor presents nothing until input or a timer asks for it.
     }
 
     pub(crate) fn text_width(&self, painter: &egui::Painter, text: &str, font: &FontId) -> f32 {
@@ -3079,9 +3387,9 @@ mod tests {
     #[test]
     fn line_number_mode_calculates_relative_numbers() {
         assert_eq!(LineNumberMode::Absolute.number_for_line(9, 4), 10);
-        assert_eq!(LineNumberMode::Relative.number_for_line(4, 4), 1);
-        assert_eq!(LineNumberMode::Relative.number_for_line(3, 4), 2);
-        assert_eq!(LineNumberMode::Relative.number_for_line(5, 4), 2);
+        assert_eq!(LineNumberMode::Relative.number_for_line(4, 4), 5);
+        assert_eq!(LineNumberMode::Relative.number_for_line(3, 4), 1);
+        assert_eq!(LineNumberMode::Relative.number_for_line(5, 4), 1);
     }
 
     #[test]

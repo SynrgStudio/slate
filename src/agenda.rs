@@ -1,7 +1,6 @@
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
-    process::Command as ProcessCommand,
 };
 
 use chrono::{Datelike, Duration, Local, NaiveDate};
@@ -313,61 +312,20 @@ pub(crate) fn load_items_from_cache(
     if !sqlite_path.exists() {
         return Err("No Flow agenda cache yet. Run :flow-rescan first.".to_string());
     }
-    let query = "SELECT path, line_number, line_index, COALESCE(kind,'task'), state, title, tags, projects, COALESCE(priority,''), COALESCE(due,''), COALESCE(scheduled,''), COALESCE(heading,'') FROM tasks ORDER BY COALESCE(scheduled, due, ''), path, line_number;";
-    let output = ProcessCommand::new("sqlite3")
-        .arg("-separator")
-        .arg("\t")
-        .arg(sqlite_path)
-        .arg(query)
-        .output()
-        .map_err(|err| format!("Agenda failed: sqlite3 unavailable: {err}"))?;
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if err.is_empty() {
-            "Agenda failed reading Flow cache".to_string()
-        } else {
-            format!("Agenda failed: {err}")
-        });
-    }
-
-    let mut items = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| parse_cache_row(root, line))
+    let mut items = crate::flow_store::read_tasks(sqlite_path)?
+        .into_iter()
+        .map(|row| AgendaItem {
+            path: root.join(&row.path), relative_path: row.path,
+            line_number: row.line_number, line_index: row.line_index, kind: row.kind,
+            state: row.state, title: row.title, tags: split_cache_list(&row.tags),
+            projects: split_cache_list(&row.projects), priority: non_empty_string(&row.priority),
+            due: parse_cache_date(&row.due), scheduled: parse_cache_date(&row.scheduled),
+            heading: non_empty_string(&row.heading),
+        })
         .filter(|item| item.path.exists())
         .collect::<Vec<_>>();
     sort_items(&mut items);
     Ok(items)
-}
-
-pub(crate) fn parse_cache_row(root: &Path, line: &str) -> Option<AgendaItem> {
-    let mut fields = line.split('\t');
-    let relative_path = fields.next()?.to_string();
-    let line_number = fields.next()?.parse().ok()?;
-    let line_index = fields.next()?.parse().ok()?;
-    let kind = fields.next()?.to_string();
-    let state = fields.next()?.to_string();
-    let title = fields.next()?.to_string();
-    let tags = split_cache_list(fields.next()?);
-    let projects = split_cache_list(fields.next()?);
-    let priority = non_empty_string(fields.next()?);
-    let due = parse_cache_date(fields.next()?);
-    let scheduled = parse_cache_date(fields.next()?);
-    let heading = non_empty_string(fields.next().unwrap_or(""));
-    Some(AgendaItem {
-        kind,
-        path: root.join(&relative_path),
-        relative_path,
-        line_number,
-        line_index,
-        state,
-        title,
-        tags,
-        projects,
-        priority,
-        due,
-        scheduled,
-        heading,
-    })
 }
 
 fn split_cache_list(value: &str) -> Vec<String> {

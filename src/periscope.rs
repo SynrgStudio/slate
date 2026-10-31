@@ -1,7 +1,6 @@
 use std::{
-    collections::{BinaryHeap, HashSet},
+    collections::HashSet,
     path::{Path, PathBuf},
-    process::Command as ProcessCommand,
 };
 
 use crate::commands::fuzzy_score_lower;
@@ -10,12 +9,6 @@ use crate::commands::fuzzy_score_lower;
 pub(crate) enum PeriscopeMode {
     Project,
     Global,
-}
-
-pub(crate) struct PeriscopeIndexedPath {
-    pub(crate) path: PathBuf,
-    pub(crate) lower: String,
-    pub(crate) is_file: bool,
 }
 
 #[derive(Clone)]
@@ -30,104 +23,9 @@ pub(crate) enum PeriscopeRow {
     },
 }
 
-pub(crate) fn command_available(name: &str) -> bool {
-    ProcessCommand::new("sh")
-        .arg("-lc")
-        .arg(format!("command -v {} >/dev/null 2>&1", name))
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-pub(crate) fn collect_project_files(root: &Path, out: &mut Vec<PathBuf>, limit: usize) {
-    if out.len() >= limit {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.filter_map(Result::ok) {
-        if out.len() >= limit {
-            return;
-        }
-        let path = entry.path();
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("");
-        if path.is_dir() {
-            if name == ".git" {
-                continue;
-            }
-            collect_project_files(&path, out, limit);
-        } else if path.is_file() {
-            out.push(path);
-        }
-    }
-}
-
-pub(crate) fn project_results(root: &Path, query: &str, limit: usize) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    if command_available("fd") {
-        if let Ok(output) = ProcessCommand::new("fd")
-            .args(["--type", "f", "--hidden", "--no-ignore", "."])
-            .arg(root)
-            .output()
-        {
-            if output.status.success() {
-                files = String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .take(20_000)
-                    .map(PathBuf::from)
-                    .collect();
-            }
-        }
-    }
-    if files.is_empty() {
-        collect_project_files(root, &mut files, 20_000);
-    }
-    rank_paths(files, root, query, limit)
-}
-
-pub(crate) fn load_global_index(home: &Path) -> Vec<PeriscopeIndexedPath> {
-    let mut seen = HashSet::new();
-    let mut files = Vec::new();
-    if command_available("fd") {
-        if let Ok(output) = ProcessCommand::new("fd")
-            .args(["--type", "f", "."])
-            .arg(home)
-            .output()
-        {
-            if output.status.success() {
-                files = String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .map(PathBuf::from)
-                    .collect();
-            }
-        }
-    }
-    if files.is_empty() {
-        collect_project_files(home, &mut files, 200_000);
-    }
-    files
-        .into_iter()
-        .filter_map(|path| {
-            let display = path.display().to_string();
-            if !seen.insert(display.clone()) {
-                return None;
-            }
-            Some(PeriscopeIndexedPath {
-                path,
-                lower: display.to_lowercase(),
-                is_file: true,
-            })
-        })
-        .collect()
-}
-
 pub(crate) fn query_tokens(query: &str) -> Vec<&str> {
     query
-        .split(|ch: char| ch.is_whitespace() || ch == '/')
+        .split(|ch: char| ch.is_whitespace() || ch == '/' || ch == '\\')
         .filter(|token| !token.is_empty())
         .collect()
 }
@@ -194,6 +92,23 @@ pub(crate) fn path_score_lower(
         return path_score.into_iter().chain(name_score).min();
     }
 
+    if name_lower.starts_with(query_lower) {
+        return Some(120 + name_lower.len().saturating_sub(query_lower.len()));
+    }
+    if tokens.iter().all(|token| name_lower.contains(token)) {
+        return Some(200 + name_lower.len().saturating_sub(query_lower.len()));
+    }
+    if tokens.iter().all(|token| path_lower.contains(token)) {
+        return Some(600 + path_lower.len().saturating_sub(query_lower.len()));
+    }
+    let joined = tokens.concat();
+    let fuzzy_fallback = || {
+        fuzzy_score_lower(name_lower, &joined)
+            .map(|score| score + 1500)
+            .into_iter()
+            .chain(fuzzy_score_lower(path_lower, &joined).map(|score| score + 2000))
+            .min()
+    };
     let mut search_start = 0usize;
     let mut previous_end = 0usize;
     let mut score = 0usize;
@@ -206,14 +121,20 @@ pub(crate) fn path_score_lower(
                 || matches!(
                     path_lower.as_bytes().get(position.saturating_sub(1)),
                     Some(b'/') | Some(b'-') | Some(b'_') | Some(b'.')
-                );
+                )
+                || path_lower[..position]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_whitespace);
             if at_boundary {
                 found_position = Some(position);
                 break;
             }
-            offset = position + 1;
+            offset = position + path_lower[position..].chars().next().unwrap().len_utf8();
         }
-        let position = found_position?;
+        let Some(position) = found_position else {
+            return fuzzy_fallback();
+        };
         let gap = position.saturating_sub(previous_end);
         score += gap;
         search_start = position + token.len();
@@ -222,52 +143,40 @@ pub(crate) fn path_score_lower(
     Some(score + path_lower.len().saturating_sub(query_lower.len()))
 }
 
-pub(crate) fn cached_results(
-    paths: &[PeriscopeIndexedPath],
+pub(crate) fn rank_native_paths(
+    mut paths: Vec<PathBuf>,
     query: &str,
     limit: usize,
 ) -> Vec<PathBuf> {
     let query = query.trim().to_lowercase();
-    if query.is_empty() {
-        return Vec::new();
-    }
-    let mut best: BinaryHeap<(usize, usize)> = BinaryHeap::new();
-    for (index, path) in paths.iter().enumerate() {
-        if !path.is_file {
-            continue;
-        }
-        let name_lower = path
-            .path
+    let terms = query.split_whitespace().collect::<Vec<_>>();
+    paths.sort_by_cached_key(|path| {
+        let name = path
             .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("")
+            .unwrap_or_default()
+            .to_string_lossy()
             .to_lowercase();
-        let Some(score) = path_score_lower(&path.lower, &name_lower, &query) else {
-            continue;
+        let score = if name == query {
+            0
+        } else if name.starts_with(&query) {
+            1
+        } else if terms.iter().all(|term| name.contains(term)) {
+            2
+        } else {
+            3
         };
-        let candidate = (score, index);
-        if best.len() < limit {
-            best.push(candidate);
-        } else if best.peek().is_some_and(|worst| candidate < *worst) {
-            best.pop();
-            best.push(candidate);
-        }
-    }
-    let mut scored = best.into_vec();
-    scored.sort_by_key(|(score, index)| (*score, *index));
-    scored
-        .into_iter()
-        .map(|(_, index)| paths[index].path.clone())
-        .collect()
+        (score, name, path.clone())
+    });
+    paths.truncate(limit);
+    paths
 }
-
 pub(crate) fn rank_paths(
     mut paths: Vec<PathBuf>,
     root: &Path,
     query: &str,
     limit: usize,
 ) -> Vec<PathBuf> {
-    let query = query.trim().to_lowercase();
+    let query = query.trim().to_lowercase().replace('\\', "/");
     if query.is_empty() {
         paths.sort();
         paths.truncate(limit);
@@ -285,7 +194,7 @@ pub(crate) fn rank_paths(
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("");
-            let relative_lower = relative.to_lowercase();
+            let relative_lower = relative.to_lowercase().replace('\\', "/");
             let name_lower = name.to_lowercase();
             path_score_lower(&relative_lower, &name_lower, &query).map(|score| (score, path))
         })
@@ -393,6 +302,58 @@ pub(crate) fn move_selection(row_count: usize, selected: usize, delta: isize) ->
 mod tests {
     use super::*;
 
+    #[test]
+    fn native_word_order_is_not_filtered_out_and_filenames_rank_before_path_only_matches() {
+        let paths = vec![
+            PathBuf::from("C:/Desktop/Abrir Miniaturas Lychee.cmd"),
+            PathBuf::from("C:/abrir/miniatures/other.cmd"),
+        ];
+        let ranked = rank_native_paths(paths, "mi abrir", 100);
+        assert_eq!(ranked.len(), 2);
+        assert!(ranked[0].to_string_lossy().contains("Lychee"));
+        assert!(
+            path_score_lower(
+                "c:/desktop/abrir miniaturas lychee.cmd",
+                "abrir miniaturas lychee.cmd",
+                "mi abrir"
+            )
+            .is_some()
+        );
+    }
+    #[test]
+    fn spaced_and_abbreviated_command_names_match_without_executing_them() {
+        assert!(
+            path_score_lower(
+                "c:/users/test/desktop/abrir minis.cmd",
+                "abrir minis.cmd",
+                "abrir minis"
+            )
+            .is_some()
+        );
+        assert!(
+            path_score_lower(
+                "c:/users/test/desktop/abrir miniaturas lychee.cmd",
+                "abrir miniaturas lychee.cmd",
+                "abrir minis"
+            )
+            .is_some()
+        );
+        assert!(
+            path_score_lower(
+                "c:/desktop/éé notes test.cmd",
+                "éé notes test.cmd",
+                "é notes"
+            )
+            .is_some()
+        );
+        let paths = rank_paths(
+            vec![PathBuf::from("C:/Desktop/Abrir Miniaturas Lychee.cmd")],
+            Path::new("C:/"),
+            "Abrir minis",
+            100,
+        );
+        assert_eq!(paths.len(), 1);
+    }
     #[test]
     fn path_score_prefers_exact_file_name() {
         let exact = path_score_lower("notes/project/readme.md", "readme.md", "readme.md").unwrap();

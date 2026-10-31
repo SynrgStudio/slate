@@ -233,9 +233,91 @@ pub(crate) fn centered_window_start(
         .min(total_rows.saturating_sub(visible_rows))
 }
 
+/// Column positions relative to the left edge; optional columns disappear on narrow windows.
+pub(crate) struct PickerColumns {
+    pub name_width: f32,
+    pub detail: Option<(f32, f32)>,
+    pub size_right: Option<f32>,
+    pub modified_right: Option<f32>,
+}
+impl PickerColumns {
+    pub fn new(width: f32, files: bool) -> Self {
+        let modified_right = (files && width >= 680.0).then_some(width - 12.0);
+        let size_right = files.then_some(
+            width
+                - if modified_right.is_some() {
+                    104.0
+                } else {
+                    12.0
+                },
+        );
+        let name_end = size_right.map(|x| x - 64.0).unwrap_or(width - 12.0);
+        let detail = (width >= 560.0).then(|| {
+            let x = width * 0.35;
+            (x, (name_end - x - 12.0).max(0.0))
+        });
+        let name_width = (detail.map(|(x, _)| x).unwrap_or(name_end) - 40.0).max(0.0);
+        Self {
+            name_width,
+            detail,
+            size_right,
+            modified_right,
+        }
+    }
+}
+
+pub(crate) fn available_roots() -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        (b'A'..=b'Z')
+            .map(|letter| PathBuf::from(format!("{}:\\", letter as char)))
+            .filter(|root| root.is_dir())
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        vec![PathBuf::from("/")]
+    }
+}
+
+/// Bare Windows drive names mean their root, not a drive-relative working directory.
+pub(crate) fn normalize_drive_path(raw: &str) -> String {
+    let raw = raw.trim().trim_matches('"');
+    if raw.len() == 2 && raw.as_bytes()[0].is_ascii_alphabetic() && raw.as_bytes()[1] == b':' {
+        format!("{raw}\\")
+    } else {
+        raw.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drive_names_are_absolute_roots() {
+        assert_eq!(normalize_drive_path("C:"), "C:\\");
+        assert_eq!(
+            normalize_drive_path("\"C:\\Program Files\""),
+            "C:\\Program Files"
+        );
+        assert_eq!(normalize_drive_path("notes"), "notes");
+    }
+
+    #[test]
+    fn picker_columns_fit_small_and_large_windows() {
+        for width in [280.0, 336.0, 500.0, 720.0, 1200.0] {
+            let cols = PickerColumns::new(width, true);
+            assert!(cols.name_width >= 0.0);
+            if let Some((x, w)) = cols.detail {
+                assert!(x + w <= width);
+            }
+            assert!(cols.size_right.unwrap() <= width);
+            if let Some(x) = cols.modified_right {
+                assert!(x <= width);
+            }
+        }
+    }
 
     #[test]
     fn centered_window_keeps_selection_near_middle() {

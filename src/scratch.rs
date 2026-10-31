@@ -53,7 +53,7 @@ pub(crate) fn feedback_toast(ctx: &egui::Context, until: Option<f64>) {
         .show(ctx, |ui| {
             egui::Frame::new()
                 .fill(Color32::from_rgb(25, 31, 40))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(136, 192, 208)))
+                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(136, 192, 208)))
                 .corner_radius(8.0)
                 .inner_margin(egui::Margin::symmetric(14, 8))
                 .show(ui, |ui| {

@@ -1,19 +1,87 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod agenda;
+#[cfg(test)]
+mod async_open_tests;
 mod commands;
 mod daily;
+#[cfg(test)]
+mod dialog_tests;
+mod dialog_ui;
+mod document_safety;
 mod editor_buffer;
 mod editor_view;
 mod file_dialogs;
+mod file_loader;
+mod find_note_ui;
+#[cfg(test)]
+mod find_note_ui_tests;
+#[cfg(test)]
+mod footer_tests;
+mod footer_ui;
+mod form_dialogs;
+#[cfg(test)]
+mod large_document_tests;
+mod notice_ui;
+mod preview_layout;
+#[cfg(test)]
+mod preview_scroll_tests;
+#[cfg(test)]
+mod resize_tests;
+mod safe_file;
+#[cfg(test)]
+mod safety_integration_tests;
+mod safety_ui;
+mod scroll_sync;
+#[cfg(test)]
+mod settings_tests;
+#[cfg(test)]
+use settings_tests::SettingsDialogGeometry;
+mod drive_picker;
+mod everything_inventory;
+mod everything_ipc;
 mod flow;
+mod flow_batch;
 mod flow_edit;
+mod flow_error;
 mod flow_runtime;
+mod flow_store;
 mod goto;
+mod index_export;
 mod link_ui;
 mod markdown;
+mod perf_log;
+mod parallel;
+mod single_instance;
+mod flow_api;
+mod preview_ui;
+mod periscope_ui;
+mod picker_ui;
+mod agenda_ui;
+mod save_as_ui;
+mod help_ui;
+mod settings_ui;
+mod shortcuts;
+mod perf_hud;
 mod periscope;
+mod periscope_backend;
+#[cfg(test)]
+mod periscope_results_tests;
+mod periscope_setup;
+#[cfg(test)]
+mod periscope_setup_tests;
+mod periscope_store;
+#[cfg(test)]
+mod picker_tests;
+mod project_membership;
+#[cfg(test)]
+mod project_membership_tests;
 mod scratch;
 mod search;
+mod window_drag;
+mod window_ui;
 
+use flow_api::{append_flow_edit_request, append_flow_open_request, append_flow_organization_request};
 use std::{
     collections::HashSet,
     fs,
@@ -53,12 +121,30 @@ use markdown::{
     parse_fenced_code_marker, parse_heading_line, parse_inline_code_spans, parse_list_line,
     parse_markdown_link_spans, parse_markdown_table_separator, split_markdown_table_row,
 };
-use periscope::{PeriscopeIndexedPath, PeriscopeMode, PeriscopeRow};
+use periscope::{PeriscopeMode, PeriscopeRow};
 use scratch::ScratchEntry;
 use search::SearchState;
 
 const PERISCOPE_RESULT_LIMIT: usize = 100;
 const DEFAULT_CURSOR_SIZE: &str = "24";
+
+fn open_url_in_browser(url: &str) -> std::io::Result<std::process::Child> {
+    #[cfg(target_os = "windows")]
+    {
+        ProcessCommand::new("rundll32.exe")
+            .arg("url.dll,FileProtocolHandler")
+            .arg(url)
+            .spawn()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        ProcessCommand::new("open").arg(url).spawn()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        ProcessCommand::new("xdg-open").arg(url).spawn()
+    }
+}
 
 fn normalize_cursor_environment() {
     if std::env::var_os("XCURSOR_SIZE").is_none() {
@@ -76,12 +162,53 @@ fn normalize_cursor_environment() {
     }
 }
 
+/// `SLATE_RENDERER=wgpu` picks the wgpu backend when built with `--features wgpu`.
+/// wgpu (DX12 flip model on Windows) by default; `SLATE_RENDERER=glow` forces
+/// OpenGL. Builds without the `wgpu` feature always use glow.
+fn selected_renderer() -> eframe::Renderer {
+    #[cfg(feature = "wgpu")]
+    if !std::env::var("SLATE_RENDERER").is_ok_and(|value| value.eq_ignore_ascii_case("glow")) {
+        return eframe::Renderer::Wgpu;
+    }
+    eframe::Renderer::Glow
+}
+
+/// Low-latency wgpu presentation. On Windows this is a DXGI flip-model swapchain
+/// (like Chromium/Thorium) instead of OpenGL's "copy with GPU GDI" composition,
+/// which made every frame wait one extra display refresh.
+#[cfg(feature = "wgpu")]
+fn low_latency_wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
+    use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup, wgpu};
+    let mut options = WgpuConfiguration::default();
+    // Do not queue frames ahead of the display: the newest keystroke wins.
+    options.desired_maximum_frame_latency = Some(1);
+    options.present_mode = match std::env::var("SLATE_PRESENT").as_deref() {
+        Ok("fifo") => wgpu::PresentMode::Fifo,
+        Ok("mailbox") => wgpu::PresentMode::Mailbox,
+        Ok("immediate") => wgpu::PresentMode::Immediate,
+        _ => wgpu::PresentMode::AutoNoVsync,
+    };
+    if let WgpuSetup::CreateNew(create_new) = &mut options.wgpu_setup {
+        // Only DX12 on Windows: skips Vulkan/GL instance creation at startup and
+        // guarantees the DXGI flip-model path. WGPU_BACKEND still overrides.
+        if cfg!(windows) && std::env::var_os("WGPU_BACKEND").is_none() {
+            create_new.instance_descriptor.backends = wgpu::Backends::DX12;
+        }
+    }
+    options
+}
+
 fn main() -> eframe::Result {
+    perf_log::init(std::time::Instant::now());
     normalize_cursor_environment();
+    perf_log::mark("startup.environment_ready", "");
 
     let raw_args = std::env::args().skip(1).collect::<Vec<_>>();
     if raw_args.first().map(String::as_str) == Some("flow-api") {
-        if let Err(err) = run_flow_api(&raw_args[1..]) {
+        let result = flow_api::run_flow_api(&raw_args[1..]);
+        index_export::flush();
+        perf_log::flush();
+        if let Err(err) = result {
             eprintln!("{err}");
             std::process::exit(1);
         }
@@ -90,6 +217,7 @@ fn main() -> eframe::Result {
 
     let mut scratch = false;
     let mut standalone_agenda = false;
+    let mut new_window = false;
     let mut path = None;
     let mut startup_line = None;
     let mut args = raw_args.into_iter().peekable();
@@ -98,10 +226,31 @@ fn main() -> eframe::Result {
         match arg.as_str() {
             "--scratch" | "-s" => scratch = true,
             "--agenda" | "--ag" => standalone_agenda = true,
+            "--new-window" | "-n" => new_window = true,
             "--line" | "-l" => {
                 startup_line = args.next().and_then(|value| value.parse::<usize>().ok());
             }
             _ => path = Some(PathBuf::from(arg)),
+        }
+    }
+
+    let use_single_instance = !scratch
+        && !standalone_agenda
+        && !new_window
+        && SlateApp::config_single_instance_enabled();
+    if use_single_instance {
+        if let Some(file) = single_instance::instance_file() {
+            let request = single_instance::OpenRequest {
+                path: path
+                    .as_deref()
+                    .map(|p| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())),
+                line: startup_line,
+            };
+            if single_instance::forward(&file, &request) {
+                perf_log::mark("startup.forwarded_to_running_instance", "");
+                perf_log::flush();
+                return Ok(());
+            }
         }
     }
 
@@ -120,9 +269,10 @@ fn main() -> eframe::Result {
         [900.0, 560.0]
     };
 
-    let options = eframe::NativeOptions {
+    let native_options = |renderer| eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(title)
+            .with_decorations(false)
             .with_inner_size(size)
             .with_min_inner_size(if standalone_agenda {
                 [620.0, 360.0]
@@ -130,398 +280,51 @@ fn main() -> eframe::Result {
                 [420.0, 260.0]
             }),
         vsync: false,
-        renderer: eframe::Renderer::Glow,
+        renderer,
+        #[cfg(feature = "wgpu")]
+        wgpu_options: low_latency_wgpu_options(),
         ..Default::default()
     };
 
-    eframe::run_native(
-        title,
-        options,
-        Box::new(|cc| {
-            Ok(Box::new(SlateApp::new(
-                cc,
-                path,
-                scratch,
-                standalone_agenda,
-                startup_line,
-            )))
-        }),
-    )
-}
-
-#[derive(Clone, Debug)]
-struct FlowApiTask {
-    kind: String,
-    id: String,
-    path: PathBuf,
-    relative_path: String,
-    line_number: usize,
-    line_index: usize,
-    state: String,
-    title: String,
-    tags: Vec<String>,
-    projects: Vec<String>,
-    priority: Option<String>,
-    due: Option<String>,
-    scheduled: Option<String>,
-    heading: Option<String>,
-    source_snippet: String,
-}
-
-fn run_flow_api(args: &[String]) -> Result<(), String> {
-    let Some(command) = args.first().map(String::as_str) else {
-        return Err("Usage: slate flow-api list|complete|open|rescan".to_string());
+    let app_started = std::cell::Cell::new(false);
+    let run = |renderer| {
+        perf_log::mark(
+            "startup.framework_begin",
+            &format!(
+                "window creation, renderer and fonts until app constructor renderer={renderer:?}"
+            ),
+        );
+        let path = path.clone();
+        let app_started = &app_started;
+        eframe::run_native(
+            title,
+            native_options(renderer),
+            Box::new(move |cc| {
+                app_started.set(true);
+                let mut app = SlateApp::new(cc, path, scratch, standalone_agenda, startup_line);
+                if use_single_instance {
+                    app.start_instance_server(&cc.egui_ctx);
+                }
+                Ok(Box::new(app))
+            }),
+        )
     };
-    match command {
-        "list" => {
-            let scope = flow_api_scope(args)?;
-            let days = flow_api_usize_arg(args, "--days").unwrap_or(45);
-            flow_api_rescan_if_empty(&scope)?;
-            let tasks = flow_api_load_tasks(&scope)?;
-            println!("{}", flow_api_tasks_json(&tasks, days));
-            Ok(())
-        }
-        "complete" => {
-            let id = args
-                .get(1)
-                .ok_or_else(|| "Usage: slate flow-api complete <id> [--scope PATH]".to_string())?;
-            let scope = flow_api_scope(args)?;
-            flow_api_complete(&scope, id)?;
-            println!("{{\"ok\":true}}");
-            Ok(())
-        }
-        "open" => {
-            let id = args
-                .get(1)
-                .ok_or_else(|| "Usage: slate flow-api open <id> [--scope PATH]".to_string())?;
-            let scope = flow_api_scope(args)?;
-            let task = flow_api_load_tasks(&scope)?
-                .into_iter()
-                .find(|task| task.id == *id)
-                .ok_or_else(|| format!("Slate Flow API task not found: {id}"))?;
-            ProcessCommand::new(std::env::current_exe().map_err(|err| err.to_string())?)
-                .arg(&task.path)
-                .arg("--line")
-                .arg(task.line_number.to_string())
-                .spawn()
-                .map_err(|err| format!("Slate Flow API open failed: {err}"))?;
-            println!("{{\"ok\":true}}");
-            Ok(())
-        }
-        "rescan" => {
-            let scope = flow_api_scope(args)?;
-            let (files, tasks) = flow_api_rescan(&scope)?;
-            println!(
-                "{{\"ok\":true,\"indexedFiles\":{},\"indexedTasks\":{}}}",
-                files, tasks
-            );
-            Ok(())
-        }
-        _ => Err(format!("Unknown Slate Flow API command: {command}")),
+    let mut result = run(selected_renderer());
+    if let Err(error) = &result
+        && !app_started.get()
+        && selected_renderer() != eframe::Renderer::Glow
+    {
+        // No usable DX12 adapter (old GPU, remote session...): OpenGL still works.
+        perf_log::mark("startup.renderer_fallback", &format!("glow after: {error}"));
+        result = run(eframe::Renderer::Glow);
     }
-}
-
-fn flow_api_scope(args: &[String]) -> Result<PathBuf, String> {
-    if let Some(scope) = flow_api_string_arg(args, "--scope") {
-        return Ok(flow_api_normalize_scope(PathBuf::from(scope))?);
-    }
-    if let Ok(scope) = std::env::var("SLATE_FLOW_SCOPE") {
-        if !scope.trim().is_empty() {
-            return Ok(flow_api_normalize_scope(PathBuf::from(scope))?);
-        }
-    }
-    let cwd = std::env::current_dir().map_err(|err| format!("Flow API scope failed: {err}"))?;
-    Ok(flow_api_normalize_scope(cwd)?)
-}
-
-fn flow_api_normalize_scope(path: PathBuf) -> Result<PathBuf, String> {
-    let path = if path.exists() {
-        fs::canonicalize(&path).map_err(|err| format!("Flow API scope failed: {err}"))?
-    } else {
-        path
-    };
-    if path.is_file() {
-        Ok(SlateApp::flow_project_root_for_path(&path))
-    } else if path.join(".git").is_dir() || path.join(".slate").is_dir() {
-        Ok(path)
-    } else {
-        Ok(SlateApp::flow_project_root_for_path(&path.join("inbox.md")))
-    }
-}
-
-fn flow_api_string_arg(args: &[String], flag: &str) -> Option<String> {
-    args.windows(2)
-        .find_map(|pair| (pair[0] == flag).then(|| pair[1].clone()))
-}
-
-fn flow_api_usize_arg(args: &[String], flag: &str) -> Option<usize> {
-    flow_api_string_arg(args, flag).and_then(|value| value.parse().ok())
-}
-
-fn flow_api_rescan_if_empty(scope: &Path) -> Result<(), String> {
-    let sqlite_path = SlateApp::flow_sqlite_path_for_root(scope)?;
-    if !sqlite_path.exists() {
-        let _ = flow_api_rescan(scope)?;
-    }
-    Ok(())
-}
-
-fn flow_api_rescan(scope: &Path) -> Result<(usize, usize), String> {
-    let sqlite_path = SlateApp::flow_sqlite_path_for_root(scope)?;
-    let mut files = Vec::new();
-    SlateApp::collect_flow_markdown_files(scope, &mut files, 20_000);
-    let mut indexed_files = 0usize;
-    let mut indexed_tasks = 0usize;
-    for path in files {
-        let Ok(contents) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let summary = flow::update_flow_index_for_file(scope, &sqlite_path, &path, &contents)?;
-        indexed_files += 1;
-        indexed_tasks += summary.tasks.len();
-    }
-    Ok((indexed_files, indexed_tasks))
-}
-
-fn flow_api_load_tasks(scope: &Path) -> Result<Vec<FlowApiTask>, String> {
-    let sqlite_path = SlateApp::flow_sqlite_path_for_root(scope)?;
-    if !sqlite_path.exists() {
-        return Ok(Vec::new());
-    }
-    let query = "SELECT path, line_number, line_index, COALESCE(kind,'task'), state, title, tags, projects, COALESCE(priority,''), COALESCE(due,''), COALESCE(scheduled,''), COALESCE(heading,''), source_snippet FROM tasks ORDER BY COALESCE(scheduled, due, ''), path, line_number;";
-    let output = ProcessCommand::new("sqlite3")
-        .arg("-separator")
-        .arg("\t")
-        .arg(&sqlite_path)
-        .arg(query)
-        .output()
-        .map_err(|err| format!("Slate Flow API failed: sqlite3 unavailable: {err}"))?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| flow_api_parse_row(scope, line))
-        .collect())
-}
-
-fn flow_api_parse_row(scope: &Path, line: &str) -> Option<FlowApiTask> {
-    let mut fields = line.split('\t');
-    let relative_path = fields.next()?.to_string();
-    let line_number = fields.next()?.parse().ok()?;
-    let line_index = fields.next()?.parse().ok()?;
-    let kind = fields.next()?.to_string();
-    let state = fields.next()?.to_string();
-    let title = fields.next()?.to_string();
-    let tags = split_cache_list(fields.next()?);
-    let projects = split_cache_list(fields.next()?);
-    let priority = non_empty_string(fields.next()?);
-    let due = non_empty_string(fields.next()?);
-    let scheduled = non_empty_string(fields.next()?);
-    let heading = non_empty_string(fields.next().unwrap_or(""));
-    let source_snippet = fields.next().unwrap_or("").to_string();
-    let id = flow_api_task_id(scope, &relative_path, line_number, &title);
-    Some(FlowApiTask {
-        kind,
-        id,
-        path: scope.join(&relative_path),
-        relative_path,
-        line_number,
-        line_index,
-        state,
-        title,
-        tags,
-        projects,
-        priority,
-        due,
-        scheduled,
-        heading,
-        source_snippet,
-    })
-}
-
-fn flow_api_task_id(scope: &Path, relative_path: &str, line_number: usize, title: &str) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    scope.display().to_string().hash(&mut hasher);
-    let scope_hash = hasher.finish();
-    let mut title_hasher = std::collections::hash_map::DefaultHasher::new();
-    title.hash(&mut title_hasher);
-    format!(
-        "slate:{scope_hash:016x}:{}:{line_number}:{:016x}",
-        relative_path.replace(':', "%3A"),
-        title_hasher.finish()
-    )
-}
-
-fn flow_api_complete(scope: &Path, id: &str) -> Result<(), String> {
-    let task = flow_api_load_tasks(scope)?
-        .into_iter()
-        .find(|task| task.id == id)
-        .ok_or_else(|| format!("Slate Flow API task not found: {id}"))?;
-    if task.kind != "task" {
-        return Err(format!(
-            "Slate Flow API cannot complete {} items",
-            task.kind
-        ));
-    }
-    if task.state == "done" {
-        return Ok(());
-    }
-
-    // Always leave a tiny local completion request for any open Slate window.
-    // If the task is in a dirty in-memory buffer, the API process cannot safely
-    // edit that memory directly, so the running editor applies this request on
-    // its next UI tick and refreshes the derived agenda cache.
-    append_flow_completion_request(scope, &task)?;
-
-    let contents = fs::read_to_string(&task.path)
-        .map_err(|err| format!("Slate Flow API complete failed reading source: {err}"))?;
-    let mut lines = contents.lines().map(str::to_string).collect::<Vec<_>>();
-    let Some(line) = lines.get_mut(task.line_index) else {
-        return Ok(());
-    };
-    if line.trim_end() != task.source_snippet.trim_end() {
-        return Ok(());
-    }
-    let Some(parsed) = parse_checkbox_line(line) else {
-        return Ok(());
-    };
-    let marker_start = parsed.indent.len() + parsed.task_prefix.len();
-    let marker_end = marker_start + parsed.marker.len();
-    line.replace_range(marker_start..marker_end, "[x]");
-    let mut next = lines.join("\n");
-    if contents.ends_with('\n') {
-        next.push('\n');
-    }
-    let tmp = task.path.with_extension(format!(
-        "{}.tmp",
-        task.path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or("md")
-    ));
-    fs::write(&tmp, next).map_err(|err| format!("Slate Flow API complete write failed: {err}"))?;
-    fs::rename(&tmp, &task.path)
-        .map_err(|err| format!("Slate Flow API complete replace failed: {err}"))?;
-    let updated = fs::read_to_string(&task.path)
-        .map_err(|err| format!("Slate Flow API reindex read failed: {err}"))?;
-    flow::update_flow_index_for_file(
-        scope,
-        &SlateApp::flow_sqlite_path_for_root(scope)?,
-        &task.path,
-        &updated,
-    )?;
-    Ok(())
-}
-
-fn append_flow_completion_request(scope: &Path, task: &FlowApiTask) -> Result<(), String> {
-    flow_runtime::append_completion_request(
-        &SlateApp::flow_sqlite_path_for_root(scope)?,
-        &task.id,
-        &task.relative_path,
-        task.line_index,
-        &task.title,
-    )
-}
-
-fn append_flow_organization_request(
-    scope: &Path,
-    item: &AgendaItem,
-    token: &str,
-) -> Result<(), String> {
-    flow_runtime::append_organization_request(
-        &SlateApp::flow_sqlite_path_for_root(scope)?,
-        &item.relative_path,
-        item.line_index,
-        token,
-    )
-}
-
-fn append_flow_edit_request(
-    scope: &Path,
-    item: &AgendaItem,
-    replacement: &str,
-) -> Result<(), String> {
-    flow_runtime::append_edit_request(
-        &SlateApp::flow_sqlite_path_for_root(scope)?,
-        &item.relative_path,
-        item.line_index,
-        replacement,
-    )
-}
-
-fn append_flow_open_request(
-    scope: &Path,
-    relative_path: &str,
-    line_index: usize,
-) -> Result<(), String> {
-    flow_runtime::append_open_request(
-        &SlateApp::flow_sqlite_path_for_root(scope)?,
-        relative_path,
-        line_index,
-    )
-}
-
-fn flow_api_tasks_json(tasks: &[FlowApiTask], days: usize) -> String {
-    let today = Local::now().date_naive();
-    let horizon = today + Duration::days(days as i64);
-    let mut out = String::from("[");
-    let mut first = true;
-    for task in tasks {
-        let due = task.due.as_deref().and_then(parse_cache_date);
-        let scheduled = task.scheduled.as_deref().and_then(parse_cache_date);
-        let dated = due.or(scheduled);
-        if dated.is_some_and(|date| date > horizon) {
-            continue;
-        }
-        if !first {
-            out.push(',');
-        }
-        first = false;
-        out.push_str(&flow_api_task_json(task));
-    }
-    out.push(']');
-    out
-}
-
-fn flow_api_task_json(task: &FlowApiTask) -> String {
-    let project = task.projects.first().cloned();
-    let priority = task.priority.as_deref().and_then(|value| match value {
-        "ALTA" => Some("high"),
-        "MEDIA" => Some("medium"),
-        "BAJA" => Some("low"),
-        _ => None,
-    });
-    format!(
-        "{{\"id\":{},\"source\":\"slate\",\"kind\":{},\"title\":{},\"status\":{},\"priority\":{},\"project\":{},\"tags\":{},\"dueIso\":{},\"scheduledAtIso\":{},\"path\":{},\"lineNumber\":{},\"heading\":{}}}",
-        json_string(&task.id),
-        json_string(&task.kind),
-        json_string(&task.title),
-        json_string(&task.state),
-        json_option(priority),
-        json_option(project.as_deref()),
-        json_string_array(&task.tags),
-        json_option(task.due.as_deref()),
-        json_option(task.scheduled.as_deref()),
-        json_string(&task.relative_path),
-        task.line_number,
-        json_option(task.heading.as_deref()),
-    )
-}
-
-fn json_option(value: Option<&str>) -> String {
-    value.map(json_string).unwrap_or_else(|| "null".to_string())
-}
-
-fn json_string_array(values: &[String]) -> String {
-    format!(
-        "[{}]",
-        values
-            .iter()
-            .map(|value| json_string(value))
-            .collect::<Vec<_>>()
-            .join(",")
-    )
+    index_export::flush();
+    perf_log::mark(
+        "process.ui_loop_exit",
+        if result.is_ok() { "ok" } else { "error" },
+    );
+    perf_log::flush();
+    result
 }
 
 fn collect_link_target_files(root: &Path, out: &mut Vec<PathBuf>, limit: usize) {
@@ -549,6 +352,54 @@ fn collect_link_target_files(root: &Path, out: &mut Vec<PathBuf>, limit: usize) 
             out.push(path);
         }
     }
+}
+
+fn find_note_file_matches(root: &Path, path: &Path, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let label = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string();
+    if label.to_ascii_lowercase().contains(query)
+        || path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(|stem| stem.to_ascii_lowercase().contains(query))
+            .unwrap_or(false)
+    {
+        return true;
+    }
+    fs::read_to_string(path)
+        .map(|contents| contents.to_ascii_lowercase().contains(query))
+        .unwrap_or(false)
+}
+
+fn find_note_match_hint(root: &Path, path: &Path, query: &str) -> String {
+    let label = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string();
+    if label.to_ascii_lowercase().contains(query) {
+        return "file".to_string();
+    }
+    let Ok(contents) = fs::read_to_string(path) else {
+        return "note".to_string();
+    };
+    for line in contents.lines() {
+        let lower = line.to_ascii_lowercase();
+        if let Some(heading) = parse_heading_line(line) {
+            if heading.text.to_ascii_lowercase().contains(query) {
+                return format!("heading: {}", heading.text.trim());
+            }
+        } else if lower.contains(query) {
+            return line.trim().chars().take(80).collect();
+        }
+    }
+    "note".to_string()
 }
 
 fn is_markdown_like_path(path: &Path) -> bool {
@@ -819,6 +670,7 @@ struct FlowBackgroundResult {
     indexed_files: usize,
     indexed_tasks: usize,
     errors: usize,
+    first_error: Option<String>,
 }
 
 struct FileCursorPosition {
@@ -831,6 +683,25 @@ struct FileCursorPosition {
 enum ReferenceResultKind {
     Backlinks,
     Mentions,
+}
+
+enum OpenDestination {
+    Restore,
+    Line(usize),
+    Fragment(String),
+    Daily {
+        date: chrono::NaiveDate,
+        refreshing: bool,
+    },
+    Agenda(usize),
+}
+
+struct PendingFileOpen {
+    id: u64,
+    path: PathBuf,
+    origin_path: Option<PathBuf>,
+    origin_revision: u64,
+    destination: OpenDestination,
 }
 
 struct SlateApp {
@@ -851,8 +722,32 @@ struct SlateApp {
     agenda_updated_toast_until: Option<f64>,
     pending_flow_agenda_sync_at: Option<f64>,
     pending_action: Option<PendingAction>,
+    file_loader: file_loader::Loader,
+    flow_heartbeat_attempt: Option<(PathBuf, std::time::Instant)>,
+    preview_sync: scroll_sync::PreviewSync,
+    preview_heights: preview_layout::Heights,
+    document_safety: document_safety::Manager,
+    disk_base: Option<safe_file::Fingerprint>,
+    modal_disk_base: Option<safe_file::Fingerprint>,
+    recovery_origins: std::collections::HashMap<document_safety::Slot, PathBuf>,
+    recovery_records: Vec<document_safety::Recovered>,
+    recovery_open: bool,
+    recovery_selected: usize,
+    file_conflict: Option<(document_safety::Slot, PathBuf)>,
+    safety_notified:
+        std::collections::HashMap<document_safety::Slot, (PathBuf, Option<safe_file::Fingerprint>)>,
+    discard_on_exit: bool,
+    pending_file_open: Option<PendingFileOpen>,
+    #[cfg(test)]
+    settings_path_override: Option<PathBuf>,
     settings_open: bool,
     selected_setting: usize,
+    settings_last_selected: Option<usize>,
+    editor_font_size: f32,
+    footer_options: footer_ui::Options,
+    footer_counts_cache: Option<(u64, u64, usize, usize)>,
+    footer_status_seen: String,
+    footer_status_since: Option<std::time::Instant>,
     command_line: String,
     command_line_cursor: usize,
     command_line_focused: bool,
@@ -866,6 +761,8 @@ struct SlateApp {
     line_number_mode: LineNumberMode,
     ctrl_shift_move_mode: CtrlShiftMoveMode,
     reopen_last_file_on_startup: bool,
+    single_instance: bool,
+    instance_server: Option<single_instance::Server>,
     markdown_live_rendering: bool,
     virtual_references_enabled: bool,
     virtual_references_collapsed: bool,
@@ -924,13 +821,17 @@ struct SlateApp {
     periscope_prompt_open: bool,
     periscope_mode: PeriscopeMode,
     periscope_project_root: Option<PathBuf>,
+    project_membership: project_membership::State,
     periscope_query: String,
     periscope_results: Vec<PathBuf>,
     selected_periscope_result: usize,
     periscope_expanded_folders: HashSet<PathBuf>,
     periscope_backend_status: String,
-    periscope_global_paths: Vec<PeriscopeIndexedPath>,
-    periscope_global_rx: Option<Receiver<Vec<PeriscopeIndexedPath>>>,
+    periscope_engine: periscope_backend::Manager,
+    periscope_setup: periscope_setup::Setup,
+    periscope_request: Option<u64>,
+    periscope_roots: Vec<PathBuf>,
+    periscope_everything: bool,
     periscope_global_loading: bool,
     find_note_open: bool,
     find_note_query: String,
@@ -989,6 +890,8 @@ struct SlateApp {
     ctrl_alt_layer_last_key_time: f64,
     duplicate_placement: Option<DuplicatePlacement>,
     suppress_editor_keyboard_once: bool,
+    perf_hud: perf_hud::PerfHud,
+    last_window_title: String,
 }
 
 impl SlateApp {
@@ -999,9 +902,14 @@ impl SlateApp {
         standalone_agenda: bool,
         startup_line: Option<usize>,
     ) -> Self {
+        let mut timing = perf_log::Span::new("startup.app_constructor", "");
         setup_style(&cc.egui_ctx);
+        timing.step("setup_style");
+        window_drag::install(cc);
 
         let mut app = Self {
+            perf_hud: perf_hud::PerfHud::default(),
+            last_window_title: String::new(),
             buffer: EditorBuffer::new(),
             editor_view: EditorView::new(),
             path: None,
@@ -1019,8 +927,43 @@ impl SlateApp {
             agenda_updated_toast_until: None,
             pending_flow_agenda_sync_at: None,
             pending_action: None,
+            file_loader: file_loader::Loader::new(cc.egui_ctx.clone()),
+            flow_heartbeat_attempt: None,
+            preview_sync: scroll_sync::PreviewSync::default(),
+            preview_heights: preview_layout::Heights::default(),
+            document_safety: {
+                #[cfg(test)]
+                {
+                    document_safety::Manager::disabled()
+                }
+                #[cfg(not(test))]
+                {
+                    document_safety::Manager::new(
+                        cc.egui_ctx.clone(),
+                        document_safety::default_root(),
+                    )
+                }
+            },
+            disk_base: None,
+            modal_disk_base: None,
+            recovery_origins: std::collections::HashMap::new(),
+            recovery_records: Vec::new(),
+            recovery_open: false,
+            recovery_selected: 0,
+            file_conflict: None,
+            safety_notified: std::collections::HashMap::new(),
+            discard_on_exit: false,
+            pending_file_open: None,
+            #[cfg(test)]
+            settings_path_override: None,
             settings_open: false,
             selected_setting: 0,
+            settings_last_selected: None,
+            editor_font_size: editor_view::DEFAULT_EDITOR_FONT_SIZE,
+            footer_options: footer_ui::Options::default(),
+            footer_counts_cache: None,
+            footer_status_seen: "Ready".into(),
+            footer_status_since: None,
             command_line: String::new(),
             command_line_cursor: 0,
             command_line_focused: false,
@@ -1034,6 +977,8 @@ impl SlateApp {
             line_number_mode: LineNumberMode::Absolute,
             ctrl_shift_move_mode: CtrlShiftMoveMode::Vim,
             reopen_last_file_on_startup: false,
+            single_instance: true,
+            instance_server: None,
             markdown_live_rendering: true,
             virtual_references_enabled: true,
             virtual_references_collapsed: false,
@@ -1092,13 +1037,17 @@ impl SlateApp {
             periscope_prompt_open: false,
             periscope_mode: PeriscopeMode::Project,
             periscope_project_root: None,
+            project_membership: Default::default(),
             periscope_query: String::new(),
             periscope_results: Vec::new(),
             selected_periscope_result: 0,
             periscope_expanded_folders: HashSet::new(),
             periscope_backend_status: String::new(),
-            periscope_global_paths: Vec::new(),
-            periscope_global_rx: None,
+            periscope_engine: periscope_backend::Manager::default(),
+            periscope_setup: periscope_setup::Setup::default(),
+            periscope_request: None,
+            periscope_roots: Vec::new(),
+            periscope_everything: true,
             periscope_global_loading: false,
             find_note_open: false,
             find_note_query: String::new(),
@@ -1159,13 +1108,17 @@ impl SlateApp {
             suppress_editor_keyboard_once: false,
         };
 
+        timing.step("initial_state");
         app.load_settings();
+        timing.step("load_settings");
 
         if let Some(path) = path {
-            app.open_path(path);
-            if let Some(line) = startup_line {
-                app.goto_startup_line(line);
-            }
+            app.request_file_open(
+                path,
+                startup_line
+                    .map(OpenDestination::Line)
+                    .unwrap_or(OpenDestination::Restore),
+            );
         } else if standalone_agenda {
             // Standalone agenda should be a view over the latest published Flow
             // cache. Do not immediately rescan from disk here: an open Slate
@@ -1178,6 +1131,7 @@ impl SlateApp {
             }
         }
 
+        timing.step("initial_document_or_agenda");
         app
     }
 
@@ -1197,35 +1151,207 @@ impl SlateApp {
         }
     }
 
-    fn open_path(&mut self, path: PathBuf) {
-        self.remember_current_cursor_position();
-        match fs::read_to_string(&path) {
-            Ok(text) => {
-                self.buffer.set_text(text);
-                self.path = Some(path.clone());
-                self.last_open_dir = path.parent().map(PathBuf::from);
-                self.restore_cursor_position_for_path(&path);
-                self.dirty = false;
-                self.search_state = None;
-                self.remember_recent_file(path.clone());
-                let flow_summary = self
-                    .refresh_flow_index_for_path(&path, self.buffer.as_str())
-                    .ok()
-                    .flatten();
-                let flow_root = Self::flow_project_root_for_path(&path);
-                self.start_flow_background_rescan(flow_root);
-                let _ = self.save_settings();
-                self.status = if let Some(summary) = flow_summary {
-                    format!(
-                        "Opened {} · indexed {} Flow tasks · scanning folder…",
-                        path.display(),
-                        summary.tasks.len()
-                    )
-                } else {
-                    format!("Opened {} · scanning folder…", path.display())
-                };
+    fn start_instance_server(&mut self, ctx: &egui::Context) {
+        if !self.single_instance {
+            return;
+        }
+        let Some(file) = single_instance::instance_file() else {
+            return;
+        };
+        let wake_ctx = ctx.clone();
+        match single_instance::Server::start(file, move || wake_ctx.request_repaint()) {
+            Ok(server) => self.instance_server = Some(server),
+            Err(err) => perf_log::mark("single_instance.unavailable", &err.to_string()),
+        }
+    }
+
+    /// Opens files handed over by `slate <file>` launches while this window runs.
+    fn poll_instance_requests(&mut self, ctx: &egui::Context) {
+        let Some(server) = self.instance_server.as_ref() else {
+            return;
+        };
+        let Some(request) = server.take_requests().into_iter().last() else {
+            return;
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        let Some(path) = request.path else {
+            return;
+        };
+        if self.path.as_ref() == Some(&path) {
+            if let Some(line) = request.line {
+                self.goto_startup_line(line);
             }
-            Err(err) => self.status = format!("Open failed: {err}"),
+        } else {
+            // Same guard as :open — dirty text is never replaced.
+            self.request_file_open(
+                path,
+                request
+                    .line
+                    .map(OpenDestination::Line)
+                    .unwrap_or(OpenDestination::Restore),
+            );
+        }
+    }
+
+    fn open_path(&mut self, path: PathBuf) {
+        self.request_file_open(path, OpenDestination::Restore);
+    }
+
+    fn request_file_open(&mut self, path: PathBuf, destination: OpenDestination) {
+        if self.dirty {
+            self.cancel_file_open();
+            self.status = "Save or discard changes before opening another file".to_string();
+            return;
+        }
+        self.remember_current_cursor_position();
+        match self.file_loader.request(path.clone()) {
+            Ok(id) => {
+                self.pending_file_open = Some(PendingFileOpen {
+                    id,
+                    path: path.clone(),
+                    origin_path: self.path.clone(),
+                    origin_revision: self.buffer.revision,
+                    destination,
+                });
+                self.status = format!("Opening {}… · Esc cancels", path.display());
+            }
+            Err(err) => {
+                self.cancel_file_open();
+                self.status = format!("Open failed: {err}");
+            }
+        }
+    }
+
+    fn cancel_file_open(&mut self) {
+        if let Some(pending) = self.pending_file_open.take() {
+            perf_log::mark(
+                "file_open.cancelled",
+                &format!("request={} path={:?}", pending.id, pending.path),
+            );
+        }
+        self.file_loader.cancel_queued();
+    }
+
+    fn poll_file_open(&mut self, ctx: &egui::Context) {
+        if self.pending_file_open.as_ref().is_some_and(|p| {
+            self.dirty || p.origin_path != self.path || p.origin_revision != self.buffer.revision
+        }) {
+            self.cancel_file_open();
+            self.status = "Open cancelled: current buffer changed; retry when ready".to_string();
+        }
+        // Let this frame's keystrokes edit the document that was visible when typed.
+        // Apply on the next frame, after revision/dirty guards can observe those edits.
+        if self.pending_file_open.is_some()
+            && ctx.input(|i| {
+                i.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Text(_)
+                            | egui::Event::Paste(_)
+                            | egui::Event::Cut
+                            | egui::Event::Key { pressed: true, .. }
+                            | egui::Event::PointerButton { pressed: true, .. }
+                    )
+                })
+            })
+        {
+            ctx.request_repaint();
+            return;
+        }
+        while let Some(mut loaded) = self.file_loader.try_recv() {
+            if !self
+                .pending_file_open
+                .as_ref()
+                .is_some_and(|p| p.id == loaded.id && p.path == loaded.path)
+            {
+                perf_log::mark(
+                    "file_open.discarded",
+                    &format!("request={} path={:?}", loaded.id, loaded.path),
+                );
+                continue;
+            }
+            let pending = self.pending_file_open.take().expect("matching request");
+            loaded.timing.step("dispatch_to_ui");
+            match loaded.result {
+                Ok(mut buffer) => {
+                    let path = loaded.path;
+                    self.remember_current_cursor_position();
+                    buffer.set_cursor(self.buffer.cursor());
+                    buffer.revision = self.buffer.revision.wrapping_add(1);
+                    perf_log::mark(
+                        "file_open.metadata",
+                        &format!("path={path:?} bytes={}", buffer.as_str().len()),
+                    );
+                    self.clear_recovery(document_safety::Slot::Main);
+                    self.buffer = buffer;
+                    self.path = Some(path.clone());
+                    self.disk_base = loaded.fingerprint;
+                    self.file_conflict = None;
+                    self.last_open_dir = path.parent().map(PathBuf::from);
+                    self.dirty = false;
+                    self.search_state = None;
+                    self.pending_flow_agenda_sync_at = None;
+                    self.restore_cursor_position_for_path(&path);
+                    self.remember_recent_file(path.clone());
+                    loaded.timing.step("apply_buffer_restore_cursor_and_recent");
+                    self.perf_hud.record_open(loaded.timing.elapsed());
+                    // The opened file's Flow cache entry is written by the background
+                    // rescan thread (first, before the folder scan): SQLite commits
+                    // and fsyncs must not block the first frame of a just-opened file.
+                    let indexes_flow = flow::should_index_flow_path(&path);
+                    let live = indexes_flow.then(|| (path.clone(), self.buffer.as_str().to_string()));
+                    self.start_flow_background_scan_with_live(
+                        Self::flow_project_root_for_path(&path),
+                        false,
+                        live,
+                    );
+                    loaded.timing.step("schedule_background_rescan");
+                    let _ = self.save_settings();
+                    loaded.timing.step("save_settings");
+                    self.focus_editor_once = true;
+                    self.status = if indexes_flow {
+                        format!("Opened {} · indexing Flow · scanning folder…", path.display())
+                    } else {
+                        format!("Opened {} · scanning folder…", path.display())
+                    };
+                    match pending.destination {
+                        OpenDestination::Restore => {}
+                        OpenDestination::Line(line) => self.goto_startup_line(line),
+                        OpenDestination::Fragment(fragment) => {
+                            self.jump_to_markdown_fragment(&fragment)
+                        }
+                        OpenDestination::Daily { date, refreshing } => {
+                            self.jump_to_daily_day(date);
+                            self.status = format!(
+                                "Daily {} at {date}: {}",
+                                if refreshing {
+                                    "refreshed/opened"
+                                } else {
+                                    "opened"
+                                },
+                                path.display()
+                            );
+                        }
+                        OpenDestination::Agenda(line_index) => {
+                            let line = line_index.min(self.buffer.line_count().saturating_sub(1));
+                            self.buffer.set_cursor(self.buffer.line_end(line));
+                            self.editor_view.request_scroll_to_cursor(&self.buffer);
+                            self.status = format!("Jumped to agenda item on line {}", line + 1);
+                        }
+                    }
+                    loaded.timing.step("apply_destination");
+                    loaded.timing.wait_for_ui();
+                    ctx.request_repaint();
+                }
+                Err(err) => {
+                    perf_log::mark(
+                        "file_open.error",
+                        &format!("path={:?} error={err}", loaded.path),
+                    );
+                    self.status = format!("Open failed: {err}");
+                }
+            }
         }
     }
 
@@ -1499,13 +1625,7 @@ impl SlateApp {
             }
         };
         let refreshing = matches!(target, daily::DailyOpenTarget::Refresh);
-        self.open_path(path.clone());
-        self.jump_to_daily_day(date);
-        self.status = if refreshing {
-            format!("Daily refreshed/opened at {date}: {}", path.display())
-        } else {
-            format!("Daily opened at {date}: {}", path.display())
-        };
+        self.request_file_open(path, OpenDestination::Daily { date, refreshing });
     }
 
     fn jump_to_daily_day(&mut self, date: chrono::NaiveDate) {
@@ -1691,51 +1811,109 @@ impl SlateApp {
         }
     }
 
+    #[cfg(test)]
     fn start_flow_background_rescan(&mut self, root: PathBuf) {
-        if self.flow_background_loading && self.flow_background_root.as_ref() == Some(&root) {
-            return;
+        self.start_flow_background_scan(root, false);
+    }
+
+    fn start_flow_background_scan(&mut self, root: PathBuf, rebuild: bool) {
+        self.start_flow_background_scan_with_live(root, rebuild, None);
+    }
+
+    /// Indexes one in-memory buffer off the UI thread, retrying briefly while
+    /// another writer holds the SQLite lock.
+    fn index_live_flow_buffer(root: &Path, sqlite_path: &Path, path: &Path, contents: &str) {
+        let mut timing = perf_log::Span::new("flow.live_index", &format!("path={path:?}"));
+        for attempt in 0..5 {
+            match flow::update_flow_index_for_file(root, sqlite_path, path, contents) {
+                Ok(_) => break,
+                Err(err) if flow_store::is_busy_error(&err) && attempt < 4 => {
+                    thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(err) => {
+                    perf_log::mark("flow.open_cache_update_failed", &err);
+                    break;
+                }
+            }
         }
+        timing.step("indexed");
+    }
+
+    fn start_flow_background_scan_with_live(
+        &mut self,
+        root: PathBuf,
+        rebuild: bool,
+        live: Option<(PathBuf, String)>,
+    ) {
         let Ok(sqlite_path) = Self::flow_sqlite_path_for_root(&root) else {
             return;
         };
+        if self.flow_background_loading && self.flow_background_root.as_ref() == Some(&root) {
+            if let Some((path, contents)) = live {
+                thread::spawn(move || {
+                    Self::index_live_flow_buffer(&root, &sqlite_path, &path, &contents)
+                });
+            }
+            return;
+        }
         let (tx, rx) = mpsc::channel();
         self.flow_background_rx = Some(rx);
         self.flow_background_root = Some(root.clone());
         self.flow_background_loading = true;
+        let protected = self.path.iter().cloned().collect::<Vec<_>>();
         thread::spawn(move || {
+            if let Some((path, contents)) = live {
+                Self::index_live_flow_buffer(&root, &sqlite_path, &path, &contents);
+            }
+            let mut timing =
+                perf_log::Span::new("flow.background_rescan", &format!("root={root:?}"));
             let mut files = Vec::new();
             Self::collect_flow_markdown_files(&root, &mut files, 20_000);
-            let mut indexed_files = 0usize;
-            let mut indexed_tasks = 0usize;
-            let mut errors = 0usize;
-            for path in files {
-                let Ok(contents) = fs::read_to_string(&path) else {
-                    errors += 1;
-                    continue;
-                };
-                match flow::update_flow_index_for_file(&root, &sqlite_path, &path, &contents) {
-                    Ok(summary) => {
-                        indexed_files += 1;
-                        indexed_tasks += summary.tasks.len();
-                    }
-                    Err(_) => errors += 1,
-                }
-            }
+            timing.step("collect_markdown_files");
+            let summary = flow_batch::index_files_with_rebuild(
+                &root,
+                &sqlite_path,
+                &files,
+                &protected,
+                rebuild,
+            )
+            .unwrap_or_else(|err| flow_batch::ScanSummary {
+                errors: 1,
+                first_error: Some(err),
+                ..Default::default()
+            });
+            timing.step("read_and_index_files");
+            perf_log::mark(
+                "flow.background_rescan.result",
+                &format!(
+                    "root={root:?} indexed_files={} indexed_tasks={} errors={} batches={} skipped_live={}",
+                    summary.indexed_files,
+                    summary.indexed_tasks,
+                    summary.errors,
+                    summary.batches,
+                    summary.skipped_live
+                ),
+            );
             let _ = tx.send(FlowBackgroundResult {
                 root,
-                indexed_files,
-                indexed_tasks,
-                errors,
+                indexed_files: summary.indexed_files,
+                indexed_tasks: summary.indexed_tasks,
+                errors: summary.errors,
+                first_error: summary.first_error,
             });
         });
     }
 
-    fn poll_flow_background_rescan(&mut self) {
+    fn poll_flow_background_rescan(&mut self, ctx: &egui::Context) {
         let Some(rx) = &self.flow_background_rx else {
             return;
         };
         match rx.try_recv() {
             Ok(result) => {
+                perf_log::mark(
+                    "flow.background_rescan.ui_received",
+                    &format!("root={:?}", result.root),
+                );
                 self.flow_background_rx = None;
                 self.flow_background_root = None;
                 self.flow_background_loading = false;
@@ -1747,6 +1925,14 @@ impl SlateApp {
                             self.agenda_open = true;
                             self.focus_editor_once = false;
                         }
+                    }
+                }
+                if let Some(err) = result.first_error.as_ref() {
+                    perf_log::mark("flow.background_rescan.failure_reported", err);
+                    if result.indexed_files == 0 {
+                        flow_error::offer(ctx, err, false);
+                        self.status = "Flow no disponible (ver aviso/log)".to_string();
+                        return;
                     }
                 }
                 self.status = format!(
@@ -1771,60 +1957,30 @@ impl SlateApp {
         }
     }
 
-    fn flow_rescan_current_scope(&mut self, rebuild: bool) {
+    fn flow_rescan_current_scope(&mut self, rebuild: bool, _ctx: &egui::Context) {
         if self.dirty {
             self.status = "Save current buffer before Flow rescan".to_string();
             return;
         }
-        let Ok(sqlite_path) = self.flow_sqlite_path() else {
-            self.status = "Flow rescan failed: no data dir".to_string();
+        if self.flow_background_loading {
+            self.status = "Flow scan already in progress".to_string();
             return;
-        };
+        }
         let root = self.flow_scope_root();
-        if rebuild {
-            let _ = fs::remove_file(root.join(".slate").join("index.tsv"));
-            let _ = fs::remove_file(&sqlite_path);
+        if self
+            .path
+            .as_ref()
+            .is_some_and(|p| flow::should_index_flow_path(p))
+        {
+            self.schedule_current_flow_buffer_agenda_sync_later();
         }
-
-        let mut files = Vec::new();
-        Self::collect_flow_markdown_files(&root, &mut files, 20_000);
-        if files.is_empty() {
-            self.status = format!(
-                "Flow {} found no Markdown files in {}",
-                if rebuild { "rebuild" } else { "rescan" },
-                root.display()
-            );
-            return;
+        self.start_flow_background_scan(root, rebuild);
+        self.status = if rebuild {
+            "Flow rebuild in background…"
+        } else {
+            "Flow rescan in background…"
         }
-
-        let mut indexed_files = 0usize;
-        let mut indexed_tasks = 0usize;
-        let mut errors = 0usize;
-        for path in files {
-            let Ok(contents) = fs::read_to_string(&path) else {
-                errors += 1;
-                continue;
-            };
-            match flow::update_flow_index_for_file(&root, &sqlite_path, &path, &contents) {
-                Ok(summary) => {
-                    indexed_files += 1;
-                    indexed_tasks += summary.tasks.len();
-                }
-                Err(_) => errors += 1,
-            }
-        }
-
-        self.status = format!(
-            "Flow {}: indexed {} files, {} tasks{}",
-            if rebuild { "rebuild" } else { "rescan" },
-            indexed_files,
-            indexed_tasks,
-            if errors > 0 {
-                format!(", {errors} errors")
-            } else {
-                String::new()
-            }
-        );
+        .to_string();
     }
 
     fn flow_inbox_path(&self) -> PathBuf {
@@ -1955,6 +2111,7 @@ impl SlateApp {
     }
 
     fn refresh_find_note_results(&mut self) {
+        let started = std::time::Instant::now();
         let root = self.project_root();
         let mut files = Vec::new();
         collect_link_target_files(&root, &mut files, 20_000);
@@ -1962,47 +2119,42 @@ impl SlateApp {
         files.sort();
         files.dedup();
         let query = self.find_note_query.trim().to_ascii_lowercase();
-        self.find_note_files = files
-            .into_iter()
-            .filter(|path| self.find_note_file_matches(path, &query))
-            .take(200)
-            .collect();
+        const LIMIT: usize = 200;
+        let mut matched = Vec::new();
+        // Read and test files on all cores, batch by batch, so a common query still
+        // stops early instead of reading the whole project.
+        for batch in files.chunks(512) {
+            let flags =
+                parallel::par_map(batch, |path| find_note_file_matches(&root, path, &query));
+            matched.extend(
+                batch
+                    .iter()
+                    .zip(flags)
+                    .filter_map(|(path, matches)| matches.then(|| path.clone())),
+            );
+            if matched.len() >= LIMIT {
+                break;
+            }
+        }
+        matched.truncate(LIMIT);
+        self.find_note_files = matched;
         self.rebuild_find_note_rows();
-    }
-
-    fn find_note_file_matches(&self, path: &Path, query: &str) -> bool {
-        if query.is_empty() {
-            return true;
-        }
-        let root = self.project_root();
-        let label = path
-            .strip_prefix(&root)
-            .unwrap_or(path)
-            .display()
-            .to_string();
-        if label.to_ascii_lowercase().contains(query)
-            || path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .map(|stem| stem.to_ascii_lowercase().contains(query))
-                .unwrap_or(false)
-        {
-            return true;
-        }
-        fs::read_to_string(path)
-            .map(|contents| contents.to_ascii_lowercase().contains(query))
-            .unwrap_or(false)
+        self.perf_hud
+            .record_note_search(started.elapsed(), self.find_note_files.len());
     }
 
     fn rebuild_find_note_rows(&mut self) {
         let query = self.find_note_query.trim().to_ascii_lowercase();
+        let root = self.project_root();
+        let hints = if query.is_empty() {
+            vec!["note".to_string(); self.find_note_files.len()]
+        } else {
+            parallel::par_map(&self.find_note_files, |path| {
+                find_note_match_hint(&root, path, &query)
+            })
+        };
         let mut rows = Vec::new();
-        for path in &self.find_note_files {
-            let hint = if query.is_empty() {
-                "note".to_string()
-            } else {
-                self.find_note_match_hint(path, &query)
-            };
+        for (path, hint) in self.find_note_files.iter().zip(hints) {
             rows.push(FindNoteRow::File {
                 path: path.clone(),
                 match_hint: hint,
@@ -2026,32 +2178,6 @@ impl SlateApp {
         self.selected_find_note_row = self
             .selected_find_note_row
             .min(self.find_note_rows.len().saturating_sub(1));
-    }
-
-    fn find_note_match_hint(&self, path: &Path, query: &str) -> String {
-        let root = self.project_root();
-        let label = path
-            .strip_prefix(&root)
-            .unwrap_or(path)
-            .display()
-            .to_string();
-        if label.to_ascii_lowercase().contains(query) {
-            return "file".to_string();
-        }
-        let Ok(contents) = fs::read_to_string(path) else {
-            return "note".to_string();
-        };
-        for line in contents.lines() {
-            let lower = line.to_ascii_lowercase();
-            if let Some(heading) = parse_heading_line(line) {
-                if heading.text.to_ascii_lowercase().contains(query) {
-                    return format!("heading: {}", heading.text.trim());
-                }
-            } else if lower.contains(query) {
-                return line.trim().chars().take(80).collect();
-            }
-        }
-        "note".to_string()
     }
 
     fn move_find_note_selection(&mut self, delta: isize) {
@@ -2101,10 +2227,12 @@ impl SlateApp {
         } else if self.dirty {
             self.status = "Save or discard changes before opening find-note result".to_string();
         } else {
-            self.open_path(path);
-            if let Some(fragment) = fragment {
-                self.jump_to_markdown_fragment(&fragment);
-            }
+            self.request_file_open(
+                path,
+                fragment
+                    .map(OpenDestination::Fragment)
+                    .unwrap_or(OpenDestination::Restore),
+            );
             self.focus_editor_once = true;
         }
     }
@@ -2282,6 +2410,8 @@ impl SlateApp {
         }
         match fs::read_to_string(&path) {
             Ok(text) => {
+                self.safety_notified.remove(&document_safety::Slot::Modal);
+                self.modal_disk_base = Some(safe_file::fingerprint(text.as_bytes()));
                 self.link_preview_buffer.set_text(text);
                 let heading_text = if let Some(fragment) = heading_fragment.as_deref() {
                     Self::jump_buffer_to_markdown_fragment(
@@ -2317,15 +2447,38 @@ impl SlateApp {
         let heading_fragment = self.link_preview_heading_fragment.clone();
         let preview_dirty = self.link_preview_dirty;
         let preview_text = self.link_preview_buffer.as_str().to_string();
+        let preview_base = self.modal_disk_base;
+        if preview_dirty && self.dirty {
+            self.status = "Save current buffer before promoting modified modal text".into();
+            return;
+        }
+        let recovery_origin = if preview_dirty {
+            self.recovery_origins.remove(&document_safety::Slot::Modal)
+        } else {
+            None
+        };
+        if preview_dirty {
+            self.clear_recovery(document_safety::Slot::Main);
+            self.document_safety
+                .swap_roles(document_safety::Slot::Main, document_safety::Slot::Modal);
+        }
         self.close_link_preview_force();
         if preview_dirty {
+            self.cancel_file_open();
+            self.clear_buffer_project();
             self.buffer.set_text(preview_text);
             self.path = Some(path.clone());
+            self.disk_base = preview_base;
+            if let Some(origin) = recovery_origin {
+                self.recovery_origins
+                    .insert(document_safety::Slot::Main, origin);
+            }
             self.dirty = true;
             self.last_open_dir = path.parent().map(PathBuf::from);
             self.remember_recent_file(path);
             self.focus_editor_once = true;
             self.status = "Promoted modified modal buffer".to_string();
+            self.observe_document_safety(0.0, true);
             if let Some(fragment) = heading_fragment {
                 self.jump_to_markdown_fragment(&fragment);
             }
@@ -2337,10 +2490,12 @@ impl SlateApp {
             self.confirm(PendingAction::OpenProjectFile);
             return;
         }
-        self.open_path(path);
-        if let Some(fragment) = heading_fragment {
-            self.jump_to_markdown_fragment(&fragment);
-        }
+        self.request_file_open(
+            path,
+            heading_fragment
+                .map(OpenDestination::Fragment)
+                .unwrap_or(OpenDestination::Restore),
+        );
     }
 
     fn save_link_preview(&mut self) {
@@ -2348,24 +2503,51 @@ impl SlateApp {
             self.status = "Modal buffer has no file path".to_string();
             return;
         };
-        match fs::write(&path, self.link_preview_buffer.as_str()) {
-            Ok(_) => {
+        match safe_file::checked_save(
+            &path,
+            self.link_preview_buffer.as_str().as_bytes(),
+            self.modal_disk_base,
+        ) {
+            Ok(base) => {
+                self.modal_disk_base = Some(base);
+                self.clear_recovery(document_safety::Slot::Modal);
+                self.file_conflict = None;
                 self.link_preview_dirty = false;
                 self.last_open_dir = path.parent().map(PathBuf::from);
                 self.remember_recent_file(path.clone());
                 self.status = format!("Saved modal buffer {}", path.display());
+            }
+            Err(safe_file::SaveError::Conflict) => {
+                self.file_conflict = Some((document_safety::Slot::Modal, path));
+                self.status = "Modal save blocked: external change; text preserved".into();
             }
             Err(err) => self.status = format!("Save modal buffer failed: {err}"),
         }
     }
 
     fn swap_link_preview_with_main(&mut self) {
+        self.cancel_file_open();
         self.remember_current_cursor_position();
         let main_cursor = self.buffer.cursor_line_col();
         let modal_cursor = self.link_preview_buffer.cursor_line_col();
         std::mem::swap(&mut self.buffer, &mut self.link_preview_buffer);
         std::mem::swap(&mut self.path, &mut self.link_preview_path);
         std::mem::swap(&mut self.dirty, &mut self.link_preview_dirty);
+        std::mem::swap(&mut self.disk_base, &mut self.modal_disk_base);
+        self.document_safety
+            .swap_roles(document_safety::Slot::Main, document_safety::Slot::Modal);
+        let main_origin = self.recovery_origins.remove(&document_safety::Slot::Main);
+        self.safety_notified.clear();
+        let modal_origin = self.recovery_origins.remove(&document_safety::Slot::Modal);
+        if let Some(origin) = main_origin {
+            self.recovery_origins
+                .insert(document_safety::Slot::Modal, origin);
+        }
+        if let Some(origin) = modal_origin {
+            self.recovery_origins
+                .insert(document_safety::Slot::Main, origin);
+        }
+        self.file_conflict = None;
 
         let main_byte = self
             .buffer
@@ -2392,12 +2574,15 @@ impl SlateApp {
     }
 
     fn close_link_preview_force(&mut self) {
+        self.clear_recovery(document_safety::Slot::Modal);
+        self.modal_disk_base = None;
         self.link_preview_open = false;
         self.link_preview_path = None;
         self.link_preview_dirty = false;
         self.focus_link_preview_once = false;
         self.link_preview_heading_fragment = None;
         self.link_preview_heading_text = None;
+        self.forget_project_buffer(self.link_preview_buffer.identity);
         self.link_preview_buffer.clear();
         self.focus_editor_once = true;
     }
@@ -2408,14 +2593,7 @@ impl SlateApp {
             self.focus_link_preview_once = true;
             return;
         }
-        self.link_preview_open = false;
-        self.link_preview_path = None;
-        self.link_preview_dirty = false;
-        self.focus_link_preview_once = false;
-        self.link_preview_heading_fragment = None;
-        self.link_preview_heading_text = None;
-        self.link_preview_buffer.clear();
-        self.focus_editor_once = true;
+        self.close_link_preview_force();
     }
 
     fn jump_to_markdown_fragment(&mut self, fragment: &str) {
@@ -2467,7 +2645,7 @@ impl SlateApp {
     }
 
     fn open_web_link(&mut self, browser_target: &str, display_target: &str) {
-        match ProcessCommand::new("xdg-open").arg(browser_target).spawn() {
+        match open_url_in_browser(browser_target) {
             Ok(_) => self.status = format!("Opened link {display_target}"),
             Err(err) => self.status = format!("Open link failed: {err}"),
         }
@@ -2904,6 +3082,7 @@ impl SlateApp {
         let text = self.buffer.as_str().to_string();
         let (quickadds, remaining) = scratch::split_quickadds(&text);
         let mut quickadd_count = 0usize;
+        let requested_quickadds = quickadds.len();
         for task in quickadds {
             if self.quickadd_flow_task(&task) {
                 quickadd_count += 1;
@@ -2916,7 +3095,8 @@ impl SlateApp {
             self.append_text_to_scratch_archive(&remaining)
         };
 
-        let saved = archived || quickadd_count > 0;
+        let saved =
+            (remaining.trim().is_empty() || archived) && quickadd_count == requested_quickadds;
         if saved {
             self.dirty = false;
             if quickadd_count > 0 && archived {
@@ -2929,6 +3109,17 @@ impl SlateApp {
     }
 
     fn close_scratch_with_feedback(&mut self, ctx: &egui::Context) {
+        if self.path.is_some()
+            || self.link_preview_dirty
+            || (self.dirty && self.buffer.as_str().trim().is_empty())
+        {
+            if self.dirty || self.link_preview_dirty {
+                self.confirm(PendingAction::Quit);
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            return;
+        }
         let previous_status = self.status.clone();
         if self.append_to_scratch_archive() {
             self.status = previous_status;
@@ -2936,8 +3127,10 @@ impl SlateApp {
             self.scratch_close_after = Some(until);
             self.agenda_updated_toast_until = Some(until);
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
-        } else {
+        } else if !self.dirty {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else {
+            self.status = format!("Scratch not fully archived; text kept: {}", self.status);
         }
     }
 
@@ -2989,7 +3182,14 @@ impl SlateApp {
         let summary = match self.refresh_flow_index_for_path(&path, self.buffer.as_str()) {
             Ok(summary) => summary,
             Err(err) => {
-                self.status = format!("Flow agenda update failed: {err}");
+                if flow_store::is_busy_error(&err) {
+                    self.pending_flow_agenda_sync_at = Some(ctx.input(|i| i.time) + 0.15);
+                    ctx.request_repaint_after(std::time::Duration::from_millis(160));
+                    perf_log::mark("flow.ui_sync.retry", &err);
+                    self.status = "Flow sync pending…".to_string();
+                } else {
+                    self.status = format!("Flow agenda update failed: {err}");
+                }
                 return;
             }
         };
@@ -3006,13 +3206,23 @@ impl SlateApp {
         self.show_agenda_updated_toast(ctx);
     }
 
-    fn publish_active_flow_buffer_heartbeat(&self) {
+    fn publish_active_flow_buffer_heartbeat(&mut self) {
         let Some(current_path) = self.path.clone() else {
             return;
         };
         if self.standalone_agenda || !flow::should_index_flow_path(&current_path) {
             return;
         }
+        if self
+            .flow_heartbeat_attempt
+            .as_ref()
+            .is_some_and(|(path, last)| {
+                path == &current_path && last.elapsed() < std::time::Duration::from_secs(3)
+            })
+        {
+            return;
+        }
+        self.flow_heartbeat_attempt = Some((current_path.clone(), std::time::Instant::now()));
         let scope = Self::flow_project_root_for_path(&current_path);
         let Ok(sqlite_path) = Self::flow_sqlite_path_for_root(&scope) else {
             return;
@@ -3197,6 +3407,7 @@ impl SlateApp {
     fn archive_scratch_modal(&mut self) {
         if self.scratch_buffer.as_str().trim().is_empty() {
             self.scratch_modal_open = false;
+            self.forget_project_buffer(self.scratch_buffer.identity);
             self.scratch_buffer.clear();
             self.status = "Scratch cancelled".to_string();
             self.focus_editor_once = true;
@@ -3205,6 +3416,7 @@ impl SlateApp {
         let text = self.scratch_buffer.as_str().to_string();
         let (quickadds, remaining) = scratch::split_quickadds(&text);
         let mut quickadd_count = 0usize;
+        let requested_quickadds = quickadds.len();
         for task in quickadds {
             if self.quickadd_flow_task(&task) {
                 quickadd_count += 1;
@@ -3217,7 +3429,8 @@ impl SlateApp {
             self.append_text_to_scratch_archive(&remaining)
         };
 
-        if archived || quickadd_count > 0 {
+        if (remaining.trim().is_empty() || archived) && quickadd_count == requested_quickadds {
+            self.forget_project_buffer(self.scratch_buffer.identity);
             self.scratch_buffer.clear();
             self.scratch_modal_open = false;
             self.focus_editor_once = true;
@@ -3233,6 +3446,7 @@ impl SlateApp {
         self.scratch_modal_open = false;
         self.focus_editor_once = true;
         self.status = if self.scratch_buffer.as_str().trim().is_empty() {
+            self.forget_project_buffer(self.scratch_buffer.identity);
             self.scratch_buffer.clear();
             "Scratch cancelled".to_string()
         } else {
@@ -3376,16 +3590,32 @@ impl SlateApp {
     }
 
     fn save_path(&mut self, path: PathBuf) {
-        match fs::write(&path, self.buffer.as_str()) {
-            Ok(_) => {
+        let project = self.document_project();
+        let expected = if self.path.as_ref() == Some(&path) {
+            self.disk_base
+        } else {
+            None
+        };
+        match safe_file::checked_save(&path, self.buffer.as_str().as_bytes(), expected) {
+            Ok(base) => {
+                self.disk_base = Some(base);
+                self.clear_recovery(document_safety::Slot::Main);
+                self.file_conflict = None;
                 self.path = Some(path.clone());
                 self.last_open_dir = path.parent().map(PathBuf::from);
                 self.dirty = false;
                 self.remember_recent_file(path.clone());
-                let flow_summary = self
-                    .refresh_flow_index_for_path(&path, self.buffer.as_str())
-                    .ok()
-                    .flatten();
+                let flow_summary =
+                    match self.refresh_flow_index_for_path(&path, self.buffer.as_str()) {
+                        Ok(summary) => summary,
+                        Err(err) => {
+                            perf_log::mark("flow.save_cache_update_failed", &err);
+                            if flow_store::is_busy_error(&err) {
+                                self.schedule_current_flow_buffer_agenda_sync_later();
+                            }
+                            None
+                        }
+                    };
                 let _ = self.save_settings();
                 self.status = if let Some(summary) = flow_summary {
                     format!(
@@ -3396,13 +3626,31 @@ impl SlateApp {
                 } else {
                     format!("Saved {}", path.display())
                 };
+                if let Err(error) = self.persist_saved_project(&path, project) {
+                    self.status
+                        .push_str(&format!(" · project metadata not saved: {error}"));
+                }
+            }
+            Err(safe_file::SaveError::Conflict) => {
+                self.file_conflict = Some((document_safety::Slot::Main, path));
+                self.status =
+                    "Save blocked: external change / existing destination; text preserved".into();
             }
             Err(err) => self.status = format!("Save failed: {err}"),
         }
     }
 
     fn new_buffer(&mut self) {
+        if self.dirty {
+            self.status = "Save or discard changes before creating a new buffer".into();
+            return;
+        }
+        self.clear_recovery(document_safety::Slot::Main);
+        self.disk_base = None;
+        self.file_conflict = None;
+        self.cancel_file_open();
         self.remember_current_cursor_position();
+        self.clear_buffer_project();
         self.buffer.clear();
         self.path = None;
         self.dirty = false;
@@ -4640,8 +4888,12 @@ impl SlateApp {
                 self.status = "Save current buffer before agenda jump".to_string();
                 return;
             }
-            self.open_path(item.path.clone());
+            self.request_file_open(item.path.clone(), OpenDestination::Agenda(item.line_index));
+            self.agenda_open = false;
+            self.focus_editor_once = true;
+            return;
         }
+        self.cancel_file_open();
         let line = item
             .line_index
             .min(self.buffer.line_count().saturating_sub(1));
@@ -4672,8 +4924,10 @@ impl SlateApp {
         }
 
         let line_number = item.line_index.saturating_add(1).to_string();
-        let slate_bin = std::env::var_os("HOME")
-            .map(PathBuf::from)
+        #[cfg(target_os = "windows")]
+        let slate_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("slate.exe"));
+        #[cfg(not(target_os = "windows"))]
+        let slate_bin = dirs_next::home_dir()
             .map(|home| home.join(".local/bin/slate"))
             .filter(|path| path.exists())
             .unwrap_or_else(|| PathBuf::from("slate"));
@@ -4900,15 +5154,7 @@ impl SlateApp {
         if path.is_dir() {
             if self.file_picker_mode == FilePickerMode::SetPeriscopeProject {
                 self.file_picker_open = false;
-                self.periscope_project_root = Some(path.clone());
-                self.periscope_mode = PeriscopeMode::Project;
-                self.periscope_open = true;
-                self.periscope_query.clear();
-                self.periscope_results.clear();
-                self.periscope_expanded_folders.clear();
-                self.selected_periscope_result = 0;
-                self.refresh_periscope_results();
-                self.status = format!("Periscope project: {}", path.display());
+                self.assign_document_project(path);
                 return;
             }
             self.file_picker_dir = path;
@@ -4931,7 +5177,7 @@ impl SlateApp {
                 self.open_link_preview(path, None);
             }
             FilePickerMode::SetPeriscopeProject => {
-                self.status = "Choose a folder for Periscope project".to_string();
+                self.status = "Choose a folder for this document's project".to_string();
             }
             FilePickerMode::AddLance => {
                 self.file_picker_open = false;
@@ -4951,6 +5197,9 @@ impl SlateApp {
     }
 
     fn open_periscope(&mut self) {
+        self.begin_periscope_setup();
+    }
+    fn choose_periscope_scope(&mut self) {
         self.shortcut_help_open = false;
         self.palette_open = false;
         self.recent_picker_open = false;
@@ -4968,20 +5217,17 @@ impl SlateApp {
         self.periscope_backend_status.clear();
         self.focus_editor_once = false;
 
-        if let Some(root) = self.detect_project_root() {
-            self.periscope_project_root = Some(root.clone());
-            self.periscope_mode = PeriscopeMode::Project;
-            self.periscope_open = true;
-            self.periscope_prompt_open = false;
-            self.refresh_periscope_results();
-            self.status = format!("Periscope project: {}", root.display());
-        } else {
-            self.periscope_open = false;
-            self.periscope_prompt_open = true;
-            self.status = "No .git project root found".to_string();
+        self.periscope_project_root = self.document_project();
+        if self.periscope_project_root.is_none() {
+            self.open_global_periscope();
+            return;
         }
+        self.periscope_open = false;
+        self.periscope_prompt_open = true;
+        self.status = "Document has a project · choose project or global".into();
     }
 
+    // Git detection remains for Flow's existing scope semantics, not Periscope membership.
     fn detect_project_root(&self) -> Option<PathBuf> {
         let mut dir = self
             .path
@@ -4999,13 +5245,10 @@ impl SlateApp {
         }
     }
 
-    fn open_periscope_project_folder_picker(&mut self) {
-        self.periscope_prompt_open = false;
-        self.open_file_picker_at(self.project_root(), FilePickerMode::SetPeriscopeProject);
-        self.status = "Choose Periscope project folder with Enter".to_string();
-    }
-
     fn open_global_periscope(&mut self) {
+        if self.periscope_setup.visible {
+            return;
+        }
         self.periscope_prompt_open = false;
         self.periscope_open = true;
         self.periscope_mode = PeriscopeMode::Global;
@@ -5041,77 +5284,39 @@ impl SlateApp {
         self.refresh_periscope_results();
     }
 
-    fn start_periscope_global_index_load(&mut self) {
-        if self.periscope_global_loading || !self.periscope_global_paths.is_empty() {
-            return;
-        }
-        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-            self.periscope_backend_status = "Home Periscope needs $HOME".to_string();
-            return;
-        };
-        let (tx, rx) = mpsc::channel();
-        self.periscope_global_rx = Some(rx);
-        self.periscope_global_loading = true;
-        self.periscope_backend_status = format!("Home index: {} · loading…", home.display());
-        thread::spawn(move || {
-            let _ = tx.send(periscope::load_global_index(&home));
-        });
-    }
-
     fn poll_periscope_global_index(&mut self) {
-        let Some(rx) = &self.periscope_global_rx else {
+        if !self.periscope_open {
+            if self.periscope_request.take().is_some() {
+                self.periscope_engine.cancel();
+            }
             return;
-        };
-        match rx.try_recv() {
-            Ok(paths) => {
-                self.periscope_global_paths = paths;
-                self.periscope_global_rx = None;
-                self.periscope_global_loading = false;
-                self.periscope_backend_status = format!(
-                    "Home index loaded: {} files · in-memory fuzzy · capped at 100 results",
-                    self.periscope_global_paths.len()
-                );
-                if self.periscope_mode == PeriscopeMode::Global {
-                    self.periscope_results = periscope::cached_results(
-                        &self.periscope_global_paths,
-                        &self.periscope_query,
-                        PERISCOPE_RESULT_LIMIT,
-                    );
-                    self.selected_periscope_result = 0;
-                }
+        }
+        if let Some(result) = self.periscope_engine.poll() {
+            if self.periscope_request != Some(result.id) {
+                return;
             }
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => {
-                self.periscope_global_rx = None;
-                self.periscope_global_loading = false;
-                self.periscope_backend_status = "Home index load failed".to_string();
-            }
+            let selected_path = self.selected_periscope_row();
+            self.periscope_results = result.paths;
+            self.periscope_backend_status = result.status;
+            self.periscope_global_loading = false;
+            self.selected_periscope_result = selected_path
+                .and_then(|selected| {
+                    self.periscope_rows()
+                        .iter()
+                        .position(|row| match (&selected, row) {
+                            (
+                                PeriscopeRow::File { path: a, .. },
+                                PeriscopeRow::File { path: b, .. },
+                            )
+                            | (
+                                PeriscopeRow::Folder { path: a, .. },
+                                PeriscopeRow::Folder { path: b, .. },
+                            ) => a == b,
+                            _ => false,
+                        })
+                })
+                .unwrap_or(0);
         }
-    }
-
-    fn periscope_global_results(&mut self, query: &str) -> Vec<PathBuf> {
-        self.start_periscope_global_index_load();
-        if self.periscope_global_paths.is_empty() {
-            self.periscope_backend_status = if self.periscope_global_loading {
-                "Home index loading… type now, results will appear when ready".to_string()
-            } else {
-                "Home index unavailable".to_string()
-            };
-            return Vec::new();
-        }
-        let query = query.trim();
-        if query.is_empty() {
-            self.periscope_backend_status = format!(
-                "Home index: {} files · type to search · capped at 100 results",
-                self.periscope_global_paths.len()
-            );
-            return Vec::new();
-        }
-        self.periscope_backend_status = format!(
-            "Home index: {} files · in-memory fuzzy · capped at 100 results",
-            self.periscope_global_paths.len()
-        );
-        periscope::cached_results(&self.periscope_global_paths, query, PERISCOPE_RESULT_LIMIT)
     }
 
     fn periscope_rows(&self) -> Vec<PeriscopeRow> {
@@ -5137,19 +5342,22 @@ impl SlateApp {
     }
 
     fn refresh_periscope_results(&mut self) {
-        self.periscope_results = match self.periscope_mode {
-            PeriscopeMode::Project => self
-                .periscope_project_root
-                .clone()
-                .map(|root| {
-                    periscope::project_results(&root, &self.periscope_query, PERISCOPE_RESULT_LIMIT)
-                })
-                .unwrap_or_default(),
-            PeriscopeMode::Global => {
-                let query = self.periscope_query.clone();
-                self.periscope_global_results(&query)
-            }
-        };
+        if self.periscope_setup.visible {
+            return;
+        }
+        self.periscope_results.clear();
+        self.periscope_global_loading = true;
+        self.periscope_backend_status = "Searching index… · latest query wins".into();
+        self.periscope_request = Some(self.periscope_engine.request(periscope_backend::Request {
+            query: self.periscope_query.clone(),
+            project: if self.periscope_mode == PeriscopeMode::Project {
+                self.periscope_project_root.clone()
+            } else {
+                None
+            },
+            roots: self.periscope_roots.clone(),
+            everything: self.periscope_everything,
+        }));
         self.selected_periscope_result = self
             .selected_periscope_result
             .min(self.periscope_rows().len().saturating_sub(1));
@@ -5223,10 +5431,12 @@ impl SlateApp {
         self.command_line_focused = false;
         self.focus_command_line_once = false;
         self.command_history_index = None;
+        let project = self.document_project();
         self.save_as_dir = self
             .path
             .as_ref()
             .and_then(|path| path.parent().map(PathBuf::from))
+            .or(project)
             .or_else(|| self.last_open_dir.clone())
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
@@ -5329,6 +5539,21 @@ impl SlateApp {
         self.focus_editor_once = true;
     }
 
+    /// Reads only `single_instance` so `main` can decide before creating a window.
+    fn config_single_instance_enabled() -> bool {
+        Self::settings_path()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .and_then(|contents| {
+                contents.lines().find_map(|line| {
+                    let (key, value) = line.split_once('=')?;
+                    (key.trim() == "single_instance")
+                        .then(|| Self::parse_config_bool(value.trim()))
+                        .flatten()
+                })
+            })
+            .unwrap_or(true)
+    }
+
     fn settings_path() -> Option<PathBuf> {
         let mut dir = dirs_next::config_dir()?;
         dir.push("slate");
@@ -5336,18 +5561,44 @@ impl SlateApp {
     }
 
     fn load_settings(&mut self) {
-        let Some(path) = Self::settings_path() else {
+        let path = Self::settings_path();
+        #[cfg(test)]
+        let path = self.settings_path_override.clone().or(path);
+        let Some(path) = path else {
             return;
         };
         let Ok(contents) = fs::read_to_string(path) else {
             return;
         };
 
+        self.periscope_roots.clear();
         for line in contents.lines() {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
             match key.trim() {
+                key if footer_ui::Options::key_index(key).is_some() => {
+                    if let Ok(enabled) = value.trim().parse::<bool>() {
+                        self.footer_options.enabled[footer_ui::Options::key_index(key).unwrap()] =
+                            enabled;
+                    }
+                }
+                "periscope_everything" => {
+                    if let Some(enabled) = Self::parse_config_bool(value) {
+                        self.periscope_everything = enabled;
+                    }
+                }
+                "periscope_root" => {
+                    let path = PathBuf::from(Self::parse_config_string(value));
+                    if path.is_absolute() && !self.periscope_roots.contains(&path) {
+                        self.periscope_roots.push(path);
+                    }
+                }
+                "editor_font_size" => {
+                    if let Ok(size) = value.trim().parse::<f32>() {
+                        self.apply_editor_font_size(size);
+                    }
+                }
                 "command_history_limit" => {
                     if let Ok(limit) = value.trim().parse::<usize>() {
                         self.command_history_limit = clamp_history_limit(limit);
@@ -5376,6 +5627,11 @@ impl SlateApp {
                 "reopen_last_file_on_startup" => {
                     if let Some(enabled) = Self::parse_config_bool(value) {
                         self.reopen_last_file_on_startup = enabled;
+                    }
+                }
+                "single_instance" => {
+                    if let Some(enabled) = Self::parse_config_bool(value) {
+                        self.single_instance = enabled;
                     }
                 }
                 "markdown_live_rendering" => {
@@ -5527,7 +5783,10 @@ impl SlateApp {
     }
 
     fn save_settings(&self) -> Result<(), String> {
-        let Some(path) = Self::settings_path() else {
+        let path = Self::settings_path();
+        #[cfg(test)]
+        let path = self.settings_path_override.clone().or(path);
+        let Some(path) = path else {
             return Err("no config dir".to_string());
         };
         let parent = path
@@ -5535,13 +5794,14 @@ impl SlateApp {
             .ok_or_else(|| "invalid config path".to_string())?;
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
         let mut contents = format!(
-            "command_history_limit = {}\nline_number_mode = \"{}\"\nword_wrap = {}\npreview_mode = {}\nctrl_shift_move_mode = \"{}\"\nreopen_last_file_on_startup = {}\nmarkdown_live_rendering = {}\nvirtual_references_enabled = {}\nvirtual_references_collapsed = {}\nvirtual_backlinks_collapsed = {}\nvirtual_mentions_collapsed = {}\nlast_opened_path = \"{}\"\nlast_open_dir = \"{}\"\n",
+            "command_history_limit = {}\nline_number_mode = \"{}\"\nword_wrap = {}\npreview_mode = {}\nctrl_shift_move_mode = \"{}\"\nreopen_last_file_on_startup = {}\nsingle_instance = {}\nmarkdown_live_rendering = {}\nvirtual_references_enabled = {}\nvirtual_references_collapsed = {}\nvirtual_backlinks_collapsed = {}\nvirtual_mentions_collapsed = {}\nlast_opened_path = \"{}\"\nlast_open_dir = \"{}\"\n",
             self.command_history_limit,
             self.line_number_mode.config_value(),
             self.wrap,
             self.preview,
             self.ctrl_shift_move_mode.config_value(),
             self.reopen_last_file_on_startup,
+            self.single_instance,
             self.markdown_live_rendering,
             self.virtual_references_enabled,
             self.virtual_references_collapsed,
@@ -5562,6 +5822,20 @@ impl SlateApp {
                     .unwrap_or_default()
             )
         );
+        contents.push_str(&format!("editor_font_size = {}\n", self.editor_font_size));
+        contents.push_str(&format!(
+            "periscope_everything = {}\n",
+            self.periscope_everything
+        ));
+        for root in &self.periscope_roots {
+            contents.push_str(&format!(
+                "periscope_root = \"{}\"\n",
+                Self::escape_config_string(&root.display().to_string())
+            ));
+        }
+        for (index, (key, _)) in footer_ui::FIELDS.iter().enumerate() {
+            contents.push_str(&format!("{key} = {}\n", self.footer_options.enabled[index]));
+        }
         let history_start = self
             .command_history
             .len()
@@ -5628,6 +5902,21 @@ impl SlateApp {
             Ok(_) => self.status = format!("History length: {}", self.command_history_limit),
             Err(err) => self.status = format!("Settings save failed: {err}"),
         }
+    }
+
+    fn apply_editor_font_size(&mut self, size: f32) {
+        self.editor_font_size = editor_view::clamp_editor_font_size(size);
+        self.editor_view.set_font_size(self.editor_font_size);
+        self.link_preview_view.set_font_size(self.editor_font_size);
+        self.scratch_view.set_font_size(self.editor_font_size);
+    }
+
+    fn set_editor_font_size(&mut self, size: f32) {
+        self.apply_editor_font_size(size);
+        self.status = match self.save_settings() {
+            Ok(()) => format!("Editor font: {} pt", self.editor_font_size),
+            Err(err) => format!("Editor font changed; settings save failed: {err}"),
+        };
     }
 
     fn set_line_number_mode(&mut self, mode: LineNumberMode) {
@@ -5827,12 +6116,13 @@ impl SlateApp {
             }
             Command::OpenBuffer => self.open_buffer_dialog(),
             Command::Periscope => self.open_periscope(),
+            Command::CreateProject => self.create_document_project(),
             Command::Lance => self.open_lance(),
             Command::LanceAdd => self.lance_add_current(),
             Command::LanceNext => self.open_next_lance_file(1),
             Command::LancePrev => self.open_next_lance_file(-1),
-            Command::FlowRescan => self.flow_rescan_current_scope(false),
-            Command::FlowRebuild => self.flow_rescan_current_scope(true),
+            Command::FlowRescan => self.flow_rescan_current_scope(false, ctx),
+            Command::FlowRebuild => self.flow_rescan_current_scope(true, ctx),
             Command::Daily => self.open_daily_with_target(""),
             Command::Refile => self.start_refile_current_line(),
             Command::QuickAdd => self.open_scratch_modal(),
@@ -5855,9 +6145,11 @@ impl SlateApp {
             Command::OpenLink => self.open_link_under_cursor(),
             Command::LineNumbersAbsolute => self.set_line_number_mode(LineNumberMode::Absolute),
             Command::LineNumbersRelative => self.set_line_number_mode(LineNumberMode::Relative),
+            Command::PerfHud => self.perf_hud.toggle(),
             Command::Settings => {
                 self.settings_open = true;
                 self.selected_setting = 0;
+                self.settings_last_selected = None;
                 self.focus_editor_once = false;
             }
             Command::Quit => self.request_close(ctx),
@@ -5948,12 +6240,27 @@ impl SlateApp {
                 }
             }
             CommandLineAction::OpenPath(path) => {
-                if self.dirty {
+                let expanded =
+                    Self::resolve_command_path(&file_dialogs::normalize_drive_path(&path));
+                if expanded.is_dir() {
+                    self.record_command_usage("open");
+                    self.open_file_picker_at(expanded, FilePickerMode::Open);
+                } else if self.dirty {
                     self.status = "Save or discard changes before opening another file".to_string();
                 } else {
                     self.record_command_usage("open");
-                    let expanded = Self::resolve_command_path(&path);
                     self.open_path(expanded);
+                }
+            }
+            CommandLineAction::BrowsePath(path) => {
+                self.record_command_usage("cd");
+                let dir = Self::resolve_command_path(&file_dialogs::normalize_drive_path(&path));
+                if path.trim().is_empty() {
+                    self.open_file_picker_for_open();
+                } else if dir.is_dir() {
+                    self.open_file_picker_at(dir, FilePickerMode::Browse);
+                } else {
+                    self.status = format!("Not an accessible directory: {}", dir.display());
                 }
             }
             CommandLineAction::OpenBufferPath(path) => {
@@ -6326,7 +6633,10 @@ impl SlateApp {
             return;
         }
 
+        let started = std::time::Instant::now();
         let state = SearchState::new(query, self.buffer.as_str(), self.buffer.revision);
+        self.perf_hud
+            .record_find(started.elapsed(), state.matches.len());
         self.search_state = Some(state);
         self.apply_selected_search_match();
         self.focus_editor_once = true;
@@ -6413,6 +6723,7 @@ impl SlateApp {
     }
 
     fn confirm(&mut self, action: PendingAction) {
+        self.cancel_file_open();
         self.pending_action = Some(action);
         self.focus_editor_once = false;
     }
@@ -6432,10 +6743,12 @@ impl SlateApp {
                 if let Some(path) = self.pending_project_file_path.take() {
                     self.file_picker_open = false;
                     let heading_fragment = self.pending_open_heading_fragment.take();
-                    self.open_path(path);
-                    if let Some(fragment) = heading_fragment {
-                        self.jump_to_markdown_fragment(&fragment);
-                    }
+                    self.request_file_open(
+                        path,
+                        heading_fragment
+                            .map(OpenDestination::Fragment)
+                            .unwrap_or(OpenDestination::Restore),
+                    );
                 }
             }
             PendingAction::OpenDaily => {
@@ -6447,9 +6760,9 @@ impl SlateApp {
     }
 
     fn request_close(&mut self, ctx: &egui::Context) {
-        if self.scratch {
+        if self.scratch && self.path.is_none() && !self.link_preview_dirty {
             self.close_scratch_with_feedback(ctx);
-        } else if self.dirty {
+        } else if self.dirty || self.link_preview_dirty {
             self.confirm(PendingAction::Quit);
         } else {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -6469,10 +6782,10 @@ impl SlateApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             return;
         }
-        if self.scratch && self.dirty {
+        if self.scratch && self.path.is_none() && self.dirty && !self.link_preview_dirty {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.close_scratch_with_feedback(ctx);
-        } else if self.dirty {
+        } else if self.dirty || self.link_preview_dirty {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.confirm(PendingAction::Quit);
         }
@@ -6935,37 +7248,55 @@ impl SlateApp {
 
         let mut undo = false;
         let mut redo = false;
+        let mut select_all = false;
+        let mut copy = false;
+        let mut paste = None;
+        let mut cut = false;
+
         ctx.input_mut(|input| {
             for event in &input.events {
-                let egui::Event::Key {
-                    key,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } = event
-                else {
-                    continue;
-                };
-                if modifiers.alt || modifiers.shift || !(modifiers.ctrl || modifiers.command) {
-                    continue;
-                }
-                match key {
-                    Key::Z => undo = true,
-                    Key::Y => redo = true,
+                match event {
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if !modifiers.alt
+                        && !modifiers.shift
+                        && (modifiers.ctrl || modifiers.command) =>
+                    {
+                        match key {
+                            Key::Z => undo = true,
+                            Key::Y => redo = true,
+                            Key::A => select_all = true,
+                            Key::C => copy = true,
+                            Key::X => cut = true,
+                            _ => {}
+                        }
+                    }
+                    egui::Event::Copy => copy = true,
+                    egui::Event::Paste(text) => paste = Some(text.clone()),
+                    egui::Event::Cut => cut = true,
                     _ => {}
                 }
             }
-            if undo || redo {
-                input.events.retain(|event| {
-                    !matches!(
-                        event,
-                        egui::Event::Key {
-                            key: Key::Z | Key::Y,
-                            pressed: true,
-                            modifiers,
-                            ..
-                        } if !modifiers.alt && !modifiers.shift && (modifiers.ctrl || modifiers.command)
-                    )
+
+            let any_action = undo || redo || select_all || copy || paste.is_some() || cut;
+            if any_action {
+                input.events.retain(|event| match event {
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if !modifiers.alt
+                        && !modifiers.shift
+                        && (modifiers.ctrl || modifiers.command) =>
+                    {
+                        !matches!(key, Key::Z | Key::Y | Key::A | Key::C | Key::V | Key::X)
+                    }
+                    egui::Event::Copy | egui::Event::Paste(_) | egui::Event::Cut => false,
+                    _ => true,
                 });
             }
         });
@@ -6991,6 +7322,53 @@ impl SlateApp {
             } else {
                 self.status = "Nothing to redo".to_string();
             }
+            self.ctrl_layer_active = false;
+            self.ctrl_layer_sequence.clear();
+            return true;
+        }
+
+        if select_all {
+            self.buffer.set_selection(0, self.buffer.as_str().len());
+            self.editor_view.request_scroll_to_cursor(&self.buffer);
+            self.status = "Select all".to_string();
+            self.ctrl_layer_active = false;
+            self.ctrl_layer_sequence.clear();
+            return true;
+        }
+
+        if copy {
+            if let Some((start, end)) = self.buffer.selection() {
+                ctx.copy_text(self.buffer.as_str()[start..end].to_string());
+                self.status = "Copied selection".to_string();
+            } else {
+                self.status = "No selection to copy".to_string();
+            }
+            self.ctrl_layer_active = false;
+            self.ctrl_layer_sequence.clear();
+            return true;
+        }
+
+        if cut {
+            if let Some((start, end)) = self.buffer.selection() {
+                ctx.copy_text(self.buffer.as_str()[start..end].to_string());
+                self.buffer.replace_selection_or_range(start, end, "");
+                self.dirty = true;
+                self.editor_view.request_scroll_to_cursor(&self.buffer);
+                self.status = "Cut selection".to_string();
+            } else {
+                self.status = "No selection to cut".to_string();
+            }
+            self.ctrl_layer_active = false;
+            self.ctrl_layer_sequence.clear();
+            return true;
+        }
+
+        if let Some(text) = paste {
+            let normalized = EditorView::normalize_paste_text(&text);
+            self.buffer.insert_text(&normalized);
+            self.dirty = true;
+            self.editor_view.request_scroll_to_cursor(&self.buffer);
+            self.status = "Pasted".to_string();
             self.ctrl_layer_active = false;
             self.ctrl_layer_sequence.clear();
             return true;
@@ -7451,1343 +7829,6 @@ impl SlateApp {
         self.focus_editor_once = false;
     }
 
-    fn shortcuts(&mut self, ctx: &egui::Context) {
-        if self.scratch_close_after.is_some() {
-            return;
-        }
-
-        if self.handle_agenda_org_keyboard(ctx) {
-            return;
-        }
-
-        if self.handle_link_inline_keyboard(ctx) {
-            return;
-        }
-
-        if self.flow_item_edit.is_some() {
-            return;
-        }
-
-        if self.handle_duplicate_placement(ctx) {
-            return;
-        }
-
-        if self.handle_shift_alt_layer(ctx) {
-            return;
-        }
-
-        if self.handle_alt_layer(ctx) {
-            return;
-        }
-
-        if self.handle_immediate_ctrl_edit(ctx) {
-            return;
-        }
-
-        if self.handle_ctrl_layer(ctx) {
-            return;
-        }
-
-        let mut command = None;
-        let mut execute_command_line = false;
-        let mut complete_command_line = false;
-        let mut previous_command = false;
-        let mut next_command = false;
-        let mut settings_decrement = false;
-        let mut settings_increment = false;
-        let mut settings_previous = false;
-        let mut settings_next = false;
-        let mut settings_activate = false;
-        let mut recent_previous = false;
-        let mut recent_next = false;
-        let mut recent_open = false;
-        let mut recent_backspace = false;
-        let mut lance_previous = false;
-        let mut lance_next = false;
-        let mut lance_open = false;
-        let mut lance_open_modal = false;
-        let mut lance_add = false;
-        let mut lance_delete = false;
-        let mut lance_backspace = false;
-        let mut doc_task_previous = false;
-        let mut doc_task_next = false;
-        let mut doc_task_open = false;
-        let mut doc_task_cycle = false;
-        let mut doc_task_backspace = false;
-        let mut agenda_previous = false;
-        let mut agenda_next = false;
-        let mut agenda_open = false;
-        let mut agenda_cycle = false;
-        let mut agenda_edit = false;
-        let mut agenda_refile = false;
-        let mut agenda_previous_day = false;
-        let mut agenda_next_day = false;
-        let mut agenda_previous_week = false;
-        let mut agenda_next_week = false;
-        let mut agenda_today = false;
-        let mut agenda_toggle_focus = false;
-        let mut agenda_cycle_tab = false;
-        let mut agenda_toggle_done = false;
-        let mut agenda_org_tag = false;
-        let mut agenda_org_project = false;
-        let mut file_previous = false;
-        let mut file_next = false;
-        let mut file_open = false;
-        let mut file_enter_dir = false;
-        let mut file_parent = false;
-        let mut file_backspace = false;
-        let mut periscope_previous = false;
-        let mut periscope_next = false;
-        let mut periscope_open = false;
-        let mut periscope_open_modal = false;
-        let mut periscope_toggle_mode = false;
-        let mut periscope_expand_folder = false;
-        let mut periscope_backspace = false;
-        let mut find_note_previous = false;
-        let mut find_note_next = false;
-        let mut find_note_open = false;
-        let mut find_note_open_modal = false;
-        let mut find_note_toggle = false;
-        let mut find_note_backspace = false;
-        let mut find_note_cancel = false;
-        let mut periscope_prompt_yes = false;
-        let mut periscope_prompt_no = false;
-        let mut save_as_previous = false;
-        let mut save_as_next = false;
-        let mut save_as_enter = false;
-        let mut save_as_enter_dir = false;
-        let mut save_as_parent = false;
-        let mut save_as_backspace = false;
-        let mut link_assist_previous = false;
-        let mut link_assist_next = false;
-        let mut link_assist_confirm = false;
-        let mut link_assist_cancel = false;
-        let mut link_web_confirm = false;
-        let mut link_web_backspace = false;
-        let mut link_web_cancel = false;
-        let mut link_heading_previous = false;
-        let mut link_heading_next = false;
-        let mut link_heading_confirm = false;
-        let mut link_heading_cancel = false;
-        let mut link_preview_confirm = false;
-        let mut link_preview_cancel = false;
-        let mut link_preview_save = false;
-        let mut link_preview_swap = false;
-        let mut scratch_archive = false;
-        let mut scratch_open_entries = false;
-        let mut scratch_entries_previous = false;
-        let mut scratch_entries_next = false;
-        let mut scratch_entries_delete = false;
-        let mut capture_confirm = false;
-        let mut search_next = false;
-        let mut search_previous = false;
-        let mut search_accept = false;
-        let mut search_cancel = false;
-        let mut search_cursor_after = false;
-        let mut search_cursor_before = false;
-        let mut command_line_backspace = false;
-        let mut command_line_delete = false;
-        let mut command_line_left = false;
-        let mut command_line_right = false;
-        let mut command_line_home = false;
-        let mut command_line_end = false;
-        let search_active = self.search_state.is_some()
-            && !self.command_line_focused
-            && !self.focus_command_line_once
-            && !self.palette_open
-            && !self.settings_open
-            && !self.recent_picker_open
-            && !self.lance_open
-            && !self.doc_tasks_open
-            && !self.agenda_open
-            && !self.file_picker_open
-            && !self.find_note_open
-            && !self.link_heading_picker_open
-            && !self.link_preview_open
-            && !self.save_as_open
-            && !self.scratch_modal_open
-            && !self.scratch_entries_open
-            && !self.capture_modal_open
-            && self.pending_action.is_none();
-        ctx.input_mut(|i| {
-            if self.settings_open {
-                settings_decrement |= i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft);
-                settings_increment |= i.consume_key(egui::Modifiers::NONE, Key::ArrowRight);
-                settings_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
-                settings_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
-                settings_activate |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
-                settings_activate |= i.consume_key(egui::Modifiers::NONE, Key::Space);
-            }
-            if self.recent_picker_open {
-                recent_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
-                recent_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
-                recent_open |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
-                recent_open |= i.consume_key(egui::Modifiers::NONE, Key::Space);
-                recent_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
-            }
-            if self.lance_open {
-                lance_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
-                lance_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
-                lance_open_modal |= i.consume_key(egui::Modifiers::CTRL, Key::Enter);
-                lance_open |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
-                lance_add |= i.consume_key(egui::Modifiers::CTRL, Key::A);
-                lance_delete |= i.consume_key(egui::Modifiers::NONE, Key::Delete);
-                lance_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
-            }
-            if self.doc_tasks_open {
-                doc_task_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
-                doc_task_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
-                let ctrl_held = i.modifiers.ctrl || i.modifiers.command;
-                doc_task_cycle |= i.events.iter().any(|event| {
-                    matches!(
-                        event,
-                        egui::Event::Key {
-                            key: Key::Enter,
-                            pressed: true,
-                            repeat: false,
-                            modifiers,
-                            ..
-                        } if ctrl_held || modifiers.ctrl || modifiers.command
-                    )
-                });
-                doc_task_open |= !doc_task_cycle
-                    && i.events.iter().any(|event| {
-                        matches!(
-                            event,
-                            egui::Event::Key {
-                                key: Key::Enter,
-                                pressed: true,
-                                repeat: false,
-                                modifiers,
-                                ..
-                            } if !ctrl_held && !modifiers.ctrl && !modifiers.command && !modifiers.alt && !modifiers.shift
-                        )
-                    });
-                if doc_task_cycle || doc_task_open {
-                    i.events.retain(|event| {
-                        !matches!(
-                            event,
-                            egui::Event::Key {
-                                key: Key::Enter,
-                                pressed: true,
-                                repeat: false,
-                                ..
-                            }
-                        )
-                    });
-                }
-                doc_task_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
-            }
-            if self.agenda_open && !self.file_picker_open && !self.link_heading_picker_open {
-                agenda_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
-                agenda_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
-                agenda_previous_day |= i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft);
-                agenda_next_day |= i.consume_key(egui::Modifiers::NONE, Key::ArrowRight);
-                agenda_previous_week |= i.consume_key(egui::Modifiers::NONE, Key::PageUp);
-                agenda_next_week |= i.consume_key(egui::Modifiers::NONE, Key::PageDown);
-                agenda_today |= i.consume_key(egui::Modifiers::NONE, Key::Home);
-                agenda_toggle_done |= i.consume_key(egui::Modifiers::NONE, Key::X);
-                agenda_refile |= i.consume_key(egui::Modifiers::NONE, Key::R);
-                agenda_org_tag |= i.events.iter().any(|event| {
-                    matches!(event, egui::Event::Text(text) if text == "#")
-                });
-                agenda_org_project |= i.events.iter().any(|event| {
-                    matches!(event, egui::Event::Text(text) if text == "@")
-                });
-                if agenda_org_tag || agenda_org_project {
-                    i.events.retain(|event| {
-                        !matches!(event, egui::Event::Text(text) if text == "#" || text == "@")
-                    });
-                }
-                agenda_cycle_tab |= i.events.iter().any(|event| {
-                    matches!(
-                        event,
-                        egui::Event::Key {
-                            key: Key::Tab,
-                            pressed: true,
-                            repeat: false,
-                            modifiers,
-                            ..
-                        } if !modifiers.ctrl && !modifiers.command && !modifiers.alt && modifiers.shift
-                    )
-                });
-                agenda_toggle_focus |= i.events.iter().any(|event| {
-                    matches!(
-                        event,
-                        egui::Event::Key {
-                            key: Key::Tab,
-                            pressed: true,
-                            repeat: false,
-                            modifiers,
-                            ..
-                        } if !modifiers.ctrl && !modifiers.command && !modifiers.alt && !modifiers.shift
-                    )
-                });
-                if agenda_toggle_focus || agenda_cycle_tab {
-                    i.events.retain(|event| {
-                        !matches!(
-                            event,
-                            egui::Event::Key {
-                                key: Key::Tab,
-                                pressed: true,
-                                ..
-                            }
-                        )
-                    });
-                }
-                let ctrl_held = i.modifiers.ctrl || i.modifiers.command;
-                agenda_cycle |= i.events.iter().any(|event| {
-                    matches!(
-                        event,
-                        egui::Event::Key {
-                            key: Key::Enter,
-                            pressed: true,
-                            repeat: false,
-                            modifiers,
-                            ..
-                        } if ctrl_held || modifiers.ctrl || modifiers.command
-                    )
-                });
-                agenda_edit |= i.events.iter().any(|event| {
-                    matches!(
-                        event,
-                        egui::Event::Key {
-                            key: Key::Enter,
-                            pressed: true,
-                            repeat: false,
-                            modifiers,
-                            ..
-                        } if !modifiers.ctrl && !modifiers.command && !modifiers.alt && modifiers.shift
-                    )
-                });
-                agenda_open |= !agenda_cycle && !agenda_edit
-                    && i.events.iter().any(|event| {
-                        matches!(
-                            event,
-                            egui::Event::Key {
-                                key: Key::Enter,
-                                pressed: true,
-                                repeat: false,
-                                modifiers,
-                                ..
-                            } if !ctrl_held && !modifiers.ctrl && !modifiers.command && !modifiers.alt && !modifiers.shift
-                        )
-                    });
-                agenda_open |= i.consume_key(egui::Modifiers::NONE, Key::Space);
-                if agenda_cycle || agenda_edit || agenda_open {
-                    i.events.retain(|event| {
-                        !matches!(
-                            event,
-                            egui::Event::Key {
-                                key: Key::Enter,
-                                pressed: true,
-                                repeat: false,
-                                ..
-                            }
-                        )
-                    });
-                }
-            }
-            if self.file_picker_open {
-                file_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
-                file_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
-                file_enter_dir |= i.consume_key(egui::Modifiers::NONE, Key::ArrowRight);
-                file_parent |= i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft);
-                file_open |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
-                file_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
-            }
-            if self.periscope_open {
-                periscope_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
-                periscope_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
-                periscope_open_modal |= i.consume_key(egui::Modifiers::CTRL, Key::Enter);
-                periscope_open |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
-                periscope_toggle_mode |= i.consume_key(egui::Modifiers::NONE, Key::Tab);
-                periscope_expand_folder |= i.consume_key(egui::Modifiers::NONE, Key::ArrowRight);
-                periscope_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
-            }
-            if self.find_note_open {
-                find_note_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
-                find_note_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
-                find_note_open_modal |= i.consume_key(egui::Modifiers::SHIFT, Key::Enter);
-                find_note_open |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
-                find_note_toggle |= i.consume_key(egui::Modifiers::NONE, Key::Tab);
-                find_note_toggle |= i.consume_key(egui::Modifiers::NONE, Key::ArrowRight);
-                find_note_toggle |= i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft);
-                find_note_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
-                find_note_cancel |= i.consume_key(egui::Modifiers::NONE, Key::Escape);
-            }
-            if self.periscope_prompt_open {
-                periscope_prompt_yes |= i.consume_key(egui::Modifiers::NONE, Key::Y);
-                periscope_prompt_yes |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
-                periscope_prompt_no |= i.consume_key(egui::Modifiers::NONE, Key::N);
-            }
-            if self.link_assist_open {
-                link_assist_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
-                link_assist_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
-                link_assist_confirm |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
-                link_assist_confirm |= i.consume_key(egui::Modifiers::NONE, Key::Space);
-                link_assist_cancel |= i.consume_key(egui::Modifiers::NONE, Key::Escape);
-            }
-            if self.link_assist_web_open {
-                link_web_confirm |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
-                link_web_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
-                link_web_cancel |= i.consume_key(egui::Modifiers::NONE, Key::Escape);
-            }
-            if self.link_heading_picker_open {
-                link_heading_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
-                link_heading_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
-                link_heading_confirm |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
-                link_heading_confirm |= i.consume_key(egui::Modifiers::NONE, Key::Space);
-                link_heading_cancel |= i.consume_key(egui::Modifiers::NONE, Key::Escape);
-            }
-            if self.link_preview_open {
-                link_preview_confirm |= i.consume_key(egui::Modifiers::CTRL, Key::Enter);
-                link_preview_save |= i.consume_key(egui::Modifiers::CTRL, Key::S);
-                link_preview_swap |= i.events.iter().any(|event| {
-                    matches!(
-                        event,
-                        egui::Event::Key {
-                            key: Key::Tab,
-                            pressed: true,
-                            repeat: false,
-                            modifiers,
-                            ..
-                        } if !modifiers.ctrl && !modifiers.command && !modifiers.alt && !modifiers.shift
-                    )
-                });
-                if link_preview_swap {
-                    i.events.retain(|event| {
-                        !matches!(
-                            event,
-                            egui::Event::Key {
-                                key: Key::Tab,
-                                pressed: true,
-                                ..
-                            }
-                        )
-                    });
-                }
-                link_preview_cancel |= i.events.iter().any(|event| {
-                    matches!(
-                        event,
-                        egui::Event::Key {
-                            key: Key::Escape,
-                            pressed: true,
-                            repeat: false,
-                            ..
-                        }
-                    )
-                });
-                if link_preview_cancel {
-                    i.events.retain(|event| {
-                        !matches!(
-                            event,
-                            egui::Event::Key {
-                                key: Key::Escape,
-                                pressed: true,
-                                ..
-                            }
-                        )
-                    });
-                }
-            }
-            if self.save_as_open {
-                save_as_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
-                save_as_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
-                save_as_enter_dir |= i.consume_key(egui::Modifiers::NONE, Key::ArrowRight);
-                save_as_parent |= i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft);
-                save_as_enter |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
-                save_as_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
-            }
-            if self.scratch_modal_open {
-                scratch_archive |= i.consume_key(egui::Modifiers::CTRL, Key::S);
-                scratch_open_entries |= i.consume_key(egui::Modifiers::CTRL, Key::E);
-            }
-            if self.capture_modal_open {
-                capture_confirm |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
-            }
-            if self.scratch_entries_open {
-                scratch_entries_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
-                scratch_entries_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
-                scratch_entries_delete |= i.consume_key(egui::Modifiers::NONE, Key::Delete);
-                scratch_entries_delete |= i.events.iter().any(|event| {
-                    matches!(
-                        event,
-                        egui::Event::Key {
-                            key: Key::D,
-                            pressed: true,
-                            repeat: false,
-                            modifiers,
-                            ..
-                        } if modifiers.ctrl && !modifiers.alt
-                    )
-                });
-            }
-            if i.consume_key(egui::Modifiers::CTRL, Key::P) {
-                self.recent_picker_open = false;
-                self.lance_open = false;
-                self.doc_tasks_open = false;
-                self.file_picker_open = false;
-                self.periscope_open = false;
-                self.periscope_prompt_open = false;
-                self.find_note_open = false;
-                self.link_heading_picker_open = false;
-                if !self.link_preview_dirty {
-                    self.link_preview_open = false;
-                }
-                self.save_as_open = false;
-                self.scratch_modal_open = false;
-                self.scratch_entries_open = false;
-                self.capture_modal_open = false;
-                self.palette_open = true;
-                self.palette_query.clear();
-                self.selected_command = 0;
-            }
-            if search_active {
-                search_cursor_after |= i.consume_key(egui::Modifiers::CTRL, Key::F);
-                search_cursor_before |= i.consume_key(egui::Modifiers::CTRL, Key::B);
-            } else if i.consume_key(egui::Modifiers::CTRL, Key::F) {
-                self.palette_open = false;
-                self.lance_open = false;
-                self.command_line = "find ".to_string();
-                self.command_line_cursor = self.command_line.len();
-                self.command_history_index = None;
-                self.command_line_focused = true;
-                self.focus_command_line_once = true;
-                self.focus_editor_once = false;
-            }
-            if i.consume_key(egui::Modifiers::CTRL, Key::Period) {
-                self.palette_open = false;
-                self.recent_picker_open = false;
-                self.lance_open = false;
-                self.doc_tasks_open = false;
-                self.file_picker_open = false;
-                self.periscope_open = false;
-                self.periscope_prompt_open = false;
-                self.find_note_open = false;
-                self.link_heading_picker_open = false;
-                if !self.link_preview_dirty {
-                    self.link_preview_open = false;
-                }
-                self.save_as_open = false;
-                self.scratch_modal_open = false;
-                self.scratch_entries_open = false;
-                self.capture_modal_open = false;
-                self.command_line.clear();
-                self.command_line_cursor = 0;
-                self.command_history_index = None;
-                self.command_line_focused = true;
-                self.focus_command_line_once = true;
-                self.focus_editor_once = false;
-            }
-            if self.command_line_focused || self.focus_command_line_once {
-                execute_command_line |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
-                complete_command_line |= i.consume_key(egui::Modifiers::NONE, Key::Tab);
-                previous_command |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
-                next_command |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
-                command_line_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
-                command_line_delete |= i.consume_key(egui::Modifiers::NONE, Key::Delete);
-                command_line_left |= i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft);
-                command_line_right |= i.consume_key(egui::Modifiers::NONE, Key::ArrowRight);
-                command_line_home |= i.consume_key(egui::Modifiers::NONE, Key::Home);
-                command_line_end |= i.consume_key(egui::Modifiers::NONE, Key::End);
-            } else if search_active {
-                search_next |= i.consume_key(egui::Modifiers::NONE, Key::F);
-                search_previous |= i.consume_key(egui::Modifiers::NONE, Key::B);
-                search_accept |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
-                search_cancel |= i.consume_key(egui::Modifiers::NONE, Key::Escape);
-            }
-            if !self.scratch_modal_open
-                && !self.scratch_entries_open
-                && !self.capture_modal_open
-                && i.consume_key(egui::Modifiers::CTRL, Key::N)
-            {
-                command = Some(Command::New);
-            }
-            if !self.scratch_modal_open
-                && !self.scratch_entries_open
-                && !self.capture_modal_open
-                && i.consume_key(egui::Modifiers::CTRL, Key::O)
-            {
-                command = Some(Command::Open);
-            }
-            let save_pressed = !self.link_preview_open
-                && !self.scratch_modal_open
-                && !self.scratch_entries_open
-                && !self.capture_modal_open
-                && i.events.iter().any(|event| {
-                    matches!(
-                        event,
-                        egui::Event::Key {
-                            key: Key::S,
-                            pressed: true,
-                            repeat: false,
-                            modifiers,
-                            ..
-                        } if modifiers.ctrl && !modifiers.alt && !modifiers.shift
-                    )
-                });
-            let save_as_pressed = !self.link_preview_open
-                && !self.scratch_modal_open
-                && !self.scratch_entries_open
-                && !self.capture_modal_open
-                && i.events.iter().any(|event| {
-                    matches!(
-                        event,
-                        egui::Event::Key {
-                            key: Key::S,
-                            pressed: true,
-                            repeat: false,
-                            modifiers,
-                            ..
-                        } if modifiers.ctrl && modifiers.alt && !modifiers.shift
-                    )
-                });
-            if save_as_pressed {
-                command = Some(Command::SaveAs);
-            } else if save_pressed {
-                command = Some(Command::Save);
-            }
-            if !self.scratch_modal_open
-                && !self.scratch_entries_open
-                && !self.capture_modal_open
-                && i.consume_key(egui::Modifiers::CTRL, Key::M)
-            {
-                command = Some(Command::TogglePreview);
-            }
-            if !self.scratch_modal_open
-                && !self.scratch_entries_open
-                && !self.capture_modal_open
-                && i.consume_key(egui::Modifiers::CTRL, Key::Q)
-            {
-                command = Some(Command::Quit);
-            }
-            if !search_cancel && i.consume_key(egui::Modifiers::NONE, Key::Escape) {
-                if self.settings_open {
-                    self.settings_open = false;
-                    self.focus_editor_once = true;
-                } else if self.command_line_focused || self.focus_command_line_once {
-                    self.command_line.clear();
-                    self.command_line_cursor = 0;
-                    self.command_line_focused = false;
-                    self.focus_command_line_once = false;
-                    self.command_history_index = None;
-                    self.focus_editor_once = true;
-                } else if self.shortcut_help_open {
-                    self.shortcut_help_open = false;
-                    self.focus_editor_once = true;
-                } else if self.recent_picker_open {
-                    self.recent_picker_open = false;
-                    self.pending_recent_path = None;
-                    self.focus_editor_once = true;
-                } else if self.lance_open {
-                    self.lance_open = false;
-                    self.focus_editor_once = true;
-                } else if self.doc_tasks_open {
-                    self.doc_tasks_open = false;
-                    self.focus_editor_once = true;
-                } else if self.agenda_open {
-                    if self.standalone_agenda {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        return;
-                    }
-                    self.agenda_open = false;
-                    self.focus_editor_once = true;
-                } else if self.file_picker_open {
-                    self.file_picker_open = false;
-                    self.pending_project_file_path = None;
-                    self.pending_open_heading_fragment = None;
-                    if self.file_picker_mode == FilePickerMode::InsertMarkdownLink {
-                        self.cancel_link_assist();
-                    }
-                    if self.file_picker_mode == FilePickerMode::Refile {
-                        self.pending_refile = None;
-                        self.pending_refile_destination = None;
-                    }
-                    self.focus_editor_once = true;
-                } else if self.periscope_open {
-                    self.periscope_open = false;
-                    self.focus_editor_once = true;
-                } else if self.periscope_prompt_open {
-                    self.periscope_prompt_open = false;
-                    self.focus_editor_once = true;
-                } else if self.find_note_open {
-                    self.find_note_open = false;
-                    self.focus_editor_once = true;
-                } else if self.link_heading_picker_open {
-                    self.cancel_link_assist();
-                } else if self.link_preview_open {
-                    self.close_link_preview();
-                } else if self.save_as_open {
-                    self.save_as_open = false;
-                    self.focus_editor_once = true;
-                } else if self.scratch_modal_open {
-                    self.cancel_scratch_modal();
-                } else if self.scratch_entries_open {
-                    self.scratch_entries_open = false;
-                    self.focus_editor_once = true;
-                } else if self.capture_modal_open {
-                    self.capture_modal_open = false;
-                    self.capture_title.clear();
-                    self.capture_text.clear();
-                    self.focus_editor_once = true;
-                } else if self.palette_open {
-                    self.palette_open = false;
-                    self.focus_editor_once = true;
-                } else if self.pending_action.is_some() {
-                    self.pending_action = None;
-                    self.pending_daily_target = None;
-                    self.focus_editor_once = true;
-                } else if self.scratch {
-                    self.close_scratch_with_feedback(ctx);
-                    return;
-                }
-            }
-        });
-
-        if scratch_archive {
-            self.archive_scratch_modal();
-            return;
-        }
-
-        if scratch_open_entries {
-            self.open_scratch_entries_modal();
-            return;
-        }
-
-        if scratch_entries_previous {
-            self.selected_scratch_entry = self.selected_scratch_entry.saturating_sub(1);
-            return;
-        }
-
-        if scratch_entries_next {
-            self.selected_scratch_entry =
-                (self.selected_scratch_entry + 1).min(self.scratch_entries.len().saturating_sub(1));
-            return;
-        }
-
-        if scratch_entries_delete {
-            self.delete_selected_scratch_entry();
-            return;
-        }
-
-        if capture_confirm {
-            self.confirm_capture_modal();
-            return;
-        }
-
-        if search_cursor_after {
-            self.place_cursor_at_search_edge(true);
-            return;
-        }
-
-        if search_cursor_before {
-            self.place_cursor_at_search_edge(false);
-            return;
-        }
-
-        if search_cancel {
-            self.cancel_search();
-            return;
-        }
-
-        if search_accept {
-            self.accept_search();
-            return;
-        }
-
-        if search_next {
-            self.move_search_match(true);
-            return;
-        }
-
-        if search_previous {
-            self.move_search_match(false);
-            return;
-        }
-
-        if self.recent_picker_open {
-            self.handle_recent_picker_text_input(ctx);
-        }
-
-        if self.lance_open {
-            self.handle_lance_text_input(ctx);
-        }
-
-        if self.doc_tasks_open {
-            self.handle_doc_tasks_text_input(ctx);
-        }
-
-        if self.file_picker_open {
-            self.handle_file_picker_text_input(ctx);
-        }
-
-        if self.periscope_open {
-            self.handle_periscope_text_input(ctx);
-        }
-
-        if self.find_note_open {
-            self.handle_find_note_text_input(ctx);
-        }
-
-        if self.link_assist_web_open {
-            self.handle_link_assist_web_text_input(ctx);
-        }
-
-        if self.save_as_open {
-            self.handle_save_as_text_input(ctx);
-        }
-
-        if self.handle_flow_inline_org_keyboard(ctx) {
-            return;
-        }
-
-        if link_assist_cancel || link_web_cancel || link_heading_cancel {
-            self.cancel_link_assist();
-            return;
-        }
-
-        if link_preview_cancel {
-            self.close_link_preview();
-            return;
-        }
-
-        if link_preview_save {
-            self.save_link_preview();
-            return;
-        }
-
-        if link_preview_swap {
-            self.swap_link_preview_with_main();
-            return;
-        }
-
-        if link_preview_confirm {
-            self.commit_link_preview();
-            return;
-        }
-
-        if link_heading_previous {
-            self.move_link_heading_selection(-1);
-            return;
-        }
-
-        if link_heading_next {
-            self.move_link_heading_selection(1);
-            return;
-        }
-
-        if link_heading_confirm {
-            self.confirm_link_heading_picker();
-            return;
-        }
-
-        if link_assist_previous || link_assist_next {
-            self.link_assist_choice = match self.link_assist_choice {
-                LinkAssistChoice::File => LinkAssistChoice::Web,
-                LinkAssistChoice::Web => LinkAssistChoice::File,
-            };
-            return;
-        }
-
-        if link_assist_confirm {
-            self.confirm_link_assist_choice();
-            return;
-        }
-
-        if link_web_backspace {
-            self.link_assist_web_url.pop();
-            return;
-        }
-
-        if link_web_confirm {
-            let url = self.link_assist_web_url.trim().to_string();
-            if url.is_empty() {
-                self.status = "Insert link: URL is empty".to_string();
-            } else {
-                self.link_assist_web_open = false;
-                self.insert_assisted_markdown_link(&url);
-            }
-            return;
-        }
-
-        if save_as_backspace {
-            self.save_as_filename.pop();
-            self.selected_save_as_entry =
-                self.save_as_entry_indices().first().copied().unwrap_or(0);
-            return;
-        }
-
-        if save_as_previous {
-            self.move_save_as_selection(-1);
-            return;
-        }
-
-        if save_as_next {
-            self.move_save_as_selection(1);
-            return;
-        }
-
-        if save_as_enter_dir {
-            self.save_as_enter_selected_dir();
-            return;
-        }
-
-        if save_as_parent {
-            self.save_as_go_parent();
-            return;
-        }
-
-        if save_as_enter {
-            self.confirm_save_as();
-            return;
-        }
-
-        if periscope_prompt_yes {
-            self.open_periscope_project_folder_picker();
-            return;
-        }
-
-        if periscope_prompt_no {
-            self.open_global_periscope();
-            return;
-        }
-
-        if find_note_cancel {
-            self.find_note_open = false;
-            self.focus_editor_once = true;
-            return;
-        }
-
-        if find_note_backspace {
-            self.find_note_query.pop();
-            self.find_note_expanded_files.clear();
-            self.selected_find_note_row = 0;
-            self.refresh_find_note_results();
-            return;
-        }
-
-        if find_note_previous {
-            self.move_find_note_selection(-1);
-            return;
-        }
-
-        if find_note_next {
-            self.move_find_note_selection(1);
-            return;
-        }
-
-        if find_note_toggle {
-            self.toggle_selected_find_note_file();
-            return;
-        }
-
-        if find_note_open_modal {
-            self.open_selected_find_note(true);
-            return;
-        }
-
-        if find_note_open {
-            self.open_selected_find_note(false);
-            return;
-        }
-
-        if periscope_backspace {
-            self.periscope_query.pop();
-            self.periscope_expanded_folders.clear();
-            self.selected_periscope_result = 0;
-            self.refresh_periscope_results();
-            return;
-        }
-
-        if periscope_previous {
-            self.move_periscope_selection(-1);
-            return;
-        }
-
-        if periscope_next {
-            self.move_periscope_selection(1);
-            return;
-        }
-
-        if periscope_toggle_mode {
-            self.toggle_periscope_mode();
-            return;
-        }
-
-        if periscope_expand_folder && self.toggle_selected_periscope_folder() {
-            return;
-        }
-
-        if periscope_open_modal {
-            self.open_selected_periscope_result_as_modal();
-            return;
-        }
-
-        if periscope_open {
-            self.open_selected_periscope_result();
-            return;
-        }
-
-        if file_backspace {
-            self.file_query.pop();
-            self.selected_project_file = self.project_file_indices().first().copied().unwrap_or(0);
-            return;
-        }
-
-        if file_previous {
-            self.move_project_file_selection(-1);
-            return;
-        }
-
-        if file_next {
-            self.move_project_file_selection(1);
-            return;
-        }
-
-        if file_enter_dir {
-            self.file_picker_enter_selected_dir();
-            return;
-        }
-
-        if file_parent {
-            self.file_picker_go_parent();
-            return;
-        }
-
-        if file_open {
-            self.open_selected_project_file();
-            return;
-        }
-
-        if recent_backspace {
-            self.recent_query.pop();
-            self.selected_recent_file = self.recent_file_indices().first().copied().unwrap_or(0);
-            return;
-        }
-
-        if recent_previous {
-            self.move_recent_selection(-1);
-            return;
-        }
-
-        if recent_next {
-            self.move_recent_selection(1);
-            return;
-        }
-
-        if recent_open {
-            self.open_selected_recent_file();
-            return;
-        }
-
-        if lance_backspace {
-            self.lance_query.pop();
-            self.selected_lance_file = self.lance_file_indices().first().copied().unwrap_or(0);
-            return;
-        }
-
-        if lance_previous {
-            self.move_lance_selection(-1);
-            return;
-        }
-
-        if lance_next {
-            self.move_lance_selection(1);
-            return;
-        }
-
-        if lance_add {
-            self.open_lance_file_picker();
-            return;
-        }
-
-        if lance_delete {
-            self.remove_selected_lance_file();
-            return;
-        }
-
-        if lance_open_modal {
-            self.open_selected_lance_file_as_modal();
-            return;
-        }
-
-        if lance_open {
-            self.open_selected_lance_file();
-            return;
-        }
-
-        if doc_task_backspace {
-            self.doc_task_query.pop();
-            let tasks = self.doc_tasks();
-            self.selected_doc_task_line = self
-                .doc_task_indices()
-                .first()
-                .and_then(|index| tasks.get(*index))
-                .map(|task| task.line_index)
-                .unwrap_or(0);
-            return;
-        }
-
-        if doc_task_previous {
-            self.move_doc_task_selection(-1);
-            return;
-        }
-
-        if doc_task_next {
-            self.move_doc_task_selection(1);
-            return;
-        }
-
-        if doc_task_cycle {
-            self.cycle_selected_doc_task();
-            return;
-        }
-
-        if doc_task_open {
-            self.jump_to_selected_doc_task();
-            return;
-        }
-
-        if agenda_org_tag {
-            self.open_agenda_org_autocomplete(AgendaOrgMode::Tag);
-            return;
-        }
-
-        if agenda_org_project {
-            self.open_agenda_org_autocomplete(AgendaOrgMode::Project);
-            return;
-        }
-
-        if agenda_previous {
-            self.move_agenda_selection(-1);
-            return;
-        }
-
-        if agenda_next {
-            self.move_agenda_selection(1);
-            return;
-        }
-
-        if agenda_previous_day {
-            self.move_agenda_week_window(-1);
-            return;
-        }
-
-        if agenda_next_day {
-            self.move_agenda_week_window(1);
-            return;
-        }
-
-        if agenda_previous_week {
-            self.move_agenda_week_window(-1);
-            return;
-        }
-
-        if agenda_next_week {
-            self.move_agenda_week_window(1);
-            return;
-        }
-
-        if agenda_today {
-            self.jump_agenda_to_today();
-            return;
-        }
-
-        if agenda_cycle_tab {
-            self.cycle_agenda_tab();
-            return;
-        }
-
-        if agenda_toggle_focus {
-            self.toggle_agenda_focus();
-            return;
-        }
-
-        if agenda_toggle_done {
-            self.toggle_agenda_done_visibility();
-            return;
-        }
-
-        if agenda_edit {
-            self.open_selected_flow_item_edit();
-            return;
-        }
-
-        if agenda_refile {
-            self.start_refile_selected_agenda_item();
-            return;
-        }
-
-        if agenda_cycle {
-            self.cycle_selected_agenda_item();
-            return;
-        }
-
-        if agenda_open {
-            self.activate_selected_agenda_row();
-            if self.standalone_agenda && !self.agenda_open {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-            return;
-        }
-
-        if settings_previous {
-            self.selected_setting = self.selected_setting.saturating_sub(1);
-            return;
-        }
-
-        if settings_next {
-            self.selected_setting = (self.selected_setting + 1).min(7);
-            return;
-        }
-
-        if settings_decrement {
-            match self.selected_setting {
-                0 => self.set_command_history_limit(self.command_history_limit.saturating_sub(1)),
-                1 => self.set_line_number_mode(LineNumberMode::Absolute),
-                2 => self.set_ctrl_shift_move_mode(CtrlShiftMoveMode::Vim),
-                3 => self.set_wrap_mode(false),
-                4 => self.set_preview_mode(false),
-                5 => self.set_markdown_live_rendering(false),
-                6 => self.set_virtual_references_enabled(false),
-                7 => self.set_reopen_last_file_on_startup(false),
-                _ => {}
-            }
-            return;
-        }
-
-        if settings_increment || settings_activate {
-            match self.selected_setting {
-                0 => self.set_command_history_limit(self.command_history_limit + 1),
-                1 => {
-                    let next_mode = match self.line_number_mode {
-                        LineNumberMode::Absolute => LineNumberMode::Relative,
-                        LineNumberMode::Relative => LineNumberMode::Absolute,
-                    };
-                    self.set_line_number_mode(next_mode);
-                }
-                2 => self.set_ctrl_shift_move_mode(self.ctrl_shift_move_mode.next()),
-                3 => self.set_wrap_mode(!self.wrap),
-                4 => self.set_preview_mode(!self.preview),
-                5 => self.set_markdown_live_rendering(!self.markdown_live_rendering),
-                6 => self.set_virtual_references_enabled(!self.virtual_references_enabled),
-                7 => self.set_reopen_last_file_on_startup(!self.reopen_last_file_on_startup),
-                _ => {}
-            }
-            return;
-        }
-
-        if self.command_line_focused || self.focus_command_line_once {
-            self.handle_command_line_text_input(ctx);
-            if command_line_backspace {
-                self.command_line_backspace();
-                return;
-            }
-            if command_line_delete {
-                self.command_line_delete();
-                return;
-            }
-            if command_line_left {
-                self.command_line_cursor = self.previous_command_line_boundary();
-                return;
-            }
-            if command_line_right {
-                self.command_line_cursor = self.next_command_line_boundary();
-                return;
-            }
-            if command_line_home {
-                self.command_line_cursor = 0;
-                return;
-            }
-            if command_line_end {
-                self.command_line_cursor = self.command_line.len();
-                return;
-            }
-        }
-
-        let navigating_command_history = self.command_history_index.is_some();
-        let command_suggestion_count = if (self.command_line_focused
-            || self.focus_command_line_once)
-            && !navigating_command_history
-        {
-            self.command_line_suggestions().len()
-        } else {
-            0
-        };
-
-        if previous_command {
-            if command_suggestion_count > 0 {
-                self.selected_command_line_suggestion =
-                    self.selected_command_line_suggestion.saturating_sub(1);
-                self.focus_command_line_once = true;
-                return;
-            }
-            if !self.command_history.is_empty() {
-                let index = self
-                    .command_history_index
-                    .unwrap_or(self.command_history.len())
-                    .saturating_sub(1);
-                self.command_history_index = Some(index);
-                self.command_line = self.command_history[index].clone();
-                self.command_line_cursor = self.command_line.len();
-                self.selected_command_line_suggestion = 0;
-                self.focus_command_line_once = true;
-                return;
-            }
-        }
-
-        if next_command {
-            if command_suggestion_count > 0 {
-                self.selected_command_line_suggestion = (self.selected_command_line_suggestion + 1)
-                    .min(command_suggestion_count.saturating_sub(1));
-                self.focus_command_line_once = true;
-                return;
-            }
-            if let Some(index) = self.command_history_index {
-                if index + 1 < self.command_history.len() {
-                    let index = index + 1;
-                    self.command_history_index = Some(index);
-                    self.command_line = self.command_history[index].clone();
-                    self.command_line_cursor = self.command_line.len();
-                } else {
-                    self.command_history_index = None;
-                    self.command_line.clear();
-                    self.command_line_cursor = 0;
-                }
-                self.selected_command_line_suggestion = 0;
-                self.focus_command_line_once = true;
-            }
-            return;
-        }
-
-        if complete_command_line {
-            if !self.accept_command_line_completion() {
-                self.run_command_line(ctx);
-            }
-            return;
-        }
-
-        if execute_command_line {
-            if command_suggestion_count > 0 {
-                let suggestions = self.command_line_suggestions();
-                if let Some(spec) = suggestions.get(
-                    self.selected_command_line_suggestion
-                        .min(suggestions.len().saturating_sub(1)),
-                ) {
-                    self.command_line = spec.name.to_string();
-                    self.command_line_cursor = self.command_line.len();
-                }
-            }
-            self.run_command_line(ctx);
-            return;
-        }
-
-        if let Some(command) = command {
-            self.run_command(command, ctx);
-        }
-    }
-
     fn filtered_commands(&self) -> Vec<&'static CommandSpec> {
         self.matching_command_specs(&self.palette_query, 12)
     }
@@ -8814,7 +7855,7 @@ impl SlateApp {
 
         let frame = egui::Frame::new()
             .fill(Color32::from_rgb(25, 31, 40))
-            .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
+            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(76, 86, 106)))
             .corner_radius(0.0)
             .inner_margin(14.0)
             .shadow(egui::epaint::Shadow {
@@ -8824,12 +7865,19 @@ impl SlateApp {
                 color: Color32::from_black_alpha(140),
             });
 
-        egui::Area::new("command_palette".into())
+        let selection = (self.selected_command, self.palette_query.clone());
+        let selection_id = egui::Id::new("palette_scroll_selection");
+        let reveal_selection =
+            ctx.data(|d| d.get_temp::<(usize, String)>(selection_id)) != Some(selection.clone());
+        ctx.data_mut(|d| d.insert_temp(selection_id, selection));
+        window_ui::DialogArea::new("command_palette".into())
+            .fixed_chrome()
             .anchor(egui::Align2::CENTER_CENTER, [0.0, -80.0])
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 frame.show(ui, |ui| {
-                    ui.set_width(520.0);
+                    ui.set_width((ctx.content_rect().width() * 0.8 - 30.0).max(1.0));
+                    ui.set_height(((ctx.content_rect().height() - 30.0) * 0.8 - 30.0).max(1.0));
                     ui.label(
                         RichText::new("command palette")
                             .font(FontId::new(16.0, FontFamily::Monospace))
@@ -8856,78 +7904,95 @@ impl SlateApp {
                     ui.painter().hline(
                         ui.available_rect_before_wrap().x_range(),
                         ui.cursor().top(),
-                        Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
+                        Stroke::new(1.0_f32, Color32::from_rgb(46, 56, 72)),
                     );
                     ui.add_space(8.0);
 
-                    if commands.is_empty() {
-                        ui.label(
-                            RichText::new("no matching commands")
-                                .font(FontId::new(14.0, FontFamily::Monospace))
-                                .color(Color32::from_rgb(94, 105, 126)),
-                        );
-                    }
-
-                    for (idx, command) in commands.iter().enumerate() {
-                        let selected = idx == self.selected_command;
-                        let fill = if selected {
-                            Color32::from_rgb(46, 56, 72)
-                        } else {
-                            Color32::TRANSPARENT
-                        };
-                        let label_color = if selected {
-                            Color32::from_rgb(236, 239, 244)
-                        } else {
-                            Color32::from_rgb(216, 222, 233)
-                        };
-                        let row = egui::Frame::new()
-                            .fill(fill)
-                            .corner_radius(0.0)
-                            .inner_margin(6.0);
-                        let clicked = row
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(if selected { ">" } else { " " })
-                                            .font(FontId::new(14.0, FontFamily::Monospace))
-                                            .color(Color32::from_rgb(136, 192, 208)),
-                                    );
-                                    ui.label(
-                                        RichText::new(command.name)
-                                            .font(FontId::new(14.0, FontFamily::Monospace))
-                                            .color(label_color),
-                                    );
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            ui.label(
-                                                RichText::new(command.hint)
-                                                    .font(FontId::new(13.0, FontFamily::Monospace))
-                                                    .color(Color32::from_rgb(136, 154, 176)),
-                                            );
-                                        },
-                                    );
-                                })
-                            })
-                            .response
-                            .clicked();
-                        if clicked {
-                            if let Some(command) = command.palette_command {
-                                self.run_command(command, ctx);
-                            } else {
-                                self.palette_open = false;
-                                self.command_line = command.name.to_string();
-                                self.command_line_cursor = self.command_line.len();
-                                self.command_line_focused = true;
-                                self.focus_command_line_once = true;
-                                self.focus_editor_once = false;
+                    egui::ScrollArea::vertical()
+                        .id_salt("command_palette_body")
+                        .auto_shrink([false, false])
+                        .min_scrolled_height(1.0)
+                        .max_height((ui.available_height() - 48.0).max(1.0))
+                        .show(ui, |ui| {
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                            if commands.is_empty() {
+                                ui.label(
+                                    RichText::new("no matching commands")
+                                        .font(FontId::new(14.0, FontFamily::Monospace))
+                                        .color(Color32::from_rgb(94, 105, 126)),
+                                );
                             }
-                            return;
-                        }
-                    }
 
+                            for (idx, command) in commands.iter().enumerate() {
+                                let selected = idx == self.selected_command;
+                                let fill = if selected {
+                                    Color32::from_rgb(46, 56, 72)
+                                } else {
+                                    Color32::TRANSPARENT
+                                };
+                                let label_color = if selected {
+                                    Color32::from_rgb(236, 239, 244)
+                                } else {
+                                    Color32::from_rgb(216, 222, 233)
+                                };
+                                let row = egui::Frame::new()
+                                    .fill(fill)
+                                    .corner_radius(0.0)
+                                    .inner_margin(6.0);
+                                let response = row
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new(if selected { ">" } else { " " })
+                                                    .font(FontId::new(14.0, FontFamily::Monospace))
+                                                    .color(Color32::from_rgb(136, 192, 208)),
+                                            );
+                                            ui.label(
+                                                RichText::new(command.name)
+                                                    .font(FontId::new(14.0, FontFamily::Monospace))
+                                                    .color(label_color),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.label(
+                                                        RichText::new(command.hint)
+                                                            .font(FontId::new(
+                                                                13.0,
+                                                                FontFamily::Monospace,
+                                                            ))
+                                                            .color(Color32::from_rgb(
+                                                                136, 154, 176,
+                                                            )),
+                                                    );
+                                                },
+                                            );
+                                        })
+                                    })
+                                    .response;
+                                if selected && reveal_selection {
+                                    response.scroll_to_me(Some(egui::Align::Min));
+                                }
+                                if response.clicked() {
+                                    if let Some(command) = command.palette_command {
+                                        self.run_command(command, ctx);
+                                    } else {
+                                        self.palette_open = false;
+                                        self.command_line = command.name.to_string();
+                                        self.command_line_cursor = self.command_line.len();
+                                        self.command_line_focused = true;
+                                        self.focus_command_line_once = true;
+                                        self.focus_editor_once = false;
+                                    }
+                                    return;
+                                }
+                            }
+                        });
+                    if !self.palette_open {
+                        return;
+                    }
                     ui.add_space(8.0);
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         for (key, label) in [("↑↓", "move"), ("enter", "run"), ("esc", "close")]
                         {
                             ui.label(
@@ -8978,8 +8043,42 @@ impl SlateApp {
             go_back |= i.consume_key(egui::Modifiers::NONE, Key::Escape);
         });
 
+        if !discard && !go_back && !save {
+            let clicked = notice_ui::show(
+                ctx,
+                "confirm_close_prompt".into(),
+                "unsaved changes",
+                &[
+                    ("y", "discard", notice_ui::RED),
+                    ("n / esc", "return", notice_ui::GREEN),
+                    ("s", "save…", notice_ui::WARN),
+                ],
+                |ui| {
+                    ui.label(action.prompt());
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("Save your text before continuing, or explicitly discard the unsaved changes.").color(notice_ui::DIM));
+                    if action == PendingAction::Quit && self.link_preview_dirty {
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new("The preview also has unsaved changes.")
+                                .color(notice_ui::WARN),
+                        );
+                    }
+                },
+            );
+            discard |= clicked[0];
+            go_back |= clicked[1];
+            save |= clicked[2];
+        }
         if discard {
             self.dirty = false;
+            self.clear_recovery(document_safety::Slot::Main);
+            if action == PendingAction::Quit {
+                self.discard_on_exit = true;
+                self.link_preview_dirty = false;
+                self.clear_recovery(document_safety::Slot::Modal);
+                self.clear_recovery(document_safety::Slot::Scratch);
+            }
             self.pending_action = None;
             self.finish_pending_action(action, ctx);
             return;
@@ -8991,64 +8090,18 @@ impl SlateApp {
             return;
         }
         if save {
-            self.save();
-            if !self.dirty {
+            if self.dirty {
+                self.save();
+            }
+            if action == PendingAction::Quit && self.link_preview_dirty {
+                self.save_link_preview();
+            }
+            if !self.dirty && (action != PendingAction::Quit || !self.link_preview_dirty) {
                 self.pending_action = None;
                 self.finish_pending_action(action, ctx);
             }
             return;
         }
-
-        egui::Area::new("confirm_close_prompt".into())
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(25, 31, 40))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
-                    .corner_radius(0.0)
-                    .inner_margin(14.0)
-                    .shadow(egui::epaint::Shadow {
-                        offset: [0, 10],
-                        blur: 24,
-                        spread: 0,
-                        color: Color32::from_black_alpha(140),
-                    })
-                    .show(ui, |ui| {
-                        ui.set_width(520.0);
-                        ui.label(
-                            RichText::new("unsaved changes")
-                                .font(FontId::new(16.0, FontFamily::Monospace))
-                                .color(Color32::from_rgb(136, 192, 208)),
-                        );
-                        ui.add_space(8.0);
-                        ui.label(
-                            RichText::new(action.prompt())
-                                .font(FontId::new(14.0, FontFamily::Monospace))
-                                .color(Color32::from_rgb(216, 222, 233)),
-                        );
-                        ui.add_space(12.0);
-                        ui.horizontal(|ui| {
-                            for (key, label, color) in [
-                                ("y", "yes / discard", Color32::from_rgb(191, 97, 106)),
-                                ("n", "no / return", Color32::from_rgb(163, 190, 140)),
-                                ("s", "save…", Color32::from_rgb(235, 203, 139)),
-                            ] {
-                                ui.label(
-                                    RichText::new(format!("[{key}]"))
-                                        .font(FontId::new(14.0, FontFamily::Monospace))
-                                        .color(color),
-                                );
-                                ui.label(
-                                    RichText::new(label)
-                                        .font(FontId::new(14.0, FontFamily::Monospace))
-                                        .color(Color32::from_rgb(136, 154, 176)),
-                                );
-                                ui.add_space(10.0);
-                            }
-                        });
-                    });
-            });
     }
 
     fn handle_recent_picker_text_input(&mut self, ctx: &egui::Context) {
@@ -9256,381 +8309,6 @@ impl SlateApp {
         Some((raw, normalized))
     }
 
-    fn settings_dialog(&mut self, ctx: &egui::Context) {
-        if !self.settings_open {
-            return;
-        }
-
-        egui::Area::new("settings_dialog".into())
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, -30.0])
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(25, 31, 40))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
-                    .corner_radius(0.0)
-                    .inner_margin(14.0)
-                    .shadow(egui::epaint::Shadow {
-                        offset: [0, 10],
-                        blur: 24,
-                        spread: 0,
-                        color: Color32::from_black_alpha(140),
-                    })
-                    .show(ui, |ui| {
-                        ui.set_width(520.0);
-                        ui.label(
-                            RichText::new("settings")
-                                .font(FontId::new(16.0, FontFamily::Monospace))
-                                .color(Color32::from_rgb(136, 192, 208)),
-                        );
-                        ui.add_space(10.0);
-
-                        egui::Frame::new()
-                            .fill(Color32::from_rgb(30, 36, 48))
-                            .inner_margin(8.0)
-                            .show(ui, |ui| {
-                                let selected_fill = Color32::from_rgb(46, 56, 72);
-                                let normal_fill = Color32::from_rgb(30, 36, 48);
-
-                                let history_selected = self.selected_setting == 0;
-                                egui::Frame::new()
-                                    .fill(if history_selected { selected_fill } else { normal_fill })
-                                    .inner_margin(6.0)
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new(if history_selected { ">" } else { " " })
-                                                    .font(FontId::new(14.0, FontFamily::Monospace))
-                                                    .color(Color32::from_rgb(136, 192, 208)),
-                                            );
-                                            ui.label(
-                                                RichText::new("History length")
-                                                    .font(FontId::new(14.0, FontFamily::Monospace))
-                                                    .color(Color32::from_rgb(216, 222, 233)),
-                                            );
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    let response = ui.add(
-                                                        egui::DragValue::new(&mut self.command_history_limit)
-                                                            .range(1..=50)
-                                                            .speed(1),
-                                                    );
-                                                    if response.changed() {
-                                                        self.set_command_history_limit(
-                                                            self.command_history_limit,
-                                                        );
-                                                    }
-                                                },
-                                            );
-                                        });
-                                        ui.add_space(4.0);
-                                        ui.label(
-                                            RichText::new("Visible command history rows when Ctrl+. opens the commandline.")
-                                                .font(FontId::new(13.0, FontFamily::Monospace))
-                                                .color(Color32::from_rgb(136, 154, 176)),
-                                        );
-                                    });
-
-                                ui.add_space(6.0);
-                                let line_numbers_selected = self.selected_setting == 1;
-                                egui::Frame::new()
-                                    .fill(if line_numbers_selected { selected_fill } else { normal_fill })
-                                    .inner_margin(6.0)
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new(if line_numbers_selected { ">" } else { " " })
-                                                    .font(FontId::new(14.0, FontFamily::Monospace))
-                                                    .color(Color32::from_rgb(136, 192, 208)),
-                                            );
-                                            ui.label(
-                                                RichText::new("Line numbers")
-                                                    .font(FontId::new(14.0, FontFamily::Monospace))
-                                                    .color(Color32::from_rgb(216, 222, 233)),
-                                            );
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    let next_mode = match self.line_number_mode {
-                                                        LineNumberMode::Absolute => LineNumberMode::Relative,
-                                                        LineNumberMode::Relative => LineNumberMode::Absolute,
-                                                    };
-                                                    if ui
-                                                        .button(self.line_number_mode.label())
-                                                        .on_hover_text("Toggle absolute/relative line numbers")
-                                                        .clicked()
-                                                    {
-                                                        self.set_line_number_mode(next_mode);
-                                                    }
-                                                },
-                                            );
-                                        });
-                                        ui.add_space(4.0);
-                                        ui.label(
-                                            RichText::new("Absolute shows file line numbers. Relative treats the cursor line as 1 and counts distance above/below.")
-                                                .font(FontId::new(13.0, FontFamily::Monospace))
-                                                .color(Color32::from_rgb(136, 154, 176)),
-                                        );
-                                    });
-
-                                ui.add_space(6.0);
-                                let movement_selected = self.selected_setting == 2;
-                                egui::Frame::new()
-                                    .fill(if movement_selected { selected_fill } else { normal_fill })
-                                    .inner_margin(6.0)
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new(if movement_selected { ">" } else { " " })
-                                                    .font(FontId::new(14.0, FontFamily::Monospace))
-                                                    .color(Color32::from_rgb(136, 192, 208)),
-                                            );
-                                            ui.label(
-                                                RichText::new("Ctrl+Shift movement")
-                                                    .font(FontId::new(14.0, FontFamily::Monospace))
-                                                    .color(Color32::from_rgb(216, 222, 233)),
-                                            );
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    if ui
-                                                        .button(self.ctrl_shift_move_mode.label())
-                                                        .on_hover_text("Toggle Vim hjkl / Slate ijkl live movement")
-                                                        .clicked()
-                                                    {
-                                                        self.set_ctrl_shift_move_mode(
-                                                            self.ctrl_shift_move_mode.next(),
-                                                        );
-                                                    }
-                                                },
-                                            );
-                                        });
-                                        ui.add_space(4.0);
-                                        ui.label(
-                                            RichText::new(self.ctrl_shift_move_mode.hint())
-                                                .font(FontId::new(13.0, FontFamily::Monospace))
-                                                .color(Color32::from_rgb(136, 154, 176)),
-                                        );
-                                    });
-
-                                ui.add_space(6.0);
-                                let wrap_selected = self.selected_setting == 3;
-                                egui::Frame::new()
-                                    .fill(if wrap_selected { selected_fill } else { normal_fill })
-                                    .inner_margin(6.0)
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new(if wrap_selected { ">" } else { " " })
-                                                    .font(FontId::new(14.0, FontFamily::Monospace))
-                                                    .color(Color32::from_rgb(136, 192, 208)),
-                                            );
-                                            ui.label(
-                                                RichText::new("Word wrap")
-                                                    .font(FontId::new(14.0, FontFamily::Monospace))
-                                                    .color(Color32::from_rgb(216, 222, 233)),
-                                            );
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    if ui
-                                                        .button(if self.wrap { "on" } else { "off" })
-                                                        .on_hover_text("Toggle editor word wrap")
-                                                        .clicked()
-                                                    {
-                                                        self.set_wrap_mode(!self.wrap);
-                                                    }
-                                                },
-                                            );
-                                        });
-                                        ui.add_space(4.0);
-                                        ui.label(
-                                            RichText::new("Persisted editor wrapping preference. Command: :wrap on|off")
-                                                .font(FontId::new(13.0, FontFamily::Monospace))
-                                                .color(Color32::from_rgb(136, 154, 176)),
-                                        );
-                                    });
-
-                                ui.add_space(6.0);
-                                let preview_selected = self.selected_setting == 4;
-                                egui::Frame::new()
-                                    .fill(if preview_selected { selected_fill } else { normal_fill })
-                                    .inner_margin(6.0)
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new(if preview_selected { ">" } else { " " })
-                                                    .font(FontId::new(14.0, FontFamily::Monospace))
-                                                    .color(Color32::from_rgb(136, 192, 208)),
-                                            );
-                                            ui.label(
-                                                RichText::new("Markdown preview")
-                                                    .font(FontId::new(14.0, FontFamily::Monospace))
-                                                    .color(Color32::from_rgb(216, 222, 233)),
-                                            );
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    if ui
-                                                        .button(if self.preview { "on" } else { "off" })
-                                                        .on_hover_text("Toggle Markdown preview split")
-                                                        .clicked()
-                                                    {
-                                                        self.set_preview_mode(!self.preview);
-                                                    }
-                                                },
-                                            );
-                                        });
-                                        ui.add_space(4.0);
-                                        ui.label(
-                                            RichText::new("Persisted preview/split preference. Command: :preview on|off")
-                                                .font(FontId::new(13.0, FontFamily::Monospace))
-                                                .color(Color32::from_rgb(136, 154, 176)),
-                                        );
-                                    });
-
-                                ui.add_space(6.0);
-                                let markdown_live_selected = self.selected_setting == 5;
-                                egui::Frame::new()
-                                    .fill(if markdown_live_selected { selected_fill } else { normal_fill })
-                                    .inner_margin(6.0)
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new(if markdown_live_selected { ">" } else { " " })
-                                                    .font(FontId::new(14.0, FontFamily::Monospace))
-                                                    .color(Color32::from_rgb(136, 192, 208)),
-                                            );
-                                            ui.label(
-                                                RichText::new("Markdown live rendering")
-                                                    .font(FontId::new(14.0, FontFamily::Monospace))
-                                                    .color(Color32::from_rgb(216, 222, 233)),
-                                            );
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    if ui
-                                                        .button(if self.markdown_live_rendering { "live" } else { "plain" })
-                                                        .on_hover_text("Choose plain source text or live inline Markdown affordances while editing")
-                                                        .clicked()
-                                                    {
-                                                        self.set_markdown_live_rendering(
-                                                            !self.markdown_live_rendering,
-                                                        );
-                                                    }
-                                                },
-                                            );
-                                        });
-                                        ui.add_space(4.0);
-                                        ui.label(
-                                            RichText::new("Preview split always keeps the editor side plain and renders Markdown on the right.")
-                                                .font(FontId::new(13.0, FontFamily::Monospace))
-                                                .color(Color32::from_rgb(136, 154, 176)),
-                                        );
-                                    });
-
-                                ui.add_space(6.0);
-                                let virtual_refs_selected = self.selected_setting == 6;
-                                egui::Frame::new()
-                                    .fill(if virtual_refs_selected { selected_fill } else { normal_fill })
-                                    .inner_margin(6.0)
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new(if virtual_refs_selected { ">" } else { " " })
-                                                    .font(FontId::new(14.0, FontFamily::Monospace))
-                                                    .color(Color32::from_rgb(136, 192, 208)),
-                                            );
-                                            ui.label(
-                                                RichText::new("Virtual backlinks/mentions")
-                                                    .font(FontId::new(14.0, FontFamily::Monospace))
-                                                    .color(Color32::from_rgb(216, 222, 233)),
-                                            );
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    if ui
-                                                        .button(if self.virtual_references_enabled { "show" } else { "hide" })
-                                                        .on_hover_text("Render the virtual Backlinks/Mentions section at the end of saved Markdown files")
-                                                        .clicked()
-                                                    {
-                                                        self.set_virtual_references_enabled(
-                                                            !self.virtual_references_enabled,
-                                                        );
-                                                    }
-                                                },
-                                            );
-                                        });
-                                        ui.add_space(4.0);
-                                        ui.label(
-                                            RichText::new("Shows a non-saved end-of-file references section. Click the virtual header, Backlinks, or Mentions to collapse/expand.")
-                                                .font(FontId::new(13.0, FontFamily::Monospace))
-                                                .color(Color32::from_rgb(136, 154, 176)),
-                                        );
-                                    });
-
-                                ui.add_space(6.0);
-                                let reopen_selected = self.selected_setting == 7;
-                                egui::Frame::new()
-                                    .fill(if reopen_selected { selected_fill } else { normal_fill })
-                                    .inner_margin(6.0)
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new(if reopen_selected { ">" } else { " " })
-                                                    .font(FontId::new(14.0, FontFamily::Monospace))
-                                                    .color(Color32::from_rgb(136, 192, 208)),
-                                            );
-                                            ui.label(
-                                                RichText::new("Reopen last file on startup")
-                                                    .font(FontId::new(14.0, FontFamily::Monospace))
-                                                    .color(Color32::from_rgb(216, 222, 233)),
-                                            );
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    if ui
-                                                        .button(if self.reopen_last_file_on_startup { "on" } else { "off" })
-                                                        .on_hover_text("Open Slate with the last opened file when no file path is provided")
-                                                        .clicked()
-                                                    {
-                                                        self.set_reopen_last_file_on_startup(
-                                                            !self.reopen_last_file_on_startup,
-                                                        );
-                                                    }
-                                                },
-                                            );
-                                        });
-                                        ui.add_space(4.0);
-                                        ui.label(
-                                            RichText::new("Off by default. Ctrl+O L / open-last remains the intentional manual workflow.")
-                                                .font(FontId::new(13.0, FontFamily::Monospace))
-                                                .color(Color32::from_rgb(136, 154, 176)),
-                                        );
-                                    });
-                            });
-
-                        ui.add_space(12.0);
-                        ui.horizontal(|ui| {
-                            for (key, label) in [("↑↓", "select"), ("←→", "adjust"), ("enter", "toggle"), ("esc", "close")] {
-                                ui.label(
-                                    RichText::new(format!("[{key}]"))
-                                        .font(FontId::new(13.0, FontFamily::Monospace))
-                                        .color(Color32::from_rgb(235, 203, 139)),
-                                );
-                                ui.label(
-                                    RichText::new(label)
-                                        .font(FontId::new(13.0, FontFamily::Monospace))
-                                        .color(Color32::from_rgb(136, 154, 176)),
-                                );
-                                ui.add_space(10.0);
-                            }
-                        });
-                    });
-            });
-    }
-
     fn text_for_width(text: &str, width: f32, font_size: f32) -> String {
         let max_chars = ((width / (font_size * 0.62)).floor() as usize).max(1);
         if text.chars().count() <= max_chars {
@@ -9675,13 +8353,13 @@ impl SlateApp {
             return;
         }
 
-        egui::Area::new("link_assist_dialog".into())
+        window_ui::DialogArea::new("link_assist_dialog".into())
             .anchor(egui::Align2::CENTER_CENTER, [0.0, -80.0])
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 egui::Frame::new()
                     .fill(Color32::from_rgb(25, 31, 40))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(76, 86, 106)))
                     .corner_radius(0.0)
                     .inner_margin(12.0)
                     .shadow(egui::epaint::Shadow {
@@ -9861,1760 +8539,23 @@ impl SlateApp {
     }
 
     fn link_preview_dialog(&mut self, ctx: &egui::Context) {
-        if !self.link_preview_open {
-            return;
-        }
-
-        egui::Area::new("link_preview_dialog".into())
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                let screen = ctx.content_rect();
-                let size = Vec2::new(screen.width() * 0.86, screen.height() * 0.82);
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(22, 28, 37))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
-                    .corner_radius(0.0)
-                    .inner_margin(12.0)
-                    .shadow(egui::epaint::Shadow {
-                        offset: [0, 12],
-                        blur: 28,
-                        spread: 0,
-                        color: Color32::from_black_alpha(170),
-                    })
-                    .show(ui, |ui| {
-                        ui.set_min_size(size);
-                        ui.set_max_size(size);
-                        let font = FontId::new(13.0, FontFamily::Monospace);
-                        let title_font = FontId::new(15.0, FontFamily::Monospace);
-                        let accent = Color32::from_rgb(136, 192, 208);
-                        let dim = Color32::from_rgb(136, 154, 176);
-                        let warn = Color32::from_rgb(235, 203, 139);
-                        let title = self
-                            .link_preview_path
-                            .as_ref()
-                            .map(|path| path.display().to_string())
-                            .unwrap_or_else(|| "link preview".to_string());
-                        let dirty_marker = if self.link_preview_dirty { "*" } else { "" };
-
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("modal buffer").font(title_font).color(accent));
-                            ui.label(RichText::new(format!("{dirty_marker}{title}")).font(font.clone()).color(dim));
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        RichText::new("[tab] swap  [ctrl+enter] promote  [ctrl+s] save  [esc] close")
-                                            .font(font.clone())
-                                            .color(warn),
-                                    );
-                                },
-                            );
-                        });
-                        if let Some(fragment) = self.link_preview_heading_fragment.as_deref() {
-                            let target = self
-                                .link_preview_heading_text
-                                .as_deref()
-                                .unwrap_or(fragment);
-                            ui.add_space(6.0);
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new("→ target heading")
-                                        .font(font.clone())
-                                        .color(warn),
-                                );
-                                ui.label(
-                                    RichText::new(format!("#{fragment}"))
-                                        .font(font.clone())
-                                        .color(Color32::from_rgb(235, 203, 139)),
-                                );
-                                ui.label(
-                                    RichText::new(format!("· {target}"))
-                                        .font(font.clone())
-                                        .color(accent),
-                                );
-                            });
-                        }
-                        ui.add_space(8.0);
-                        let editor_height = (ui.available_height() - 4.0).max(80.0);
-                        ui.allocate_ui(Vec2::new(ui.available_width(), editor_height), |ui| {
-                            if self.focus_link_preview_once {
-                                self.link_preview_view.request_keyboard_focus();
-                            }
-                            self.link_preview_view
-                                .observe_buffer(&self.link_preview_buffer);
-                            let target_line = self
-                                .link_preview_heading_fragment
-                                .as_ref()
-                                .map(|_| self.link_preview_buffer.cursor_line_col().0);
-                            let (_, changed) = self.link_preview_view.render(
-                                ui,
-                                &mut self.link_preview_buffer,
-                                self.wrap,
-                                None,
-                                self.line_number_mode,
-                                true,
-                                true,
-                                target_line,
-                                self.markdown_live_rendering,
-                                None,
-                            );
-                            if self.focus_link_preview_once {
-                                self.focus_link_preview_once = false;
-                            }
-                            if changed {
-                                self.link_preview_dirty = true;
-                            }
-                        });
-                    });
-            });
-    }
-
-    #[allow(dead_code)]
-    fn lance_dialog(&mut self, ctx: &egui::Context) {
-        if !self.lance_open {
-            return;
-        }
-
-        egui::Area::new("lance_dialog".into())
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                let screen = ctx.content_rect();
-                let row_count = self.lance_file_indices().len().clamp(3, 10) as f32;
-                let height = (132.0 + row_count * 24.0).clamp(210.0, 380.0);
-                let size = Vec2::new(
-                    (screen.width() * 0.52).clamp(420.0, 720.0),
-                    height.min(screen.height() * 0.7),
-                );
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(22, 28, 37))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
-                    .corner_radius(0.0)
-                    .inner_margin(12.0)
-                    .shadow(egui::epaint::Shadow {
-                        offset: [0, 12],
-                        blur: 28,
-                        spread: 0,
-                        color: Color32::from_black_alpha(170),
-                    })
-                    .show(ui, |ui| {
-                        ui.set_min_size(size);
-                        ui.set_max_size(size);
-                        let font = FontId::new(13.0, FontFamily::Monospace);
-                        let title_font = FontId::new(15.0, FontFamily::Monospace);
-                        let accent = Color32::from_rgb(136, 192, 208);
-                        let dim = Color32::from_rgb(136, 154, 176);
-                        let warn = Color32::from_rgb(235, 203, 139);
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("lance").font(title_font).color(accent));
-                            ui.label(
-                                RichText::new(format!("{} marks", self.lance_files.len()))
-                                    .font(font.clone())
-                                    .color(dim),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        RichText::new(
-                                            "↑↓ select  Enter open  Ctrl+Enter modal  Ctrl+A add  Del remove  Esc close",
-                                        )
-                                        .font(font.clone())
-                                        .color(warn),
-                                    );
-                                },
-                            );
-                        });
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(">").font(font.clone()).color(accent));
-                            let query = if self.lance_query.is_empty() {
-                                "filter marks".to_string()
-                            } else {
-                                self.lance_query.clone()
-                            };
-                            ui.label(
-                                RichText::new(query)
-                                    .font(font.clone())
-                                    .color(if self.lance_query.is_empty() { dim } else { Color32::from_rgb(216, 222, 233) }),
-                            );
-                        });
-                        ui.add_space(8.0);
-                        let indices = self.lance_file_indices();
-                        let row_height = 24.0;
-                        let visible_rows = ((ui.available_height() - 10.0) / row_height).floor().max(1.0) as usize;
-                        let selected_position = indices
-                            .iter()
-                            .position(|index| *index == self.selected_lance_file)
-                            .unwrap_or(0);
-                        let start = file_dialogs::centered_window_start(selected_position, visible_rows, indices.len());
-                        let end = (start + visible_rows).min(indices.len());
-                        if indices.is_empty() {
-                            ui.add_space(20.0);
-                            ui.label(
-                                RichText::new("No lance marks yet. Ctrl+A adds a file manually; :lance-add marks the current file.")
-                                    .font(font.clone())
-                                    .color(dim),
-                            );
-                        }
-                        for index in indices[start..end].iter().copied() {
-                            let Some(path) = self.lance_files.get(index) else {
-                                continue;
-                            };
-                            let selected = index == self.selected_lance_file;
-                            let (rect, response) = ui.allocate_exact_size(
-                                Vec2::new(ui.available_width(), row_height),
-                                egui::Sense::click(),
-                            );
-                            let painter = ui.painter_at(rect);
-                            if selected {
-                                painter.rect_filled(rect, 0.0, Color32::from_rgb(38, 47, 61));
-                            }
-                            let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("unknown");
-                            painter.text(
-                                egui::pos2(rect.left() + 8.0, rect.center().y),
-                                egui::Align2::LEFT_CENTER,
-                                if selected { ">" } else { " " },
-                                font.clone(),
-                                accent,
-                            );
-                            painter.text(
-                                egui::pos2(rect.left() + 28.0, rect.center().y),
-                                egui::Align2::LEFT_CENTER,
-                                format!("{} {}", index + 1, name),
-                                font.clone(),
-                                if selected { Color32::from_rgb(216, 222, 233) } else { Color32::from_rgb(190, 200, 216) },
-                            );
-                            painter.text(
-                                egui::pos2(rect.left() + 220.0, rect.center().y),
-                                egui::Align2::LEFT_CENTER,
-                                path.display().to_string(),
-                                font.clone(),
-                                dim,
-                            );
-                            if response.clicked() {
-                                self.selected_lance_file = index;
-                            }
-                        }
-                    });
-            });
-    }
-
-    fn slate_picker_dialog(&mut self, ctx: &egui::Context) {
-        enum ActivePicker {
-            File,
-            Lance,
-            Recent,
-        }
-
-        let active = if self.file_picker_open {
-            ActivePicker::File
-        } else if self.lance_open {
-            ActivePicker::Lance
-        } else if self.recent_picker_open {
-            ActivePicker::Recent
-        } else {
-            return;
-        };
-
-        let file_matches = if matches!(active, ActivePicker::File) {
-            self.project_file_indices()
-        } else {
-            Vec::new()
-        };
-        let lance_matches = if matches!(active, ActivePicker::Lance) {
-            self.lance_file_indices()
-        } else {
-            Vec::new()
-        };
-        let recent_matches = if matches!(active, ActivePicker::Recent) {
-            self.recent_file_indices()
-        } else {
-            Vec::new()
-        };
-
-        let (title, subtitle, prompt, query, selected_index, total_len, visible_rows) = match active
-        {
-            ActivePicker::File => {
-                let title = match self.file_picker_mode {
-                    FilePickerMode::Open => "open",
-                    FilePickerMode::OpenBuffer => "open buffer",
-                    FilePickerMode::AddLance => "add lance",
-                    FilePickerMode::Browse => "files",
-                    FilePickerMode::InsertMarkdownLink => "insert link file",
-                    FilePickerMode::Refile => "refile target",
-                    FilePickerMode::SetPeriscopeProject => "set periscope project",
-                };
-                (
-                    title.to_string(),
-                    format!(
-                        "{} entries · {}",
-                        self.project_files.len(),
-                        self.file_picker_dir.display()
-                    ),
-                    "type to fuzzy-find files and folders".to_string(),
-                    self.file_query.clone(),
-                    file_matches
-                        .iter()
-                        .position(|index| *index == self.selected_project_file)
-                        .unwrap_or(0),
-                    file_matches.len(),
-                    16usize,
-                )
-            }
-            ActivePicker::Lance => (
-                "lance".to_string(),
-                format!("{} marks", self.lance_files.len()),
-                "filter marks".to_string(),
-                self.lance_query.clone(),
-                lance_matches
-                    .iter()
-                    .position(|index| *index == self.selected_lance_file)
-                    .unwrap_or(0),
-                lance_matches.len(),
-                10usize,
-            ),
-            ActivePicker::Recent => (
-                "recent".to_string(),
-                format!("{} files", self.recent_files.len()),
-                "filter recent files".to_string(),
-                self.recent_query.clone(),
-                recent_matches
-                    .iter()
-                    .position(|index| *index == self.selected_recent_file)
-                    .unwrap_or(0),
-                recent_matches.len(),
-                10usize,
-            ),
-        };
-
-        let start = file_dialogs::centered_window_start(selected_index, visible_rows, total_len);
-        let end = (start + visible_rows).min(total_len);
-
-        egui::Area::new("slate_picker_dialog".into())
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, -16.0])
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(25, 31, 40))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
-                    .corner_radius(0.0)
-                    .inner_margin(14.0)
-                    .shadow(egui::epaint::Shadow {
-                        offset: [0, 10],
-                        blur: 24,
-                        spread: 0,
-                        color: Color32::from_black_alpha(150),
-                    })
-                    .show(ui, |ui| {
-                        ui.set_width(match active {
-                            ActivePicker::File => 820.0,
-                            ActivePicker::Lance | ActivePicker::Recent => 760.0,
-                        });
-                        let font = FontId::new(13.0, FontFamily::Monospace);
-                        let title_font = FontId::new(16.0, FontFamily::Monospace);
-                        let accent = Color32::from_rgb(136, 192, 208);
-                        let text = Color32::from_rgb(216, 222, 233);
-                        let dim = Color32::from_rgb(136, 154, 176);
-                        let faint = Color32::from_rgb(94, 105, 126);
-                        let warn = Color32::from_rgb(235, 203, 139);
-
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(title).font(title_font).color(accent));
-                            ui.label(RichText::new(subtitle).font(font.clone()).color(faint));
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        RichText::new("[esc] close").font(font.clone()).color(warn),
-                                    );
-                                },
-                            );
-                        });
-                        ui.add_space(10.0);
-
-                        let input_height = 30.0;
-                        let (input_rect, _) = ui.allocate_exact_size(
-                            Vec2::new(ui.available_width(), input_height),
-                            egui::Sense::hover(),
-                        );
-                        let painter = ui.painter_at(input_rect);
-                        painter.rect_filled(input_rect, 0.0, Color32::from_rgb(30, 36, 48));
-                        painter.rect_stroke(
-                            input_rect,
-                            0.0,
-                            Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
-                            egui::StrokeKind::Outside,
-                        );
-                        let query_text = if query.is_empty() {
-                            prompt
-                        } else {
-                            query.clone()
-                        };
-                        let query_color = if query.is_empty() { faint } else { text };
-                        painter.text(
-                            egui::pos2(input_rect.left() + 10.0, input_rect.center().y - 0.5),
-                            egui::Align2::LEFT_CENTER,
-                            ">",
-                            font.clone(),
-                            accent,
-                        );
-                        let query_rect = painter.text(
-                            egui::pos2(input_rect.left() + 32.0, input_rect.center().y - 0.5),
-                            egui::Align2::LEFT_CENTER,
-                            query_text,
-                            font.clone(),
-                            query_color,
-                        );
-                        let cursor_x = if query.is_empty() {
-                            input_rect.left() + 32.0
-                        } else {
-                            query_rect.right() + 2.0
-                        };
-                        painter.line_segment(
-                            [
-                                egui::pos2(cursor_x, input_rect.top() + 7.0),
-                                egui::pos2(cursor_x, input_rect.bottom() - 7.0),
-                            ],
-                            Stroke::new(1.0, accent),
-                        );
-
-                        ui.add_space(8.0);
-                        let row_height = 24.0;
-                        let list_height = (visible_rows.max(1) as f32 + 1.0) * row_height;
-                        let (list_rect, _) = ui.allocate_exact_size(
-                            Vec2::new(ui.available_width(), list_height),
-                            egui::Sense::hover(),
-                        );
-                        let painter = ui.painter_at(list_rect).with_clip_rect(list_rect);
-                        painter.rect_filled(list_rect, 0.0, Color32::from_rgb(22, 28, 37));
-                        painter.rect_stroke(
-                            list_rect,
-                            0.0,
-                            Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
-                            egui::StrokeKind::Outside,
-                        );
-                        let header_y = list_rect.top() + row_height * 0.5;
-                        painter.text(
-                            egui::pos2(list_rect.left() + 32.0, header_y),
-                            egui::Align2::LEFT_CENTER,
-                            "name",
-                            font.clone(),
-                            faint,
-                        );
-                        painter.text(
-                            egui::pos2(list_rect.left() + 240.0, header_y),
-                            egui::Align2::LEFT_CENTER,
-                            "path / detail",
-                            font.clone(),
-                            faint,
-                        );
-                        if matches!(active, ActivePicker::File) {
-                            painter.text(
-                                egui::pos2(list_rect.right() - 180.0, header_y),
-                                egui::Align2::LEFT_CENTER,
-                                "size",
-                                font.clone(),
-                                faint,
-                            );
-                            painter.text(
-                                egui::pos2(list_rect.right() - 92.0, header_y),
-                                egui::Align2::LEFT_CENTER,
-                                "modified",
-                                font.clone(),
-                                faint,
-                            );
-                        }
-
-                        if total_len == 0 {
-                            painter.text(
-                                list_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "no matches",
-                                font.clone(),
-                                faint,
-                            );
-                        }
-
-                        for (row, match_position) in (start..end).enumerate() {
-                            let row_top = list_rect.top() + (row as f32 + 1.0) * row_height;
-                            let row_rect = egui::Rect::from_min_size(
-                                egui::pos2(list_rect.left() + 4.0, row_top),
-                                Vec2::new(list_rect.width() - 8.0, row_height),
-                            );
-                            let selected = match_position == selected_index;
-                            if selected {
-                                painter.rect_filled(row_rect, 0.0, Color32::from_rgb(38, 47, 61));
-                            }
-
-                            let (item_index, name, detail, size_label, modified_label, is_dir) =
-                                match active {
-                                    ActivePicker::File => {
-                                        let index = file_matches[match_position];
-                                        let path = &self.project_files[index];
-                                        let name = path
-                                            .file_name()
-                                            .and_then(|name| name.to_str())
-                                            .unwrap_or("unknown");
-                                        let relative = path
-                                            .strip_prefix(&self.file_picker_dir)
-                                            .unwrap_or(path)
-                                            .display()
-                                            .to_string();
-                                        let (size, modified) = if path.is_dir() {
-                                            ("dir".to_string(), "".to_string())
-                                        } else {
-                                            file_dialogs::file_metadata_labels(path)
-                                        };
-                                        (
-                                            index,
-                                            name.to_string(),
-                                            relative,
-                                            size,
-                                            modified,
-                                            path.is_dir(),
-                                        )
-                                    }
-                                    ActivePicker::Lance => {
-                                        let index = lance_matches[match_position];
-                                        let path = &self.lance_files[index];
-                                        let name = path
-                                            .file_name()
-                                            .and_then(|name| name.to_str())
-                                            .unwrap_or("unknown");
-                                        (
-                                            index,
-                                            format!("{} {}", index + 1, name),
-                                            path.display().to_string(),
-                                            String::new(),
-                                            String::new(),
-                                            false,
-                                        )
-                                    }
-                                    ActivePicker::Recent => {
-                                        let index = recent_matches[match_position];
-                                        let path = &self.recent_files[index];
-                                        let name = path
-                                            .file_name()
-                                            .and_then(|name| name.to_str())
-                                            .unwrap_or("unknown");
-                                        (
-                                            index,
-                                            name.to_string(),
-                                            path.display().to_string(),
-                                            String::new(),
-                                            String::new(),
-                                            false,
-                                        )
-                                    }
-                                };
-
-                            let y = row_rect.center().y - 0.5;
-                            painter.text(
-                                egui::pos2(row_rect.left() + 8.0, y),
-                                egui::Align2::LEFT_CENTER,
-                                if selected { ">" } else { " " },
-                                font.clone(),
-                                accent,
-                            );
-                            painter.text(
-                                egui::pos2(row_rect.left() + 28.0, y),
-                                egui::Align2::LEFT_CENTER,
-                                Self::text_for_width(
-                                    &format!("{}{}", if is_dir { "▸ " } else { "" }, name),
-                                    190.0,
-                                    13.0,
-                                ),
-                                font.clone(),
-                                if selected { text } else { accent },
-                            );
-                            painter.text(
-                                egui::pos2(row_rect.left() + 236.0, y),
-                                egui::Align2::LEFT_CENTER,
-                                Self::text_for_width(&detail, list_rect.width() - 430.0, 13.0),
-                                font.clone(),
-                                if selected { dim } else { faint },
-                            );
-                            if matches!(active, ActivePicker::File) {
-                                painter.text(
-                                    egui::pos2(row_rect.right() - 176.0, y),
-                                    egui::Align2::LEFT_CENTER,
-                                    size_label,
-                                    font.clone(),
-                                    if selected { dim } else { faint },
-                                );
-                                painter.text(
-                                    egui::pos2(row_rect.right() - 88.0, y),
-                                    egui::Align2::LEFT_CENTER,
-                                    modified_label,
-                                    font.clone(),
-                                    if selected { dim } else { faint },
-                                );
-                            }
-
-                            let response = ui.interact(
-                                row_rect,
-                                ui.id().with(("slate_picker", match_position)),
-                                egui::Sense::click(),
-                            );
-                            if response.clicked() || response.double_clicked() {
-                                match active {
-                                    ActivePicker::File => self.selected_project_file = item_index,
-                                    ActivePicker::Lance => self.selected_lance_file = item_index,
-                                    ActivePicker::Recent => self.selected_recent_file = item_index,
-                                }
-                            }
-                            if response.double_clicked() {
-                                match active {
-                                    ActivePicker::File => self.open_selected_project_file(),
-                                    ActivePicker::Lance => self.open_selected_lance_file(),
-                                    ActivePicker::Recent => self.open_selected_recent_file(),
-                                }
-                            }
-                        }
-
-                        ui.add_space(10.0);
-                        ui.horizontal(|ui| {
-                            let actions: &[(&str, &str)] = match active {
-                                ActivePicker::File => &[
-                                    ("↑↓", "select"),
-                                    ("type", "filter"),
-                                    ("→", "enter dir"),
-                                    ("←", "parent"),
-                                    ("enter", "open"),
-                                    ("esc", "close"),
-                                ],
-                                ActivePicker::Lance => &[
-                                    ("↑↓", "select"),
-                                    ("type", "filter"),
-                                    ("enter", "open"),
-                                    ("Ctrl+Enter", "modal"),
-                                    ("Ctrl+A", "add"),
-                                    ("Del", "remove"),
-                                ],
-                                ActivePicker::Recent => &[
-                                    ("↑↓", "select"),
-                                    ("type", "filter"),
-                                    ("enter", "open"),
-                                    ("esc", "close"),
-                                ],
-                            };
-                            for (key, label) in actions {
-                                ui.label(
-                                    RichText::new(format!("[{key}]"))
-                                        .font(font.clone())
-                                        .color(warn),
-                                );
-                                ui.label(RichText::new(*label).font(font.clone()).color(dim));
-                                ui.add_space(10.0);
-                            }
-                        });
-                    });
-            });
+        self.render_modal_form(ctx);
     }
 
     fn periscope_prompt_dialog(&mut self, ctx: &egui::Context) {
-        if !self.periscope_prompt_open {
+        if self.periscope_setup.visible {
+            self.periscope_setup_dialog(ctx);
             return;
         }
-        egui::Area::new("periscope_prompt_dialog".into())
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, -16.0])
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(25, 31, 40))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
-                    .corner_radius(0.0)
-                    .inner_margin(16.0)
-                    .show(ui, |ui| {
-                        ui.set_width(620.0);
-                        let font = FontId::new(13.0, FontFamily::Monospace);
-                        let title_font = FontId::new(16.0, FontFamily::Monospace);
-                        let accent = Color32::from_rgb(136, 192, 208);
-                        let text = Color32::from_rgb(216, 222, 233);
-                        let dim = Color32::from_rgb(136, 154, 176);
-                        let warn = Color32::from_rgb(235, 203, 139);
-                        ui.label(RichText::new("Periscope").font(title_font).color(accent));
-                        ui.add_space(8.0);
-                        ui.label(
-                            RichText::new(
-                                "No .git project root found for the current file/context.",
-                            )
-                            .font(font.clone())
-                            .color(text),
-                        );
-                        ui.label(
-                            RichText::new(
-                                "Define a project folder, or jump straight to Home search?",
-                            )
-                            .font(font.clone())
-                            .color(dim),
-                        );
-                        ui.add_space(14.0);
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("[Y/Enter]").font(font.clone()).color(warn));
-                            ui.label(
-                                RichText::new("choose project folder")
-                                    .font(font.clone())
-                                    .color(dim),
-                            );
-                            ui.add_space(16.0);
-                            ui.label(RichText::new("[N]").font(font.clone()).color(warn));
-                            ui.label(
-                                RichText::new("Home Periscope")
-                                    .font(font.clone())
-                                    .color(dim),
-                            );
-                            ui.add_space(16.0);
-                            ui.label(RichText::new("[Esc]").font(font.clone()).color(warn));
-                            ui.label(RichText::new("cancel").font(font.clone()).color(dim));
-                        });
-                    });
-            });
-    }
-
-    fn periscope_dialog(&mut self, ctx: &egui::Context) {
-        if !self.periscope_open {
-            return;
-        }
-        self.poll_periscope_global_index();
-        let rows = self.periscope_rows();
-        let visible_rows = 16usize;
-        let selected = self
-            .selected_periscope_result
-            .min(rows.len().saturating_sub(1));
-        let start = file_dialogs::centered_window_start(selected, visible_rows, rows.len());
-        let end = (start + visible_rows).min(rows.len());
-        let mode_label = match self.periscope_mode {
-            PeriscopeMode::Project => "project",
-            PeriscopeMode::Global => "home",
-        };
-        let scope = match self.periscope_mode {
-            PeriscopeMode::Project => self
-                .periscope_project_root
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "no project".to_string()),
-            PeriscopeMode::Global => std::env::var("HOME").unwrap_or_else(|_| "~".to_string()),
-        };
-
-        egui::Area::new("periscope_dialog".into())
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, -16.0])
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(25, 31, 40))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
-                    .corner_radius(0.0)
-                    .inner_margin(14.0)
-                    .shadow(egui::epaint::Shadow {
-                        offset: [0, 10],
-                        blur: 24,
-                        spread: 0,
-                        color: Color32::from_black_alpha(150),
-                    })
-                    .show(ui, |ui| {
-                        ui.set_width(860.0);
-                        let font = FontId::new(13.0, FontFamily::Monospace);
-                        let title_font = FontId::new(16.0, FontFamily::Monospace);
-                        let accent = Color32::from_rgb(136, 192, 208);
-                        let text = Color32::from_rgb(216, 222, 233);
-                        let dim = Color32::from_rgb(136, 154, 176);
-                        let faint = Color32::from_rgb(94, 105, 126);
-                        let warn = Color32::from_rgb(235, 203, 139);
-                        let danger = Color32::from_rgb(191, 97, 106);
-
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!("Periscope · {mode_label}"))
-                                    .font(title_font)
-                                    .color(accent),
-                            );
-                            ui.label(RichText::new(scope.clone()).font(font.clone()).color(faint));
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        RichText::new("[esc] close").font(font.clone()).color(warn),
-                                    );
-                                },
-                            );
-                        });
-                        if !self.periscope_backend_status.is_empty() {
-                            ui.label(
-                                RichText::new(self.periscope_backend_status.clone())
-                                    .font(font.clone())
-                                    .color(faint),
-                            );
-                        }
-                        ui.add_space(8.0);
-
-                        let input_height = 30.0;
-                        let (input_rect, _) = ui.allocate_exact_size(
-                            Vec2::new(ui.available_width(), input_height),
-                            egui::Sense::hover(),
-                        );
-                        let painter = ui.painter_at(input_rect);
-                        painter.rect_filled(input_rect, 0.0, Color32::from_rgb(30, 36, 48));
-                        painter.rect_stroke(
-                            input_rect,
-                            0.0,
-                            Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
-                            egui::StrokeKind::Outside,
-                        );
-                        let query = if self.periscope_query.is_empty() {
-                            "type to search files".to_string()
-                        } else {
-                            self.periscope_query.clone()
-                        };
-                        let query_color = if self.periscope_query.is_empty() {
-                            faint
-                        } else {
-                            text
-                        };
-                        painter.text(
-                            egui::pos2(input_rect.left() + 10.0, input_rect.center().y - 0.5),
-                            egui::Align2::LEFT_CENTER,
-                            ">",
-                            font.clone(),
-                            accent,
-                        );
-                        let query_rect = painter.text(
-                            egui::pos2(input_rect.left() + 32.0, input_rect.center().y - 0.5),
-                            egui::Align2::LEFT_CENTER,
-                            query,
-                            font.clone(),
-                            query_color,
-                        );
-                        let cursor_x = if self.periscope_query.is_empty() {
-                            input_rect.left() + 32.0
-                        } else {
-                            query_rect.right() + 2.0
-                        };
-                        painter.line_segment(
-                            [
-                                egui::pos2(cursor_x, input_rect.top() + 7.0),
-                                egui::pos2(cursor_x, input_rect.bottom() - 7.0),
-                            ],
-                            Stroke::new(1.0, accent),
-                        );
-
-                        ui.add_space(8.0);
-                        let row_height = 24.0;
-                        let list_height = (visible_rows as f32 + 1.0) * row_height;
-                        let (list_rect, _) = ui.allocate_exact_size(
-                            Vec2::new(ui.available_width(), list_height),
-                            egui::Sense::hover(),
-                        );
-                        let painter = ui.painter_at(list_rect).with_clip_rect(list_rect);
-                        painter.rect_filled(list_rect, 0.0, Color32::from_rgb(22, 28, 37));
-                        painter.rect_stroke(
-                            list_rect,
-                            0.0,
-                            Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
-                            egui::StrokeKind::Outside,
-                        );
-                        painter.text(
-                            egui::pos2(list_rect.left() + 32.0, list_rect.top() + row_height * 0.5),
-                            egui::Align2::LEFT_CENTER,
-                            "path",
-                            font.clone(),
-                            faint,
-                        );
-
-                        if rows.is_empty() {
-                            let message = if self.periscope_mode == PeriscopeMode::Global
-                                && self.periscope_global_loading
-                            {
-                                "loading home index…"
-                            } else if self.periscope_mode == PeriscopeMode::Global
-                                && self.periscope_query.trim().is_empty()
-                            {
-                                "type to search $HOME · capped at 100 results"
-                            } else if self.periscope_query.trim().is_empty() {
-                                "type a query to search this project"
-                            } else {
-                                "no matches"
-                            };
-                            painter.text(
-                                list_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                message,
-                                font.clone(),
-                                faint,
-                            );
-                        }
-
-                        for (row, index) in (start..end).enumerate() {
-                            let row_top = list_rect.top() + (row as f32 + 1.0) * row_height;
-                            let row_rect = egui::Rect::from_min_size(
-                                egui::pos2(list_rect.left() + 4.0, row_top),
-                                Vec2::new(list_rect.width() - 8.0, row_height),
-                            );
-                            let selected = index == self.selected_periscope_result;
-                            if selected {
-                                painter.rect_filled(row_rect, 0.0, Color32::from_rgb(38, 47, 61));
-                            }
-                            let row = &rows[index];
-                            let (path, path_text, is_folder) = match row {
-                                PeriscopeRow::Folder { path, expanded } => {
-                                    let mut label = format!("{}/", path.display());
-                                    if *expanded {
-                                        label.push_str("  expanded");
-                                    }
-                                    (path, label, true)
-                                }
-                                PeriscopeRow::File { path, group } => {
-                                    let label = if let Some(group) = group {
-                                        format!(
-                                            "---/{}",
-                                            path.strip_prefix(group).unwrap_or(path).display()
-                                        )
-                                    } else if self.periscope_mode == PeriscopeMode::Project {
-                                        if let Some(root) = &self.periscope_project_root {
-                                            path.strip_prefix(root)
-                                                .unwrap_or(path)
-                                                .display()
-                                                .to_string()
-                                        } else {
-                                            path.display().to_string()
-                                        }
-                                    } else {
-                                        path.display().to_string()
-                                    };
-                                    (path, label, false)
-                                }
-                            };
-                            let full = path.display().to_string();
-                            let sensitive = full.starts_with("/etc/")
-                                || full.starts_with("/boot/")
-                                || full.starts_with("/usr/")
-                                || full.starts_with("/var/")
-                                || full.contains("/.ssh/");
-                            let y = row_rect.center().y - 0.5;
-                            painter.text(
-                                egui::pos2(row_rect.left() + 8.0, y),
-                                egui::Align2::LEFT_CENTER,
-                                if selected { ">" } else { " " },
-                                font.clone(),
-                                accent,
-                            );
-                            painter.text(
-                                egui::pos2(row_rect.left() + 28.0, y),
-                                egui::Align2::LEFT_CENTER,
-                                Self::text_for_width(&path_text, list_rect.width() - 56.0, 13.0),
-                                font.clone(),
-                                if sensitive {
-                                    danger
-                                } else if is_folder {
-                                    warn
-                                } else if selected {
-                                    text
-                                } else {
-                                    dim
-                                },
-                            );
-                            let response = ui.interact(
-                                row_rect,
-                                ui.id().with(("periscope", index)),
-                                egui::Sense::click(),
-                            );
-                            if response.clicked() || response.double_clicked() {
-                                self.selected_periscope_result = index;
-                            }
-                            if response.double_clicked() {
-                                self.open_selected_periscope_result();
-                            }
-                        }
-
-                        ui.add_space(10.0);
-                        ui.horizontal(|ui| {
-                            for (key, label) in [
-                                ("↑↓", "select"),
-                                ("type", "search"),
-                                ("Tab", "project/home"),
-                                ("→", "expand"),
-                                ("Enter", "open/expand"),
-                                ("Ctrl+Enter", "modal"),
-                            ] {
-                                ui.label(
-                                    RichText::new(format!("[{key}]"))
-                                        .font(font.clone())
-                                        .color(warn),
-                                );
-                                ui.label(RichText::new(label).font(font.clone()).color(dim));
-                                ui.add_space(8.0);
-                            }
-                        });
-                    });
-            });
-    }
-
-    fn find_note_dialog(&mut self, ctx: &egui::Context) {
-        if !self.find_note_open {
-            return;
-        }
-        let root = self.project_root();
-        let visible_rows = 16usize;
-        let selected = self
-            .selected_find_note_row
-            .min(self.find_note_rows.len().saturating_sub(1));
-        let start =
-            file_dialogs::centered_window_start(selected, visible_rows, self.find_note_rows.len());
-        let end = (start + visible_rows).min(self.find_note_rows.len());
-
-        egui::Area::new("find_note_dialog".into())
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, -16.0])
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(25, 31, 40))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
-                    .corner_radius(0.0)
-                    .inner_margin(14.0)
-                    .shadow(egui::epaint::Shadow {
-                        offset: [0, 10],
-                        blur: 24,
-                        spread: 0,
-                        color: Color32::from_black_alpha(150),
-                    })
-                    .show(ui, |ui| {
-                        ui.set_width(860.0);
-                        let font = FontId::new(13.0, FontFamily::Monospace);
-                        let title_font = FontId::new(16.0, FontFamily::Monospace);
-                        let accent = Color32::from_rgb(136, 192, 208);
-                        let text = Color32::from_rgb(216, 222, 233);
-                        let dim = Color32::from_rgb(136, 154, 176);
-                        let faint = Color32::from_rgb(94, 105, 126);
-                        let warn = Color32::from_rgb(235, 203, 139);
-
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("Find note").font(title_font).color(accent));
-                            ui.label(
-                                RichText::new(root.display().to_string())
-                                    .font(font.clone())
-                                    .color(faint),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        RichText::new("[esc] close").font(font.clone()).color(warn),
-                                    );
-                                },
-                            );
-                        });
-                        ui.add_space(8.0);
-
-                        let input_height = 30.0;
-                        let (input_rect, _) = ui.allocate_exact_size(
-                            Vec2::new(ui.available_width(), input_height),
-                            egui::Sense::hover(),
-                        );
-                        let painter = ui.painter_at(input_rect);
-                        painter.rect_filled(input_rect, 0.0, Color32::from_rgb(30, 36, 48));
-                        painter.rect_stroke(
-                            input_rect,
-                            0.0,
-                            Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
-                            egui::StrokeKind::Outside,
-                        );
-                        let query = if self.find_note_query.is_empty() {
-                            "type to filter notes".to_string()
-                        } else {
-                            self.find_note_query.clone()
-                        };
-                        let query_color = if self.find_note_query.is_empty() {
-                            faint
-                        } else {
-                            text
-                        };
-                        painter.text(
-                            egui::pos2(input_rect.left() + 10.0, input_rect.center().y - 0.5),
-                            egui::Align2::LEFT_CENTER,
-                            ">",
-                            font.clone(),
-                            accent,
-                        );
-                        let query_rect = painter.text(
-                            egui::pos2(input_rect.left() + 32.0, input_rect.center().y - 0.5),
-                            egui::Align2::LEFT_CENTER,
-                            query,
-                            font.clone(),
-                            query_color,
-                        );
-                        let cursor_x = if self.find_note_query.is_empty() {
-                            input_rect.left() + 32.0
-                        } else {
-                            query_rect.right() + 2.0
-                        };
-                        painter.line_segment(
-                            [
-                                egui::pos2(cursor_x, input_rect.top() + 7.0),
-                                egui::pos2(cursor_x, input_rect.bottom() - 7.0),
-                            ],
-                            Stroke::new(1.0, accent),
-                        );
-
-                        ui.add_space(8.0);
-                        let row_height = 24.0;
-                        let list_height = (visible_rows as f32 + 1.0) * row_height;
-                        let (list_rect, _) = ui.allocate_exact_size(
-                            Vec2::new(ui.available_width(), list_height),
-                            egui::Sense::hover(),
-                        );
-                        let painter = ui.painter_at(list_rect).with_clip_rect(list_rect);
-                        painter.rect_filled(list_rect, 0.0, Color32::from_rgb(22, 28, 37));
-                        painter.rect_stroke(
-                            list_rect,
-                            0.0,
-                            Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
-                            egui::StrokeKind::Outside,
-                        );
-                        painter.text(
-                            egui::pos2(list_rect.left() + 32.0, list_rect.top() + row_height * 0.5),
-                            egui::Align2::LEFT_CENTER,
-                            "note",
-                            font.clone(),
-                            faint,
-                        );
-                        painter.text(
-                            egui::pos2(
-                                list_rect.right() - 260.0,
-                                list_rect.top() + row_height * 0.5,
-                            ),
-                            egui::Align2::LEFT_CENTER,
-                            "match",
-                            font.clone(),
-                            faint,
-                        );
-
-                        if self.find_note_rows.is_empty() {
-                            painter.text(
-                                list_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "no notes found",
-                                font.clone(),
-                                faint,
-                            );
-                        }
-
-                        for (row, index) in (start..end).enumerate() {
-                            let row_top = list_rect.top() + (row as f32 + 1.0) * row_height;
-                            let row_rect = egui::Rect::from_min_size(
-                                egui::pos2(list_rect.left() + 4.0, row_top),
-                                Vec2::new(list_rect.width() - 8.0, row_height),
-                            );
-                            let selected = index == self.selected_find_note_row;
-                            if selected {
-                                painter.rect_filled(row_rect, 0.0, Color32::from_rgb(38, 47, 61));
-                            }
-                            let (label, hint, has_headings, expanded, is_heading) = match &self
-                                .find_note_rows[index]
-                            {
-                                FindNoteRow::File { path, match_hint } => {
-                                    let label = path
-                                        .strip_prefix(&root)
-                                        .unwrap_or(path)
-                                        .display()
-                                        .to_string();
-                                    let has_headings = fs::read_to_string(path)
-                                        .map(|contents| {
-                                            contents
-                                                .lines()
-                                                .any(|line| parse_heading_line(line).is_some())
-                                        })
-                                        .unwrap_or(false);
-                                    (
-                                        label,
-                                        match_hint.clone(),
-                                        has_headings,
-                                        self.find_note_expanded_files.contains(path),
-                                        false,
-                                    )
-                                }
-                                FindNoteRow::Heading {
-                                    line, title, level, ..
-                                } => (
-                                    format!("{}# {}", "  ".repeat(level.saturating_sub(1)), title),
-                                    format!("line {line}"),
-                                    false,
-                                    false,
-                                    true,
-                                ),
-                            };
-                            let prefix = if is_heading {
-                                "  "
-                            } else if has_headings && expanded {
-                                "▾ "
-                            } else if has_headings {
-                                "▸ "
-                            } else {
-                                "  "
-                            };
-                            let y = row_rect.center().y - 0.5;
-                            painter.text(
-                                egui::pos2(row_rect.left() + 8.0, y),
-                                egui::Align2::LEFT_CENTER,
-                                if selected { ">" } else { " " },
-                                font.clone(),
-                                accent,
-                            );
-                            painter.text(
-                                egui::pos2(row_rect.left() + 28.0, y),
-                                egui::Align2::LEFT_CENTER,
-                                Self::text_for_width(
-                                    &format!("{prefix}{label}"),
-                                    list_rect.width() - 340.0,
-                                    13.0,
-                                ),
-                                font.clone(),
-                                if selected {
-                                    text
-                                } else if is_heading {
-                                    dim
-                                } else {
-                                    accent
-                                },
-                            );
-                            painter.text(
-                                egui::pos2(list_rect.right() - 260.0, y),
-                                egui::Align2::LEFT_CENTER,
-                                Self::text_for_width(&hint, 245.0, 13.0),
-                                font.clone(),
-                                faint,
-                            );
-                            let response = ui.interact(
-                                row_rect,
-                                ui.id().with(("find_note", index)),
-                                egui::Sense::click(),
-                            );
-                            if response.clicked() || response.double_clicked() {
-                                self.selected_find_note_row = index;
-                            }
-                            if response.double_clicked() {
-                                self.open_selected_find_note(false);
-                            }
-                        }
-
-                        ui.add_space(10.0);
-                        ui.horizontal(|ui| {
-                            for (key, label) in [
-                                ("↑↓", "select"),
-                                ("type", "filter"),
-                                ("Tab/→", "expand"),
-                                ("←", "collapse"),
-                                ("Enter", "open main"),
-                                ("Shift+Enter", "front modal"),
-                            ] {
-                                ui.label(
-                                    RichText::new(format!("[{key}]"))
-                                        .font(font.clone())
-                                        .color(warn),
-                                );
-                                ui.label(RichText::new(label).font(font.clone()).color(dim));
-                                ui.add_space(8.0);
-                            }
-                        });
-                    });
-            });
-    }
-
-    #[allow(dead_code)]
-    fn file_picker_dialog(&mut self, ctx: &egui::Context) {
-        if !self.file_picker_open {
-            return;
-        }
-
-        let root = self.file_picker_dir.clone();
-        let matches = self.project_file_indices();
-        let visible_rows = 16usize;
-        let selected_position = matches
-            .iter()
-            .position(|index| *index == self.selected_project_file)
-            .unwrap_or(0);
-        let start =
-            file_dialogs::centered_window_start(selected_position, visible_rows, matches.len());
-        let end = (start + visible_rows).min(matches.len());
-
-        egui::Area::new("file_picker_dialog".into())
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, -20.0])
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(25, 31, 40))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
-                    .corner_radius(0.0)
-                    .inner_margin(14.0)
-                    .shadow(egui::epaint::Shadow {
-                        offset: [0, 10],
-                        blur: 24,
-                        spread: 0,
-                        color: Color32::from_black_alpha(150),
-                    })
-                    .show(ui, |ui| {
-                        ui.set_width(820.0);
-                        let font = FontId::new(13.0, FontFamily::Monospace);
-                        let title_font = FontId::new(16.0, FontFamily::Monospace);
-                        let accent = Color32::from_rgb(136, 192, 208);
-                        let text = Color32::from_rgb(216, 222, 233);
-                        let dim = Color32::from_rgb(136, 154, 176);
-                        let faint = Color32::from_rgb(94, 105, 126);
-                        let warn = Color32::from_rgb(235, 203, 139);
-
-                        ui.horizontal(|ui| {
-                            let title = match self.file_picker_mode {
-                                FilePickerMode::Open => "open",
-                                FilePickerMode::OpenBuffer => "open buffer",
-                                FilePickerMode::AddLance => "add lance",
-                                FilePickerMode::Browse => "files",
-                                FilePickerMode::InsertMarkdownLink => "insert link file",
-                                FilePickerMode::Refile => "refile target",
-                                FilePickerMode::SetPeriscopeProject => "set periscope project",
-                            };
-                            ui.label(RichText::new(title).font(title_font).color(accent));
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} files · {}",
-                                    self.project_files.len(),
-                                    root.display()
-                                ))
-                                .font(font.clone())
-                                .color(faint),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        RichText::new("[esc] close").font(font.clone()).color(warn),
-                                    );
-                                },
-                            );
-                        });
-                        ui.add_space(10.0);
-
-                        let input_height = 30.0;
-                        let (input_rect, _) = ui.allocate_exact_size(
-                            Vec2::new(ui.available_width(), input_height),
-                            egui::Sense::hover(),
-                        );
-                        let painter = ui.painter_at(input_rect);
-                        painter.rect_filled(input_rect, 0.0, Color32::from_rgb(30, 36, 48));
-                        painter.rect_stroke(
-                            input_rect,
-                            0.0,
-                            Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
-                            egui::StrokeKind::Outside,
-                        );
-                        let query = if self.file_query.is_empty() {
-                            "type to fuzzy-find files and folders".to_string()
-                        } else {
-                            self.file_query.clone()
-                        };
-                        let query_color = if self.file_query.is_empty() {
-                            faint
-                        } else {
-                            text
-                        };
-                        painter.text(
-                            egui::pos2(input_rect.left() + 10.0, input_rect.center().y - 0.5),
-                            egui::Align2::LEFT_CENTER,
-                            "files: ",
-                            font.clone(),
-                            accent,
-                        );
-                        let query_rect = painter.text(
-                            egui::pos2(input_rect.left() + 66.0, input_rect.center().y - 0.5),
-                            egui::Align2::LEFT_CENTER,
-                            query,
-                            font.clone(),
-                            query_color,
-                        );
-                        let cursor_x = if self.file_query.is_empty() {
-                            input_rect.left() + 66.0
-                        } else {
-                            query_rect.right() + 2.0
-                        };
-                        painter.line_segment(
-                            [
-                                egui::pos2(cursor_x, input_rect.top() + 7.0),
-                                egui::pos2(cursor_x, input_rect.bottom() - 7.0),
-                            ],
-                            Stroke::new(1.0, accent),
-                        );
-
-                        ui.add_space(8.0);
-                        let row_height = 24.0;
-                        let list_height = (visible_rows.max(1) as f32 + 1.0) * row_height;
-                        let (list_rect, _) = ui.allocate_exact_size(
-                            Vec2::new(ui.available_width(), list_height),
-                            egui::Sense::hover(),
-                        );
-                        let painter = ui.painter_at(list_rect).with_clip_rect(list_rect);
-                        painter.rect_filled(list_rect, 0.0, Color32::from_rgb(22, 28, 37));
-                        painter.rect_stroke(
-                            list_rect,
-                            0.0,
-                            Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
-                            egui::StrokeKind::Outside,
-                        );
-                        let header_y = list_rect.top() + row_height * 0.5;
-                        painter.text(
-                            egui::pos2(list_rect.left() + 32.0, header_y),
-                            egui::Align2::LEFT_CENTER,
-                            "name",
-                            font.clone(),
-                            faint,
-                        );
-                        painter.text(
-                            egui::pos2(list_rect.left() + 240.0, header_y),
-                            egui::Align2::LEFT_CENTER,
-                            "path",
-                            font.clone(),
-                            faint,
-                        );
-                        painter.text(
-                            egui::pos2(list_rect.right() - 180.0, header_y),
-                            egui::Align2::LEFT_CENTER,
-                            "size",
-                            font.clone(),
-                            faint,
-                        );
-                        painter.text(
-                            egui::pos2(list_rect.right() - 92.0, header_y),
-                            egui::Align2::LEFT_CENTER,
-                            "modified",
-                            font.clone(),
-                            faint,
-                        );
-
-                        if matches.is_empty() {
-                            painter.text(
-                                list_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "no matching files",
-                                font.clone(),
-                                faint,
-                            );
-                        }
-
-                        for (row, index) in matches[start..end].iter().copied().enumerate() {
-                            let row_top = list_rect.top() + (row as f32 + 1.0) * row_height;
-                            let row_rect = egui::Rect::from_min_size(
-                                egui::pos2(list_rect.left() + 4.0, row_top),
-                                Vec2::new(list_rect.width() - 8.0, row_height),
-                            );
-                            let selected = index == self.selected_project_file;
-                            if selected {
-                                painter.rect_filled(row_rect, 0.0, Color32::from_rgb(38, 47, 61));
-                            }
-                            let path = &self.project_files[index];
-                            let name = path
-                                .file_name()
-                                .and_then(|name| name.to_str())
-                                .unwrap_or("unknown");
-                            let relative = path
-                                .strip_prefix(&root)
-                                .unwrap_or(path)
-                                .display()
-                                .to_string();
-                            let (size_label, modified_label) = if path.is_dir() {
-                                ("dir".to_string(), "".to_string())
-                            } else {
-                                file_dialogs::file_metadata_labels(path)
-                            };
-                            let y = row_rect.center().y - 0.5;
-                            painter.text(
-                                egui::pos2(row_rect.left() + 8.0, y),
-                                egui::Align2::LEFT_CENTER,
-                                if selected { ">" } else { " " },
-                                font.clone(),
-                                accent,
-                            );
-                            painter.text(
-                                egui::pos2(row_rect.left() + 28.0, y),
-                                egui::Align2::LEFT_CENTER,
-                                Self::text_for_width(
-                                    &format!("{}{}", if path.is_dir() { "▸ " } else { "  " }, name),
-                                    190.0,
-                                    13.0,
-                                ),
-                                font.clone(),
-                                if selected { text } else { accent },
-                            );
-                            painter.text(
-                                egui::pos2(row_rect.left() + 236.0, y),
-                                egui::Align2::LEFT_CENTER,
-                                Self::text_for_width(&relative, list_rect.width() - 430.0, 13.0),
-                                font.clone(),
-                                if selected { dim } else { faint },
-                            );
-                            painter.text(
-                                egui::pos2(row_rect.right() - 176.0, y),
-                                egui::Align2::LEFT_CENTER,
-                                size_label,
-                                font.clone(),
-                                if selected { dim } else { faint },
-                            );
-                            painter.text(
-                                egui::pos2(row_rect.right() - 88.0, y),
-                                egui::Align2::LEFT_CENTER,
-                                modified_label,
-                                font.clone(),
-                                if selected { dim } else { faint },
-                            );
-
-                            let response = ui.interact(
-                                row_rect,
-                                ui.id().with(("project_file", index)),
-                                egui::Sense::click(),
-                            );
-                            if response.clicked() {
-                                self.selected_project_file = index;
-                            }
-                            if response.double_clicked() {
-                                self.selected_project_file = index;
-                                self.open_selected_project_file();
-                            }
-                        }
-
-                        ui.add_space(10.0);
-                        ui.horizontal(|ui| {
-                            for (key, label) in [
-                                ("↑↓", "select"),
-                                ("type", "filter"),
-                                ("→", "enter dir"),
-                                ("←", "parent"),
-                                ("enter", "open"),
-                                ("esc", "close"),
-                            ] {
-                                ui.label(
-                                    RichText::new(format!("[{key}]"))
-                                        .font(font.clone())
-                                        .color(warn),
-                                );
-                                ui.label(RichText::new(label).font(font.clone()).color(dim));
-                                ui.add_space(10.0);
-                            }
-                        });
-                    });
-            });
+        self.render_periscope_prompt(ctx);
     }
 
     fn scratch_modal_dialog(&mut self, ctx: &egui::Context) {
-        if !self.scratch_modal_open {
-            return;
-        }
-
-        egui::Area::new("scratch_modal_dialog".into())
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, -20.0])
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(25, 31, 40))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
-                    .corner_radius(0.0)
-                    .inner_margin(14.0)
-                    .shadow(egui::epaint::Shadow {
-                        offset: [0, 10],
-                        blur: 24,
-                        spread: 0,
-                        color: Color32::from_black_alpha(150),
-                    })
-                    .show(ui, |ui| {
-                        ui.set_width(760.0);
-                        ui.set_height(430.0);
-                        let font = FontId::new(13.0, FontFamily::Monospace);
-                        let title_font = FontId::new(16.0, FontFamily::Monospace);
-                        let accent = Color32::from_rgb(136, 192, 208);
-                        let dim = Color32::from_rgb(136, 154, 176);
-                        let faint = Color32::from_rgb(94, 105, 126);
-                        let warn = Color32::from_rgb(235, 203, 139);
-
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("scratch").font(title_font).color(accent));
-                            ui.label(
-                                RichText::new(
-                                    "quick capture · archives to ~/.local/share/slate/scratch.md",
-                                )
-                                .font(font.clone())
-                                .color(faint),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        RichText::new("[esc] hide").font(font.clone()).color(warn),
-                                    );
-                                },
-                            );
-                        });
-                        ui.add_space(10.0);
-
-                        let editor_height = 330.0;
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(ui.available_width(), editor_height),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                let (response, changed) = self.scratch_view.render(
-                                    ui,
-                                    &mut self.scratch_buffer,
-                                    self.wrap,
-                                    None,
-                                    self.line_number_mode,
-                                    true,
-                                    true,
-                                    None,
-                                    false,
-                                    None,
-                                );
-                                response.request_focus();
-                                if changed {
-                                    self.status = "Scratch capture modified".to_string();
-                                }
-                            },
-                        );
-
-                        ui.add_space(10.0);
-                        ui.horizontal(|ui| {
-                            for (key, label) in [
-                                ("Ctrl+S", "archive"),
-                                ("Esc", "hide"),
-                                (":scratch", "resume"),
-                            ] {
-                                ui.label(
-                                    RichText::new(format!("[{key}]"))
-                                        .font(font.clone())
-                                        .color(warn),
-                                );
-                                ui.label(RichText::new(label).font(font.clone()).color(dim));
-                                ui.add_space(10.0);
-                            }
-                        });
-                    });
-            });
+        self.render_scratch_form(ctx);
     }
 
     fn capture_dialog(&mut self, ctx: &egui::Context) {
-        if !self.capture_modal_open {
-            return;
-        }
-
-        egui::Area::new("capture_dialog".into())
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, -20.0])
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(25, 31, 40))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
-                    .corner_radius(0.0)
-                    .inner_margin(14.0)
-                    .shadow(egui::epaint::Shadow {
-                        offset: [0, 10],
-                        blur: 24,
-                        spread: 0,
-                        color: Color32::from_black_alpha(150),
-                    })
-                    .show(ui, |ui| {
-                        ui.set_width(720.0);
-                        let font = FontId::new(13.0, FontFamily::Monospace);
-                        let title_font = FontId::new(16.0, FontFamily::Monospace);
-                        let accent = Color32::from_rgb(136, 192, 208);
-                        let dim = Color32::from_rgb(136, 154, 176);
-                        let faint = Color32::from_rgb(94, 105, 126);
-                        let text = Color32::from_rgb(216, 222, 233);
-                        let warn = Color32::from_rgb(235, 203, 139);
-
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("capture").font(title_font).color(accent));
-                            ui.label(
-                                RichText::new("selection/current line → scratch")
-                                    .font(font.clone())
-                                    .color(faint),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        RichText::new("[esc] cancel")
-                                            .font(font.clone())
-                                            .color(warn),
-                                    );
-                                },
-                            );
-                        });
-                        ui.add_space(10.0);
-
-                        ui.label(
-                            RichText::new("title/context optional")
-                                .font(font.clone())
-                                .color(faint),
-                        );
-                        let title_input_id = ui.make_persistent_id("capture_title_input");
-                        let response = ui.add(
-                            TextEdit::singleline(&mut self.capture_title)
-                                .id_salt(title_input_id)
-                                .hint_text("press Enter empty for no title")
-                                .desired_width(f32::INFINITY)
-                                .font(font.clone())
-                                .text_color(text)
-                                .frame(egui::Frame::NONE),
-                        );
-                        if self.capture_title_focus_once {
-                            response.request_focus();
-                            ui.memory_mut(|memory| memory.request_focus(response.id));
-                            ctx.request_repaint();
-                            self.capture_title_focus_once = false;
-                        }
-
-                        ui.add_space(10.0);
-                        ui.label(RichText::new("capturing").font(font.clone()).color(faint));
-                        let preview_height = 220.0;
-                        let (preview_rect, _) = ui.allocate_exact_size(
-                            Vec2::new(ui.available_width(), preview_height),
-                            egui::Sense::hover(),
-                        );
-                        let painter = ui.painter_at(preview_rect);
-                        painter.rect_filled(preview_rect, 0.0, Color32::from_rgb(30, 36, 48));
-                        painter.rect_stroke(
-                            preview_rect,
-                            0.0,
-                            Stroke::new(1.0, Color32::from_rgb(59, 69, 89)),
-                            egui::StrokeKind::Inside,
-                        );
-                        let inner = preview_rect.shrink(10.0);
-                        let line_height = ui.fonts_mut(|fonts| fonts.row_height(&font));
-                        let clip = painter.with_clip_rect(inner);
-                        let mut y = inner.top();
-                        for line in self.capture_text.lines() {
-                            if y + line_height > inner.bottom() {
-                                break;
-                            }
-                            clip.text(
-                                egui::pos2(inner.left(), y),
-                                egui::Align2::LEFT_TOP,
-                                line,
-                                font.clone(),
-                                text,
-                            );
-                            y += line_height;
-                        }
-
-                        ui.add_space(10.0);
-                        ui.horizontal(|ui| {
-                            for (key, label) in [("Enter", "archive"), ("Esc", "cancel")] {
-                                ui.label(
-                                    RichText::new(format!("[{key}]"))
-                                        .font(font.clone())
-                                        .color(warn),
-                                );
-                                ui.label(RichText::new(label).font(font.clone()).color(dim));
-                                ui.add_space(10.0);
-                            }
-                        });
-                    });
-            });
+        self.render_capture_form(ctx);
     }
 
     fn scratch_entries_dialog(&mut self, ctx: &egui::Context) {
@@ -11622,13 +8563,13 @@ impl SlateApp {
             return;
         }
 
-        egui::Area::new("scratch_entries_dialog".into())
+        window_ui::DialogArea::new("scratch_entries_dialog".into())
             .anchor(egui::Align2::CENTER_CENTER, [0.0, -20.0])
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 egui::Frame::new()
                     .fill(Color32::from_rgb(25, 31, 40))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(76, 86, 106)))
                     .corner_radius(0.0)
                     .inner_margin(14.0)
                     .shadow(egui::epaint::Shadow {
@@ -11799,7 +8740,7 @@ impl SlateApp {
                                 painter.rect_stroke(
                                     preview_rect,
                                     0.0,
-                                    Stroke::new(1.0, Color32::from_rgb(59, 69, 89)),
+                                    Stroke::new(1.0_f32, Color32::from_rgb(59, 69, 89)),
                                     egui::StrokeKind::Inside,
                                 );
 
@@ -11851,608 +8792,6 @@ impl SlateApp {
             });
     }
 
-    fn save_as_dialog(&mut self, ctx: &egui::Context) {
-        if !self.save_as_open {
-            return;
-        }
-
-        let matches = self.save_as_entry_indices();
-        let visible_rows = 12usize;
-        let selected_position = matches
-            .iter()
-            .position(|index| *index == self.selected_save_as_entry)
-            .unwrap_or(0);
-        let start =
-            file_dialogs::centered_window_start(selected_position, visible_rows, matches.len());
-        let end = (start + visible_rows).min(matches.len());
-
-        egui::Area::new("save_as_dialog".into())
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, -20.0])
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(25, 31, 40))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
-                    .corner_radius(0.0)
-                    .inner_margin(14.0)
-                    .shadow(egui::epaint::Shadow {
-                        offset: [0, 10],
-                        blur: 24,
-                        spread: 0,
-                        color: Color32::from_black_alpha(150),
-                    })
-                    .show(ui, |ui| {
-                        ui.set_width(820.0);
-                        let font = FontId::new(13.0, FontFamily::Monospace);
-                        let title_font = FontId::new(16.0, FontFamily::Monospace);
-                        let accent = Color32::from_rgb(136, 192, 208);
-                        let text = Color32::from_rgb(216, 222, 233);
-                        let dim = Color32::from_rgb(136, 154, 176);
-                        let faint = Color32::from_rgb(94, 105, 126);
-                        let warn = Color32::from_rgb(235, 203, 139);
-
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("save as").font(title_font).color(accent));
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} · {} entries",
-                                    self.save_as_dir.display(),
-                                    self.save_as_entries.len()
-                                ))
-                                .font(font.clone())
-                                .color(faint),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        RichText::new("[esc] close").font(font.clone()).color(warn),
-                                    );
-                                },
-                            );
-                        });
-                        ui.add_space(10.0);
-
-                        let input_height = 30.0;
-                        let (input_rect, _) = ui.allocate_exact_size(
-                            Vec2::new(ui.available_width(), input_height),
-                            egui::Sense::hover(),
-                        );
-                        let painter = ui.painter_at(input_rect);
-                        painter.rect_filled(input_rect, 0.0, Color32::from_rgb(30, 36, 48));
-                        painter.rect_stroke(
-                            input_rect,
-                            0.0,
-                            Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
-                            egui::StrokeKind::Outside,
-                        );
-                        let filename = if self.save_as_filename.is_empty() {
-                            "type file name".to_string()
-                        } else {
-                            self.save_as_filename.clone()
-                        };
-                        let filename_color = if self.save_as_filename.is_empty() {
-                            faint
-                        } else {
-                            text
-                        };
-                        painter.text(
-                            egui::pos2(input_rect.left() + 10.0, input_rect.center().y - 0.5),
-                            egui::Align2::LEFT_CENTER,
-                            "save as: ",
-                            font.clone(),
-                            accent,
-                        );
-                        let filename_rect = painter.text(
-                            egui::pos2(input_rect.left() + 90.0, input_rect.center().y - 0.5),
-                            egui::Align2::LEFT_CENTER,
-                            filename,
-                            font.clone(),
-                            filename_color,
-                        );
-                        let cursor_x = if self.save_as_filename.is_empty() {
-                            input_rect.left() + 90.0
-                        } else {
-                            filename_rect.right() + 2.0
-                        };
-                        painter.line_segment(
-                            [
-                                egui::pos2(cursor_x, input_rect.top() + 7.0),
-                                egui::pos2(cursor_x, input_rect.bottom() - 7.0),
-                            ],
-                            Stroke::new(1.0, accent),
-                        );
-
-                        ui.add_space(8.0);
-                        let row_height = 24.0;
-                        let list_height = (visible_rows.max(1) as f32 + 1.0) * row_height;
-                        let (list_rect, _) = ui.allocate_exact_size(
-                            Vec2::new(ui.available_width(), list_height),
-                            egui::Sense::hover(),
-                        );
-                        let painter = ui.painter_at(list_rect).with_clip_rect(list_rect);
-                        painter.rect_filled(list_rect, 0.0, Color32::from_rgb(22, 28, 37));
-                        painter.rect_stroke(
-                            list_rect,
-                            0.0,
-                            Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
-                            egui::StrokeKind::Outside,
-                        );
-                        let header_y = list_rect.top() + row_height * 0.5;
-                        painter.text(
-                            egui::pos2(list_rect.left() + 32.0, header_y),
-                            egui::Align2::LEFT_CENTER,
-                            "name",
-                            font.clone(),
-                            faint,
-                        );
-                        painter.text(
-                            egui::pos2(list_rect.left() + 300.0, header_y),
-                            egui::Align2::LEFT_CENTER,
-                            "size",
-                            font.clone(),
-                            faint,
-                        );
-                        painter.text(
-                            egui::pos2(list_rect.left() + 390.0, header_y),
-                            egui::Align2::LEFT_CENTER,
-                            "modified",
-                            font.clone(),
-                            faint,
-                        );
-
-                        if matches.is_empty() {
-                            painter.text(
-                                list_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "no matching entries",
-                                font.clone(),
-                                faint,
-                            );
-                        }
-
-                        for (row, index) in matches[start..end].iter().copied().enumerate() {
-                            let row_top = list_rect.top() + (row as f32 + 1.0) * row_height;
-                            let row_rect = egui::Rect::from_min_size(
-                                egui::pos2(list_rect.left() + 4.0, row_top),
-                                Vec2::new(list_rect.width() - 8.0, row_height),
-                            );
-                            let selected = index == self.selected_save_as_entry;
-                            if selected {
-                                painter.rect_filled(row_rect, 0.0, Color32::from_rgb(38, 47, 61));
-                            }
-                            let path = &self.save_as_entries[index];
-                            let name = path
-                                .file_name()
-                                .and_then(|name| name.to_str())
-                                .unwrap_or("unknown");
-                            let (size_label, modified_label) = if path.is_dir() {
-                                ("dir".to_string(), "".to_string())
-                            } else {
-                                file_dialogs::file_metadata_labels(path)
-                            };
-                            let y = row_rect.center().y - 0.5;
-                            painter.text(
-                                egui::pos2(row_rect.left() + 8.0, y),
-                                egui::Align2::LEFT_CENTER,
-                                if selected { ">" } else { " " },
-                                font.clone(),
-                                accent,
-                            );
-                            painter.text(
-                                egui::pos2(row_rect.left() + 28.0, y),
-                                egui::Align2::LEFT_CENTER,
-                                Self::text_for_width(
-                                    &format!("{}{}", if path.is_dir() { "▸ " } else { "  " }, name),
-                                    250.0,
-                                    13.0,
-                                ),
-                                font.clone(),
-                                if selected { text } else { accent },
-                            );
-                            painter.text(
-                                egui::pos2(row_rect.left() + 300.0, y),
-                                egui::Align2::LEFT_CENTER,
-                                size_label,
-                                font.clone(),
-                                if selected { dim } else { faint },
-                            );
-                            painter.text(
-                                egui::pos2(row_rect.left() + 390.0, y),
-                                egui::Align2::LEFT_CENTER,
-                                modified_label,
-                                font.clone(),
-                                if selected { dim } else { faint },
-                            );
-
-                            let response = ui.interact(
-                                row_rect,
-                                ui.id().with(("save_as_entry", index)),
-                                egui::Sense::click(),
-                            );
-                            if response.clicked() {
-                                self.selected_save_as_entry = index;
-                                if path.is_file() {
-                                    self.save_as_filename = name.to_string();
-                                }
-                            }
-                            if response.double_clicked() {
-                                self.selected_save_as_entry = index;
-                                if path.is_dir() {
-                                    self.save_as_enter_selected_dir();
-                                } else {
-                                    self.save_as_filename = name.to_string();
-                                    self.confirm_save_as();
-                                }
-                            }
-                        }
-
-                        ui.add_space(10.0);
-                        ui.horizontal(|ui| {
-                            for (key, label) in [
-                                ("↑↓", "select"),
-                                ("type", "name/filter"),
-                                ("→", "enter dir"),
-                                ("←", "parent"),
-                                ("enter", "save"),
-                                ("esc", "close"),
-                            ] {
-                                ui.label(
-                                    RichText::new(format!("[{key}]"))
-                                        .font(font.clone())
-                                        .color(warn),
-                                );
-                                ui.label(RichText::new(label).font(font.clone()).color(dim));
-                                ui.add_space(10.0);
-                            }
-                        });
-                    });
-            });
-    }
-
-    fn shortcut_help_dialog(&mut self, ctx: &egui::Context) {
-        if !self.shortcut_help_open {
-            return;
-        }
-
-        let shortcut_groups: &[(&str, &[(&str, &str)])] = &[
-            (
-                "global",
-                &[
-                    ("Ctrl+.", "open commandline"),
-                    ("Ctrl+P", "open command palette/browser"),
-                    ("Ctrl+H", "open this help"),
-                    ("Esc", "close modal / cancel active mode"),
-                    ("Ctrl+S", "save"),
-                    ("Ctrl+Alt+S", "save as"),
-                    ("Ctrl+O", "open file"),
-                    ("Ctrl+M", "toggle Markdown preview"),
-                    ("Ctrl+Q", "quit"),
-                ],
-            ),
-            (
-                "ctrl layer",
-                &[
-                    ("Ctrl: s", "save"),
-                    ("Ctrl: o", "open file"),
-                    ("Ctrl: ol", "open last file"),
-                    ("Ctrl: r", "recent files"),
-                    ("Ctrl: f/b", "find next / previous"),
-                    ("Ctrl: sw/sl", "select word / line"),
-                    ("Ctrl: dw/dl", "delete word / line"),
-                    ("Ctrl: dup", "duplicate line"),
-                    ("Ctrl: dupp", "duplicate and place"),
-                    ("Ctrl: gt/gb", "go top / bottom"),
-                ],
-            ),
-            (
-                "movement layers",
-                &[
-                    ("Ctrl+Shift", "live cursor movement"),
-                    ("CapsLock", "system nav layer: ijkl arrows"),
-                    ("Alt up/down", "move line/block"),
-                    ("Alt double", "move to paragraph edge"),
-                    ("Alt left/right", "word selection"),
-                    ("Shift+Alt", "paragraph / word / line-edge jumps"),
-                    ("duplicate mode", "move · Enter/Space place · Esc cancel"),
-                ],
-            ),
-            (
-                "commandline",
-                &[
-                    ("Tab", "accept completion"),
-                    ("↑/↓", "history / picker selection"),
-                    ("Enter", "run command / accept picker item"),
-                    (":recent query", "filter recent files"),
-                    (":find text", "find in file"),
-                    (":g 10 / :g +5", "absolute / relative goto"),
-                ],
-            ),
-        ];
-
-        let viewport_width = ctx.input(|i| {
-            i.viewport()
-                .inner_rect
-                .map(|rect| rect.width())
-                .unwrap_or_else(|| i.content_rect().width())
-        });
-        // This is the frame *content* width. The frame itself adds margin/stroke,
-        // so keep extra room for tiled/WM-small windows instead of filling edge-to-edge.
-        let modal_width = (viewport_width - 80.0).clamp(420.0, 1320.0);
-        let shortcut_width = (modal_width * 0.32).clamp(300.0, 380.0);
-        let gutter_width = 18.0;
-        let command_width = (modal_width - shortcut_width - gutter_width - 30.0).max(260.0);
-        let key_x = (shortcut_width * 0.28).clamp(84.0, 112.0);
-        let arrow_x = key_x + 22.0;
-        let desc_x = arrow_x + 24.0;
-        let compact_help = modal_width < 900.0;
-        let command_table_width = (command_width - 44.0).max(240.0);
-        let command_col = if compact_help {
-            (command_table_width * 0.72).max(160.0)
-        } else {
-            (command_table_width * 0.30).clamp(150.0, 240.0)
-        };
-        let aliases_col = if compact_help {
-            0.0
-        } else {
-            (command_table_width * 0.17).clamp(90.0, 140.0)
-        };
-        let summary_col = if compact_help {
-            0.0
-        } else {
-            (command_table_width * 0.37).clamp(220.0, 330.0)
-        };
-        let hint_col = if compact_help {
-            (command_table_width - command_col - 10.0).max(110.0)
-        } else {
-            (command_table_width * 0.16).clamp(110.0, 150.0)
-        };
-
-        egui::Area::new("shortcut_help_dialog".into())
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, -20.0])
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(25, 31, 40))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(76, 86, 106)))
-                    .corner_radius(0.0)
-                    .inner_margin(14.0)
-                    .shadow(egui::epaint::Shadow {
-                        offset: [0, 10],
-                        blur: 24,
-                        spread: 0,
-                        color: Color32::from_black_alpha(150),
-                    })
-                    .show(ui, |ui| {
-                        ui.set_width(modal_width);
-                        ui.spacing_mut().item_spacing.y = 2.0;
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new("shortcuts + commands")
-                                    .font(FontId::new(16.0, FontFamily::Monospace))
-                                    .color(Color32::from_rgb(136, 192, 208)),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        RichText::new("[esc] close")
-                                            .font(FontId::new(13.0, FontFamily::Monospace))
-                                            .color(Color32::from_rgb(235, 203, 139)),
-                                    );
-                                },
-                            );
-                        });
-                        ui.add_space(8.0);
-
-                        ui.horizontal_top(|ui| {
-                            ui.vertical(|ui| {
-                                ui.set_width(shortcut_width);
-                                for (title, entries) in shortcut_groups {
-                                    ui.label(
-                                        RichText::new(*title)
-                                            .font(FontId::new(14.0, FontFamily::Monospace))
-                                            .color(Color32::from_rgb(163, 190, 140)),
-                                    );
-                                    ui.add_space(3.0);
-                                    for (key, desc) in *entries {
-                                        let (row_rect, _) = ui.allocate_exact_size(
-                                            Vec2::new(shortcut_width, 15.0),
-                                            egui::Sense::hover(),
-                                        );
-                                        let painter = ui.painter_at(row_rect);
-                                        let y = row_rect.center().y - 0.5;
-                                        painter.text(
-                                            egui::pos2(row_rect.left() + key_x, y),
-                                            egui::Align2::RIGHT_CENTER,
-                                            *key,
-                                            FontId::new(12.5, FontFamily::Monospace),
-                                            Color32::from_rgb(235, 203, 139),
-                                        );
-                                        painter.text(
-                                            egui::pos2(row_rect.left() + arrow_x, y),
-                                            egui::Align2::CENTER_CENTER,
-                                            "→",
-                                            FontId::new(12.5, FontFamily::Monospace),
-                                            Color32::from_rgb(94, 105, 126),
-                                        );
-                                        painter.text(
-                                            egui::pos2(row_rect.left() + desc_x, y),
-                                            egui::Align2::LEFT_CENTER,
-                                            Self::text_for_width(
-                                                Self::compact_shortcut_desc(desc),
-                                                (shortcut_width - desc_x - 4.0).max(24.0),
-                                                12.5,
-                                            ),
-                                            FontId::new(12.5, FontFamily::Monospace),
-                                            Color32::from_rgb(216, 222, 233),
-                                        );
-                                    }
-                                    ui.add_space(7.0);
-                                }
-                            });
-
-                            ui.add_space(gutter_width);
-                            ui.vertical(|ui| {
-                                ui.set_width(command_width);
-                                ui.label(
-                                    RichText::new("available commands")
-                                        .font(FontId::new(14.0, FontFamily::Monospace))
-                                        .color(Color32::from_rgb(163, 190, 140)),
-                                );
-                                ui.add_space(3.0);
-                                let header_height = 16.0;
-                                let row_height = 15.0;
-                                let table_height =
-                                    header_height + COMMAND_SPECS.len() as f32 * row_height + 16.0;
-                                let (table_rect, _) = ui.allocate_exact_size(
-                                    Vec2::new(command_width, table_height),
-                                    egui::Sense::hover(),
-                                );
-                                let painter = ui.painter_at(table_rect).with_clip_rect(table_rect);
-                                painter.rect_filled(table_rect, 0.0, Color32::from_rgb(22, 28, 37));
-                                painter.rect_stroke(
-                                    table_rect,
-                                    0.0,
-                                    Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
-                                    egui::StrokeKind::Outside,
-                                );
-
-                                let left = table_rect.left() + 8.0;
-                                let top = table_rect.top() + 8.0;
-                                let text_y_offset = 0.5;
-                                if compact_help {
-                                    let cols = [command_col, hint_col];
-                                    let col_lefts = [left, left + command_col + 10.0];
-                                    for (idx, header) in ["command", "hint"].iter().enumerate() {
-                                        painter.text(
-                                            egui::pos2(
-                                                col_lefts[idx] + cols[idx] * 0.5,
-                                                top + header_height * 0.5,
-                                            ),
-                                            egui::Align2::CENTER_CENTER,
-                                            *header,
-                                            FontId::new(11.5, FontFamily::Monospace),
-                                            Color32::from_rgb(136, 154, 176),
-                                        );
-                                    }
-
-                                    for (row, spec) in COMMAND_SPECS.iter().enumerate() {
-                                        let row_top = top + header_height + row as f32 * row_height;
-                                        let row_rect = egui::Rect::from_min_size(
-                                            egui::pos2(table_rect.left() + 4.0, row_top),
-                                            Vec2::new(command_width - 8.0, row_height),
-                                        );
-                                        if row % 2 == 0 {
-                                            painter.rect_filled(
-                                                row_rect,
-                                                0.0,
-                                                Color32::from_rgb(38, 47, 61),
-                                            );
-                                        }
-                                        let y = row_rect.center().y - text_y_offset;
-                                        let command = Self::text_for_width(
-                                            &format!(":{}", spec.name),
-                                            command_col - 6.0,
-                                            12.5,
-                                        );
-                                        let hint =
-                                            Self::text_for_width(spec.hint, hint_col - 6.0, 11.5);
-                                        for (idx, (text, color, size)) in [
-                                            (command, Color32::from_rgb(136, 192, 208), 12.5),
-                                            (hint, Color32::from_rgb(235, 203, 139), 11.5),
-                                        ]
-                                        .into_iter()
-                                        .enumerate()
-                                        {
-                                            painter.text(
-                                                egui::pos2(col_lefts[idx] + cols[idx] * 0.5, y),
-                                                egui::Align2::CENTER_CENTER,
-                                                text,
-                                                FontId::new(size, FontFamily::Monospace),
-                                                color,
-                                            );
-                                        }
-                                    }
-                                } else {
-                                    let cols = [command_col, aliases_col, summary_col, hint_col];
-                                    let mut col_lefts = [left, left, left, left];
-                                    for idx in 1..cols.len() {
-                                        col_lefts[idx] = col_lefts[idx - 1] + cols[idx - 1] + 10.0;
-                                    }
-                                    for (idx, header) in
-                                        ["command", "aliases", "summary", "hint"].iter().enumerate()
-                                    {
-                                        painter.text(
-                                            egui::pos2(
-                                                col_lefts[idx] + cols[idx] * 0.5,
-                                                top + header_height * 0.5,
-                                            ),
-                                            egui::Align2::CENTER_CENTER,
-                                            *header,
-                                            FontId::new(11.5, FontFamily::Monospace),
-                                            Color32::from_rgb(136, 154, 176),
-                                        );
-                                    }
-
-                                    for (row, spec) in COMMAND_SPECS.iter().enumerate() {
-                                        let row_top = top + header_height + row as f32 * row_height;
-                                        let row_rect = egui::Rect::from_min_size(
-                                            egui::pos2(table_rect.left() + 4.0, row_top),
-                                            Vec2::new(command_width - 8.0, row_height),
-                                        );
-                                        if row % 2 == 0 {
-                                            painter.rect_filled(
-                                                row_rect,
-                                                0.0,
-                                                Color32::from_rgb(38, 47, 61),
-                                            );
-                                        }
-                                        let y = row_rect.center().y - text_y_offset;
-                                        let aliases = if spec.aliases.is_empty() {
-                                            "".to_string()
-                                        } else {
-                                            spec.aliases.join(", ")
-                                        };
-                                        let command = Self::text_for_width(
-                                            &format!(":{}", spec.name),
-                                            command_col - 6.0,
-                                            12.5,
-                                        );
-                                        let aliases =
-                                            Self::text_for_width(&aliases, aliases_col - 6.0, 11.5);
-                                        let summary = Self::text_for_width(
-                                            spec.summary,
-                                            summary_col - 6.0,
-                                            11.5,
-                                        );
-                                        let hint =
-                                            Self::text_for_width(spec.hint, hint_col - 6.0, 11.5);
-                                        for (idx, (text, color, size)) in [
-                                            (command, Color32::from_rgb(136, 192, 208), 12.5),
-                                            (aliases, Color32::from_rgb(94, 105, 126), 11.5),
-                                            (summary, Color32::from_rgb(136, 154, 176), 11.5),
-                                            (hint, Color32::from_rgb(235, 203, 139), 11.5),
-                                        ]
-                                        .into_iter()
-                                        .enumerate()
-                                        {
-                                            painter.text(
-                                                egui::pos2(col_lefts[idx] + cols[idx] * 0.5, y),
-                                                egui::Align2::CENTER_CENTER,
-                                                text,
-                                                FontId::new(size, FontFamily::Monospace),
-                                                color,
-                                            );
-                                        }
-                                    }
-                                }
-                            });
-                        });
-                    });
-            });
-    }
-
     fn checkbox_preview_icon(ui: &mut egui::Ui, state: CheckboxState) {
         let (rect, _) = ui.allocate_exact_size(Vec2::new(13.0, 13.0), egui::Sense::hover());
         let (fill, stroke) = match state {
@@ -12473,7 +8812,7 @@ impl SlateApp {
         ui.painter().rect_stroke(
             rect,
             2.0,
-            Stroke::new(1.2, stroke),
+            Stroke::new(1.2_f32, stroke),
             egui::StrokeKind::Outside,
         );
         let glyph_rect = rect.shrink(3.2);
@@ -12482,17 +8821,17 @@ impl SlateApp {
             CheckboxState::Doing => {
                 ui.painter().line_segment(
                     [glyph_rect.left_bottom(), glyph_rect.right_top()],
-                    Stroke::new(1.5, stroke),
+                    Stroke::new(1.5_f32, stroke),
                 );
             }
             CheckboxState::Done => {
                 ui.painter().line_segment(
                     [glyph_rect.left_top(), glyph_rect.right_bottom()],
-                    Stroke::new(1.5, stroke),
+                    Stroke::new(1.5_f32, stroke),
                 );
                 ui.painter().line_segment(
                     [glyph_rect.left_bottom(), glyph_rect.right_top()],
-                    Stroke::new(1.5, stroke),
+                    Stroke::new(1.5_f32, stroke),
                 );
             }
         }
@@ -12552,7 +8891,7 @@ impl SlateApp {
                 if start < end {
                     let mut format = TextFormat::simple(font.clone(), color);
                     if underline {
-                        format.underline = Stroke::new(1.0, color);
+                        format.underline = Stroke::new(1.0_f32, color);
                     }
                     sections.push(LayoutSection {
                         leading_space: 0.0,
@@ -12584,9 +8923,9 @@ impl SlateApp {
         ui: &mut egui::Ui,
         rows: &[Vec<String>],
         alignments: &[TableAlignment],
-    ) {
+    ) -> egui::Rect {
         if rows.is_empty() {
-            return;
+            return egui::Rect::NOTHING;
         }
 
         let column_count = rows[0].len();
@@ -12610,6 +8949,10 @@ impl SlateApp {
             Vec2::new(table_width.min(ui.available_width()), table_height),
             egui::Sense::hover(),
         );
+        if !ui.is_rect_visible(rect) {
+            ui.add_space(6.0);
+            return rect;
+        }
         let painter = ui.painter();
         let border = Color32::from_rgb(59, 70, 90);
         let strong_border = Color32::from_rgb(76, 86, 106);
@@ -12666,7 +9009,7 @@ impl SlateApp {
         painter.rect_stroke(
             rect,
             3.0,
-            Stroke::new(1.0, border),
+            Stroke::new(1.0_f32, border),
             egui::StrokeKind::Inside,
         );
         let mut x = rect.left();
@@ -12674,7 +9017,7 @@ impl SlateApp {
             x += *width;
             painter.line_segment(
                 [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                Stroke::new(1.0, Color32::from_rgb(46, 56, 72)),
+                Stroke::new(1.0_f32, Color32::from_rgb(46, 56, 72)),
             );
         }
         if rows.len() > 1 {
@@ -12684,17 +9027,18 @@ impl SlateApp {
                     egui::pos2(rect.left(), header_y),
                     egui::pos2(rect.right(), header_y),
                 ],
-                Stroke::new(1.0, strong_border),
+                Stroke::new(1.0_f32, strong_border),
             );
         }
         for row_index in 2..rows.len() {
             let y = rect.top() + row_index as f32 * row_height;
             painter.line_segment(
                 [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-                Stroke::new(1.0, Color32::from_rgb(36, 45, 58)),
+                Stroke::new(1.0_f32, Color32::from_rgb(36, 45, 58)),
             );
         }
         ui.add_space(6.0);
+        rect
     }
 
     fn inline_code_preview_label(ui: &mut egui::Ui, line: &str) -> bool {
@@ -12763,156 +9107,19 @@ impl SlateApp {
         true
     }
 
-    fn preview_ui(&self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            let lines = self.buffer.as_str().lines().collect::<Vec<_>>();
-            let mut index = 0;
-            let mut in_code = false;
-            let mut code_language = String::new();
-            while index < lines.len() {
-                let line = lines[index];
-                let trimmed = line.trim_start();
-                if let Some(fence) = parse_fenced_code_marker(line) {
-                    if in_code {
-                        in_code = false;
-                        code_language.clear();
-                    } else {
-                        in_code = true;
-                        code_language = fence.language.to_string();
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new("code")
-                                    .font(FontId::new(12.0, FontFamily::Monospace))
-                                    .color(Color32::from_rgb(136, 154, 176)),
-                            );
-                            if !code_language.is_empty() {
-                                ui.label(
-                                    RichText::new(&code_language)
-                                        .font(FontId::new(12.0, FontFamily::Monospace))
-                                        .color(Color32::from_rgb(235, 203, 139)),
-                                );
-                            }
-                        });
-                    }
-                    index += 1;
-                    continue;
-                }
-
-                if in_code {
-                    egui::Frame::new()
-                        .fill(Color32::from_rgb(25, 31, 40))
-                        .inner_margin(egui::Margin::symmetric(8, 3))
-                        .show(ui, |ui| {
-                            ui.label(
-                                RichText::new(line)
-                                    .font(FontId::new(14.0, FontFamily::Monospace))
-                                    .color(Color32::from_rgb(216, 222, 233)),
-                            );
-                        });
-                } else if is_markdown_table_start(line, lines.get(index + 1).copied()) {
-                    let mut rows = vec![split_markdown_table_row(line).unwrap_or_default()];
-                    let alignments = parse_markdown_table_separator(lines[index + 1])
-                        .unwrap_or_else(|| vec![TableAlignment::Left; rows[0].len()]);
-                    index += 2;
-                    while let Some(next_line) = lines.get(index).copied() {
-                        let Some(cells) = split_markdown_table_row(next_line) else {
-                            break;
-                        };
-                        if cells.len() != rows[0].len() {
-                            break;
-                        }
-                        rows.push(cells);
-                        index += 1;
-                    }
-                    Self::markdown_table_preview(ui, &rows, &alignments);
-                    continue;
-                } else if let Some(heading) = parse_heading_line(line) {
-                    let size = match heading.level {
-                        1 => 28.0,
-                        2 => 22.0,
-                        3 => 18.0,
-                        _ => 16.0,
-                    };
-                    let color = match heading.level {
-                        1 => Color32::from_rgb(235, 203, 139),
-                        2 => Color32::from_rgb(180, 142, 173),
-                        3 => Color32::from_rgb(136, 192, 208),
-                        _ => Color32::from_rgb(216, 222, 233),
-                    };
-                    ui.add_space(if heading.level <= 2 { 4.0 } else { 2.0 });
-                    ui.label(RichText::new(heading.text).size(size).strong().color(color));
-                    if heading.level <= 2 {
-                        ui.separator();
-                    }
-                } else if is_markdown_separator(line) {
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.add_space(6.0);
-                } else if let Some(blockquote) = parse_blockquote_line(line) {
-                    ui.horizontal(|ui| {
-                        ui.add_space((blockquote.depth.saturating_sub(1) as f32) * 8.0);
-                        let (bar_rect, _) =
-                            ui.allocate_exact_size(Vec2::new(3.0, 20.0), egui::Sense::hover());
-                        ui.painter()
-                            .rect_filled(bar_rect, 1.5, Color32::from_rgb(136, 192, 208));
-                        ui.add_space(8.0);
-                        ui.label(
-                            RichText::new(blockquote.text)
-                                .size(15.0)
-                                .color(Color32::from_rgb(190, 200, 216)),
-                        );
-                    });
-                } else if let Some(checkbox) = parse_checkbox_line(line) {
-                    ui.horizontal(|ui| {
-                        if !checkbox.indent.is_empty() {
-                            ui.label(
-                                RichText::new(checkbox.indent)
-                                    .font(FontId::new(15.0, FontFamily::Monospace)),
-                            );
-                        }
-                        if !checkbox.task_prefix.is_empty() {
-                            ui.label(
-                                RichText::new(checkbox.task_prefix)
-                                    .font(FontId::new(15.0, FontFamily::Monospace))
-                                    .color(Color32::from_rgb(136, 154, 176)),
-                            );
-                        }
-                        Self::checkbox_preview_icon(ui, checkbox.state);
-                        ui.label(RichText::new(checkbox.text).size(15.0));
-                    });
-                } else if let Some(list) = parse_list_line(line) {
-                    ui.horizontal(|ui| {
-                        if !list.indent.is_empty() {
-                            ui.label(
-                                RichText::new(list.indent)
-                                    .font(FontId::new(15.0, FontFamily::Monospace)),
-                            );
-                        }
-                        let marker = if list.ordered { list.marker } else { "•" };
-                        ui.label(
-                            RichText::new(marker)
-                                .font(FontId::new(15.0, FontFamily::Monospace))
-                                .color(if list.ordered {
-                                    Color32::from_rgb(235, 203, 139)
-                                } else {
-                                    Color32::from_rgb(136, 192, 208)
-                                }),
-                        );
-                        ui.label(RichText::new(list.text).size(15.0));
-                    });
-                } else if trimmed.is_empty() {
-                    ui.add_space(8.0);
-                } else if !Self::markdown_link_preview_label(ui, line)
-                    && !Self::inline_code_preview_label(ui, line)
-                {
-                    ui.label(RichText::new(line).size(15.0));
-                }
-                index += 1;
-            }
+    fn prepare_preview_wheel_sync(&mut self, ui: &egui::Ui) {
+        let valid = self.preview_sync.key.is_some_and(|(id, revision, _, _)| {
+            id == self.buffer.identity && revision == self.buffer.revision
         });
+        let delta = ui.input(|i| i.smooth_scroll_delta.y);
+        if valid && delta != 0.0 && ui.rect_contains_pointer(ui.max_rect()) {
+            let offset =
+                (self.preview_sync.offset - delta).clamp(0.0, self.preview_sync.max_scroll);
+            self.editor_view
+                .set_scroll_position(self.preview_sync.position_for(offset));
+        }
     }
+
 }
 
 impl SlateApp {
@@ -12955,7 +9162,7 @@ impl SlateApp {
             .show(ctx, |ui| {
                 egui::Frame::new()
                     .fill(Color32::from_rgb(13, 17, 24))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(53, 66, 86)))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(53, 66, 86)))
                     .corner_radius(7.0)
                     .inner_margin(egui::Margin::symmetric(7, 6))
                     .show(ui, |ui| {
@@ -13080,7 +9287,7 @@ impl SlateApp {
             .show(ctx, |ui| {
                 egui::Frame::new()
                     .fill(Color32::from_rgb(13, 17, 24))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(53, 66, 86)))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(53, 66, 86)))
                     .corner_radius(7.0)
                     .inner_margin(egui::Margin::symmetric(7, 6))
                     .show(ui, |ui| {
@@ -13131,816 +9338,89 @@ impl SlateApp {
             });
     }
 
-    fn flow_item_edit_dialog(&mut self, ctx: &egui::Context) {
-        if self.flow_item_edit.is_none() {
-            return;
-        }
-
-        let mut save = false;
-        let mut cancel = false;
-        let mut open_org = None;
-        let mut confirm_org = false;
-        let mut org_next = false;
-        let mut org_previous = false;
-        let mut org_backspace = false;
-        let mut org_typed = String::new();
-
-        ctx.input_mut(|input| {
-            if input.consume_key(egui::Modifiers::CTRL, Key::Enter) {
-                save = true;
-            }
-            if input.consume_key(egui::Modifiers::NONE, Key::Escape) {
-                if self
-                    .flow_item_edit
-                    .as_ref()
-                    .is_some_and(|edit| edit.org_mode.is_some())
-                {
-                    if let Some(edit) = self.flow_item_edit.as_mut() {
-                        edit.close_org();
-                    }
-                } else {
-                    cancel = true;
-                }
-            }
-            let org_open = self
-                .flow_item_edit
-                .as_ref()
-                .is_some_and(|edit| edit.org_mode.is_some());
-            if org_open && input.consume_key(egui::Modifiers::NONE, Key::Tab) {
-                org_next = true;
-            }
-            if org_open && input.consume_key(egui::Modifiers::SHIFT, Key::Tab) {
-                org_previous = true;
-            }
-            if org_open
-                && (input.consume_key(egui::Modifiers::NONE, Key::Enter)
-                    || input.consume_key(egui::Modifiers::NONE, Key::Space))
-            {
-                confirm_org = true;
-            }
-            if org_open && input.consume_key(egui::Modifiers::NONE, Key::Backspace) {
-                org_backspace = true;
-            }
-            for event in &input.events {
-                if let egui::Event::Text(text) = event {
-                    if text == "#" {
-                        open_org = Some(AgendaOrgMode::Tag);
-                    } else if text == "@" {
-                        open_org = Some(AgendaOrgMode::Project);
-                    } else if self
-                        .flow_item_edit
-                        .as_ref()
-                        .is_some_and(|edit| edit.org_mode.is_some())
-                    {
-                        org_typed.push_str(text);
-                    }
-                }
-            }
-        });
-
-        let all_values = |mode: AgendaOrgMode, items: &[AgendaItem]| -> Vec<String> {
-            items
-                .iter()
-                .flat_map(move |item| match mode {
-                    AgendaOrgMode::Tag => item.tags.clone(),
-                    AgendaOrgMode::Project => item.projects.clone(),
-                })
-                .collect()
-        };
-
-        if let Some(edit) = self.flow_item_edit.as_mut() {
-            if let Some(mode) = open_org {
-                edit.open_org(mode);
-            }
-            if let Some(mode) = edit.org_mode {
-                if org_backspace {
-                    edit.org_query.pop();
-                    edit.selected_org_suggestion = 0;
-                }
-                if !org_typed.is_empty() {
-                    for ch in org_typed.chars() {
-                        if ch.is_alphanumeric() || matches!(ch, '-' | '_' | '/' | '.') {
-                            edit.org_query.push(ch);
-                        }
-                    }
-                    edit.selected_org_suggestion = 0;
-                }
-                let suggestions =
-                    organization_suggestions(all_values(mode, &self.agenda_items), &edit.org_query);
-                let len = suggestions.len().max(1);
-                if org_next {
-                    edit.selected_org_suggestion = (edit.selected_org_suggestion + 1) % len;
-                }
-                if org_previous {
-                    edit.selected_org_suggestion = if edit.selected_org_suggestion == 0 {
-                        len.saturating_sub(1)
-                    } else {
-                        edit.selected_org_suggestion.saturating_sub(1)
-                    };
-                }
-                edit.selected_org_suggestion =
-                    edit.selected_org_suggestion.min(len.saturating_sub(1));
-                if confirm_org {
-                    let value = suggestions
-                        .get(edit.selected_org_suggestion)
-                        .cloned()
-                        .unwrap_or_else(|| edit.org_query.trim().to_string());
-                    if let Some(token) = organization_token(mode, &value) {
-                        edit.cursor_char_index = replace_org_token_at_cursor(
-                            &mut edit.text,
-                            edit.cursor_char_index,
-                            mode,
-                            &token,
-                        );
-                    }
-                    edit.close_org();
-                }
-            }
-        }
-
-        let screen_rect = ctx.content_rect();
-        ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Foreground,
-            "flow_item_edit_scrim".into(),
-        ))
-        .rect_filled(screen_rect, 0.0, Color32::from_black_alpha(90));
-
-        let mut commit_payload = None;
-        egui::Area::new("flow_item_edit_dialog".into())
-            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(13, 17, 24))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(105, 117, 148)))
-                    .corner_radius(9.0)
-                    .inner_margin(egui::Margin::symmetric(12, 10))
-                    .show(ui, |ui| {
-                        ui.set_min_width(720.0);
-                        let row_font = FontId::new(14.0, FontFamily::Monospace);
-                        let small_font = FontId::new(12.0, FontFamily::Monospace);
-                        let title_font = FontId::new(15.0, FontFamily::Monospace);
-                        let accent = Color32::from_rgb(154, 185, 235);
-                        let accent_soft = Color32::from_rgb(42, 56, 76);
-                        let text = Color32::from_rgb(218, 224, 235);
-                        let muted = Color32::from_rgb(126, 136, 157);
-                        let panel = Color32::from_rgb(17, 22, 31);
-                        let field = Color32::from_rgb(10, 15, 22);
-                        let line = Color32::from_rgb(43, 53, 68);
-
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new("Flow item")
-                                    .font(title_font.clone())
-                                    .color(text),
-                            );
-                            ui.add_space(8.0);
-                            egui::Frame::new()
-                                .fill(Color32::from_rgb(24, 30, 42))
-                                .corner_radius(999.0)
-                                .inner_margin(egui::Margin::symmetric(7, 2))
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        RichText::new("Ctrl+Enter save")
-                                            .font(small_font.clone())
-                                            .color(accent),
-                                    );
-                                });
-                            ui.label(
-                                RichText::new("Esc cancel · #/@ autocomplete")
-                                    .font(small_font.clone())
-                                    .color(muted),
-                            );
-                        });
-                        ui.add_space(10.0);
-                        if let Some(edit) = self.flow_item_edit.as_mut() {
-                            let output = egui::Frame::new()
-                                .fill(field)
-                                .stroke(Stroke::new(1.0, line))
-                                .corner_radius(5.0)
-                                .inner_margin(egui::Margin::symmetric(8, 4))
-                                .show(ui, |ui| {
-                                    TextEdit::singleline(&mut edit.text)
-                                        .font(row_font.clone())
-                                        .desired_width(ui.available_width())
-                                        .show(ui)
-                                })
-                                .inner;
-                            if let Some(cursor) =
-                                output.cursor_range.and_then(|range| range.single())
-                            {
-                                edit.cursor_char_index = cursor.index;
-                            }
-                            if edit.focus_once {
-                                output.response.request_focus();
-                                edit.focus_once = false;
-                            }
-                            if let Some(mode) = edit.org_mode {
-                                if let Some(query) =
-                                    org_query_at_cursor(&edit.text, edit.cursor_char_index, mode)
-                                {
-                                    edit.org_query = query;
-                                }
-                            }
-                            if let Some(mode) = edit.org_mode {
-                                ui.add_space(9.0);
-                                let prefix = match mode {
-                                    AgendaOrgMode::Tag => "#",
-                                    AgendaOrgMode::Project => "@",
-                                };
-                                let mode_label = match mode {
-                                    AgendaOrgMode::Tag => "tags",
-                                    AgendaOrgMode::Project => "projects",
-                                };
-                                let suggestions = organization_suggestions(
-                                    self.agenda_items.iter().flat_map(|item| match mode {
-                                        AgendaOrgMode::Tag => item.tags.clone(),
-                                        AgendaOrgMode::Project => item.projects.clone(),
-                                    }),
-                                    &edit.org_query,
-                                );
-                                egui::Frame::new()
-                                    .fill(panel)
-                                    .stroke(Stroke::new(1.0, Color32::from_rgb(29, 37, 50)))
-                                    .corner_radius(6.0)
-                                    .inner_margin(egui::Margin::symmetric(9, 7))
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new(mode_label)
-                                                    .font(small_font.clone())
-                                                    .color(muted),
-                                            );
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "{prefix}{}",
-                                                    edit.org_query
-                                                ))
-                                                .font(row_font.clone())
-                                                .color(accent),
-                                            );
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    ui.label(
-                                                        RichText::new(
-                                                            "Tab cycle · Enter add · Esc close",
-                                                        )
-                                                        .font(small_font.clone())
-                                                        .color(muted),
-                                                    );
-                                                },
-                                            );
-                                        });
-                                        ui.add_space(6.0);
-                                        ui.horizontal_wrapped(|ui| {
-                                            for (index, suggestion) in
-                                                suggestions.iter().take(8).enumerate()
-                                            {
-                                                let selected =
-                                                    index == edit.selected_org_suggestion;
-                                                egui::Frame::new()
-                                                    .fill(if selected {
-                                                        accent_soft
-                                                    } else {
-                                                        Color32::from_rgb(23, 29, 39)
-                                                    })
-                                                    .stroke(Stroke::new(
-                                                        1.0,
-                                                        if selected {
-                                                            Color32::from_rgb(91, 124, 170)
-                                                        } else {
-                                                            Color32::from_rgb(28, 35, 47)
-                                                        },
-                                                    ))
-                                                    .corner_radius(999.0)
-                                                    .inner_margin(egui::Margin::symmetric(8, 3))
-                                                    .show(ui, |ui| {
-                                                        ui.label(
-                                                            RichText::new(format!(
-                                                                "{prefix}{suggestion}"
-                                                            ))
-                                                            .font(small_font.clone())
-                                                            .color(if selected {
-                                                                text
-                                                            } else {
-                                                                muted
-                                                            }),
-                                                        );
-                                                    });
-                                            }
-                                        });
-                                    });
-                            }
-                            if save {
-                                commit_payload = Some((edit.item_index, edit.text.clone()));
-                            }
-                        }
-                    });
-            });
-
-        if cancel {
-            self.flow_item_edit = None;
-            self.status = "Flow item edit cancelled".to_string();
-        }
-        if let Some((index, replacement)) = commit_payload {
-            self.confirm_flow_item_edit(index, replacement, ctx);
-        }
-    }
-
-    fn agenda_dialog(&mut self, ctx: &egui::Context) {
-        if !self.agenda_open {
-            return;
-        }
-
-        let today = Local::now().date_naive();
-        let week_start = self.agenda_week_start();
-        let week_end = week_start + Duration::days(6);
-        let title = format!("week-agenda (W{}):", week_start.iso_week().week());
-        let mut clicked_dated_row = None;
-        let mut clicked_inbox_row = None;
-        let mut clicked_flat_row = None;
-        let mut clicked_task_index = None;
-        let mut open_clicked = false;
-        let mut toggle_clicked_day = None;
-        let mut org_anchor_rect = None;
-        let scroll_to_selected = self.agenda_scroll_to_selected;
-
-        egui::Area::new("agenda_dialog".into())
-            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                let rect = ui.ctx().content_rect();
-                let (width, height) = if self.standalone_agenda {
-                    (
-                        (rect.width() * 0.96).clamp(620.0, 1200.0),
-                        (rect.height() * 0.94).clamp(420.0, 900.0),
-                    )
-                } else {
-                    (
-                        (rect.width() * 0.78).clamp(560.0, 920.0),
-                        (rect.height() * 0.82).clamp(420.0, 760.0),
-                    )
-                };
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(19, 23, 31))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(67, 76, 94)))
-                    .corner_radius(8.0)
-                    .inner_margin(egui::Margin::same(14))
-                    .show(ui, |ui| {
-                        ui.set_min_size(Vec2::new(width, height));
-                        ui.set_max_size(Vec2::new(width, height));
-                        let title_font = FontId::new(16.0, FontFamily::Monospace);
-                        let row_font = FontId::new(14.0, FontFamily::Monospace);
-                        let accent = Color32::from_rgb(180, 160, 235);
-                        let dim = Color32::from_rgb(118, 112, 150);
-                        let text = Color32::from_rgb(216, 222, 233);
-                        let muted = Color32::from_rgb(143, 151, 170);
-                        let today_bg = Color32::from_rgb(38, 47, 61);
-                        let selected_bg = Color32::from_rgb(49, 61, 79);
-                        let inactive_bg = Color32::from_rgb(27, 32, 42);
-                        let separator = Color32::from_rgb(49, 56, 72);
-
-                        ui.horizontal(|ui| {
-                            for tab in AgendaTab::ALL {
-                                let active = self.agenda_tab == tab;
-                                let label = format!(" {} ", tab.label());
-                                let tab_text = RichText::new(label)
-                                    .font(row_font.clone())
-                                    .color(if active { text } else { muted });
-                                let response = egui::Frame::new()
-                                    .fill(if active { selected_bg } else { inactive_bg })
-                                    .stroke(Stroke::new(
-                                        1.0,
-                                        if active {
-                                            accent
-                                        } else {
-                                            Color32::from_rgb(37, 44, 58)
-                                        },
-                                    ))
-                                    .corner_radius(4.0)
-                                    .inner_margin(egui::Margin::symmetric(8, 3))
-                                    .show(ui, |ui| ui.label(tab_text))
-                                    .response;
-                                let _ = response;
-                                ui.add_space(4.0);
-                            }
-                            ui.label(
-                                RichText::new("Shift+Tab cambia vista")
-                                    .font(row_font.clone())
-                                    .color(dim),
-                            );
-                        });
-                        ui.add_space(8.0);
-
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(title).font(title_font).color(text));
-                            ui.label(
-                                RichText::new(format!(
-                                    "{}–{}",
-                                    week_start.format("%-d %B"),
-                                    week_end.format("%-d %B %Y")
-                                ))
-                                .font(row_font.clone())
-                                .color(dim),
-                            );
-                            ui.label(
-                                RichText::new(match self.agenda_focus {
-                                    AgendaFocus::Dated => "focus: dated week",
-                                    AgendaFocus::Inbox => "focus: no-date",
-                                })
-                                .font(row_font.clone())
-                                .color(accent),
-                            );
-                            ui.label(
-                                RichText::new(if self.agenda_show_done {
-                                    "done: shown"
-                                } else {
-                                    "done: hidden"
-                                })
-                                .font(row_font.clone())
-                                .color(muted),
-                            );
-                            if !self.agenda_filter.is_empty() {
-                                ui.label(
-                                    RichText::new(format!("filter: {}", self.agenda_filter))
-                                        .font(row_font.clone())
-                                        .color(accent),
-                                );
-                            }
-                        });
-                        ui.add_space(8.0);
-
-                        if self.agenda_tab == AgendaTab::Agenda {
-                            let dated_rows = self.agenda_dated_rows();
-                            let dated_panel_height = (height * 0.42).clamp(160.0, 310.0);
-                            let dated_title_rect = ui
-                                .allocate_exact_size(
-                                    Vec2::new(ui.available_width(), 22.0),
-                                    egui::Sense::hover(),
-                                )
-                                .0;
-                            let dated_active = self.agenda_focus == AgendaFocus::Dated;
-                            ui.painter().rect_filled(
-                                dated_title_rect,
-                                0.0,
-                                if dated_active { today_bg } else { inactive_bg },
-                            );
-                            ui.painter().text(
-                                egui::pos2(
-                                    dated_title_rect.left() + 6.0,
-                                    dated_title_rect.center().y,
-                                ),
-                                egui::Align2::LEFT_CENTER,
-                                "Dated tasks · ↑↓ row · Enter expand/open · ←→ week",
-                                row_font.clone(),
-                                if dated_active { text } else { muted },
-                            );
-
-                            egui::ScrollArea::vertical()
-                                .id_salt("agenda_dated_scroll")
-                                .max_height(dated_panel_height)
-                                .show(ui, |ui| {
-                                    for (row_index, row) in dated_rows.iter().copied().enumerate() {
-                                        let selected = self.agenda_focus == AgendaFocus::Dated
-                                            && self.agenda_selected_dated_row == row_index;
-                                        match row {
-                                            AgendaDatedRow::Day(date) => {
-                                                let count = self.agenda_items_for_date(date).len();
-                                                let response = agenda::day_row(
-                                                    ui,
-                                                    row_index,
-                                                    date,
-                                                    count,
-                                                    self.agenda_expanded_dates.contains(&date),
-                                                    date == today,
-                                                    selected,
-                                                    scroll_to_selected && selected,
-                                                    selected_bg,
-                                                    today_bg,
-                                                    row_font.clone(),
-                                                    text,
-                                                    muted,
-                                                    accent,
-                                                );
-                                                if response.clicked() {
-                                                    clicked_dated_row = Some(row_index);
-                                                    open_clicked = false;
-                                                }
-                                                if response.double_clicked() {
-                                                    clicked_dated_row = Some(row_index);
-                                                    toggle_clicked_day = Some(date);
-                                                }
-                                            }
-                                            AgendaDatedRow::Task(index) => {
-                                                let response = agenda::task_row(
-                                                    ui,
-                                                    index,
-                                                    selected,
-                                                    scroll_to_selected && selected,
-                                                    selected_bg,
-                                                    row_font.clone(),
-                                                    text,
-                                                    accent,
-                                                    &self.agenda_items[index],
-                                                );
-                                                if selected && self.agenda_org_mode.is_some() {
-                                                    org_anchor_rect = Some(response.rect);
-                                                }
-                                                if response.clicked() {
-                                                    clicked_dated_row = Some(row_index);
-                                                    clicked_task_index = Some(index);
-                                                    open_clicked = false;
-                                                }
-                                                if response.double_clicked() {
-                                                    clicked_dated_row = Some(row_index);
-                                                    clicked_task_index = Some(index);
-                                                    open_clicked = true;
-                                                }
-                                            }
-                                        }
-                                    }
-                                });
-
-                            ui.add_space(8.0);
-                            let (rule_rect, _) = ui.allocate_exact_size(
-                                Vec2::new(ui.available_width(), 1.0),
-                                egui::Sense::hover(),
-                            );
-                            ui.painter().rect_filled(rule_rect, 0.0, separator);
-                            ui.add_space(8.0);
-
-                            let inbox_indices = self.agenda_inbox_item_indices();
-                            let inbox_title_rect = ui
-                                .allocate_exact_size(
-                                    Vec2::new(ui.available_width(), 22.0),
-                                    egui::Sense::hover(),
-                                )
-                                .0;
-                            let inbox_active = self.agenda_focus == AgendaFocus::Inbox;
-                            ui.painter().rect_filled(
-                                inbox_title_rect,
-                                0.0,
-                                if inbox_active { today_bg } else { inactive_bg },
-                            );
-                            ui.painter().text(
-                            egui::pos2(inbox_title_rect.left() + 6.0, inbox_title_rect.center().y),
-                            egui::Align2::LEFT_CENTER,
-                            format!(
-                                "No-date tasks · {} item{} · Tab switches segment · x toggles done",
-                                inbox_indices.len(),
-                                if inbox_indices.len() == 1 { "" } else { "s" }
-                            ),
-                            row_font.clone(),
-                            if inbox_active { text } else { muted },
-                        );
-
-                            let inbox_height = (ui.available_height() - 4.0).max(80.0);
-                            egui::ScrollArea::vertical()
-                                .id_salt("agenda_inbox_scroll")
-                                .max_height(inbox_height)
-                                .show(ui, |ui| {
-                                    if inbox_indices.is_empty() {
-                                        ui.add_space(14.0);
-                                        ui.label(
-                                            RichText::new("No tasks without date.")
-                                                .font(row_font.clone())
-                                                .color(dim),
-                                        );
-                                    }
-                                    for (position, index) in
-                                        inbox_indices.iter().copied().enumerate()
-                                    {
-                                        let selected = self.agenda_focus == AgendaFocus::Inbox
-                                            && self.agenda_selected_inbox_item == position;
-                                        let response = agenda::task_row(
-                                            ui,
-                                            index,
-                                            selected,
-                                            scroll_to_selected && selected,
-                                            selected_bg,
-                                            row_font.clone(),
-                                            text,
-                                            accent,
-                                            &self.agenda_items[index],
-                                        );
-                                        if selected && self.agenda_org_mode.is_some() {
-                                            org_anchor_rect = Some(response.rect);
-                                        }
-                                        if response.clicked() {
-                                            clicked_inbox_row = Some(position);
-                                            clicked_task_index = Some(index);
-                                            open_clicked = false;
-                                        }
-                                        if response.double_clicked() {
-                                            clicked_inbox_row = Some(position);
-                                            clicked_task_index = Some(index);
-                                            open_clicked = true;
-                                        }
-                                    }
-                                });
-                        } else {
-                            let flat_indices = self.agenda_flat_item_indices();
-                            let tab_index = self.agenda_tab.index();
-                            let title_rect = ui
-                                .allocate_exact_size(
-                                    Vec2::new(ui.available_width(), 22.0),
-                                    egui::Sense::hover(),
-                                )
-                                .0;
-                            ui.painter().rect_filled(title_rect, 0.0, today_bg);
-                            ui.painter().text(
-                                egui::pos2(title_rect.left() + 6.0, title_rect.center().y),
-                                egui::Align2::LEFT_CENTER,
-                                format!(
-                                    "{} · {} item{} · ↑↓ row · Enter open · Shift+Tab tab",
-                                    self.agenda_tab.label(),
-                                    flat_indices.len(),
-                                    if flat_indices.len() == 1 { "" } else { "s" }
-                                ),
-                                row_font.clone(),
-                                text,
-                            );
-
-                            let flat_height = (ui.available_height() - 4.0).max(120.0);
-                            egui::ScrollArea::vertical()
-                                .id_salt(format!("agenda_{}_scroll", self.agenda_tab.label()))
-                                .max_height(flat_height)
-                                .show(ui, |ui| {
-                                    if flat_indices.is_empty() {
-                                        ui.add_space(14.0);
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "No {} items.",
-                                                self.agenda_tab.label().to_ascii_lowercase()
-                                            ))
-                                            .font(row_font.clone())
-                                            .color(dim),
-                                        );
-                                    }
-                                    for (position, index) in
-                                        flat_indices.iter().copied().enumerate()
-                                    {
-                                        let selected =
-                                            self.agenda_selected_tab_items[tab_index] == position;
-                                        let response = agenda::task_row(
-                                            ui,
-                                            index,
-                                            selected,
-                                            scroll_to_selected && selected,
-                                            selected_bg,
-                                            row_font.clone(),
-                                            text,
-                                            accent,
-                                            &self.agenda_items[index],
-                                        );
-                                        if selected && self.agenda_org_mode.is_some() {
-                                            org_anchor_rect = Some(response.rect);
-                                        }
-                                        if response.clicked() {
-                                            clicked_flat_row = Some(position);
-                                            clicked_task_index = Some(index);
-                                            open_clicked = false;
-                                        }
-                                        if response.double_clicked() {
-                                            clicked_flat_row = Some(position);
-                                            clicked_task_index = Some(index);
-                                            open_clicked = true;
-                                        }
-                                    }
-                                });
-                        }
-                    });
-            });
-
-        if let (Some(mode), Some(anchor_rect)) = (self.agenda_org_mode, org_anchor_rect) {
-            let screen_rect = ctx.content_rect();
-            let popup_width = 380.0;
-            let popup_height = 82.0;
-            let x = (anchor_rect.left() + anchor_rect.width() * 0.48)
-                .min(screen_rect.right() - popup_width - 18.0)
-                .max(screen_rect.left() + 18.0);
-            let mut y = anchor_rect.bottom() + 4.0;
-            if y + popup_height > screen_rect.bottom() - 18.0 {
-                y = (anchor_rect.top() - popup_height - 4.0).max(screen_rect.top() + 18.0);
-            }
-            ctx.layer_painter(egui::LayerId::new(
-                egui::Order::Foreground,
-                "agenda_org_scrim".into(),
-            ))
-            .rect_filled(screen_rect, 0.0, Color32::from_black_alpha(72));
-
-            let prefix = match mode {
-                AgendaOrgMode::Tag => "#",
-                AgendaOrgMode::Project => "@",
-            };
-            let suggestions = self.agenda_org_suggestions();
-            egui::Area::new("agenda_org_autocomplete".into())
-                .fixed_pos(egui::pos2(x, y))
-                .order(egui::Order::Foreground)
-                .show(ctx, |ui| {
-                    let row_font = FontId::new(14.0, FontFamily::Monospace);
-                    let accent = Color32::from_rgb(180, 160, 235);
-                    let text = Color32::from_rgb(216, 222, 233);
-                    let muted = Color32::from_rgb(143, 151, 170);
-                    let dim = Color32::from_rgb(118, 112, 150);
-                    let selected_bg = Color32::from_rgb(49, 61, 79);
-                    let inactive_bg = Color32::from_rgb(27, 32, 42);
-                    egui::Frame::new()
-                        .fill(Color32::from_rgb(15, 19, 27))
-                        .stroke(Stroke::new(1.0, accent))
-                        .corner_radius(6.0)
-                        .inner_margin(egui::Margin::symmetric(8, 6))
-                        .show(ui, |ui| {
-                            ui.set_min_width(popup_width);
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(format!("{prefix}{}", self.agenda_org_query))
-                                        .font(row_font.clone())
-                                        .color(accent),
-                                );
-                                ui.label(
-                                    RichText::new("Tab cycle · ↑↓ select · Enter add · Esc cancel")
-                                        .font(row_font.clone())
-                                        .color(dim),
-                                );
-                            });
-                            ui.add_space(4.0);
-                            ui.horizontal_wrapped(|ui| {
-                                for (index, suggestion) in suggestions.iter().take(8).enumerate() {
-                                    let selected = index == self.selected_agenda_org_suggestion;
-                                    let chip = RichText::new(format!(" {prefix}{suggestion} "))
-                                        .font(row_font.clone())
-                                        .color(if selected { text } else { muted });
-                                    egui::Frame::new()
-                                        .fill(if selected { selected_bg } else { inactive_bg })
-                                        .corner_radius(4.0)
-                                        .inner_margin(egui::Margin::symmetric(4, 2))
-                                        .show(ui, |ui| {
-                                            ui.label(chip);
-                                        });
-                                    ui.add_space(4.0);
-                                }
-                            });
-                        });
-                });
-        }
-
-        self.flow_item_edit_dialog(ctx);
-
-        if let Some(row) = clicked_dated_row {
-            self.agenda_focus = AgendaFocus::Dated;
-            self.agenda_selected_dated_row = row;
-            self.agenda_scroll_to_selected = false;
-        }
-        if let Some(row) = clicked_inbox_row {
-            self.agenda_focus = AgendaFocus::Inbox;
-            self.agenda_selected_inbox_item = row;
-            self.agenda_scroll_to_selected = false;
-        }
-        if let Some(row) = clicked_flat_row {
-            self.agenda_selected_tab_items[self.agenda_tab.index()] = row;
-            self.agenda_scroll_to_selected = false;
-        }
-        if let Some(index) = clicked_task_index {
-            self.selected_agenda_item = index;
-            if open_clicked {
-                self.jump_to_agenda_item_index(index);
-                if self.standalone_agenda && !self.agenda_open {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            }
-        }
-        if let Some(date) = toggle_clicked_day {
-            if !self.agenda_expanded_dates.insert(date) {
-                self.agenda_expanded_dates.remove(&date);
-            }
-            self.clamp_agenda_selection();
-        }
-        self.agenda_scroll_to_selected = false;
-    }
 }
 
 impl eframe::App for SlateApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.observe_document_safety(0.0, true);
         self.remember_current_cursor_position();
-        if self.scratch_modal_open || !self.scratch_buffer.as_str().trim().is_empty() {
-            self.archive_scratch_modal();
+        if !self.discard_on_exit {
+            if self.scratch_modal_open || !self.scratch_buffer.as_str().is_empty() {
+                self.archive_scratch_modal();
+            }
+            self.append_to_scratch_archive();
         }
-        self.append_to_scratch_archive();
+        self.observe_document_safety(0.0, true);
+        self.document_safety.flush();
         let _ = self.save_settings();
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let started = std::time::Instant::now();
         let ctx = ui.ctx().clone();
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title()));
+        window_drag::note_frame();
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F12)) {
+            self.perf_hud.toggle();
+        }
+        let had_input = ctx.input(|input| {
+            input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Text(_)
+                        | egui::Event::Paste(_)
+                        | egui::Event::Key { pressed: true, .. }
+                )
+            })
+        });
+        self.ui_frame(ui);
+        self.perf_hud
+            .record_frame(started.elapsed(), had_input, frame.info().cpu_usage);
+        if self.perf_hud.visible {
+            let stats = perf_hud::DocumentStats {
+                bytes: self.buffer.as_str().len(),
+                lines: self.buffer.line_count(),
+                undo_bytes: self.buffer.undo_history_bytes(),
+            };
+            self.perf_hud.show(&ctx, &stats);
+        }
+    }
+}
+
+impl SlateApp {
+    fn ui_frame(&mut self, ui: &mut egui::Ui) {
+        let mut ui_timing = perf_log::ui_frame();
+        let ctx = ui.ctx().clone();
+        let title = self.title();
+        if title != self.last_window_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_window_title = title;
+        }
         self.publish_active_flow_buffer_heartbeat();
-        self.poll_flow_background_rescan();
+        if !self.standalone_agenda
+            && self
+                .path
+                .as_ref()
+                .is_some_and(|p| flow::should_index_flow_path(p))
+        {
+            ctx.request_repaint_after(std::time::Duration::from_secs(3));
+        }
+        ui_timing.step("publish_flow_heartbeat");
+        self.poll_flow_background_rescan(&ctx);
         self.poll_flow_open_requests();
         self.poll_flow_completion_requests(&ctx);
         self.poll_flow_organization_requests(&ctx);
         self.poll_flow_edit_requests(&ctx);
         self.poll_pending_flow_agenda_sync(&ctx);
+        self.poll_file_open(&ctx);
+        self.poll_instance_requests(&ctx);
+        self.poll_periscope_setup(&ctx);
+        self.poll_periscope_global_index();
+        if self.periscope_open {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        self.poll_document_safety(&ctx);
+        ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        ui_timing.step("poll_background_and_requests");
         if self.flow_background_loading {
             ctx.request_repaint();
         }
@@ -13966,6 +9446,15 @@ impl eframe::App for SlateApp {
             return;
         }
         self.shortcuts(&ctx);
+        window_ui::titlebar(ui, &self.title());
+        if self.recovery_open || self.file_conflict.is_some() {
+            egui::CentralPanel::default().show_inside(ui, |ui| {
+                ui.label("Your current text is preserved while this notice is open.");
+            });
+            self.document_safety_dialog(&ctx);
+            self.observe_document_safety(ctx.input(|i| i.time), false);
+            return;
+        }
 
         if self.standalone_agenda {
             egui::CentralPanel::default()
@@ -13976,6 +9465,7 @@ impl eframe::App for SlateApp {
                 )
                 .show_inside(ui, |_ui| {});
             self.agenda_dialog(&ctx);
+            flow_error::show(&ctx);
             return;
         }
 
@@ -13984,6 +9474,7 @@ impl eframe::App for SlateApp {
                 .frame(egui::Frame::new().fill(Color32::from_rgb(30, 36, 48)))
                 .show_inside(ui, |_ui| {});
             self.confirm_action_dialog(&ctx);
+            flow_error::show(&ctx);
             return;
         }
 
@@ -14061,6 +9552,7 @@ impl eframe::App for SlateApp {
 
                 self.editor_view.observe_buffer(&self.buffer);
                 let editor_keyboard_enabled = self.duplicate_placement.is_none()
+                    && !flow_error::is_open(&ctx)
                     && !self.suppress_editor_keyboard_once
                     && !command_line_active
                     && !self.palette_open
@@ -14095,6 +9587,7 @@ impl eframe::App for SlateApp {
                     |ui| {
                         if self.preview {
                             ui.columns(2, |columns| {
+                                self.prepare_preview_wheel_sync(&columns[1]);
                                 let (response, changed) = self.editor_view.render(
                                     &mut columns[0],
                                     &mut self.buffer,
@@ -14221,19 +9714,6 @@ impl eframe::App for SlateApp {
                 self.flow_inline_org_suggestion_popup(&ctx);
                 self.link_inline_suggestion_popup(&ctx);
 
-                let filename = self
-                    .path
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "untitled".to_string());
-                let dirty_label = if self.dirty { "modified" } else { "saved" };
-                let dirty_color = if self.dirty { footer_warn } else { footer_ok };
-                let lines = self.buffer.line_count();
-                let chars = self.buffer.as_str().chars().count();
-                let words = self.buffer.as_str().split_whitespace().count();
-                let (cursor_line, cursor_col) = self.buffer.cursor_line_col();
-                let cursor_line = cursor_line + 1;
-                let cursor_col = cursor_col + 1;
                 let base_mode = if self.preview { "preview" } else { "edit" };
                 let active_mode = if self.shortcut_help_open {
                     "help"
@@ -14257,6 +9737,8 @@ impl eframe::App for SlateApp {
                     "files"
                 } else if self.periscope_open {
                     "periscope"
+                } else if self.periscope_setup.visible {
+                    "periscope setup"
                 } else if self.periscope_prompt_open {
                     "periscope?"
                 } else if self.link_heading_picker_open {
@@ -14280,53 +9762,12 @@ impl eframe::App for SlateApp {
                 } else {
                     base_mode
                 };
-                let wrap = if self.wrap { "wrap" } else { "nowrap" };
 
                 let (status_rect, _) = ui.allocate_exact_size(
                     Vec2::new(ui.available_width(), status_height),
                     egui::Sense::hover(),
                 );
-                let painter = ui.painter_at(status_rect);
-                painter.rect_filled(status_rect, 0.0, Color32::from_rgb(25, 31, 40));
-
-                // Raw-painted monospace text needs only a tiny optical correction here.
-                let status_y = status_rect.center().y - 0.5;
-                let mut status_x = status_rect.left() + 10.0;
-                for (text, color) in [
-                    ("slate".to_string(), footer_accent),
-                    ("::".to_string(), footer_dim),
-                    (filename, footer_color),
-                    (format!("[{dirty_label}]"), dirty_color),
-                    (format!("— {}", self.status), footer_dim),
-                ] {
-                    let text_rect = painter.text(
-                        egui::pos2(status_x, status_y),
-                        egui::Align2::LEFT_CENTER,
-                        text,
-                        footer_font.clone(),
-                        color,
-                    );
-                    status_x = text_rect.right() + 8.0;
-                }
-
-                let mut status_right = status_rect.right() - 10.0;
-                let shortcut_rect = painter.text(
-                    egui::pos2(status_right, status_y),
-                    egui::Align2::RIGHT_CENTER,
-                    "[Ctrl+P] [Ctrl+H]",
-                    footer_font.clone(),
-                    footer_accent,
-                );
-                status_right = shortcut_rect.left() - 12.0;
-                painter.text(
-                    egui::pos2(status_right, status_y),
-                    egui::Align2::RIGHT_CENTER,
-                    format!(
-                        "{active_mode} · {wrap} · ln {cursor_line}, col {cursor_col} · {lines}l · {words}w · {chars}c"
-                    ),
-                    footer_font.clone(),
-                    footer_dim,
-                );
+                self.compact_footer(ui,status_rect,active_mode);
 
                 if visible_recent_rows > 0 {
                     let (recent_rect, _) = ui.allocate_exact_size(
@@ -14594,6 +10035,9 @@ impl eframe::App for SlateApp {
                 );
                 let painter = ui.painter_at(command_rect);
                 painter.rect_filled(command_rect, 0.0, Color32::from_rgb(25, 31, 40));
+                let active=self.command_line_focused || self.focus_command_line_once;
+                let (command_text_rect,open_palette)=footer_ui::palette_launcher(ui,command_rect,!(active && !self.command_line.is_empty()));
+                if open_palette {self.open_command_palette();}
                 let command_center_y = command_rect.center().y;
                 let input_rect = egui::Rect::from_min_max(
                     egui::pos2(command_rect.left() + 19.0, command_rect.top() + 4.0),
@@ -14634,14 +10078,9 @@ impl eframe::App for SlateApp {
                     }
                     self.command_line_focused = true;
                     if self.command_line.is_empty() {
-                        paint_command_line(vec![
-                            (":".to_string(), footer_accent),
-                            (
-                                "command  Ctrl+. enter · Tab complete · Ctrl+H help · Ctrl+P palette"
-                                    .to_string(),
-                                footer_dim,
-                            ),
-                        ]);
+                        let hint="command  Ctrl+. enter · Tab complete · Ctrl+H help";
+                        paint_command_line(footer_ui::fitted_hints(&painter,&footer_font,(command_text_rect.width()-20.0).max(0.0),hint,footer_dim,footer_accent));
+                        ui.interact(command_text_rect,ui.id().with("command_hints"),egui::Sense::hover()).on_hover_ui(|ui| {footer_ui::style_hints(ui);ui.label(hint);});
                     } else {
                         let mut segments = vec![
                             (":".to_string(), footer_accent),
@@ -14663,7 +10102,7 @@ impl eframe::App for SlateApp {
                             egui::pos2(cursor_x, input_rect.top() + 3.0),
                             egui::pos2(cursor_x, input_rect.bottom() - 3.0),
                         ],
-                        Stroke::new(1.0, footer_accent),
+                        Stroke::new(1.0_f32, footer_accent),
                     );
                 } else {
                     let (text, color) = if self.duplicate_placement.is_some() {
@@ -14689,14 +10128,18 @@ impl eframe::App for SlateApp {
                             format!("lance {} ↑↓ select · type filter · Enter open · Ctrl+Enter modal · Ctrl+A add · Del remove", if self.lance_query.is_empty() { "".to_string() } else { format!("/{} ", self.lance_query) }),
                             footer_accent,
                         )
+                    } else if self.file_picker_open && self.file_picker_mode==FilePickerMode::SetPeriscopeProject {
+                        ("create project  Enter choose folder · → navigate · Ctrl+Enter use current folder · Esc cancel".into(),footer_accent)
                     } else if self.file_picker_open {
                         ("files  type filter · ↑↓ select · → enter folder · ← parent · Enter open · Esc close".to_string(), footer_accent)
                     } else if self.periscope_open {
-                        ("periscope  type search · ↑↓ select · Tab project/home · Enter open · Ctrl+Enter modal".to_string(), footer_accent)
+                        ("periscope  type search · ↑↓ select · Tab project/global · Enter open · Ctrl+Enter modal".to_string(), footer_accent)
                     } else if self.find_note_open {
                         ("find-note  type filter · ↑↓ select · Tab/←/→ headings · Enter main · Shift+Enter front modal".to_string(), footer_accent)
+                    } else if self.periscope_setup.visible {
+                        (self.periscope_setup.hint().to_string(),footer_accent)
                     } else if self.periscope_prompt_open {
-                        ("periscope  Y/Enter project folder · N global · Esc cancel".to_string(), footer_accent)
+                        ("periscope  Y/Enter project · N global · Esc cancel".to_string(), footer_accent)
                     } else if self.link_inline_anchor.is_some() {
                         ("link  type fuzzy · ↑↓ select · Enter file · Tab/Shift+Enter headings · ] cancel/manual".to_string(), footer_accent)
                     } else if self.link_heading_picker_open {
@@ -14720,12 +10163,13 @@ impl eframe::App for SlateApp {
                         ("agenda  Tab segment · ↑↓ move · ←→ week · Enter open · Ctrl+Enter cycle · r refile · x show done · Esc close".to_string(), footer_accent)
                     } else {
                         (
-                            "command  Ctrl+. enter · Ctrl+H help · Ctrl+P palette · w · q · wq"
+                            "command  Ctrl+. enter · Ctrl+H help · w · q · wq"
                                 .to_string(),
                             footer_dim,
                         )
                     };
-                    paint_command_line(vec![(":".to_string(), footer_accent), (text, color)]);
+                    paint_command_line(footer_ui::fitted_hints(&painter,&footer_font,(command_text_rect.width()-20.0).max(0.0),&text,color,footer_accent));
+                    ui.interact(command_text_rect,ui.id().with("command_hints"),egui::Sense::hover()).on_hover_ui(|ui| {footer_ui::style_hints(ui);ui.label(text);});
                     self.command_line_focused = false;
                 }
             });
@@ -14745,6 +10189,8 @@ impl eframe::App for SlateApp {
         self.scratch_entries_dialog(&ctx);
         self.agenda_dialog(&ctx);
         self.scratch_feedback_toast(&ctx);
+        self.observe_document_safety(ctx.input(|i| i.time), false);
+        flow_error::show(&ctx);
     }
 }
 
@@ -14806,7 +10252,7 @@ fn setup_style(ctx: &egui::Context) {
     style.visuals.extreme_bg_color = Color32::from_rgb(25, 31, 40);
     style.visuals.faint_bg_color = Color32::from_rgb(38, 47, 61);
     style.visuals.selection.bg_fill = Color32::from_rgb(67, 76, 94);
-    style.visuals.selection.stroke = Stroke::new(1.0, Color32::from_rgb(136, 192, 208));
+    style.visuals.selection.stroke = Stroke::new(1.0_f32, Color32::from_rgb(136, 192, 208));
     style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(33, 41, 54);
     style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(46, 56, 72);
     style.visuals.widgets.active.bg_fill = Color32::from_rgb(59, 66, 82);

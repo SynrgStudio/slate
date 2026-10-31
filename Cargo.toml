@@ -6,4 +6,27 @@ edition = "2024"
 [dependencies]
 chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
 dirs-next = "2.0.0"
+memchr = "2"
+raw-window-handle = "0.6"
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.37", features = ["bundled"] }
 eframe = { version = "0.34.2", default-features = false, features = ["default_fonts", "glow", "x11"] }
+
+[features]
+default = ["wgpu"]
+# wgpu renderer (Direct3D 12 flip model on Windows), the default at runtime.
+# SLATE_RENDERER=glow forces OpenGL; it is also the fallback if wgpu fails.
+wgpu = ["eframe/wgpu"]
+
+# Debug builds stay pleasant to *use*: dependencies (egui, glow, sqlite...) are
+# compiled optimized once and cached, while Slate itself keeps fast incremental
+# debug compiles.
+[profile.dev.package."*"]
+opt-level = 3
+
+# Release: whole-program optimization for the shipped binary.
+[profile.release]
+lto = "thin"
+codegen-units = 1
