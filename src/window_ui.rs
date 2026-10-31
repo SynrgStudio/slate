@@ -90,6 +90,12 @@ pub enum TabAction {
         index: usize,
         alias: String,
     },
+    /// The tab was dropped outside the window, at this screen position
+    /// (ui points): open it in a new window there.
+    Detach {
+        index: usize,
+        at: egui::Pos2,
+    },
     New,
 }
 
@@ -319,7 +325,21 @@ fn draw_tabs(
             painter.line_segment([c + Vec2::new(-3.5, -3.5), c + Vec2::new(3.5, 3.5)], stroke);
             painter.line_segment([c + Vec2::new(-3.5, 3.5), c + Vec2::new(3.5, -3.5)], stroke);
         }
-        if dragging {
+        if response.drag_stopped() {
+            // Dropped outside the window: move the tab to a new window.
+            let screen = ui.ctx().content_rect();
+            if let Some(pos) = ui.input(|i| i.pointer.latest_pos())
+                && !screen.expand(4.0).contains(pos)
+            {
+                let origin = ui
+                    .input(|i| i.viewport().inner_rect)
+                    .map_or(egui::Pos2::ZERO, |inner| inner.min);
+                *action = Some(TabAction::Detach {
+                    index,
+                    at: origin + pos.to_vec2(),
+                });
+            }
+        } else if dragging {
             // Reorder live: the tab follows the pointer across its neighbours.
             if let Some(pos) = pointer {
                 let target = drag_target(&rects, index, pos.x);
@@ -762,6 +782,64 @@ mod tests {
             Some(TabAction::Rename {
                 index: 0,
                 alias: "nota.md · plan".into()
+            })
+        );
+    }
+    #[test]
+    fn dropping_a_tab_outside_the_window_detaches_it() {
+        let ctx = egui::Context::default();
+        let tabs: Vec<_> = (0..2)
+            .map(|n| crate::tabs::TabLabel {
+                id: n,
+                text: format!("nota-{n}.md"),
+                dirty: false,
+                tooltip: String::new(),
+            })
+            .collect();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(900.0, 560.0));
+        let mut frame = |time: f64, events: Vec<egui::Event>| {
+            let mut action = None;
+            let mut raw = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            raw.viewports.insert(
+                egui::ViewportId::ROOT,
+                egui::ViewportInfo {
+                    inner_rect: Some(screen.translate(Vec2::new(100.0, 50.0))),
+                    ..Default::default()
+                },
+            );
+            let _ = ctx.run_ui(raw, |ui| action = titlebar_with_tabs(ui, "Slate", &tabs, 0));
+            action
+        };
+        frame(0.0, vec![]);
+        let tab = ctx
+            .data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("tab_rect", 1))))
+            .unwrap();
+        let start = tab.center();
+        let outside = egui::pos2(start.x, 700.0);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(0.1, vec![egui::Event::PointerMoved(start)]);
+        frame(0.2, vec![button(start, true)]);
+        frame(
+            0.3,
+            vec![egui::Event::PointerMoved(start + Vec2::new(0.0, 40.0))],
+        );
+        frame(0.4, vec![egui::Event::PointerMoved(outside)]);
+        let action = frame(0.5, vec![button(outside, false)]);
+        assert_eq!(
+            action,
+            Some(TabAction::Detach {
+                index: 1,
+                at: egui::pos2(100.0 + outside.x, 750.0)
             })
         );
     }

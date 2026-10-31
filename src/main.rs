@@ -227,6 +227,7 @@ fn main() -> eframe::Result {
     let mut standalone_agenda = false;
     let mut new_window = false;
     let mut background = false;
+    let mut position: Option<egui::Pos2> = None;
     let mut path = None;
     let mut startup_line = None;
     let mut args = raw_args.into_iter().peekable();
@@ -237,6 +238,12 @@ fn main() -> eframe::Result {
             "--agenda" | "--ag" => standalone_agenda = true,
             "--new-window" | "-n" => new_window = true,
             "--background" => background = true,
+            "--position" => {
+                position = args.next().and_then(|value| {
+                    let (x, y) = value.split_once(',')?;
+                    Some(egui::pos2(x.trim().parse().ok()?, y.trim().parse().ok()?))
+                });
+            }
             "--line" | "-l" => {
                 startup_line = args.next().and_then(|value| value.parse::<usize>().ok());
             }
@@ -290,8 +297,12 @@ fn main() -> eframe::Result {
         [900.0, 560.0]
     };
 
+    tabs::set_owns_session(use_single_instance);
     let native_options = |renderer| eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
+        viewport: position
+            .map_or_else(egui::ViewportBuilder::default, |at| {
+                egui::ViewportBuilder::default().with_position(at)
+            })
             .with_title(title)
             .with_decorations(false)
             .with_inner_size(size)
@@ -1219,7 +1230,7 @@ impl SlateApp {
         timing.step("load_settings");
 
         if let Some(path) = path {
-            if !scratch {
+            if !scratch && tabs::owns_session() {
                 app.restore_session();
             }
             app.request_file_open(
@@ -1234,7 +1245,10 @@ impl SlateApp {
             // editor may have just published unsaved in-memory Flow items, and
             // a disk rescan would make those live agenda rows disappear.
             app.open_agenda();
-        } else if !scratch && !app.restore_session() && app.reopen_last_file_on_startup {
+        } else if !scratch
+            && !(tabs::owns_session() && app.restore_session())
+            && app.reopen_last_file_on_startup
+        {
             if let Some(last_path) = app.last_opened_path.clone() {
                 app.open_path(last_path);
             }
@@ -9831,6 +9845,7 @@ impl SlateApp {
             Some(window_ui::TabAction::Rename { index, alias }) => {
                 self.rename_tab(index, Some(&alias))
             }
+            Some(window_ui::TabAction::Detach { index, at }) => self.detach_tab(index, at),
             None => {}
         }
         if self.recovery_open || self.file_conflict.is_some() {

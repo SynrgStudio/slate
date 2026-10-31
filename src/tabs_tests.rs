@@ -468,3 +468,35 @@ fn an_alias_names_the_file_in_tabs_title_lance_and_periscope_only() {
     run_command_line(&mut f, ":alias Borrador");
     assert_eq!(f.app.status, "Save the file first to give it an alias");
 }
+
+#[test]
+fn a_tab_dropped_outside_moves_to_a_new_window_only_when_saved() {
+    let mut f = Fixture::new();
+    let a = f.file("a.md", "alpha\n");
+    let b = f.file("b.md", "beta\n");
+    f.open(&a);
+    f.open(&b);
+    f.app.dirty = true;
+    f.app.detach_tab(1, egui::pos2(500.0, 300.0));
+    assert_eq!(f.labels(), ["a.md", "b.md"], "unsaved tab stays");
+    assert_eq!(
+        f.app.status,
+        "Save the tab first to move it to a new window"
+    );
+
+    f.app.dirty = false;
+    f.app.detach_tab(1, egui::pos2(500.0, 300.0));
+    assert_eq!(f.labels(), ["a.md"]);
+    assert!(
+        f.app.status.starts_with("Moved b.md to a new window"),
+        "{}",
+        f.app.status
+    );
+    assert!(f.app.status.contains("--new-window"));
+    assert!(
+        f.app.status.contains("\"440,286\""),
+        "window under the pointer: {}",
+        f.app.status
+    );
+    assert!(f.app.status.contains("b.md"));
+}

@@ -6,6 +6,19 @@
 //! `Main` checkpoint role with the tab's own `Slot::Tab(id)`, so every
 //! unsaved document keeps a durable record of its own.
 use super::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Only the primary window (the single-instance owner) reads and writes the
+/// session; `--new-window` and detached windows must not clobber it.
+static OWNS_SESSION: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_owns_session(owns: bool) {
+    OWNS_SESSION.store(owns, Ordering::Relaxed);
+}
+
+pub(crate) fn owns_session() -> bool {
+    OWNS_SESSION.load(Ordering::Relaxed)
+}
 
 pub(crate) struct DocumentState {
     buffer: EditorBuffer,
@@ -273,6 +286,60 @@ impl SlateApp {
             .retain(|path| !matches.iter().any(|alias_path| same_file(alias_path, path)));
         matches.append(&mut self.periscope_results);
         self.periscope_results = matches;
+    }
+
+    /// A tab dropped outside the window opens in a new Slate window at `at`
+    /// (screen points) and leaves this one. Unsaved text never moves between
+    /// processes: such tabs are saved first.
+    pub(super) fn detach_tab(&mut self, index: usize, at: egui::Pos2) {
+        let Some(path) = self.tab_path(index).map(Path::to_path_buf) else {
+            self.status = "Save the file first to move it to a new window".into();
+            return;
+        };
+        let dirty = self.tabs.list[index]
+            .doc
+            .as_ref()
+            .map_or(self.dirty, |doc| doc.dirty);
+        if dirty {
+            self.status = "Save the tab first to move it to a new window".into();
+            return;
+        }
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        // Put the new window's tab strip under the pointer.
+        let position = format!("{},{}", (at.x - 60.0).round(), (at.y - 14.0).round());
+        let command = {
+            let mut command = std::process::Command::new(exe);
+            command
+                .arg("--new-window")
+                .arg("--position")
+                .arg(position)
+                .arg(&path);
+            command
+        };
+        // Tests check the command instead of starting a window.
+        #[cfg(test)]
+        let spawned: std::io::Result<()> = {
+            self.status = format!("{command:?}");
+            Ok(())
+        };
+        #[cfg(not(test))]
+        let spawned = { command }.spawn();
+        match spawned {
+            Ok(_) => {
+                #[cfg(test)]
+                let launched = self.status.clone();
+                if index != self.tabs.active {
+                    self.activate_tab(index);
+                }
+                self.close_active_tab_now();
+                self.status = format!("Moved {} to a new window", file_label(Some(&path)));
+                #[cfg(test)]
+                self.status.push_str(&format!(" · {launched}"));
+            }
+            Err(err) => self.status = format!("New window failed: {err}"),
+        }
     }
 
     /// Moves a tab in the strip; the active tab stays active.
@@ -562,7 +629,7 @@ impl SlateApp {
     }
 
     pub(super) fn save_session(&self) {
-        if self.scratch || self.standalone_agenda {
+        if self.scratch || self.standalone_agenda || !(cfg!(test) || owns_session()) {
             return;
         }
         let Some(file) = self.session_path() else {

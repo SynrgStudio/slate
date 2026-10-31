@@ -140,7 +140,8 @@ instantly instead of starting a new one. Use `slate --new-window file.md`
 
 Files open in tabs: opening a file that is already open switches to its tab,
 and `slate file.md` adds a tab to the running window. Drag tabs to reorder
-them; files with the same name show their folder (`README.md · notas`).
+them, or drop one outside the window to open it in a new window there; files
+with the same name show their folder (`README.md · notas`).
 
 Double-click a tab (or run `:alias Weekly meeting`) to give its file an alias:
 a name shown only inside Slate — in tabs, the window title, Lance and recent

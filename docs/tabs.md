@@ -56,4 +56,9 @@ document keeps its own durable checkpoint.
    the window title, Lance and recent files; Periscope matches every word
    of the query against aliases and lists those files first. App shortcuts
    pause while an alias is being typed.
-4. Drag a tab out to a new window.
+4. Drag out (done 2026-10-31): dropping a saved tab outside the window opens
+   `slate --new-window --position X,Y file` under the pointer and closes the
+   tab here; unsaved and untitled tabs stay (save first). Only the primary
+   window (single-instance owner) reads/writes `session.json`, so extra
+   windows never clobber the session. Dropping a tab into another Slate
+   window is not supported yet.
