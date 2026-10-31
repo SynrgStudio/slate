@@ -66,7 +66,7 @@ impl SlateApp {
                             self.link_preview_path.as_ref() == Some(&path)
                                 && self.modal_disk_base == expected
                         }
-                        Slot::Scratch => false,
+                        Slot::Scratch | Slot::Tab(_) => false,
                     };
                     if matches
                         && !self.save_as_open

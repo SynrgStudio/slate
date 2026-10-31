@@ -17,16 +17,26 @@ pub(crate) enum Slot {
     Main,
     Modal,
     Scratch,
+    /// An inactive editor tab. Switching tabs swaps roles with `Main`, so each
+    /// document keeps its own durable record.
+    Tab(u64),
 }
 impl Slot {
-    fn name(self) -> &'static str {
+    fn name(self) -> String {
         match self {
-            Self::Main => "main.json",
-            Self::Modal => "modal.json",
-            Self::Scratch => "scratch.json",
+            Self::Main => "main.json".into(),
+            Self::Modal => "modal.json".into(),
+            Self::Scratch => "scratch.json".into(),
+            Self::Tab(id) => format!("tab-{id}.json"),
         }
     }
-    const ALL_NAMES: [&'static str; 3] = ["main.json", "modal.json", "scratch.json"];
+    fn is_record_name(name: &str) -> bool {
+        matches!(name, "main.json" | "modal.json" | "scratch.json")
+            || name
+                .strip_prefix("tab-")
+                .and_then(|rest| rest.strip_suffix(".json"))
+                .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Draft {
@@ -364,6 +374,7 @@ impl Manager {
         if let Event::CheckpointFailed(slot) = &event {
             let logical = [Slot::Main, Slot::Modal, Slot::Scratch]
                 .into_iter()
+                .chain(self.storage.keys().copied())
                 .find(|s| self.record_slot(*s) == *slot)
                 .unwrap_or(*slot);
             self.seen.remove(&logical);
@@ -407,7 +418,7 @@ fn remove_if_exists(path: &Path) -> Result<(), String> {
 }
 fn retire_record(root: &Path, path: &Path) -> Result<(), String> {
     if !path.starts_with(root)
-        || !Slot::ALL_NAMES.contains(&path.file_name().and_then(|n| n.to_str()).unwrap_or(""))
+        || !Slot::is_record_name(path.file_name().and_then(|n| n.to_str()).unwrap_or(""))
     {
         return Err("invalid recovery record path".into());
     }
@@ -457,8 +468,16 @@ fn scan(root: &Path, own: &Path) -> Vec<Recovered> {
         if process_alive(pid) {
             continue;
         }
-        for name in Slot::ALL_NAMES {
-            let record = folder.join(name);
+        let mut names: Vec<String> = fs::read_dir(&folder)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+            .filter(|name| Slot::is_record_name(name))
+            .collect();
+        names.sort();
+        for name in names {
+            let record = folder.join(&name);
             if is_link(&record) {
                 continue;
             }

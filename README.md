@@ -138,6 +138,10 @@ instantly instead of starting a new one. Use `slate --new-window file.md`
 (`-n`) for a separate window, or set `single_instance = false` in
 `config.toml`. See [`docs/speed-work.md`](docs/speed-work.md).
 
+Files open in tabs: opening a file that is already open switches to its tab,
+and `slate file.md` adds a tab to the running window. Tabs survive closing the
+window and restarting Slate.
+
 Closing the window keeps Slate running in the tray, so opening it again is
 instant (~25 ms instead of ~300 ms). Quit for real from the tray icon or with
 `:quit-all`. In Settings you can turn this off, or start Slate hidden with
@@ -197,7 +201,12 @@ slate --scratch
 | `Shift+Tab` | Dedent current line or selected lines by up to 4 spaces |
 | `Ctrl+LeftClick` | Open Markdown/web link under pointer |
 | `F12` | Timing overlay (frame, keystroke, find, startup) |
-| `Ctrl+Q` | Quit |
+| `Ctrl+T` | New tab |
+| `Ctrl+W` | Close tab (asks first when it has unsaved changes) |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
+| `Ctrl+wheel` | Next (up) / previous (down) tab |
+| `Ctrl+1` … `Ctrl+9` | Go to tab 1–8, `Ctrl+9` = last tab |
+| `Ctrl+Q` | Close the window (tabs kept; Slate stays in the tray) |
 | `Alt+1` … `Alt+9`, `Alt+0` | Open Lance slots 1 through 10 |
 | `Alt+Up` / `Alt+Down` | Move current line up/down |
 
@@ -222,8 +231,9 @@ Open the command line with `Ctrl+.`. Commands may be typed with or without the l
 
 ```text
 :w                         save
-:q                         close (Slate stays in the tray)
-:wq / :x                   save and close
+:q                         close the window (Slate stays in the tray)
+:wq / :x                   save and close the window
+:close / :bd               close the current tab
 :quit-all / :exit-all      quit Slate completely
 :new / :enew               new buffer
 :open / :e                 open file picker

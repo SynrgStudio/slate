@@ -365,3 +365,40 @@ fn real_dead_process_recovers_three_drafts_and_excludes_live_peer() {
     );
     assert_eq!(fs::read(source).unwrap(), b"untouched source");
 }
+#[test]
+fn each_tab_keeps_its_own_record_across_switches_and_crash_scan() {
+    let f = Fixture::new();
+    let ctx = egui::Context::default();
+    let mut manager = Manager::new(ctx, Some(f.0.clone()));
+    let observe = |manager: &mut Manager, text: &str, revision: u64| {
+        manager.observe(
+            Slot::Main, None, None, text, revision, 0, true, 0.0, true, None,
+        );
+    };
+    // Tab 1 active and dirty, then switch to tab 2 and edit it.
+    observe(&mut manager, "first tab", 1);
+    manager.swap_roles(Slot::Main, Slot::Tab(1));
+    manager.swap_roles(Slot::Tab(2), Slot::Main);
+    observe(&mut manager, "second tab", 1);
+    manager.flush();
+    assert_eq!(f.records().len(), 2, "one record per tab");
+    let session = f.records()[0].parent().unwrap().to_path_buf();
+    drop(manager);
+    let dead = f.0.join("100000002-interrupted");
+    fs::rename(&session, &dead).unwrap();
+    let mut texts: Vec<_> = scan(&f.0, &f.0.join("other"))
+        .into_iter()
+        .map(|found| found.draft.text)
+        .collect();
+    texts.sort();
+    assert_eq!(texts, ["first tab", "second tab"]);
+}
+#[test]
+fn tab_record_names_are_recognized_and_others_rejected() {
+    assert!(Slot::is_record_name("main.json"));
+    assert!(Slot::is_record_name("tab-12.json"));
+    assert!(!Slot::is_record_name("tab-.json"));
+    assert!(!Slot::is_record_name("tab-1x.json"));
+    assert!(!Slot::is_record_name("other.json"));
+    assert_eq!(Slot::Tab(7).name(), "tab-7.json");
+}

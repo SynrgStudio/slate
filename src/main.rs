@@ -9,6 +9,8 @@ mod daily;
 mod dialog_tests;
 #[cfg(test)]
 mod resident_tests;
+#[cfg(test)]
+mod tabs_tests;
 mod dialog_ui;
 mod document_safety;
 mod editor_buffer;
@@ -56,6 +58,7 @@ mod perf_log;
 mod parallel;
 mod resident;
 mod single_instance;
+mod tabs;
 mod flow_api;
 mod flow_worker;
 mod preview_ui;
@@ -644,6 +647,7 @@ enum PendingAction {
     OpenRecent,
     OpenProjectFile,
     OpenDaily,
+    CloseTab,
     Quit,
 }
 
@@ -702,6 +706,7 @@ impl PendingAction {
                 "buffer has unsaved changes; open selected file anyway?"
             }
             PendingAction::OpenDaily => "buffer has unsaved changes; open Daily anyway?",
+            PendingAction::CloseTab => "tab has unsaved changes; close it anyway?",
             PendingAction::Quit => "buffer has unsaved changes; close anyway?",
         }
     }
@@ -748,6 +753,7 @@ enum ReferenceResultKind {
     Mentions,
 }
 
+#[derive(Clone)]
 enum OpenDestination {
     Restore,
     Line(usize),
@@ -836,6 +842,11 @@ struct SlateApp {
     quit_for_real: bool,
     start_with_windows: bool,
     flow_worker: flow_worker::FlowWorker,
+    tabs: tabs::Tabs,
+    /// An open action that continues in a freshly opened tab this frame.
+    pending_tab_action: Option<PendingAction>,
+    /// Ctrl+wheel accumulator so touchpads switch one tab per gesture step.
+    tab_wheel: f32,
     markdown_live_rendering: bool,
     virtual_references_enabled: bool,
     virtual_references_collapsed: bool,
@@ -1059,6 +1070,9 @@ impl SlateApp {
             quit_for_real: false,
             start_with_windows: resident::autostart_enabled(),
             flow_worker: flow_worker::FlowWorker::start(cc.egui_ctx.clone()),
+            tabs: tabs::Tabs::default(),
+            pending_tab_action: None,
+            tab_wheel: 0.0,
             markdown_live_rendering: true,
             virtual_references_enabled: true,
             virtual_references_collapsed: false,
@@ -1193,6 +1207,9 @@ impl SlateApp {
         timing.step("load_settings");
 
         if let Some(path) = path {
+            if !scratch {
+                app.restore_session();
+            }
             app.request_file_open(
                 path,
                 startup_line
@@ -1205,7 +1222,7 @@ impl SlateApp {
             // editor may have just published unsaved in-memory Flow items, and
             // a disk rescan would make those live agenda rows disappear.
             app.open_agenda();
-        } else if !scratch && app.reopen_last_file_on_startup {
+        } else if !scratch && !app.restore_session() && app.reopen_last_file_on_startup {
             if let Some(last_path) = app.last_opened_path.clone() {
                 app.open_path(last_path);
             }
@@ -1277,12 +1294,12 @@ impl SlateApp {
             }
         }
         if resident::take_show_request() {
-            self.show_window(ctx, true);
+            self.show_window(ctx);
         }
     }
 
-    /// Closing in resident mode: persist exactly what a real exit persists,
-    /// reset to a fresh session and hide the window.
+    /// Closing in resident mode: persist what a real exit persists (unsaved
+    /// text included, as recovery checkpoints) and hide; tabs stay as they are.
     fn hide_to_tray(&mut self, ctx: &egui::Context) {
         self.observe_document_safety(0.0, true);
         self.remember_current_cursor_position();
@@ -1317,24 +1334,16 @@ impl SlateApp {
         ] {
             *open = false;
         }
-        self.new_buffer();
-        self.status = "Ready".to_string();
         self.window_hidden = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         perf_log::mark("resident.hidden", "");
     }
 
-    /// Shows the window (un-hides, un-minimizes, focuses). A hidden window shown
-    /// without a file to open behaves like a fresh launch.
-    fn show_window(&mut self, ctx: &egui::Context, fresh_launch: bool) {
+    /// Shows the window (un-hides, un-minimizes, focuses) with its tabs.
+    fn show_window(&mut self, ctx: &egui::Context) {
         if std::mem::take(&mut self.window_hidden) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             perf_log::mark("resident.shown", "");
-            if fresh_launch && self.reopen_last_file_on_startup && self.path.is_none() {
-                if let Some(last_path) = self.last_opened_path.clone() {
-                    self.open_path(last_path);
-                }
-            }
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -1378,7 +1387,7 @@ impl SlateApp {
         let Some(request) = server.take_requests().into_iter().last() else {
             return;
         };
-        self.show_window(ctx, request.path.is_none());
+        self.show_window(ctx);
         let Some(path) = request.path else {
             return;
         };
@@ -1403,6 +1412,30 @@ impl SlateApp {
     }
 
     fn request_file_open(&mut self, path: PathBuf, destination: OpenDestination) {
+        if !self.scratch && !self.standalone_agenda && !self.prepare_tab_for_open(&path, &destination)
+        {
+            return;
+        }
+        self.start_file_load(path, destination);
+    }
+
+    fn apply_open_destination(&mut self, destination: OpenDestination) {
+        match destination {
+            OpenDestination::Restore => {}
+            OpenDestination::Line(line) => self.goto_startup_line(line),
+            OpenDestination::Fragment(fragment) => self.jump_to_markdown_fragment(&fragment),
+            OpenDestination::Daily { date, .. } => self.jump_to_daily_day(date),
+            OpenDestination::Agenda(line_index) => {
+                let line = line_index.min(self.buffer.line_count().saturating_sub(1));
+                self.buffer.set_cursor(self.buffer.line_end(line));
+                self.editor_view.request_scroll_to_cursor(&self.buffer);
+            }
+        }
+        self.focus_editor_once = true;
+    }
+
+    /// Loads `path` into the active tab (it must be clean).
+    fn start_file_load(&mut self, path: PathBuf, destination: OpenDestination) {
         if self.dirty {
             self.cancel_file_open();
             self.status = "Save or discard changes before opening another file".to_string();
@@ -6036,6 +6069,7 @@ impl SlateApp {
             .parent()
             .ok_or_else(|| "invalid config path".to_string())?;
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        self.save_session();
         let mut contents = format!(
             "command_history_limit = {}\nline_number_mode = \"{}\"\nword_wrap = {}\npreview_mode = {}\nctrl_shift_move_mode = \"{}\"\nreopen_last_file_on_startup = {}\nsingle_instance = {}\nresident = {}\nmarkdown_live_rendering = {}\nvirtual_references_enabled = {}\nvirtual_references_collapsed = {}\nvirtual_backlinks_collapsed = {}\nvirtual_mentions_collapsed = {}\nlast_opened_path = \"{}\"\nlast_open_dir = \"{}\"\n",
             self.command_history_limit,
@@ -6345,10 +6379,14 @@ impl SlateApp {
 
         match command {
             Command::New => {
-                if self.dirty {
-                    self.confirm(PendingAction::New);
+                if self.scratch || self.standalone_agenda {
+                    if self.dirty {
+                        self.confirm(PendingAction::New);
+                    } else {
+                        self.new_buffer();
+                    }
                 } else {
-                    self.new_buffer();
+                    self.new_tab();
                 }
             }
             Command::Open => {
@@ -6401,6 +6439,7 @@ impl SlateApp {
                 self.quit_for_real = true;
                 self.request_close(ctx);
             }
+            Command::CloseBuffer => self.close_active_tab(),
         }
     }
 
@@ -6971,6 +7010,22 @@ impl SlateApp {
     }
 
     fn confirm(&mut self, action: PendingAction) {
+        if !self.scratch
+            && !self.standalone_agenda
+            && matches!(
+                action,
+                PendingAction::Open
+                    | PendingAction::OpenLast
+                    | PendingAction::OpenRecent
+                    | PendingAction::OpenProjectFile
+                    | PendingAction::OpenDaily
+            )
+        {
+            // The unsaved document stays in its tab; continue in a new one.
+            self.new_tab();
+            self.pending_tab_action = Some(action);
+            return;
+        }
         self.cancel_file_open();
         self.pending_action = Some(action);
         self.focus_editor_once = false;
@@ -7003,11 +7058,21 @@ impl SlateApp {
                 let target = self.pending_daily_target.take().unwrap_or_default();
                 self.open_daily_with_target(&target);
             }
+            PendingAction::CloseTab => self.close_active_tab_now(),
             PendingAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
     }
 
     fn request_close(&mut self, ctx: &egui::Context) {
+        if self.resident_active && !self.quit_for_real {
+            // Hiding keeps every tab, saved or not: nothing to ask.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        if !self.dirty && self.activate_first_dirty_tab() {
+            self.confirm(PendingAction::Quit);
+            return;
+        }
         if self.scratch && self.path.is_none() && !self.link_preview_dirty {
             self.close_scratch_with_feedback(ctx);
         } else if self.dirty || self.link_preview_dirty {
@@ -7030,15 +7095,22 @@ impl SlateApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             return;
         }
+        if self.resident_active && !self.quit_for_real {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.hide_to_tray(ctx);
+            return;
+        }
+        if !self.dirty && self.activate_first_dirty_tab() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm(PendingAction::Quit);
+            return;
+        }
         if self.scratch && self.path.is_none() && self.dirty && !self.link_preview_dirty {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.close_scratch_with_feedback(ctx);
         } else if self.dirty || self.link_preview_dirty {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.confirm(PendingAction::Quit);
-        } else if self.resident_active && !self.quit_for_real {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.hide_to_tray(ctx);
         }
     }
 
@@ -7056,6 +7128,7 @@ impl SlateApp {
                 return false;
             }
             i.consume_key(egui::Modifiers::NONE, Key::Escape)
+                || i.consume_key(egui::Modifiers::CTRL, Key::W)
                 || i.consume_key(egui::Modifiers::CTRL, Key::Q)
                 || i.viewport().close_requested()
         });
@@ -7644,11 +7717,15 @@ impl SlateApp {
         }
 
         if self.ctrl_layer_active && ctrl_down {
+            if self.handle_tab_switch_input(ctx) {
+                return true;
+            }
             let keys = ctx.input(|input| input.events.clone());
             if self.handle_ctrl_shift_navigation(&keys) {
                 return true;
             }
 
+            let mut acted = false;
             for event in keys {
                 let egui::Event::Key {
                     key,
@@ -7664,8 +7741,23 @@ impl SlateApp {
                     continue;
                 }
                 if let Some(ch) = Self::ctrl_layer_key(key) {
+                    // Tab keys act at once, like Ctrl+1…9, so holding Ctrl and
+                    // tapping W closes one tab per tap. No sequence starts with
+                    // t, w or q, so `dw`, `gt`, … keep working.
+                    if self.ctrl_layer_sequence.is_empty() && matches!(ch, 't' | 'w' | 'q') {
+                        acted = true;
+                        self.dispatch_ctrl_layer(&ch.to_string(), ctx);
+                        if ch == 'q' {
+                            return true;
+                        }
+                        continue;
+                    }
                     self.ctrl_layer_sequence.push(ch);
                 }
+            }
+            if acted && self.ctrl_layer_sequence.is_empty() {
+                // Keep the result of an immediate action visible.
+                return true;
             }
             self.status = "Ctrl layer".to_string();
             return true;
@@ -7801,6 +7893,8 @@ impl SlateApp {
                 self.selected_command = 0;
                 self.focus_editor_once = false;
             }
+            "t" => self.run_command(Command::New, ctx),
+            "w" => self.run_command(Command::CloseBuffer, ctx),
             "q" => self.run_command(Command::Quit, ctx),
             "m" => self.run_command(Command::TogglePreview, ctx),
             "." => self.focus_command_line(),
@@ -9669,6 +9763,9 @@ impl SlateApp {
         self.poll_file_open(&ctx);
         self.poll_instance_requests(&ctx);
         self.poll_resident(&ctx);
+        if let Some(action) = self.pending_tab_action.take() {
+            self.finish_pending_action(action, &ctx);
+        }
         self.poll_periscope_setup(&ctx);
         self.poll_periscope_global_index();
         if self.periscope_open {
@@ -9702,7 +9799,17 @@ impl SlateApp {
             return;
         }
         self.shortcuts(&ctx);
-        window_ui::titlebar(ui, &self.title());
+        let labels = if self.scratch || self.standalone_agenda {
+            Vec::new()
+        } else {
+            self.tab_labels()
+        };
+        match window_ui::titlebar_with_tabs(ui, &self.title(), &labels, self.tabs.active) {
+            Some(window_ui::TabAction::Activate(index)) => self.activate_tab(index),
+            Some(window_ui::TabAction::Close(index)) => self.close_tab(index),
+            Some(window_ui::TabAction::New) => self.new_tab(),
+            None => {}
+        }
         if self.recovery_open || self.file_conflict.is_some() {
             egui::CentralPanel::default().show_inside(ui, |ui| {
                 ui.label("Your current text is preserved while this notice is open.");

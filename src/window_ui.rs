@@ -71,7 +71,163 @@ fn dialog_size(window: Vec2) -> Vec2 {
     Vec2::new(window.x * 0.8, (window.y - 30.0).max(1.0) * 0.8)
 }
 
+#[cfg(test)]
 pub fn titlebar(ui: &mut egui::Ui, title: &str) {
+    titlebar_with_tabs(ui, title, &[], 0);
+}
+
+/// What the user did on the tab strip this frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TabAction {
+    Activate(usize),
+    Close(usize),
+    New,
+}
+
+const TAB_FONT: f32 = 12.0;
+
+/// Draws the tabs from the left edge of the title bar and returns where the
+/// strip ends (the rest of the bar stays draggable).
+fn draw_tabs(
+    ui: &mut egui::Ui,
+    bar: egui::Rect,
+    tabs: &[crate::tabs::TabLabel],
+    active: usize,
+    action: &mut Option<TabAction>,
+) -> f32 {
+    let font = FontId::monospace(TAB_FONT);
+    let window_buttons = 3.0 * 38.0;
+    let plus_width = 26.0;
+    // Leave some empty bar to grab and move the window.
+    let available = (bar.width() - window_buttons - plus_width - 60.0).max(80.0);
+    let natural: Vec<f32> = tabs
+        .iter()
+        .map(|tab| {
+            let text = ui
+                .painter()
+                .layout_no_wrap(tab.text.clone(), font.clone(), Color32::WHITE)
+                .size()
+                .x;
+            (text + 44.0).clamp(90.0, 220.0)
+        })
+        .collect();
+    let gap = 2.0;
+    let room = (available - gap * tabs.len() as f32).max(0.0);
+    let natural_total: f32 = natural.iter().sum();
+    let scale = if natural_total > room {
+        room / natural_total
+    } else {
+        1.0
+    };
+    // Narrow tabs keep a usable minimum unless there is no room even for that.
+    let min_width = 44.0_f32.min(room / tabs.len().max(1) as f32);
+    let mut x = bar.left() + 6.0;
+    for (index, tab) in tabs.iter().enumerate() {
+        let width = (natural[index] * scale).max(min_width);
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(x, bar.top() + 4.0),
+            Vec2::new(width, bar.height() - 4.0),
+        );
+        x += width + gap;
+        let id = ui.id().with(("slate_tab", index));
+        let response = ui.interact(rect, id, egui::Sense::click());
+        let close_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.right() - 13.0, rect.center().y),
+            Vec2::splat(16.0),
+        );
+        let close = ui.interact(close_rect, id.with("close"), egui::Sense::click());
+        let is_active = index == active;
+        let hovered = response.hovered() || close.hovered();
+        let fill = if is_active {
+            Some(Color32::from_rgb(36, 44, 58))
+        } else if hovered {
+            Some(Color32::from_rgb(30, 37, 48))
+        } else {
+            None
+        };
+        if let Some(fill) = fill {
+            ui.painter().rect_filled(
+                rect,
+                egui::CornerRadius {
+                    nw: 6,
+                    ne: 6,
+                    sw: 0,
+                    se: 0,
+                },
+                fill,
+            );
+        }
+        let text_color = if is_active {
+            Color32::from_rgb(216, 222, 233)
+        } else {
+            Color32::from_rgb(136, 154, 176)
+        };
+        let mut job =
+            egui::text::LayoutJob::simple_singleline(tab.text.clone(), font.clone(), text_color);
+        job.wrap.max_width = (rect.width() - 34.0).max(8.0);
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        job.wrap.overflow_character = Some('…');
+        let galley = ui.painter().layout_job(job);
+        let text_pos = egui::pos2(rect.left() + 10.0, rect.center().y - galley.size().y / 2.0);
+        ui.painter_at(rect).galley(text_pos, galley, text_color);
+        if close.hovered() {
+            ui.painter()
+                .rect_filled(close_rect, 3.0, Color32::from_rgb(58, 68, 86));
+        }
+        if tab.dirty && !hovered {
+            ui.painter()
+                .circle_filled(close_rect.center(), 3.5, Color32::from_rgb(235, 203, 139));
+        } else if is_active || hovered {
+            let c = close_rect.center();
+            let stroke = egui::Stroke::new(1.3_f32, text_color);
+            ui.painter()
+                .line_segment([c + Vec2::new(-3.5, -3.5), c + Vec2::new(3.5, 3.5)], stroke);
+            ui.painter()
+                .line_segment([c + Vec2::new(-3.5, 3.5), c + Vec2::new(3.5, -3.5)], stroke);
+        }
+        if close.clicked() || response.middle_clicked() {
+            *action = Some(TabAction::Close(index));
+        } else if response.clicked() {
+            *action = Some(TabAction::Activate(index));
+        }
+        #[cfg(test)]
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(egui::Id::new(("tab_rect", index)), rect));
+    }
+    let plus_rect = egui::Rect::from_min_size(
+        egui::pos2(x + 2.0, bar.top() + 6.0),
+        Vec2::new(plus_width - 4.0, bar.height() - 10.0),
+    );
+    let plus = ui.interact(
+        plus_rect,
+        ui.id().with("slate_tab_new"),
+        egui::Sense::click(),
+    );
+    if plus.hovered() {
+        ui.painter()
+            .rect_filled(plus_rect, 4.0, Color32::from_rgb(36, 44, 58));
+    }
+    let c = plus_rect.center();
+    let stroke = egui::Stroke::new(1.3_f32, Color32::from_rgb(136, 154, 176));
+    ui.painter()
+        .line_segment([c + Vec2::new(-4.5, 0.0), c + Vec2::new(4.5, 0.0)], stroke);
+    ui.painter()
+        .line_segment([c + Vec2::new(0.0, -4.5), c + Vec2::new(0.0, 4.5)], stroke);
+    if plus.on_hover_text("New tab (Ctrl+T)").clicked() {
+        *action = Some(TabAction::New);
+    }
+    plus_rect.right()
+}
+
+/// Title bar; with `tabs` it shows the tab strip instead of the centered title.
+pub fn titlebar_with_tabs(
+    ui: &mut egui::Ui,
+    title: &str,
+    tabs: &[crate::tabs::TabLabel],
+    active: usize,
+) -> Option<TabAction> {
+    let mut action = None;
     let ctx = ui.ctx().clone();
     resize_edges(&ctx);
     egui::Panel::top("slate_titlebar")
@@ -83,8 +239,13 @@ pub fn titlebar(ui: &mut egui::Ui, title: &str) {
         )
         .show_inside(ui, |ui| {
             let rect = ui.max_rect();
+            let tabs_end = if tabs.is_empty() {
+                rect.left()
+            } else {
+                draw_tabs(ui, rect, tabs, active, &mut action)
+            };
             let drag_rect = egui::Rect::from_min_max(
-                rect.min + Vec2::new(5.0, 5.0),
+                egui::pos2((rect.min.x + 5.0).max(tabs_end + 6.0), rect.min.y + 5.0),
                 rect.max - Vec2::new(120.0, 0.0),
             );
             let drag = ui.interact(
@@ -103,7 +264,7 @@ pub fn titlebar(ui: &mut egui::Ui, title: &str) {
             let title_width = (rect.width() - 2.0 * (3.0 * 38.0 + 10.0)).max(0.0);
             #[cfg(test)]
             let mut recorded_title_rect = egui::Rect::from_center_size(rect.center(), Vec2::ZERO);
-            if title_width > 0.0 {
+            if title_width > 0.0 && tabs.is_empty() {
                 let mut job = egui::text::LayoutJob::simple_singleline(
                     title.into(),
                     FontId::monospace(12.0),
@@ -201,6 +362,7 @@ pub fn titlebar(ui: &mut egui::Ui, title: &str) {
                 egui::Stroke::new(1.0_f32, Color32::from_rgb(46, 56, 72)),
             );
         });
+    action
 }
 
 #[derive(Clone, Copy)]
@@ -283,6 +445,46 @@ fn resize_edges(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tabs_never_overlap_window_buttons_and_leave_room_to_drag() {
+        for (width, count) in [(420.0, 3), (900.0, 1), (900.0, 12), (1600.0, 30)] {
+            let ctx = egui::Context::default();
+            let tabs: Vec<_> = (0..count)
+                .map(|n| crate::tabs::TabLabel {
+                    text: format!("documento-{n}-con-nombre-largo.md"),
+                    dirty: n % 2 == 0,
+                })
+                .collect();
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(width, 560.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    titlebar_with_tabs(ui, "Slate", &tabs, 0);
+                },
+            );
+            let (frame, _, buttons) = ctx
+                .data(|data| {
+                    data.get_temp::<(egui::Rect, egui::Rect, Vec<egui::Rect>)>(
+                        "titlebar_geometry".into(),
+                    )
+                })
+                .unwrap();
+            let first_button = buttons.iter().map(|b| b.left()).fold(f32::MAX, f32::min);
+            let last_tab = ctx
+                .data(|data| data.get_temp::<egui::Rect>(egui::Id::new(("tab_rect", count - 1))))
+                .unwrap();
+            assert!(frame.contains_rect(last_tab), "{width} {count}");
+            assert!(
+                last_tab.right() + 26.0 + 30.0 < first_button,
+                "tabs + new-tab button leave drag room: {width} {count} {last_tab:?} {first_button}"
+            );
+        }
+    }
     #[test]
     fn title_is_centered_on_window_and_never_overlaps_controls() {
         for width in [180.0, 300.0, 420.0, 900.0, 1600.0] {

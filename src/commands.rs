@@ -35,6 +35,7 @@ pub(crate) enum Command {
     Mentions,
     FindNote,
     OpenLink,
+    CloseBuffer,
     Quit,
     QuitAll,
 }
@@ -70,10 +71,17 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
         palette_command: Some(Command::Quit),
     },
     CommandSpec {
+        name: "close",
+        aliases: &["close-buffer", "bd"],
+        summary: "Close the current document (a tab, once Slate has tabs)",
+        hint: "Ctrl+W",
+        palette_command: Some(Command::CloseBuffer),
+    },
+    CommandSpec {
         name: "quit-all",
         aliases: &["exit-all"],
         summary: "Quit Slate completely, including the tray",
-        hint: "tray: Quit",
+        hint: "tray: Quit Slate",
         palette_command: Some(Command::QuitAll),
     },
     CommandSpec {
@@ -87,7 +95,7 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
         name: "new",
         aliases: &["enew"],
         summary: "New buffer",
-        hint: "Ctrl+N",
+        hint: "Ctrl+T",
         palette_command: Some(Command::New),
     },
     CommandSpec {
@@ -507,6 +515,7 @@ pub(crate) fn command_name(command: Command) -> &'static str {
         Command::Mentions => "mentions",
         Command::FindNote => "find-note",
         Command::OpenLink => "open-link",
+        Command::CloseBuffer => "close",
         Command::Quit => "quit",
         Command::QuitAll => "quit-all",
     }
@@ -762,6 +771,7 @@ pub(crate) fn parse_command_line(raw: &str) -> CommandLineAction {
         "capture" | "cap" => CommandLineAction::Run(Command::Capture),
         "q" | "quit" | "exit" => CommandLineAction::Run(Command::Quit),
         "quit-all" | "exit-all" => CommandLineAction::Run(Command::QuitAll),
+        "close" | "close-buffer" | "bd" => CommandLineAction::Run(Command::CloseBuffer),
         "wq" | "x" => CommandLineAction::SaveQuit,
         "new" | "enew" => CommandLineAction::Run(Command::New),
         "open" | "edit" | "e" => {

@@ -621,12 +621,20 @@ impl SlateApp {
             {
                 command = Some(Command::TogglePreview);
             }
+            // Tab-style keys: Ctrl+T new document, Ctrl+W close the document
+            // (a tab once Slate has tabs), Ctrl+Q close the window (Slate
+            // stays in the tray; :quit-all or the tray quit completely).
             if !self.scratch_modal_open
                 && !self.scratch_entries_open
                 && !self.capture_modal_open
-                && i.consume_key(egui::Modifiers::CTRL, Key::Q)
             {
-                command = Some(Command::Quit);
+                if i.consume_key(egui::Modifiers::CTRL, Key::T) {
+                    command = Some(Command::New);
+                } else if i.consume_key(egui::Modifiers::CTRL, Key::W) {
+                    command = Some(Command::CloseBuffer);
+                } else if i.consume_key(egui::Modifiers::CTRL, Key::Q) {
+                    command = Some(Command::Quit);
+                }
             }
             if !search_cancel && i.consume_key(egui::Modifiers::NONE, Key::Escape) {
                 if self.settings_open {
