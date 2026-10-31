@@ -14,6 +14,10 @@ serde_json = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 eframe = { version = "0.34.2", default-features = false, features = ["default_fonts", "glow", "x11"] }
 
+# Embeds assets/slate.ico as the .exe icon (see build.rs).
+[target.'cfg(windows)'.build-dependencies]
+winresource = { version = "0.1", default-features = false }
+
 [features]
 default = ["wgpu"]
 # wgpu renderer (Direct3D 12 flip model on Windows), the default at runtime.

@@ -206,6 +206,14 @@ fn low_latency_wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
     options
 }
 
+/// Window/taskbar icon (assets/slate-256.png, from tools/generate_icon.py).
+/// A decode failure only costs the icon, never the start: egui-winit and
+/// eframe treat an empty `IconData` as "no icon".
+fn app_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/slate-256.png"))
+        .unwrap_or_default()
+}
+
 fn main() -> eframe::Result {
     perf_log::init(std::time::Instant::now());
     normalize_cursor_environment();
@@ -298,12 +306,14 @@ fn main() -> eframe::Result {
     };
 
     tabs::set_owns_session(use_single_instance);
+    let icon = std::sync::Arc::new(app_icon());
     let native_options = |renderer| eframe::NativeOptions {
         viewport: position
             .map_or_else(egui::ViewportBuilder::default, |at| {
                 egui::ViewportBuilder::default().with_position(at)
             })
             .with_title(title)
+            .with_icon(icon.clone())
             .with_decorations(false)
             .with_inner_size(size)
             .with_min_inner_size(if standalone_agenda {

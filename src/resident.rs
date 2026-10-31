@@ -74,6 +74,10 @@ mod win {
     const TPM_RIGHTBUTTON: u32 = 0x2;
     const GCLP_HICONSM: i32 = -34;
     const IDI_APPLICATION: usize = 32512;
+    const APP_ICON_ID: usize = 1; // see build.rs
+    const IMAGE_ICON: u32 = 1;
+    const LR_SHARED: u32 = 0x8000;
+    const SM_CXSMICON: i32 = 49;
     const ASFW_ANY: u32 = u32::MAX;
     const MENU_OPEN: usize = 1;
     const MENU_NEW_WINDOW: usize = 2;
@@ -131,6 +135,15 @@ mod win {
         fn PostMessageW(hwnd: Hwnd, message: u32, wparam: usize, lparam: isize) -> i32;
         fn GetClassLongPtrW(hwnd: Hwnd, index: i32) -> usize;
         fn LoadIconW(instance: Handle, name: *const u16) -> Handle;
+        fn LoadImageW(
+            instance: Handle,
+            name: *const u16,
+            kind: u32,
+            width: i32,
+            height: i32,
+            flags: u32,
+        ) -> Handle;
+        fn GetSystemMetrics(index: i32) -> i32;
         fn CreatePopupMenu() -> Handle;
         fn AppendMenuW(menu: Handle, flags: u32, id: usize, text: *const u16) -> i32;
         fn TrackPopupMenu(
@@ -148,6 +161,10 @@ mod win {
         fn IsWindowVisible(hwnd: Hwnd) -> i32;
         fn ShowWindowAsync(hwnd: Hwnd, command: i32) -> i32;
         fn AllowSetForegroundWindow(process_id: u32) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> Handle;
     }
     #[link(name = "advapi32")]
     unsafe extern "system" {
@@ -236,8 +253,23 @@ mod win {
     }
 
     fn window_icon() -> Handle {
-        // SAFETY: read-only queries of our own window and a stock icon.
+        // SAFETY: read-only queries of our own module, window and a stock icon.
         unsafe {
+            // The .exe icon resource (build.rs) has a hand-tuned frame for the
+            // small icon size; the window's icon is a scaled 256 px image.
+            // LR_SHARED: the system owns the handle, so re-adding is free.
+            let small = GetSystemMetrics(SM_CXSMICON);
+            let icon = LoadImageW(
+                GetModuleHandleW(std::ptr::null()),
+                APP_ICON_ID as *const u16,
+                IMAGE_ICON,
+                small,
+                small,
+                LR_SHARED,
+            );
+            if !icon.is_null() {
+                return icon;
+            }
             for icon in [
                 SendMessageW(hwnd(), WM_GETICON, 2, 0) as Handle, // ICON_SMALL2
                 SendMessageW(hwnd(), WM_GETICON, 0, 0) as Handle, // ICON_SMALL
