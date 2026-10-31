@@ -46,7 +46,9 @@ document keeps its own durable checkpoint.
 1. Core (done 2026-10-31): tab strip in the title bar, keys above, open-in-tab and dedupe,
    per-tab state and recovery, close/quit flows, session restore, forwarding
    from `slate file.md` into a tab.
-2. Comfort (done 2026-10-31): drag to reorder, `Ctrl+Shift+T`, name
+2. Comfort (done 2026-10-31): drag to reorder, `Ctrl+Shift+T` (a tab closed
+   with unsaved or discarded text comes back whole — text, undo history,
+   cursor, alias — kept in memory up to 64 MB of text), name
    disambiguation, scrolling strip (tabs never narrower than 72 pt), path
    tooltips. External changes to an inactive tab's file are flagged when the
    tab is shown again (switching re-checks the file at once), and the agenda

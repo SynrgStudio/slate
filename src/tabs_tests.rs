@@ -561,3 +561,92 @@ fn unsaved_and_untitled_tabs_carry_their_text_to_the_new_window() {
         "nothing was saved"
     );
 }
+
+/// Ctrl+W on an unsaved tab, then "discard" in the dialog.
+fn close_discarding(f: &mut Fixture) {
+    f.app.close_active_tab();
+    assert!(f.app.pending_action == Some(PendingAction::CloseTab));
+    f.app.pending_action = None;
+    f.app.tabs.discarded_close = true;
+    f.app.dirty = false;
+    let app = &mut f.app;
+    let _ = f.ctx.run_ui(egui::RawInput::default(), |ui| {
+        app.finish_pending_action(PendingAction::CloseTab, &ui.ctx().clone())
+    });
+}
+
+#[test]
+fn ctrl_shift_t_brings_back_discarded_text_with_its_undo_history() {
+    let mut f = Fixture::new();
+    let a = f.file("a.md", "alpha\n");
+    let b = f.file("b.md", "beta\n");
+    f.open(&a);
+    f.open(&b);
+    f.app.buffer.set_cursor(4);
+    f.app.buffer.type_text(" importante");
+    f.app.dirty = true;
+    close_discarding(&mut f);
+    assert_eq!(f.labels(), ["a.md"]);
+    assert_eq!(
+        fs::read_to_string(&b).unwrap(),
+        "beta\n",
+        "discard never saves"
+    );
+
+    f.app.reopen_closed_tab();
+    assert_eq!(f.labels(), ["a.md", "b.md"]);
+    assert_eq!(f.app.buffer.as_str(), "beta importante\n");
+    assert!(f.app.dirty, "still unsaved");
+    assert!(
+        f.app
+            .status
+            .starts_with("Reopened b.md with its unsaved changes")
+    );
+    assert!(f.app.buffer.undo(), "undo history came back too");
+    assert_eq!(f.app.buffer.as_str(), "beta\n");
+}
+
+#[test]
+fn ctrl_shift_t_brings_back_an_untitled_tab_and_its_alias() {
+    let mut f = Fixture::new();
+    let a = f.file("a.md", "alpha\n");
+    f.open(&a);
+    f.app.new_tab();
+    f.app.buffer.type_text("borrador sin archivo");
+    f.app.dirty = true;
+    f.app.rename_tab(1, Some("Borrador"));
+    close_discarding(&mut f);
+    assert_eq!(f.labels(), ["a.md"]);
+
+    f.app.reopen_closed_tab();
+    assert_eq!(f.labels(), ["a.md", "Borrador"]);
+    assert_eq!(f.app.buffer.as_str(), "borrador sin archivo");
+    assert!(f.app.dirty);
+}
+
+#[test]
+fn reopening_into_a_lone_empty_tab_replaces_it() {
+    let mut f = Fixture::new();
+    f.app.buffer.type_text("nota rápida");
+    f.app.dirty = true;
+    close_discarding(&mut f);
+    assert_eq!(f.labels(), ["untitled"]);
+    assert_eq!(f.app.buffer.as_str(), "");
+    f.app.reopen_closed_tab();
+    assert_eq!(f.labels(), ["untitled"], "no extra empty tab");
+    assert_eq!(f.app.buffer.as_str(), "nota rápida");
+}
+
+#[test]
+fn a_tab_moved_to_another_window_is_not_offered_for_reopening() {
+    let mut f = Fixture::new();
+    let a = f.file("a.md", "alpha\n");
+    f.open(&a);
+    f.app.new_tab();
+    f.app.buffer.type_text("viaja");
+    f.app.dirty = true;
+    f.app.detach_tab(1, egui::pos2(10.0, 10.0));
+    assert_eq!(f.labels(), ["a.md"]);
+    f.app.reopen_closed_tab();
+    assert_eq!(f.app.status, "No closed tab to reopen");
+}

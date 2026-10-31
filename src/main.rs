@@ -8465,6 +8465,10 @@ impl SlateApp {
             save |= clicked[2];
         }
         if discard {
+            if action == PendingAction::CloseTab {
+                // Discarded text stays reachable with Ctrl+Shift+T.
+                self.tabs.discarded_close = true;
+            }
             self.dirty = false;
             self.clear_recovery(document_safety::Slot::Main);
             if action == PendingAction::Quit {

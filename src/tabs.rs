@@ -69,11 +69,42 @@ pub(crate) struct Tabs {
     pub(crate) list: Vec<Tab>,
     pub(crate) active: usize,
     next_id: u64,
-    /// Files of recently closed tabs, newest last (Ctrl+Shift+T).
-    closed: Vec<PathBuf>,
+    /// Recently closed tabs, newest last (Ctrl+Shift+T).
+    closed: Vec<ClosedTab>,
+    /// Set when the user chose "discard" to close the active tab: its text
+    /// still goes to `closed`, so Ctrl+Shift+T can bring it back.
+    pub(crate) discarded_close: bool,
 }
 
 const MAX_CLOSED_TABS: usize = 25;
+/// Unsaved documents kept for Ctrl+Shift+T, in bytes of text.
+const MAX_CLOSED_TEXT: usize = 64 * 1024 * 1024;
+
+/// A closed tab: a clean file reopens from disk; unsaved (or untitled) text is
+/// kept whole — text, undo history, cursor and alias.
+pub(crate) enum ClosedTab {
+    File(PathBuf),
+    Document {
+        doc: Box<DocumentState>,
+        alias: Option<String>,
+    },
+}
+
+impl ClosedTab {
+    fn path(&self) -> Option<&Path> {
+        match self {
+            ClosedTab::File(path) => Some(path),
+            ClosedTab::Document { doc, .. } => doc.path.as_deref(),
+        }
+    }
+
+    fn text_len(&self) -> usize {
+        match self {
+            ClosedTab::File(_) => 0,
+            ClosedTab::Document { doc, .. } => doc.buffer.as_str().len(),
+        }
+    }
+}
 
 impl Default for Tabs {
     fn default() -> Self {
@@ -86,6 +117,7 @@ impl Default for Tabs {
             active: 0,
             next_id: 2,
             closed: Vec::new(),
+            discarded_close: false,
         }
     }
 }
@@ -414,7 +446,7 @@ impl SlateApp {
                 }
                 // The text now lives in the handoff file and the new window.
                 self.dirty = false;
-                self.close_active_tab_now();
+                self.close_active_tab_inner(false);
                 self.status = format!("Moved {label} to a new window");
                 #[cfg(test)]
                 self.status.push_str(&format!(" · {launched}"));
@@ -532,12 +564,47 @@ impl SlateApp {
             .unwrap_or(0);
     }
 
-    /// Ctrl+Shift+T: reopens the most recently closed file that still exists.
+    /// Ctrl+Shift+T: reopens the most recently closed tab — unsaved text
+    /// exactly as it was, a clean file from disk.
     pub(super) fn reopen_closed_tab(&mut self) {
-        while let Some(path) = self.tabs.closed.pop() {
-            if path.is_file() {
-                self.request_file_open(path, OpenDestination::Restore);
-                return;
+        while let Some(closed) = self.tabs.closed.pop() {
+            match closed {
+                ClosedTab::File(path) => {
+                    if path.is_file() {
+                        self.request_file_open(path, OpenDestination::Restore);
+                        return;
+                    }
+                }
+                ClosedTab::Document { doc, alias } => {
+                    let label = alias
+                        .clone()
+                        .unwrap_or_else(|| file_label(doc.path.as_deref()));
+                    let id = self.tabs.allocate_id();
+                    let index = if self.active_tab_is_blank() && self.tabs.list.len() == 1 {
+                        // Replace the lone empty tab.
+                        0
+                    } else {
+                        self.tabs.active + 1
+                    };
+                    self.tabs.list.insert(
+                        index,
+                        Tab {
+                            id,
+                            doc: Some(*doc),
+                            alias,
+                        },
+                    );
+                    if index == 0 {
+                        // The empty tab shifted right: show the restored one, then drop it.
+                        self.tabs.active = 1;
+                        self.activate_tab(0);
+                        self.tabs.list.remove(1);
+                    } else {
+                        self.activate_tab(index);
+                    }
+                    self.status = format!("Reopened {label} with its unsaved changes");
+                    return;
+                }
             }
         }
         self.status = "No closed tab to reopen".into();
@@ -710,16 +777,57 @@ impl SlateApp {
     }
 
     /// Closes the active tab without asking (clean or already discarded).
+    /// Ctrl+Shift+T can bring it back, unsaved text included.
     pub(super) fn close_active_tab_now(&mut self) {
-        let closed = file_label(self.path.as_deref());
-        if let Some(path) = self.path.clone() {
-            self.tabs.closed.retain(|old| !same_file(old, &path));
-            self.tabs.closed.push(path);
-            let excess = self.tabs.closed.len().saturating_sub(MAX_CLOSED_TABS);
-            self.tabs.closed.drain(..excess);
+        self.close_active_tab_inner(true);
+    }
+
+    fn remember_closed(&mut self, closed: ClosedTab) {
+        if let Some(path) = closed.path().map(Path::to_path_buf) {
+            self.tabs
+                .closed
+                .retain(|old| !old.path().is_some_and(|old| same_file(old, &path)));
         }
+        self.tabs.closed.push(closed);
+        let excess = self.tabs.closed.len().saturating_sub(MAX_CLOSED_TABS);
+        self.tabs.closed.drain(..excess);
+        // Bound the memory held by closed unsaved documents (oldest go first).
+        while self
+            .tabs
+            .closed
+            .iter()
+            .map(ClosedTab::text_len)
+            .sum::<usize>()
+            > MAX_CLOSED_TEXT
+            && self.tabs.closed.len() > 1
+        {
+            self.tabs.closed.remove(0);
+        }
+    }
+
+    /// `remember: false` when the tab moved to another window instead.
+    fn close_active_tab_inner(&mut self, remember: bool) {
+        let closed = file_label(self.path.as_deref());
+        let unsaved = std::mem::take(&mut self.tabs.discarded_close)
+            || self.dirty
+            || (self.path.is_none() && !self.buffer.as_str().is_empty());
+        let alias = self
+            .tabs
+            .list
+            .get_mut(self.tabs.active)
+            .and_then(|tab| tab.alias.take());
         self.cancel_file_open();
         self.remember_current_cursor_position();
+        if remember && unsaved {
+            let mut doc = self.stash_active_document();
+            doc.dirty = true;
+            self.remember_closed(ClosedTab::Document {
+                doc: Box::new(doc),
+                alias,
+            });
+        } else if let (true, Some(path)) = (remember, self.path.clone()) {
+            self.remember_closed(ClosedTab::File(path));
+        }
         self.clear_recovery(document_safety::Slot::Main);
         self.forget_project_buffer(self.buffer.identity);
         if self.tabs.list.len() == 1 {

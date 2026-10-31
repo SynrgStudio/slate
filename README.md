@@ -213,7 +213,7 @@ slate --scratch
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
 | `Ctrl+wheel` | Next (up) / previous (down) tab |
 | `Ctrl+1` … `Ctrl+9` | Go to tab 1–8, `Ctrl+9` = last tab |
-| `Ctrl+Shift+T` | Reopen the last closed tab |
+| `Ctrl+Shift+T` | Reopen the last closed tab (unsaved text included) |
 | `Ctrl+Q` | Close the window (tabs kept; Slate stays in the tray) |
 | `Alt+1` … `Alt+9`, `Alt+0` | Open Lance slots 1 through 10 |
 | `Alt+Up` / `Alt+Down` | Move current line up/down |
