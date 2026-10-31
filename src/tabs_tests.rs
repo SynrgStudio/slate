@@ -487,21 +487,12 @@ fn renaming_an_untitled_tab_starts_from_an_empty_field() {
 }
 
 #[test]
-fn a_tab_dropped_outside_moves_to_a_new_window_only_when_saved() {
+fn a_saved_tab_dropped_outside_reopens_its_file_in_a_new_window() {
     let mut f = Fixture::new();
     let a = f.file("a.md", "alpha\n");
     let b = f.file("b.md", "beta\n");
     f.open(&a);
     f.open(&b);
-    f.app.dirty = true;
-    f.app.detach_tab(1, egui::pos2(500.0, 300.0));
-    assert_eq!(f.labels(), ["a.md", "b.md"], "unsaved tab stays");
-    assert_eq!(
-        f.app.status,
-        "Save the tab first to move it to a new window"
-    );
-
-    f.app.dirty = false;
     f.app.detach_tab(1, egui::pos2(500.0, 300.0));
     assert_eq!(f.labels(), ["a.md"]);
     assert!(
@@ -516,4 +507,57 @@ fn a_tab_dropped_outside_moves_to_a_new_window_only_when_saved() {
         f.app.status
     );
     assert!(f.app.status.contains("b.md"));
+    assert!(
+        !f.app.status.contains("--handoff"),
+        "the file on disk is enough"
+    );
+}
+
+#[test]
+fn unsaved_and_untitled_tabs_carry_their_text_to_the_new_window() {
+    let mut f = Fixture::new();
+    let a = f.file("a.md", "alpha\n");
+    f.open(&a);
+    f.app.buffer.set_text("alpha editado\n".into());
+    f.app.buffer.set_cursor(5);
+    f.app.dirty = true;
+    f.app.new_tab();
+    f.app.buffer.type_text("idea suelta");
+    f.app.dirty = true;
+    f.app.rename_tab(1, Some("Ideas"));
+
+    // The untitled tab moves first, then the unsaved file.
+    f.app.detach_tab(1, egui::pos2(500.0, 300.0));
+    assert!(f.app.status.contains("--handoff"), "{}", f.app.status);
+    f.app.detach_tab(0, egui::pos2(500.0, 300.0));
+    assert_eq!(f.labels(), ["untitled"], "both left this window");
+    let mut handoffs: Vec<PathBuf> = fs::read_dir(f.root.join("handoff"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    handoffs.sort();
+    assert_eq!(handoffs.len(), 2);
+
+    // Each new window takes its text and deletes the handoff file.
+    let mut g = Fixture::new();
+    g.app.apply_handoff(&handoffs[0]);
+    assert_eq!(g.app.buffer.as_str(), "idea suelta");
+    assert!(g.app.dirty);
+    assert_eq!(g.app.path, None);
+    assert_eq!(g.labels(), ["Ideas"], "untitled alias came along");
+    assert!(!handoffs[0].exists());
+
+    let mut h = Fixture::new();
+    h.app.apply_handoff(&handoffs[1]);
+    assert_eq!(h.app.buffer.as_str(), "alpha editado\n");
+    assert_eq!(h.app.buffer.cursor(), 5);
+    assert!(h.app.dirty);
+    assert_eq!(h.app.path.as_deref(), Some(a.as_path()));
+    assert!(h.app.disk_base.is_some(), "conflict checks keep working");
+    assert_eq!(
+        fs::read_to_string(&a).unwrap(),
+        "alpha\n",
+        "nothing was saved"
+    );
 }

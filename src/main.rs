@@ -236,6 +236,7 @@ fn main() -> eframe::Result {
     let mut new_window = false;
     let mut background = false;
     let mut position: Option<egui::Pos2> = None;
+    let mut handoff: Option<PathBuf> = None;
     let mut path = None;
     let mut startup_line = None;
     let mut args = raw_args.into_iter().peekable();
@@ -246,6 +247,7 @@ fn main() -> eframe::Result {
             "--agenda" | "--ag" => standalone_agenda = true,
             "--new-window" | "-n" => new_window = true,
             "--background" => background = true,
+            "--handoff" => handoff = args.next().map(PathBuf::from),
             "--position" => {
                 position = args.next().and_then(|value| {
                     let (x, y) = value.split_once(',')?;
@@ -337,6 +339,7 @@ fn main() -> eframe::Result {
             ),
         );
         let path = path.clone();
+        let handoff = handoff.clone();
         let app_started = &app_started;
         eframe::run_native(
             title,
@@ -347,6 +350,9 @@ fn main() -> eframe::Result {
                 if use_single_instance {
                     app.start_instance_server(&cc.egui_ctx);
                     app.enable_resident(cc, background);
+                }
+                if let Some(file) = &handoff {
+                    app.apply_handoff(file);
                 }
                 Ok(Box::new(app))
             }),

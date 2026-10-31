@@ -111,6 +111,19 @@ pub(crate) struct TabLabel {
     pub(crate) rename_text: String,
 }
 
+/// A tab moving to a new window with unsaved text (or no file yet). Written
+/// by the old window, read and deleted by the new one after it has its own
+/// recovery checkpoint, so the text always exists in at least one place.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct Handoff {
+    path: Option<PathBuf>,
+    disk_base: Option<safe_file::Fingerprint>,
+    text: String,
+    cursor: usize,
+    dirty: bool,
+    alias: Option<String>,
+}
+
 /// Saved between runs: the files of the open tabs and which one was active.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct Session {
@@ -349,30 +362,39 @@ impl SlateApp {
     /// (screen points) and leaves this one. Unsaved text never moves between
     /// processes: such tabs are saved first.
     pub(super) fn detach_tab(&mut self, index: usize, at: egui::Pos2) {
-        let Some(path) = self.tab_path(index).map(Path::to_path_buf) else {
-            self.status = "Save the file first to move it to a new window".into();
-            return;
-        };
-        let dirty = self.tabs.list[index]
-            .doc
-            .as_ref()
-            .map_or(self.dirty, |doc| doc.dirty);
-        if dirty {
-            self.status = "Save the tab first to move it to a new window".into();
+        if index >= self.tabs.list.len() {
             return;
         }
+        let path = self.tab_path(index).map(Path::to_path_buf);
+        let label = self.tab_labels()[index].text.clone();
         let Ok(exe) = std::env::current_exe() else {
             return;
+        };
+        // Unsaved text (or a tab without a file) travels in a handoff file.
+        let handoff = match self.tab_handoff(index) {
+            Some(handoff) => match self.write_handoff(&handoff) {
+                Ok(file) => Some(file),
+                Err(err) => {
+                    self.status = format!("Could not move the tab: {err}");
+                    return;
+                }
+            },
+            None => None,
         };
         // Put the new window's tab strip under the pointer.
         let position = format!("{},{}", (at.x - 60.0).round(), (at.y - 14.0).round());
         let command = {
             let mut command = std::process::Command::new(exe);
-            command
-                .arg("--new-window")
-                .arg("--position")
-                .arg(position)
-                .arg(&path);
+            command.arg("--new-window").arg("--position").arg(position);
+            match (&handoff, &path) {
+                (Some(file), _) => {
+                    command.arg("--handoff").arg(file);
+                }
+                (None, Some(path)) => {
+                    command.arg(path);
+                }
+                (None, None) => {}
+            }
             command
         };
         // Tests check the command instead of starting a window.
@@ -390,13 +412,107 @@ impl SlateApp {
                 if index != self.tabs.active {
                     self.activate_tab(index);
                 }
+                // The text now lives in the handoff file and the new window.
+                self.dirty = false;
                 self.close_active_tab_now();
-                self.status = format!("Moved {} to a new window", file_label(Some(&path)));
+                self.status = format!("Moved {label} to a new window");
                 #[cfg(test)]
                 self.status.push_str(&format!(" · {launched}"));
             }
-            Err(err) => self.status = format!("New window failed: {err}"),
+            Err(err) => {
+                if let Some(file) = handoff {
+                    let _ = fs::remove_file(file);
+                }
+                self.status = format!("New window failed: {err}");
+            }
         }
+    }
+
+    /// What has to travel with a tab: `None` when the file on disk is enough.
+    fn tab_handoff(&self, index: usize) -> Option<Handoff> {
+        let tab = &self.tabs.list[index];
+        let (path, disk_base, text, cursor, dirty) = match &tab.doc {
+            None => (
+                self.path.clone(),
+                self.disk_base,
+                self.buffer.as_str(),
+                self.buffer.cursor(),
+                self.dirty,
+            ),
+            Some(doc) => (
+                doc.path.clone().or(doc.lazy_path.clone()),
+                doc.disk_base,
+                doc.buffer.as_str(),
+                doc.buffer.cursor(),
+                doc.dirty,
+            ),
+        };
+        if !dirty && path.is_some() {
+            return None;
+        }
+        Some(Handoff {
+            alias: path.is_none().then(|| tab.alias.clone()).flatten(),
+            path,
+            disk_base,
+            text: text.to_string(),
+            cursor,
+            dirty,
+        })
+    }
+
+    fn handoff_dir(&self) -> Option<PathBuf> {
+        #[cfg(test)]
+        return self
+            .settings_path_override
+            .as_ref()
+            .and_then(|path| path.parent().map(|dir| dir.join("handoff")));
+        #[cfg(not(test))]
+        dirs_next::data_local_dir().map(|dir| dir.join("slate").join("handoff"))
+    }
+
+    fn write_handoff(&self, handoff: &Handoff) -> Result<PathBuf, String> {
+        let dir = self.handoff_dir().ok_or("no local data folder")?;
+        fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let file = dir.join(format!("{}-{nanos}.json", std::process::id()));
+        let json = serde_json::to_vec(handoff).map_err(|err| err.to_string())?;
+        safe_file::atomic_replace(&file, &json)?;
+        Ok(file)
+    }
+
+    /// New window side of a moved tab: takes the text, makes it durable in
+    /// this process's recovery, then deletes the handoff file.
+    pub(super) fn apply_handoff(&mut self, file: &Path) {
+        let Some(handoff) = fs::read(file)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Handoff>(&bytes).ok())
+        else {
+            self.status = format!("Moved tab could not be read: {}", file.display());
+            return;
+        };
+        self.cancel_file_open();
+        let cursor = handoff.cursor.min(handoff.text.len());
+        self.buffer.set_text(handoff.text);
+        self.buffer.set_cursor(cursor);
+        self.path = handoff.path;
+        self.disk_base = handoff.disk_base;
+        self.dirty = handoff.dirty;
+        if let Some(tab) = self.tabs.list.get_mut(self.tabs.active) {
+            tab.alias = handoff.alias;
+        }
+        self.focus_editor_once = true;
+        self.editor_view.request_scroll_to_cursor(&self.buffer);
+        self.observe_document_safety(0.0, true);
+        self.document_safety.flush();
+        let _ = fs::remove_file(file);
+        self.status = if self.dirty {
+            "Moved here with its unsaved changes".into()
+        } else {
+            "Moved here".into()
+        };
     }
 
     /// Moves a tab in the strip; the active tab stays active.

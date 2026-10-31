@@ -57,9 +57,12 @@ document keeps its own durable checkpoint.
    of the query against aliases and lists those files first. App shortcuts
    pause while an alias is being typed. An untitled tab keeps its alias on
    the tab and hands it to the file on the first save.
-4. Drag out (done 2026-10-31): dropping a saved tab outside the window opens
+4. Drag out (done 2026-10-31): dropping a tab outside the window opens
    `slate --new-window --position X,Y file` under the pointer and closes the
-   tab here; unsaved and untitled tabs stay (save first). Only the primary
+   tab here. Unsaved or untitled tabs travel as a handoff file
+   (`%LOCALAPPDATA%/slate/handoff/*.json`: text, cursor, path, disk base,
+   alias) passed with `--handoff`; the new window loads it, makes its own
+   recovery checkpoint durable, then deletes the file. Only the primary
    window (single-instance owner) reads/writes `session.json`, so extra
    windows never clobber the session. Dropping a tab into another Slate
    window is not supported yet.
