@@ -4370,6 +4370,7 @@ impl SlateApp {
 
         let root = Self::flow_project_root_for_path(path);
         agenda::overlay_live_buffer_items(items, path, &root, self.buffer.as_str());
+        self.overlay_inactive_tab_agenda_items(items);
     }
 
     fn agenda_visible_item_indices(&self) -> Vec<usize> {
@@ -9808,6 +9809,7 @@ impl SlateApp {
             Some(window_ui::TabAction::Activate(index)) => self.activate_tab(index),
             Some(window_ui::TabAction::Close(index)) => self.close_tab(index),
             Some(window_ui::TabAction::New) => self.new_tab(),
+            Some(window_ui::TabAction::Move { from, to }) => self.move_tab(from, to),
             None => {}
         }
         if self.recovery_open || self.file_conflict.is_some() {

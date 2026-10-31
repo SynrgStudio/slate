@@ -54,7 +54,11 @@ pub(crate) struct Tabs {
     pub(crate) list: Vec<Tab>,
     pub(crate) active: usize,
     next_id: u64,
+    /// Files of recently closed tabs, newest last (Ctrl+Shift+T).
+    closed: Vec<PathBuf>,
 }
+
+const MAX_CLOSED_TABS: usize = 25;
 
 impl Default for Tabs {
     fn default() -> Self {
@@ -62,6 +66,7 @@ impl Default for Tabs {
             list: vec![Tab { id: 1, doc: None }],
             active: 0,
             next_id: 2,
+            closed: Vec::new(),
         }
     }
 }
@@ -77,8 +82,11 @@ impl Tabs {
 /// What the tab strip shows for one tab.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TabLabel {
+    /// Stable across reorders (widget identity while dragging).
+    pub(crate) id: u64,
     pub(crate) text: String,
     pub(crate) dirty: bool,
+    pub(crate) tooltip: String,
 }
 
 /// Saved between runs: the files of the open tabs and which one was active.
@@ -108,18 +116,125 @@ fn file_label(path: Option<&Path>) -> String {
         .to_string()
 }
 
+/// The last `depth` folder names above `path`, e.g. `slate` or `src/slate`.
+fn parent_suffix(path: &Path, depth: usize) -> String {
+    let mut parts: Vec<String> = path
+        .parent()
+        .into_iter()
+        .flat_map(|parent| parent.components().rev())
+        .filter_map(|part| match part {
+            std::path::Component::Normal(name) => name.to_str().map(str::to_owned),
+            _ => None,
+        })
+        .take(depth)
+        .collect();
+    parts.reverse();
+    parts.join("/")
+}
+
+/// Tab texts: the file name, plus as many parent folders as needed to tell
+/// apart tabs whose file names are equal (`README.md · slate`).
+pub(crate) fn disambiguated_names(paths: &[Option<&Path>]) -> Vec<String> {
+    let names: Vec<String> = paths.iter().map(|p| file_label(*p)).collect();
+    let key = |name: &str| name.to_lowercase();
+    (0..paths.len())
+        .map(|index| {
+            let Some(path) = paths[index] else {
+                return names[index].clone();
+            };
+            let clashes: Vec<&Path> = (0..paths.len())
+                .filter(|&other| other != index && key(&names[other]) == key(&names[index]))
+                .filter_map(|other| paths[other])
+                .collect();
+            if clashes.is_empty() {
+                return names[index].clone();
+            }
+            for depth in 1..=4 {
+                let mine = parent_suffix(path, depth);
+                if clashes
+                    .iter()
+                    .all(|other| parent_suffix(other, depth).to_lowercase() != mine.to_lowercase())
+                {
+                    return format!("{} · {mine}", names[index]);
+                }
+            }
+            format!("{} · {}", names[index], parent_suffix(path, 4))
+        })
+        .collect()
+}
+
 impl SlateApp {
     pub(super) fn tab_labels(&self) -> Vec<TabLabel> {
+        // Paths include a file that is still loading.
+        let paths: Vec<Option<&Path>> = (0..self.tabs.list.len())
+            .map(|index| self.tab_path(index))
+            .collect();
+        let names = disambiguated_names(&paths);
         self.tabs
             .list
             .iter()
-            .enumerate()
-            .map(|(index, tab)| TabLabel {
-                // Includes a file that is still loading.
-                text: file_label(self.tab_path(index)),
-                dirty: tab.doc.as_ref().map_or(self.dirty, |doc| doc.dirty),
+            .zip(names)
+            .zip(&paths)
+            .map(|((tab, text), path)| {
+                let dirty = tab.doc.as_ref().map_or(self.dirty, |doc| doc.dirty);
+                let tooltip = match path {
+                    Some(path) => format!(
+                        "{}{}",
+                        path.display(),
+                        if dirty { " · unsaved changes" } else { "" }
+                    ),
+                    None if dirty => "untitled · unsaved".to_string(),
+                    None => "untitled".to_string(),
+                };
+                TabLabel {
+                    id: tab.id,
+                    text,
+                    dirty,
+                    tooltip,
+                }
             })
             .collect()
+    }
+
+    /// The agenda shows unsaved tasks of every tab, not only the active one.
+    pub(super) fn overlay_inactive_tab_agenda_items(&self, items: &mut Vec<AgendaItem>) {
+        for doc in self.tabs.list.iter().filter_map(|tab| tab.doc.as_ref()) {
+            let Some(path) = doc.path.as_deref() else {
+                continue;
+            };
+            if doc.dirty && flow::should_index_flow_path(path) {
+                let root = Self::flow_project_root_for_path(path);
+                agenda::overlay_live_buffer_items(items, path, &root, doc.buffer.as_str());
+            }
+        }
+    }
+
+    /// Moves a tab in the strip; the active tab stays active.
+    pub(super) fn move_tab(&mut self, from: usize, to: usize) {
+        let count = self.tabs.list.len();
+        if from >= count || to >= count || from == to {
+            return;
+        }
+        let active_id = self.tabs.list[self.tabs.active].id;
+        let tab = self.tabs.list.remove(from);
+        self.tabs.list.insert(to, tab);
+        self.tabs.active = self
+            .tabs
+            .list
+            .iter()
+            .position(|tab| tab.id == active_id)
+            .unwrap_or(0);
+    }
+
+    /// Ctrl+Shift+T: reopens the most recently closed file that still exists.
+    pub(super) fn reopen_closed_tab(&mut self) {
+        while let Some(path) = self.tabs.closed.pop() {
+            if path.is_file() {
+                self.request_file_open(path, OpenDestination::Restore);
+                return;
+            }
+        }
+        self.status = "No closed tab to reopen".into();
     }
 
     fn tab_path(&self, index: usize) -> Option<&Path> {
@@ -286,6 +401,12 @@ impl SlateApp {
     /// Closes the active tab without asking (clean or already discarded).
     pub(super) fn close_active_tab_now(&mut self) {
         let closed = file_label(self.path.as_deref());
+        if let Some(path) = self.path.clone() {
+            self.tabs.closed.retain(|old| !same_file(old, &path));
+            self.tabs.closed.push(path);
+            let excess = self.tabs.closed.len().saturating_sub(MAX_CLOSED_TABS);
+            self.tabs.closed.drain(..excess);
+        }
         self.cancel_file_open();
         self.remember_current_cursor_position();
         self.clear_recovery(document_safety::Slot::Main);
@@ -448,8 +569,19 @@ impl SlateApp {
         let mut step = 0isize;
         let mut goto = None;
         let mut wheel = 0.0f32;
+        let mut reopen = false;
         ctx.input_mut(|input| {
             input.events.retain(|event| match event {
+                egui::Event::Key {
+                    key: egui::Key::T,
+                    pressed,
+                    repeat: false,
+                    modifiers,
+                    ..
+                } if modifiers.ctrl && modifiers.shift && !modifiers.alt => {
+                    reopen |= *pressed;
+                    false
+                }
                 egui::Event::Key {
                     key: egui::Key::Tab,
                     pressed,
@@ -501,6 +633,10 @@ impl SlateApp {
                 self.tab_wheel += 1.0;
                 step -= 1;
             }
+        }
+        if reopen {
+            self.reopen_closed_tab();
+            return true;
         }
         if let Some(number) = goto {
             let last = self.tabs.list.len() - 1;

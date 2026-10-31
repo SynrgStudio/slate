@@ -139,7 +139,8 @@ instantly instead of starting a new one. Use `slate --new-window file.md`
 `config.toml`. See [`docs/speed-work.md`](docs/speed-work.md).
 
 Files open in tabs: opening a file that is already open switches to its tab,
-and `slate file.md` adds a tab to the running window. Tabs survive closing the
+and `slate file.md` adds a tab to the running window. Drag tabs to reorder
+them; files with the same name show their folder (`README.md · notas`). Tabs survive closing the
 window and restarting Slate.
 
 Closing the window keeps Slate running in the tray, so opening it again is
@@ -206,6 +207,7 @@ slate --scratch
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
 | `Ctrl+wheel` | Next (up) / previous (down) tab |
 | `Ctrl+1` … `Ctrl+9` | Go to tab 1–8, `Ctrl+9` = last tab |
+| `Ctrl+Shift+T` | Reopen the last closed tab |
 | `Ctrl+Q` | Close the window (tabs kept; Slate stays in the tray) |
 | `Alt+1` … `Alt+9`, `Alt+0` | Open Lance slots 1 through 10 |
 | `Alt+Up` / `Alt+Down` | Move current line up/down |

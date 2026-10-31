@@ -26,7 +26,7 @@ Agreed with the user on 2026-10-31.
 - Each tab keeps its text, undo/redo, cursor, scroll, selection, search and
   crash-recovery checkpoint.
 - Unsaved tabs show `●`; `×` (or a middle click) closes a tab and `+` opens one.
-- Equal file names show their folder (`README.md · notas`) — stage 2.
+- Equal file names show their folder (`README.md · notas`).
 - Hiding the window keeps the tabs. Starting Slate without a file restores the
   last session's tabs (replaces "reopen last file").
 - Aliases are stored per absolute path; Periscope matches them and shows
@@ -46,6 +46,10 @@ document keeps its own durable checkpoint.
 1. Core (done 2026-10-31): tab strip in the title bar, keys above, open-in-tab and dedupe,
    per-tab state and recovery, close/quit flows, session restore, forwarding
    from `slate file.md` into a tab.
-2. Comfort: drag to reorder, `Ctrl+Shift+T`, name disambiguation, overflow.
+2. Comfort (done 2026-10-31): drag to reorder, `Ctrl+Shift+T`, name
+   disambiguation, scrolling strip (tabs never narrower than 72 pt), path
+   tooltips. External changes to an inactive tab's file are flagged when the
+   tab is shown again (switching re-checks the file at once), and the agenda
+   overlays unsaved tasks from every tab.
 3. Aliases: rename by double click, show everywhere, Periscope search.
 4. Drag a tab out to a new window.

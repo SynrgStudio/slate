@@ -161,7 +161,22 @@ fn session_restores_tabs_and_loads_inactive_ones_when_shown() {
     assert_eq!(g.app.path.as_deref(), Some(b.as_path()));
 }
 
-fn ctrl_events(f: &mut Fixture, events: Vec<egui::Event>) {
+fn ctrl_events(f: &mut Fixture, mut events: Vec<egui::Event>) {
+    // Release the keys too, or egui reports the next press as a repeat.
+    let releases: Vec<egui::Event> = events
+        .iter()
+        .filter_map(|event| match event {
+            egui::Event::Key { key, modifiers, .. } => Some(egui::Event::Key {
+                key: *key,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: *modifiers,
+            }),
+            _ => None,
+        })
+        .collect();
+    events.extend(releases);
     let raw = egui::RawInput {
         events,
         modifiers: egui::Modifiers::CTRL,
@@ -278,4 +293,133 @@ fn ctrl_sequences_containing_w_still_run_on_release() {
     release_ctrl(&mut f);
     assert_ne!(f.app.buffer.as_str(), "uno dos", "`dw` deleted a word");
     assert_eq!(f.app.tabs.list.len(), 1);
+}
+
+#[test]
+fn equal_file_names_show_as_many_folders_as_needed() {
+    let a = PathBuf::from("C:/notas/README.md");
+    let b = PathBuf::from("C:/slate/README.md");
+    let c = PathBuf::from("C:/x/docs/plan.md");
+    let d = PathBuf::from("C:/y/docs/plan.md");
+    let e = PathBuf::from("C:/solo/unico.md");
+    let names =
+        tabs::disambiguated_names(&[Some(&a), Some(&b), Some(&c), Some(&d), Some(&e), None]);
+    assert_eq!(
+        names,
+        [
+            "README.md · notas",
+            "README.md · slate",
+            "plan.md · x/docs",
+            "plan.md · y/docs",
+            "unico.md",
+            "untitled",
+        ]
+    );
+}
+
+#[test]
+fn moving_a_tab_keeps_the_active_document() {
+    let mut f = Fixture::new();
+    let a = f.file("a.md", "alpha\n");
+    let b = f.file("b.md", "beta\n");
+    let c = f.file("c.md", "gamma\n");
+    f.open(&a);
+    f.open(&b);
+    f.open(&c);
+    f.app.activate_tab(1);
+    f.app.move_tab(1, 2);
+    assert_eq!(f.labels(), ["a.md", "c.md", "b.md"]);
+    assert_eq!(f.app.tabs.active, 2);
+    assert_eq!(f.app.buffer.as_str(), "beta\n");
+    f.app.move_tab(0, 2);
+    assert_eq!(f.labels(), ["c.md", "b.md", "a.md"]);
+    assert_eq!(f.app.tabs.active, 1, "active follows its tab");
+    f.app.activate_tab(2);
+    assert_eq!(f.app.buffer.as_str(), "alpha\n");
+}
+
+#[test]
+fn ctrl_shift_t_reopens_closed_tabs_newest_first() {
+    let mut f = Fixture::new();
+    let a = f.file("a.md", "alpha\n");
+    let b = f.file("b.md", "beta\n");
+    f.open(&a);
+    f.open(&b);
+    f.app.close_active_tab();
+    f.app.close_active_tab();
+    assert_eq!(f.labels(), ["untitled"]);
+    let ctrl_shift = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
+    ctrl_events(&mut f, vec![key(egui::Key::T, ctrl_shift)]);
+    f.settle();
+    assert_eq!(f.labels(), ["a.md"], "reuses the empty tab");
+    ctrl_events(&mut f, vec![key(egui::Key::T, ctrl_shift)]);
+    f.settle();
+    assert_eq!(f.labels(), ["a.md", "b.md"]);
+    f.app.reopen_closed_tab();
+    assert_eq!(f.app.status, "No closed tab to reopen");
+}
+
+#[test]
+fn a_dragged_tab_swaps_only_past_the_neighbours_centre() {
+    let rect = |x: f32, w: f32| egui::Rect::from_min_size(egui::pos2(x, 0.0), egui::vec2(w, 26.0));
+    let rects = [rect(0.0, 200.0), rect(202.0, 90.0), rect(294.0, 90.0)];
+    assert_eq!(
+        window_ui::drag_target(&rects, 0, 240.0),
+        0,
+        "before the centre"
+    );
+    assert_eq!(
+        window_ui::drag_target(&rects, 0, 250.0),
+        1,
+        "past the centre"
+    );
+    assert_eq!(
+        window_ui::drag_target(&rects, 0, 500.0),
+        2,
+        "beyond the end"
+    );
+    assert_eq!(window_ui::drag_target(&rects, 2, 10.0), 0);
+}
+
+#[test]
+fn a_file_changed_on_disk_while_its_tab_was_inactive_is_flagged_when_shown() {
+    let mut f = Fixture::new();
+    f.app.document_safety =
+        document_safety::Manager::new(f.ctx.clone(), Some(f.root.join("recovery")));
+    let a = f.file("a.md", "alpha\n");
+    let b = f.file("b.md", "beta\n");
+    f.open(&a);
+    f.open(&b);
+    fs::write(&a, "changed outside Slate\n").unwrap();
+    f.app.activate_tab(0);
+    for _ in 0..300 {
+        let app = &mut f.app;
+        let _ = f.ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.poll_document_safety(ui.ctx())
+        });
+        if f.app.file_conflict.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(f.app.file_conflict.is_some(), "conflict flagged on return");
+    assert_eq!(f.app.buffer.as_str(), "alpha\n", "editor text is kept");
+}
+
+#[test]
+fn the_agenda_sees_unsaved_tasks_of_every_tab() {
+    let mut f = Fixture::new();
+    let a = f.file("a.md", "");
+    let b = f.file("b.md", "");
+    f.open(&a);
+    f.app.buffer.set_text("- [ ] comprar pan\n".into());
+    f.app.dirty = true;
+    f.open(&b);
+    f.app.buffer.set_text("- [ ] llamar a Ana\n".into());
+    f.app.dirty = true;
+    let mut items = Vec::new();
+    f.app.overlay_current_buffer_agenda_items(&mut items);
+    let mut titles: Vec<_> = items.iter().map(|item| item.title.clone()).collect();
+    titles.sort();
+    assert_eq!(titles, ["comprar pan", "llamar a Ana"]);
 }

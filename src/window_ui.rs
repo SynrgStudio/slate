@@ -81,6 +81,7 @@ pub fn titlebar(ui: &mut egui::Ui, title: &str) {
 pub enum TabAction {
     Activate(usize),
     Close(usize),
+    Move { from: usize, to: usize },
     New,
 }
 
@@ -88,6 +89,10 @@ const TAB_FONT: f32 = 12.0;
 
 /// Draws the tabs from the left edge of the title bar and returns where the
 /// strip ends (the rest of the bar stays draggable).
+///
+/// Tabs shrink down to `MIN_TAB` and then the strip scrolls: the wheel over the
+/// strip moves it, and the active tab is always brought into view. Widget ids
+/// come from tab ids, so dragging a tab survives the reorders it causes.
 fn draw_tabs(
     ui: &mut egui::Ui,
     bar: egui::Rect,
@@ -95,6 +100,8 @@ fn draw_tabs(
     active: usize,
     action: &mut Option<TabAction>,
 ) -> f32 {
+    const MIN_TAB: f32 = 72.0;
+    const GAP: f32 = 2.0;
     let font = FontId::monospace(TAB_FONT);
     let window_buttons = 3.0 * 38.0;
     let plus_width = 26.0;
@@ -111,34 +118,97 @@ fn draw_tabs(
             (text + 44.0).clamp(90.0, 220.0)
         })
         .collect();
-    let gap = 2.0;
-    let room = (available - gap * tabs.len() as f32).max(0.0);
+    let room = (available - GAP * tabs.len() as f32).max(0.0);
     let natural_total: f32 = natural.iter().sum();
     let scale = if natural_total > room {
         room / natural_total
     } else {
         1.0
     };
-    // Narrow tabs keep a usable minimum unless there is no room even for that.
-    let min_width = 44.0_f32.min(room / tabs.len().max(1) as f32);
-    let mut x = bar.left() + 6.0;
+    let widths: Vec<f32> = natural.iter().map(|w| (w * scale).max(MIN_TAB)).collect();
+    let content: f32 = widths.iter().map(|w| w + GAP).sum();
+    let strip = egui::Rect::from_min_size(
+        egui::pos2(bar.left() + 6.0, bar.top()),
+        Vec2::new(content.min(available), bar.height()),
+    );
+
+    // Horizontal scroll offset, kept per window.
+    let scroll_id = ui.id().with("slate_tab_scroll");
+    let max_offset = (content - strip.width()).max(0.0);
+    let mut offset: f32 = ui.ctx().data(|d| d.get_temp(scroll_id)).unwrap_or(0.0);
+    let hover = ui.rect_contains_pointer(strip);
+    if hover && max_offset > 0.0 {
+        let delta = ui.input(|i| {
+            if i.modifiers.ctrl {
+                0.0
+            } else {
+                i.smooth_scroll_delta.y + i.smooth_scroll_delta.x
+            }
+        });
+        offset -= delta;
+    }
+    let active_id = tabs.get(active).map(|t| t.id);
+    let last_active_id = ui.id().with("slate_tab_last_active");
+    if ui.ctx().data(|d| d.get_temp::<u64>(last_active_id)) != active_id {
+        // Bring a newly active tab into view.
+        let start: f32 = widths[..active.min(widths.len())]
+            .iter()
+            .map(|w| w + GAP)
+            .sum();
+        let end = start + widths.get(active).copied().unwrap_or(0.0);
+        if start < offset {
+            offset = start;
+        } else if end > offset + strip.width() {
+            offset = end - strip.width();
+        }
+        if let Some(id) = active_id {
+            ui.ctx().data_mut(|d| d.insert_temp(last_active_id, id));
+        }
+    }
+    offset = offset.clamp(0.0, max_offset);
+    ui.ctx().data_mut(|d| d.insert_temp(scroll_id, offset));
+
+    let painter = ui.painter_at(strip);
+    #[cfg(test)]
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(egui::Id::new("tab_strip"), strip));
+    let pointer = ui.ctx().pointer_interact_pos();
+    let mut x = strip.left() - offset;
+    let rects: Vec<egui::Rect> = widths
+        .iter()
+        .map(|width| {
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(x, bar.top() + 4.0),
+                Vec2::new(*width, bar.height() - 4.0),
+            );
+            x += width + GAP;
+            rect
+        })
+        .collect();
     for (index, tab) in tabs.iter().enumerate() {
-        let width = (natural[index] * scale).max(min_width);
-        let rect = egui::Rect::from_min_size(
-            egui::pos2(x, bar.top() + 4.0),
-            Vec2::new(width, bar.height() - 4.0),
-        );
-        x += width + gap;
-        let id = ui.id().with(("slate_tab", index));
-        let response = ui.interact(rect, id, egui::Sense::click());
+        let rect = rects[index];
+        let visible = rect.intersect(strip);
+        if visible.width() <= 0.0 {
+            continue;
+        }
+        let id = ui.id().with(("slate_tab", tab.id));
+        let response = ui
+            .interact(visible, id, egui::Sense::click_and_drag())
+            .on_hover_text(&tab.tooltip);
         let close_rect = egui::Rect::from_center_size(
             egui::pos2(rect.right() - 13.0, rect.center().y),
             Vec2::splat(16.0),
         );
-        let close = ui.interact(close_rect, id.with("close"), egui::Sense::click());
+        let close = if strip.contains_rect(close_rect) {
+            Some(ui.interact(close_rect, id.with("close"), egui::Sense::click()))
+        } else {
+            None
+        };
+        let close_hovered = close.as_ref().is_some_and(|c| c.hovered());
         let is_active = index == active;
-        let hovered = response.hovered() || close.hovered();
-        let fill = if is_active {
+        let dragging = response.dragged();
+        let hovered = response.hovered() || close_hovered;
+        let fill = if is_active || dragging {
             Some(Color32::from_rgb(36, 44, 58))
         } else if hovered {
             Some(Color32::from_rgb(30, 37, 48))
@@ -146,7 +216,7 @@ fn draw_tabs(
             None
         };
         if let Some(fill) = fill {
-            ui.painter().rect_filled(
+            painter.rect_filled(
                 rect,
                 egui::CornerRadius {
                     nw: 6,
@@ -170,33 +240,61 @@ fn draw_tabs(
         job.wrap.overflow_character = Some('…');
         let galley = ui.painter().layout_job(job);
         let text_pos = egui::pos2(rect.left() + 10.0, rect.center().y - galley.size().y / 2.0);
-        ui.painter_at(rect).galley(text_pos, galley, text_color);
-        if close.hovered() {
-            ui.painter()
-                .rect_filled(close_rect, 3.0, Color32::from_rgb(58, 68, 86));
+        painter
+            .with_clip_rect(rect.intersect(strip))
+            .galley(text_pos, galley, text_color);
+        if close_hovered {
+            painter.rect_filled(close_rect, 3.0, Color32::from_rgb(58, 68, 86));
         }
         if tab.dirty && !hovered {
-            ui.painter()
-                .circle_filled(close_rect.center(), 3.5, Color32::from_rgb(235, 203, 139));
+            painter.circle_filled(close_rect.center(), 3.5, Color32::from_rgb(235, 203, 139));
         } else if is_active || hovered {
             let c = close_rect.center();
             let stroke = egui::Stroke::new(1.3_f32, text_color);
-            ui.painter()
-                .line_segment([c + Vec2::new(-3.5, -3.5), c + Vec2::new(3.5, 3.5)], stroke);
-            ui.painter()
-                .line_segment([c + Vec2::new(-3.5, 3.5), c + Vec2::new(3.5, -3.5)], stroke);
+            painter.line_segment([c + Vec2::new(-3.5, -3.5), c + Vec2::new(3.5, 3.5)], stroke);
+            painter.line_segment([c + Vec2::new(-3.5, 3.5), c + Vec2::new(3.5, -3.5)], stroke);
         }
-        if close.clicked() || response.middle_clicked() {
+        if dragging {
+            // Reorder live: the tab follows the pointer across its neighbours.
+            if let Some(pos) = pointer {
+                let target = drag_target(&rects, index, pos.x);
+                if target != index {
+                    *action = Some(TabAction::Move {
+                        from: index,
+                        to: target,
+                    });
+                }
+            }
+        } else if close.is_some_and(|c| c.clicked()) || response.middle_clicked() {
             *action = Some(TabAction::Close(index));
-        } else if response.clicked() {
+        } else if response.clicked() || response.drag_started() {
             *action = Some(TabAction::Activate(index));
         }
         #[cfg(test)]
         ui.ctx()
             .data_mut(|data| data.insert_temp(egui::Id::new(("tab_rect", index)), rect));
     }
+    // Scroll hints when tabs are hidden on either side.
+    let fade = Color32::from_rgba_unmultiplied(22, 28, 37, 220);
+    if offset > 0.5 {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(strip.left_top(), Vec2::new(10.0, strip.height())),
+            0.0,
+            fade,
+        );
+    }
+    if offset < max_offset - 0.5 {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(strip.right() - 10.0, strip.top()),
+                Vec2::new(10.0, strip.height()),
+            ),
+            0.0,
+            fade,
+        );
+    }
     let plus_rect = egui::Rect::from_min_size(
-        egui::pos2(x + 2.0, bar.top() + 6.0),
+        egui::pos2(strip.right() + 2.0, bar.top() + 6.0),
         Vec2::new(plus_width - 4.0, bar.height() - 10.0),
     );
     let plus = ui.interact(
@@ -218,6 +316,19 @@ fn draw_tabs(
         *action = Some(TabAction::New);
     }
     plus_rect.right()
+}
+
+/// Where a dragged tab goes: it swaps with a neighbour once the pointer passes
+/// that neighbour's centre, so tabs of different widths do not flicker.
+pub(crate) fn drag_target(rects: &[egui::Rect], index: usize, x: f32) -> usize {
+    let mut target = index;
+    while target + 1 < rects.len() && x > rects[target + 1].center().x {
+        target += 1;
+    }
+    while target > 0 && x < rects[target - 1].center().x {
+        target -= 1;
+    }
+    target
 }
 
 /// Title bar; with `tabs` it shows the tab strip instead of the centered title.
@@ -451,8 +562,10 @@ mod tests {
             let ctx = egui::Context::default();
             let tabs: Vec<_> = (0..count)
                 .map(|n| crate::tabs::TabLabel {
+                    id: n as u64,
                     text: format!("documento-{n}-con-nombre-largo.md"),
                     dirty: n % 2 == 0,
+                    tooltip: String::new(),
                 })
                 .collect();
             let _ = ctx.run_ui(
@@ -475,13 +588,58 @@ mod tests {
                 })
                 .unwrap();
             let first_button = buttons.iter().map(|b| b.left()).fold(f32::MAX, f32::min);
+            // Tabs are drawn clipped to the strip (the rest scrolls).
             let last_tab = ctx
-                .data(|data| data.get_temp::<egui::Rect>(egui::Id::new(("tab_rect", count - 1))))
+                .data(|data| data.get_temp::<egui::Rect>(egui::Id::new("tab_strip")))
                 .unwrap();
             assert!(frame.contains_rect(last_tab), "{width} {count}");
             assert!(
                 last_tab.right() + 26.0 + 30.0 < first_button,
                 "tabs + new-tab button leave drag room: {width} {count} {last_tab:?} {first_button}"
+            );
+        }
+    }
+    #[test]
+    fn many_tabs_scroll_and_the_active_tab_is_always_visible() {
+        let ctx = egui::Context::default();
+        let tabs: Vec<_> = (0..40)
+            .map(|n| crate::tabs::TabLabel {
+                id: n as u64,
+                text: format!("nota-{n}.md"),
+                dirty: false,
+                tooltip: String::new(),
+            })
+            .collect();
+        for active in [39, 0, 20] {
+            for _ in 0..2 {
+                let _ = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(900.0, 560.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        titlebar_with_tabs(ui, "Slate", &tabs, active);
+                    },
+                );
+            }
+            let (frame, _, buttons) = ctx
+                .data(|data| {
+                    data.get_temp::<(egui::Rect, egui::Rect, Vec<egui::Rect>)>(
+                        "titlebar_geometry".into(),
+                    )
+                })
+                .unwrap();
+            let first_button = buttons.iter().map(|b| b.left()).fold(f32::MAX, f32::min);
+            let rect = ctx
+                .data(|data| data.get_temp::<egui::Rect>(egui::Id::new(("tab_rect", active))))
+                .unwrap();
+            assert!(rect.width() >= 72.0, "tabs stay readable: {rect:?}");
+            assert!(
+                rect.left() >= frame.left() && rect.right() + 26.0 < first_button,
+                "active {active} visible: {rect:?}"
             );
         }
     }
