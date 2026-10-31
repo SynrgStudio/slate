@@ -54,6 +54,7 @@ mod perf_log;
 mod parallel;
 mod single_instance;
 mod flow_api;
+mod flow_worker;
 mod preview_ui;
 mod periscope_ui;
 mod picker_ui;
@@ -763,6 +764,7 @@ struct SlateApp {
     reopen_last_file_on_startup: bool,
     single_instance: bool,
     instance_server: Option<single_instance::Server>,
+    flow_worker: flow_worker::FlowWorker,
     markdown_live_rendering: bool,
     virtual_references_enabled: bool,
     virtual_references_collapsed: bool,
@@ -979,6 +981,7 @@ impl SlateApp {
             reopen_last_file_on_startup: false,
             single_instance: true,
             instance_server: None,
+            flow_worker: flow_worker::FlowWorker::start(cc.egui_ctx.clone()),
             markdown_live_rendering: true,
             virtual_references_enabled: true,
             virtual_references_collapsed: false,
@@ -1678,6 +1681,41 @@ impl SlateApp {
             .line_col_to_byte(entry.line_index + 1, entry.column + 1);
         self.buffer.set_cursor(byte);
         self.editor_view.request_scroll_to_cursor(&self.buffer);
+    }
+
+    fn queue_flow_index_after_save(&mut self, path: &Path) {
+        if !flow::should_index_flow_path(path) {
+            return;
+        }
+        let project_root = Self::flow_project_root_for_path(path);
+        let Ok(sqlite_path) = Self::flow_sqlite_path_for_root(&project_root) else {
+            return;
+        };
+        self.flow_worker.save_index(
+            project_root,
+            sqlite_path,
+            path.to_path_buf(),
+            self.buffer.as_str().to_string(),
+        );
+    }
+
+    fn poll_flow_save_index(&mut self) {
+        for report in self.flow_worker.take_results() {
+            match report.result {
+                Ok(summary) => {
+                    let saved = format!("Saved {}", report.path.display());
+                    if self.status == saved {
+                        self.status = format!("{saved} · indexed {} Flow tasks", summary.tasks.len());
+                    }
+                }
+                Err(err) => {
+                    perf_log::mark("flow.save_cache_update_failed", &err);
+                    if flow_store::is_busy_error(&err) && self.path.as_ref() == Some(&report.path) {
+                        self.schedule_current_flow_buffer_agenda_sync_later();
+                    }
+                }
+            }
+        }
     }
 
     fn refresh_flow_index_for_path(
@@ -3154,6 +3192,12 @@ impl SlateApp {
         let Some(sync_at) = self.pending_flow_agenda_sync_at else {
             return;
         };
+        if self.flow_worker.save_pending() {
+            // Let the save's index land first so this newer sync is never
+            // overwritten by older saved contents.
+            ctx.request_repaint_after(std::time::Duration::from_millis(25));
+            return;
+        }
         let now = ctx.input(|input| input.time);
         if now < sync_at {
             let remaining_ms = ((sync_at - now) * 1000.0).max(25.0) as u64;
@@ -3227,7 +3271,7 @@ impl SlateApp {
         let Ok(sqlite_path) = Self::flow_sqlite_path_for_root(&scope) else {
             return;
         };
-        let _ = flow_runtime::publish_active_buffer_heartbeat(&sqlite_path, &scope, &current_path);
+        self.flow_worker.heartbeat(sqlite_path, scope, current_path);
     }
 
     fn flow_item_is_active_in_live_editor(&self, item: &AgendaItem) -> bool {
@@ -3605,27 +3649,11 @@ impl SlateApp {
                 self.last_open_dir = path.parent().map(PathBuf::from);
                 self.dirty = false;
                 self.remember_recent_file(path.clone());
-                let flow_summary =
-                    match self.refresh_flow_index_for_path(&path, self.buffer.as_str()) {
-                        Ok(summary) => summary,
-                        Err(err) => {
-                            perf_log::mark("flow.save_cache_update_failed", &err);
-                            if flow_store::is_busy_error(&err) {
-                                self.schedule_current_flow_buffer_agenda_sync_later();
-                            }
-                            None
-                        }
-                    };
+                // The Flow index refresh runs on the Flow writer thread; the
+                // task count is appended to the status when it reports back.
+                self.queue_flow_index_after_save(&path);
                 let _ = self.save_settings();
-                self.status = if let Some(summary) = flow_summary {
-                    format!(
-                        "Saved {} · indexed {} Flow tasks",
-                        path.display(),
-                        summary.tasks.len()
-                    )
-                } else {
-                    format!("Saved {}", path.display())
-                };
+                self.status = format!("Saved {}", path.display());
                 if let Err(error) = self.persist_saved_project(&path, project) {
                     self.status
                         .push_str(&format!(" · project metadata not saved: {error}"));
@@ -9406,6 +9434,7 @@ impl SlateApp {
         }
         ui_timing.step("publish_flow_heartbeat");
         self.poll_flow_background_rescan(&ctx);
+        self.poll_flow_save_index();
         self.poll_flow_open_requests();
         self.poll_flow_completion_requests(&ctx);
         self.poll_flow_organization_requests(&ctx);
