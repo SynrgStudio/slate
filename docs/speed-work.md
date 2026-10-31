@@ -88,8 +88,7 @@ context: ~300–350 ms on this machine, Slate's own constructor < 0.5 ms.
 
 Not done: keeping Slate resident after its window closes (instant reopen from
 nothing running). It needs a tray/hidden-window lifecycle and exit semantics
-decided first. Saving still updates the Flow index on the UI thread (6+ ms per
-save); moving it needs care because daily events use its result.
+decided first.
 
 ## 6. Keystroke-to-photon latency
 
@@ -118,6 +117,23 @@ RTX 3090, ~100–360 keystrokes per window.
   paints with the default procedure, then requests one repaint at the end.
   Each drag logs `window.drag ... frames=N`; measured: 0 frames and ~120
   position updates/s (was ~30). Resizes still repaint.
+
+- **Flow writes off the UI thread.** The 3 s active-buffer heartbeat, the
+  index refresh after a save, and the agenda sync 0.8 s after typing near a
+  task wrote shared files/SQLite on the UI thread: usually < 1 ms, but p99
+  10 ms and max 184 ms when another Slate process held the lock, which froze
+  the next keystroke. `src/flow_worker.rs` runs them on one writer thread, in
+  order, keeping only the newest job per kind and file when they queue up.
+  Explicit agenda actions (complete, edit, organize) stay synchronous.
+  Each job logs `flow.writer_job kind=… ms=…`.
+- **Measured, left alone:**
+  - The 1 frame/s idle poll receives Flow requests from the agenda window and
+    the CLI; it costs 0.02–0.15 ms per frame, so it stays.
+  - First use of a glyph (egui rasterizes it into the font atlas): 0.05 ms for
+    one new character, 0.4 ms for a batch of accents, once per process. No
+    custom atlas or pre-warming needed.
+  - Windows decides when a window gets "Hardware: Independent Flip" (it took
+    seconds after opening); there is no API to request it.
 
 ## 7. Text representation
 
