@@ -1,17 +1,20 @@
 //! One background thread for Flow writes that the editor does not wait on.
 //!
-//! The active-buffer heartbeat (every 3 s while a Flow file is open) and the
-//! index refresh after a save both touch shared files/SQLite that other Slate
-//! processes also write. On the UI thread they were usually < 1 ms but spiked
-//! to 10 ms (p99) and 184 ms (max) when they hit a lock, freezing typing. Jobs
-//! run in order on a single thread, so an older save never lands after a newer
-//! one; heartbeats and saves queued behind a slow job are coalesced.
+//! The active-buffer heartbeat (every 3 s while a Flow file is open), the index
+//! refresh after a save, and the agenda sync after a typing pause near a task
+//! all touch shared files/SQLite that other Slate processes also write. On the
+//! UI thread they were usually < 1 ms but spiked to 10 ms (p99) and 184 ms (max)
+//! when they hit a lock, freezing typing. Jobs run in order on a single thread,
+//! so older contents never land after newer ones; when jobs queue up behind a
+//! slow one, only the newest heartbeat and the newest job of each kind per file
+//! run (moved to the end so ordering between files' contents stays newest-last).
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use eframe::egui;
 
+use crate::agenda::{self, AgendaItem};
 use crate::{flow, flow_runtime};
 
 enum Job {
@@ -25,37 +28,58 @@ enum Job {
         sqlite_path: PathBuf,
         path: PathBuf,
         contents: String,
-        seq: u64,
+    },
+    AgendaSync {
+        project_root: PathBuf,
+        sqlite_path: PathBuf,
+        path: PathBuf,
+        contents: String,
+        load_items: bool,
     },
 }
 
-pub(crate) struct SaveIndexResult {
-    seq: u64,
-    pub(crate) path: PathBuf,
-    pub(crate) result: Result<flow::FlowIndexSummary, String>,
+impl Job {
+    /// Jobs with the same key supersede each other.
+    fn key(&self) -> (u8, &PathBuf) {
+        match self {
+            Job::Heartbeat { path, .. } => (0, path),
+            Job::SaveIndex { path, .. } => (1, path),
+            Job::AgendaSync { path, .. } => (2, path),
+        }
+    }
+}
+
+pub(crate) enum Report {
+    SaveIndex {
+        path: PathBuf,
+        result: Result<flow::FlowIndexSummary, String>,
+    },
+    AgendaSync {
+        path: PathBuf,
+        result: Result<AgendaSynced, String>,
+    },
+}
+
+pub(crate) struct AgendaSynced {
+    /// Fresh cache items when the agenda panel was open at request time.
+    pub(crate) items: Option<Vec<AgendaItem>>,
+    pub(crate) daily_error: Option<String>,
 }
 
 pub(crate) struct FlowWorker {
     jobs: Sender<Job>,
-    results: Receiver<SaveIndexResult>,
-    sent_seq: u64,
-    done_seq: u64,
+    reports: Receiver<Report>,
 }
 
 impl FlowWorker {
     pub(crate) fn start(ctx: egui::Context) -> Self {
         let (jobs, job_rx) = mpsc::channel::<Job>();
-        let (result_tx, results) = mpsc::channel();
+        let (report_tx, reports) = mpsc::channel();
         std::thread::Builder::new()
             .name("slate-flow-writer".into())
-            .spawn(move || run(job_rx, result_tx, ctx))
+            .spawn(move || run(job_rx, report_tx, ctx))
             .expect("spawn Flow writer thread");
-        Self {
-            jobs,
-            results,
-            sent_seq: 0,
-            done_seq: 0,
-        }
+        Self { jobs, reports }
     }
 
     pub(crate) fn heartbeat(&self, sqlite_path: PathBuf, scope: PathBuf, path: PathBuf) {
@@ -67,42 +91,49 @@ impl FlowWorker {
     }
 
     pub(crate) fn save_index(
-        &mut self,
+        &self,
         project_root: PathBuf,
         sqlite_path: PathBuf,
         path: PathBuf,
         contents: String,
     ) {
-        self.sent_seq += 1;
         let _ = self.jobs.send(Job::SaveIndex {
             project_root,
             sqlite_path,
             path,
             contents,
-            seq: self.sent_seq,
         });
     }
 
-    /// True while the newest save's index refresh has not been reported back.
-    pub(crate) fn save_pending(&self) -> bool {
-        self.done_seq < self.sent_seq
+    pub(crate) fn agenda_sync(
+        &self,
+        project_root: PathBuf,
+        sqlite_path: PathBuf,
+        path: PathBuf,
+        contents: String,
+        load_items: bool,
+    ) {
+        let _ = self.jobs.send(Job::AgendaSync {
+            project_root,
+            sqlite_path,
+            path,
+            contents,
+            load_items,
+        });
     }
 
-    pub(crate) fn take_results(&mut self) -> Vec<SaveIndexResult> {
-        let results: Vec<_> = self.results.try_iter().collect();
-        if let Some(max) = results.iter().map(|r| r.seq).max() {
-            self.done_seq = self.done_seq.max(max);
-        }
-        results
+    pub(crate) fn take_reports(&self) -> Vec<Report> {
+        self.reports.try_iter().collect()
     }
 }
 
-fn run(jobs: Receiver<Job>, results: Sender<SaveIndexResult>, ctx: egui::Context) {
+fn run(jobs: Receiver<Job>, reports: Sender<Report>, ctx: egui::Context) {
     while let Ok(first) = jobs.recv() {
         let mut batch = vec![first];
         batch.extend(jobs.try_iter());
         for job in coalesce(batch) {
-            match job {
+            let started = std::time::Instant::now();
+            let report = match job {
                 Job::Heartbeat {
                     sqlite_path,
                     scope,
@@ -110,55 +141,96 @@ fn run(jobs: Receiver<Job>, results: Sender<SaveIndexResult>, ctx: egui::Context
                 } => {
                     let _ =
                         flow_runtime::publish_active_buffer_heartbeat(&sqlite_path, &scope, &path);
+                    continue;
                 }
                 Job::SaveIndex {
                     project_root,
                     sqlite_path,
                     path,
                     contents,
-                    seq,
                 } => {
-                    let started = std::time::Instant::now();
                     let result = flow::update_flow_index_for_file(
                         &project_root,
                         &sqlite_path,
                         &path,
                         &contents,
                     );
-                    crate::perf_log::mark(
-                        "flow.save_index_background",
-                        &format!(
-                            "ms={:.2} ok={}",
-                            started.elapsed().as_secs_f64() * 1000.0,
-                            result.is_ok()
-                        ),
-                    );
-                    if results.send(SaveIndexResult { seq, path, result }).is_err() {
-                        return;
-                    }
-                    ctx.request_repaint();
+                    Report::SaveIndex { path, result }
                 }
+                Job::AgendaSync {
+                    project_root,
+                    sqlite_path,
+                    path,
+                    contents,
+                    load_items,
+                } => {
+                    let result =
+                        agenda_sync(&project_root, &sqlite_path, &path, &contents, load_items);
+                    Report::AgendaSync { path, result }
+                }
+            };
+            crate::perf_log::mark(
+                "flow.writer_job",
+                &format!(
+                    "kind={} ms={:.2}",
+                    match report {
+                        Report::SaveIndex { .. } => "save_index",
+                        Report::AgendaSync { .. } => "agenda_sync",
+                    },
+                    started.elapsed().as_secs_f64() * 1000.0
+                ),
+            );
+            if reports.send(report).is_err() {
+                return;
             }
+            ctx.request_repaint();
         }
     }
 }
 
-/// Keeps only the newest heartbeat, and only the newest save per file (its
-/// higher sequence number also settles the saves it replaced).
+fn agenda_sync(
+    project_root: &std::path::Path,
+    sqlite_path: &std::path::Path,
+    path: &std::path::Path,
+    contents: &str,
+    load_items: bool,
+) -> Result<AgendaSynced, String> {
+    let old_items = agenda::load_items_from_cache(sqlite_path, project_root).unwrap_or_default();
+    let summary = flow::update_flow_index_for_file(project_root, sqlite_path, path, contents)?;
+    let daily_error = record_daily_events(path, &old_items, &summary).err();
+    let items = if load_items {
+        agenda::load_items_from_cache(sqlite_path, project_root).ok()
+    } else {
+        None
+    };
+    Ok(AgendaSynced { items, daily_error })
+}
+
+#[cfg(not(test))]
+use crate::record_flow_daily_events as record_daily_events;
+
+/// Tests must not append to the user's real daily log.
+#[cfg(test)]
+fn record_daily_events(
+    _path: &std::path::Path,
+    _old_items: &[AgendaItem],
+    _summary: &flow::FlowIndexSummary,
+) -> Result<(), String> {
+    Ok(())
+}
+
+/// Keeps only the newest job per kind and file, moved to the newest position.
 fn coalesce(batch: Vec<Job>) -> Vec<Job> {
     let mut kept: Vec<Job> = Vec::with_capacity(batch.len());
     for job in batch {
-        match &job {
-            Job::Heartbeat { .. } => kept.retain(|k| !matches!(k, Job::Heartbeat { .. })),
-            Job::SaveIndex { path, .. } => {
-                if let Some(old) = kept.iter_mut().find(
-                    |k| matches!(k, Job::SaveIndex { path: old_path, .. } if old_path == path),
-                ) {
-                    *old = job;
-                    continue;
-                }
+        let heartbeat = matches!(job, Job::Heartbeat { .. });
+        kept.retain(|old| {
+            if heartbeat {
+                !matches!(old, Job::Heartbeat { .. })
+            } else {
+                old.key() != job.key()
             }
-        }
+        });
         kept.push(job);
     }
     kept
@@ -168,13 +240,22 @@ fn coalesce(batch: Vec<Job>) -> Vec<Job> {
 mod tests {
     use super::*;
 
-    fn save(path: &str, seq: u64) -> Job {
+    fn save(path: &str, contents: &str) -> Job {
         Job::SaveIndex {
             project_root: PathBuf::new(),
             sqlite_path: PathBuf::new(),
             path: PathBuf::from(path),
-            contents: String::new(),
-            seq,
+            contents: contents.into(),
+        }
+    }
+
+    fn sync(path: &str, contents: &str) -> Job {
+        Job::AgendaSync {
+            project_root: PathBuf::new(),
+            sqlite_path: PathBuf::new(),
+            path: PathBuf::from(path),
+            contents: contents.into(),
+            load_items: false,
         }
     }
 
@@ -190,53 +271,79 @@ mod tests {
         jobs.iter()
             .map(|job| match job {
                 Job::Heartbeat { path, .. } => format!("hb:{}", path.display()),
-                Job::SaveIndex { path, seq, .. } => format!("save:{}:{seq}", path.display()),
+                Job::SaveIndex { path, contents, .. } => {
+                    format!("save:{}:{contents}", path.display())
+                }
+                Job::AgendaSync { path, contents, .. } => {
+                    format!("sync:{}:{contents}", path.display())
+                }
             })
             .collect()
     }
 
     #[test]
-    fn coalesce_keeps_newest_save_per_file_and_one_heartbeat() {
+    fn coalesce_keeps_newest_per_kind_and_file_in_newest_position() {
         let batch = vec![
             heartbeat("a"),
-            save("a", 1),
-            save("b", 2),
+            save("a", "1"),
+            sync("a", "2"),
+            save("b", "x"),
             heartbeat("b"),
-            save("a", 3),
+            save("a", "3"),
         ];
+        // The newest contents of `a` (save 3) run after the older sync 2.
         assert_eq!(
             describe(&coalesce(batch)),
-            ["save:a:3", "save:b:2", "hb:b"]
+            ["sync:a:2", "save:b:x", "hb:b", "save:a:3"]
         );
     }
 
     #[test]
-    fn worker_reports_newest_save_and_clears_pending() {
+    fn worker_indexes_and_syncs_in_order() {
         let dir = std::env::temp_dir().join(format!("slate-flow-worker-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let note = dir.join("note.md");
+        // The agenda only lists tasks of files that still exist.
+        std::fs::write(&note, "- [ ] one\n- [ ] two\n").unwrap();
         let sqlite = dir.join("agenda.db");
-        let mut worker = FlowWorker::start(egui::Context::default());
-        worker.save_index(dir.clone(), sqlite.clone(), note.clone(), "- [ ] one\n".into());
+        let worker = FlowWorker::start(egui::Context::default());
         worker.save_index(
+            dir.clone(),
+            sqlite.clone(),
+            note.clone(),
+            "- [ ] one\n".into(),
+        );
+        worker.agenda_sync(
             dir.clone(),
             sqlite,
             note.clone(),
             "- [ ] one\n- [ ] two\n".into(),
+            true,
         );
-        assert!(worker.save_pending());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut last = None;
-        while worker.save_pending() && std::time::Instant::now() < deadline {
-            if let Some(result) = worker.take_results().pop() {
-                last = Some(result);
-            }
+        let mut reports = Vec::new();
+        while reports.len() < 2 && std::time::Instant::now() < deadline {
+            reports.extend(worker.take_reports());
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert!(!worker.save_pending());
-        let last = last.expect("save result");
-        assert_eq!(last.path, note);
-        assert_eq!(last.result.expect("indexed").tasks.len(), 2);
+        let [
+            Report::SaveIndex { result: saved, .. },
+            Report::AgendaSync { path, result },
+        ] = &reports[..]
+        else {
+            panic!("expected a save report then a sync report");
+        };
+        assert_eq!(saved.as_ref().expect("indexed").tasks.len(), 1);
+        assert_eq!(path, &note);
+        let synced = result.as_ref().expect("synced");
+        let titles: Vec<_> = synced
+            .items
+            .as_ref()
+            .expect("items loaded")
+            .iter()
+            .map(|item| item.title.clone())
+            .collect();
+        assert_eq!(titles, ["one", "two"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

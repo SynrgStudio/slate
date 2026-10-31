@@ -328,6 +328,51 @@ fn main() -> eframe::Result {
     result
 }
 
+/// Appends Captured/Completed daily events for tasks that are new or newly
+/// done in `summary` compared with the cached `old_items`.
+pub(crate) fn record_flow_daily_events(
+path: &Path,
+old_items: &[AgendaItem],
+summary: &flow::FlowIndexSummary,
+) -> Result<(), String> {
+    let relative_path = summary.known_file.path.clone();
+    let old_for_path = old_items
+        .iter()
+        .filter(|item| item.path == path)
+        .map(|item| (item.line_index, item))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    for task in &summary.tasks {
+        let source = format!("{}:{}", relative_path, task.line_number);
+        let source_link = Some(format!("{}#L{}", path.display(), task.line_number));
+        let old = old_for_path.get(&task.line_index).copied();
+        let event_kind = if old.is_none() {
+            Some(DailyEventKind::Captured)
+        } else if task.kind == flow::FlowItemKind::Task
+            && old.map(|item| item.state.as_str()) != Some("done")
+            && task.state == CheckboxState::Done
+        {
+            Some(DailyEventKind::Completed)
+        } else {
+            None
+        };
+
+        let Some(kind) = event_kind else {
+            continue;
+        };
+        let event = DailyEvent::now(
+            kind,
+            task.title.clone(),
+            task.tags.clone(),
+            task.projects.clone(),
+            source,
+            source_link,
+        );
+        daily::append_event(&event)?;
+    }
+    Ok(())
+}
+
 fn collect_link_target_files(root: &Path, out: &mut Vec<PathBuf>, limit: usize) {
     if out.len() >= limit {
         return;
@@ -1699,19 +1744,67 @@ impl SlateApp {
         );
     }
 
-    fn poll_flow_save_index(&mut self) {
-        for report in self.flow_worker.take_results() {
-            match report.result {
-                Ok(summary) => {
-                    let saved = format!("Saved {}", report.path.display());
-                    if self.status == saved {
-                        self.status = format!("{saved} · indexed {} Flow tasks", summary.tasks.len());
+    fn queue_flow_agenda_sync(&mut self) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        if !flow::should_index_flow_path(&path) {
+            return;
+        }
+        let project_root = Self::flow_project_root_for_path(&path);
+        let Ok(sqlite_path) = Self::flow_sqlite_path_for_root(&project_root) else {
+            return;
+        };
+        self.flow_worker.agenda_sync(
+            project_root,
+            sqlite_path,
+            path,
+            self.buffer.as_str().to_string(),
+            self.agenda_open,
+        );
+    }
+
+    fn poll_flow_writer(&mut self, ctx: &egui::Context) {
+        for report in self.flow_worker.take_reports() {
+            match report {
+                flow_worker::Report::SaveIndex { path, result } => match result {
+                    Ok(summary) => {
+                        let saved = format!("Saved {}", path.display());
+                        if self.status == saved {
+                            self.status =
+                                format!("{saved} · indexed {} Flow tasks", summary.tasks.len());
+                        }
                     }
-                }
-                Err(err) => {
-                    perf_log::mark("flow.save_cache_update_failed", &err);
-                    if flow_store::is_busy_error(&err) && self.path.as_ref() == Some(&report.path) {
-                        self.schedule_current_flow_buffer_agenda_sync_later();
+                    Err(err) => {
+                        perf_log::mark("flow.save_cache_update_failed", &err);
+                        if flow_store::is_busy_error(&err) && self.path.as_ref() == Some(&path) {
+                            self.schedule_current_flow_buffer_agenda_sync_later();
+                        }
+                    }
+                },
+                flow_worker::Report::AgendaSync { path, result } => {
+                    if self.path.as_ref() != Some(&path) {
+                        continue;
+                    }
+                    match result {
+                        Ok(synced) => {
+                            if let Some(err) = synced.daily_error {
+                                self.status = err;
+                            }
+                            if let (true, Some(mut items)) = (self.agenda_open, synced.items) {
+                                self.overlay_current_buffer_agenda_items(&mut items);
+                                self.agenda_items = items;
+                                self.clamp_agenda_selection();
+                            }
+                            self.show_agenda_updated_toast(ctx);
+                        }
+                        Err(err) if flow_store::is_busy_error(&err) => {
+                            self.pending_flow_agenda_sync_at = Some(ctx.input(|i| i.time) + 0.15);
+                            ctx.request_repaint_after(std::time::Duration::from_millis(160));
+                            perf_log::mark("flow.ui_sync.retry", &err);
+                            self.status = "Flow sync pending…".to_string();
+                        }
+                        Err(err) => self.status = format!("Flow agenda update failed: {err}"),
                     }
                 }
             }
@@ -1737,43 +1830,8 @@ impl SlateApp {
         old_items: &[AgendaItem],
         summary: &flow::FlowIndexSummary,
     ) {
-        let relative_path = summary.known_file.path.clone();
-        let old_for_path = old_items
-            .iter()
-            .filter(|item| item.path == path)
-            .map(|item| (item.line_index, item))
-            .collect::<std::collections::HashMap<_, _>>();
-
-        for task in &summary.tasks {
-            let source = format!("{}:{}", relative_path, task.line_number);
-            let source_link = Some(format!("{}#L{}", path.display(), task.line_number));
-            let old = old_for_path.get(&task.line_index).copied();
-            let event_kind = if old.is_none() {
-                Some(DailyEventKind::Captured)
-            } else if task.kind == flow::FlowItemKind::Task
-                && old.map(|item| item.state.as_str()) != Some("done")
-                && task.state == CheckboxState::Done
-            {
-                Some(DailyEventKind::Completed)
-            } else {
-                None
-            };
-
-            let Some(kind) = event_kind else {
-                continue;
-            };
-            let event = DailyEvent::now(
-                kind,
-                task.title.clone(),
-                task.tags.clone(),
-                task.projects.clone(),
-                source,
-                source_link,
-            );
-            if let Err(err) = daily::append_event(&event) {
-                self.status = err;
-                return;
-            }
+        if let Err(err) = record_flow_daily_events(path, old_items, summary) {
+            self.status = err;
         }
     }
 
@@ -3192,12 +3250,6 @@ impl SlateApp {
         let Some(sync_at) = self.pending_flow_agenda_sync_at else {
             return;
         };
-        if self.flow_worker.save_pending() {
-            // Let the save's index land first so this newer sync is never
-            // overwritten by older saved contents.
-            ctx.request_repaint_after(std::time::Duration::from_millis(25));
-            return;
-        }
         let now = ctx.input(|input| input.time);
         if now < sync_at {
             let remaining_ms = ((sync_at - now) * 1000.0).max(25.0) as u64;
@@ -3205,7 +3257,9 @@ impl SlateApp {
             return;
         }
         self.pending_flow_agenda_sync_at = None;
-        self.sync_current_flow_buffer_to_agenda(ctx);
+        // Debounced typing sync: index, daily events and agenda reload run on
+        // the Flow writer thread, so resuming typing never waits on SQLite.
+        self.queue_flow_agenda_sync();
     }
 
     fn sync_current_flow_buffer_to_agenda(&mut self, ctx: &egui::Context) {
@@ -9434,7 +9488,7 @@ impl SlateApp {
         }
         ui_timing.step("publish_flow_heartbeat");
         self.poll_flow_background_rescan(&ctx);
-        self.poll_flow_save_index();
+        self.poll_flow_writer(&ctx);
         self.poll_flow_open_requests();
         self.poll_flow_completion_requests(&ctx);
         self.poll_flow_organization_requests(&ctx);
