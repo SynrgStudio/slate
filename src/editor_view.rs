@@ -213,6 +213,11 @@ pub(crate) struct EditorLook {
     pub(crate) cursor_trail_weight: u8,
     /// A short trail also follows the caret while typing.
     pub(crate) cursor_trail_typing: bool,
+    /// While gliding, the caret's leading edge runs ahead and its trailing
+    /// edge lags, so it stretches toward the jump and snaps back on landing.
+    pub(crate) cursor_stretch: bool,
+    /// A ring expands and fades where the caret lands after a jump.
+    pub(crate) cursor_pulse: bool,
     pub(crate) cursor_color: Color32,
 }
 
@@ -231,6 +236,8 @@ impl Default for EditorLook {
             cursor_trail: false,
             cursor_trail_weight: DEFAULT_TRAIL_WEIGHT,
             cursor_trail_typing: false,
+            cursor_stretch: false,
+            cursor_pulse: false,
             cursor_color: CURSOR_COLORS[0].1,
         }
     }
@@ -271,6 +278,13 @@ fn trail_seconds(weight: u8) -> f64 {
     CURSOR_GLIDE_SECONDS + 0.035 * f64::from(clamp_trail_weight(weight))
 }
 
+/// With stretch on, the leading corners land at 0.75× the glide time and the
+/// trailing ones at 1.5×.
+const STRETCH_LEAD: f64 = 0.75;
+const STRETCH_LAG: f64 = 1.5;
+/// How long the landing ring takes to expand and fade.
+const CURSOR_PULSE_SECONDS: f64 = 0.25;
+
 /// Opacity of the trail right behind the caret.
 fn trail_opacity(weight: u8) -> f32 {
     0.12 + 0.11 * f32::from(clamp_trail_weight(weight))
@@ -296,6 +310,8 @@ pub(crate) struct EditorView {
     cursor_target: Option<Pos2>,
     cursor_drawn: Option<Pos2>,
     cursor_glide: Option<CursorGlide>,
+    /// When the landing ring starts (it may be scheduled for the end of a glide).
+    cursor_pulse_at: Option<f64>,
     /// Where the trail's tail was last drawn, so a new keystroke continues
     /// the trail instead of restarting it.
     cursor_tail: Option<Pos2>,
@@ -340,6 +356,7 @@ impl EditorView {
             cursor_target: None,
             cursor_drawn: None,
             cursor_glide: None,
+            cursor_pulse_at: None,
             cursor_tail: None,
             row_layout: RefCell::new(None),
             fence_layout: RefCell::new(None),
@@ -3095,6 +3112,17 @@ impl EditorView {
                     })
                 }
             });
+            let jumped = from.is_some() && !typing_step;
+            self.cursor_pulse_at = if jumped && look.cursor_pulse {
+                let landing = match self.cursor_glide {
+                    Some(_) if look.cursor_stretch => CURSOR_GLIDE_SECONDS * STRETCH_LAG,
+                    Some(_) => CURSOR_GLIDE_SECONDS,
+                    None => 0.0,
+                };
+                Some(now + landing)
+            } else {
+                None
+            };
             self.cursor_target = Some(target);
         }
         // Ease-out cubic: fast start, gentle landing.
@@ -3107,6 +3135,8 @@ impl EditorView {
                 let elapsed = now - glide.started;
                 let head_seconds = if glide.instant_head {
                     0.0
+                } else if self.look.cursor_stretch {
+                    CURSOR_GLIDE_SECONDS * STRETCH_LAG
                 } else {
                     CURSOR_GLIDE_SECONDS
                 };
@@ -3164,7 +3194,44 @@ impl EditorView {
                 color.gamma_multiply(trail_opacity(self.look.cursor_trail_weight)),
             );
         }
-        if self.look.block_cursor {
+        // Stretch: each corner of the shape travels on its own clock, the
+        // ones facing the jump fastest, so the caret leans into the move.
+        let stretched = self.cursor_glide.filter(|glide| {
+            gliding && self.look.cursor_stretch && !glide.instant_head
+        });
+        if let Some(glide) = stretched {
+            let elapsed = now - glide.started;
+            let travel = target - glide.head_from;
+            let from_shape = shape(to_screen(glide.head_from));
+            let corners = [
+                from_shape.left_top(),
+                from_shape.right_top(),
+                from_shape.right_bottom(),
+                from_shape.left_bottom(),
+            ];
+            let center = from_shape.center();
+            let direction = travel.normalized();
+            let reach = corners
+                .iter()
+                .map(|corner| (*corner - center).dot(direction).abs())
+                .fold(0.0_f32, f32::max)
+                .max(f32::EPSILON);
+            let points = corners
+                .iter()
+                .map(|corner| {
+                    let lead = f64::from(((*corner - center).dot(direction) / reach).clamp(-1.0, 1.0));
+                    // lead 1 → STRETCH_LEAD, lead -1 → STRETCH_LAG.
+                    let share = STRETCH_LAG - (STRETCH_LAG - STRETCH_LEAD) * (lead + 1.0) / 2.0;
+                    *corner + travel * ease(elapsed / (CURSOR_GLIDE_SECONDS * share))
+                })
+                .collect::<Vec<_>>();
+            let fill = if self.look.block_cursor {
+                color.gamma_multiply(0.75)
+            } else {
+                color
+            };
+            painter.add(egui::Shape::convex_polygon(points, fill, Stroke::NONE));
+        } else if self.look.block_cursor {
             let block = shape(at);
             if gliding {
                 painter.rect_filled(block, 1.0, color.gamma_multiply(0.75));
@@ -3189,11 +3256,35 @@ impl EditorView {
                 Stroke::new(1.5_f32, color),
             );
         }
+        if let Some(start) = self.cursor_pulse_at {
+            let progress = ((now - start) / CURSOR_PULSE_SECONDS) as f32;
+            if progress >= 1.0 {
+                self.cursor_pulse_at = None;
+            } else {
+                animating = true;
+                if progress >= 0.0 {
+                    let fade = (1.0 - progress).powi(2);
+                    let ring = shape(at).expand(2.0 + 7.0 * ease(f64::from(progress)));
+                    painter.rect_stroke(
+                        ring,
+                        3.0,
+                        Stroke::new(1.5_f32, color.gamma_multiply(0.7 * fade)),
+                        egui::StrokeKind::Outside,
+                    );
+                }
+            }
+        }
         // The caret does not blink: once it has landed, drawing it schedules
         // no frame, so an idle editor presents nothing until input arrives.
         if animating {
             painter.ctx().request_repaint();
         }
+    }
+
+    /// Whether the landing ring is scheduled or showing (tests).
+    #[cfg(test)]
+    pub(crate) fn cursor_pulsing(&self) -> bool {
+        self.cursor_pulse_at.is_some()
     }
 
     /// (drawn, target, animating) for tests.
@@ -3206,6 +3297,7 @@ impl EditorView {
         self.cursor_target = None;
         self.cursor_drawn = None;
         self.cursor_glide = None;
+        self.cursor_pulse_at = None;
         self.cursor_tail = None;
     }
 

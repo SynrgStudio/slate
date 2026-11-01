@@ -6181,6 +6181,22 @@ impl SlateApp {
                         });
                     }
                 }
+                "cursor_stretch" => {
+                    if let Some(enabled) = Self::parse_config_bool(value) {
+                        self.apply_editor_look(editor_view::EditorLook {
+                            cursor_stretch: enabled,
+                            ..self.editor_look
+                        });
+                    }
+                }
+                "cursor_pulse" => {
+                    if let Some(enabled) = Self::parse_config_bool(value) {
+                        self.apply_editor_look(editor_view::EditorLook {
+                            cursor_pulse: enabled,
+                            ..self.editor_look
+                        });
+                    }
+                }
                 "cursor_color" => {
                     if let Some(color) = editor_view::color_from_hex(value) {
                         self.apply_editor_look(editor_view::EditorLook {
@@ -6421,13 +6437,15 @@ impl SlateApp {
         );
         contents.push_str(&format!("editor_font_size = {}\n", self.editor_font_size));
         contents.push_str(&format!(
-            "editor_font = \"{}\"\nblock_cursor = {}\ncursor_animation = {}\ncursor_trail = {}\ncursor_trail_weight = {}\ncursor_trail_typing = {}\ncursor_color = \"{}\"\n",
+            "editor_font = \"{}\"\nblock_cursor = {}\ncursor_animation = {}\ncursor_trail = {}\ncursor_trail_weight = {}\ncursor_trail_typing = {}\ncursor_stretch = {}\ncursor_pulse = {}\ncursor_color = \"{}\"\n",
             self.editor_look.font.config_value(),
             self.editor_look.block_cursor,
             self.editor_look.animate_cursor,
             self.editor_look.cursor_trail,
             self.editor_look.cursor_trail_weight,
             self.editor_look.cursor_trail_typing,
+            self.editor_look.cursor_stretch,
+            self.editor_look.cursor_pulse,
             editor_view::color_to_hex(self.editor_look.cursor_color)
         ));
         contents.push_str(&format!(
@@ -6528,7 +6546,7 @@ impl SlateApp {
     fn set_editor_look(&mut self, look: editor_view::EditorLook) {
         self.apply_editor_look(look);
         let summary = format!(
-            "Editor: {} · {} {} cursor{}{}",
+            "Editor: {} · {} {} cursor{}{}{}{}",
             look.font.label(),
             editor_view::CURSOR_COLORS
                 .iter()
@@ -6536,6 +6554,8 @@ impl SlateApp {
                 .map_or_else(|| editor_view::color_to_hex(look.cursor_color), |(name, _)| (*name).to_string()),
             if look.block_cursor { "block" } else { "line" },
             if look.animate_cursor { " · animated" } else { "" },
+            if look.animate_cursor && look.cursor_stretch { " · stretch" } else { "" },
+            if look.cursor_pulse { " · pulse" } else { "" },
             if look.cursor_trail {
                 format!(
                     " · trail {}{}",

@@ -55,7 +55,14 @@ temporary directory.
 - **Trail while typing too**: each keystroke leaves a short trail. The
   cursor itself is already after the new letter; only the trail follows,
   and a new key continues the trail from where its tail was.
+- **Stretch toward the jump**: while gliding, each corner of the cursor runs
+  on its own clock — the ones facing the jump land at 68 ms, the trailing ones
+  at 135 ms — so the cursor leans into the move and snaps back as it lands.
+- **Pulse where it lands**: after a jump (not while typing), a ring expands
+  and fades around the cursor for 250 ms; it starts when the glide lands, or
+  at once without animation.
 - Saved as `editor_font = "hack" | "jetbrains-mono"`, `block_cursor`,
   `cursor_animation`, `cursor_trail`, `cursor_trail_weight`,
-  `cursor_trail_typing` and `cursor_color = "#rrggbb"` in
+  `cursor_trail_typing`, `cursor_stretch`, `cursor_pulse` and
+  `cursor_color = "#rrggbb"` in
   `config.toml`; all off, Hack and snow by default.

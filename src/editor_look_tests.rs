@@ -123,6 +123,8 @@ fn jetbrains_mono_changes_the_text_metrics_and_everything_persists() {
         cursor_trail: true,
         cursor_trail_weight: 5,
         cursor_trail_typing: true,
+        cursor_stretch: true,
+        cursor_pulse: true,
         cursor_color: editor_view::CURSOR_COLORS[3].1,
     });
     f.frame_after(0.016);
@@ -136,6 +138,8 @@ fn jetbrains_mono_changes_the_text_metrics_and_everything_persists() {
     assert!(config.contains("cursor_trail = true"));
     assert!(config.contains("cursor_trail_weight = 5"));
     assert!(config.contains("cursor_trail_typing = true"));
+    assert!(config.contains("cursor_stretch = true"));
+    assert!(config.contains("cursor_pulse = true"));
     assert!(config.contains("cursor_color = \"#ebcb8b\""), "{config}");
     f.app.editor_look = Default::default();
     f.app.load_settings();
@@ -148,6 +152,8 @@ fn jetbrains_mono_changes_the_text_metrics_and_everything_persists() {
             cursor_trail: true,
             cursor_trail_weight: 5,
             cursor_trail_typing: true,
+            cursor_stretch: true,
+            cursor_pulse: true,
             cursor_color: editor_view::CURSOR_COLORS[3].1,
         }
     );
@@ -236,4 +242,42 @@ fn a_heavier_trail_lasts_longer() {
     }
     assert!(!light.cursor().2, "weight 1 is done by 150 ms");
     assert!(heavy.cursor().2, "weight 5 is still trailing");
+}
+
+#[test]
+fn a_stretched_jump_lands_exactly_and_then_rests() {
+    let mut f = Fixture::new("uno\ndos\ntres\ncuatro\n");
+    f.app.apply_editor_look(editor_view::EditorLook {
+        cursor_stretch: true,
+        block_cursor: true,
+        ..animated()
+    });
+    f.frame_after(0.016);
+    f.app.buffer.move_to_bottom();
+    f.frame_after(0.0);
+    f.frame_after(0.1);
+    assert!(f.cursor().2, "the trailing edge is still catching up at 100 ms");
+    f.frame_after(0.1);
+    let (drawn, target, animating) = f.cursor();
+    assert!(!animating);
+    assert_eq!(drawn, target);
+}
+
+#[test]
+fn a_pulse_follows_a_jump_but_not_typing() {
+    let mut f = Fixture::new("uno\ndos\ntres\n");
+    f.app.apply_editor_look(editor_view::EditorLook {
+        cursor_pulse: true,
+        ..Default::default()
+    });
+    f.frame_after(0.016);
+    f.app.buffer.insert_text("x");
+    f.frame_after(0.016);
+    assert!(!f.app.editor_view.cursor_pulsing(), "typing does not pulse");
+    f.app.buffer.move_to_bottom();
+    f.frame_after(0.016);
+    assert!(f.app.editor_view.cursor_pulsing(), "a jump pulses, even without the glide");
+    f.frame_after(0.3);
+    f.frame_after(0.016);
+    assert!(!f.app.editor_view.cursor_pulsing(), "and then it rests");
 }
