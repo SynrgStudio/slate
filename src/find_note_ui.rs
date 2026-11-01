@@ -9,6 +9,38 @@ pub(super) struct Geometry {
     pub start: usize,
     pub end: usize,
 }
+/// Whether a note has headings (the ▸ marker). Rows are drawn every frame, so
+/// the answer is remembered per file and re-read only when its modification
+/// time or size changes: still fresh, without reading every visible file on
+/// every frame.
+fn file_has_headings(path: &Path) -> bool {
+    type Seen = (Option<std::time::SystemTime>, u64, bool);
+    thread_local! {
+        static SEEN: std::cell::RefCell<std::collections::HashMap<PathBuf, Seen>> = Default::default();
+    }
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    let stamp = (metadata.modified().ok(), metadata.len());
+    if let Some(known) = SEEN.with_borrow(|seen| {
+        seen.get(path)
+            .filter(|(modified, len, _)| (*modified, *len) == stamp)
+            .map(|(_, _, has)| *has)
+    }) {
+        return known;
+    }
+    let has = fs::read_to_string(path)
+        .map(|contents| contents.lines().any(|line| parse_heading_line(line).is_some()))
+        .unwrap_or(false);
+    SEEN.with_borrow_mut(|seen| {
+        if seen.len() > 4096 {
+            seen.clear();
+        }
+        seen.insert(path.to_path_buf(), (stamp.0, stamp.1, has));
+    });
+    has
+}
+
 impl SlateApp {
     pub(super) fn find_note_dialog(&mut self, ctx: &egui::Context) {
         if !self.find_note_open {
@@ -184,14 +216,7 @@ impl SlateApp {
                     }
                     let (label, hint, prefix, is_heading) = match &self.find_note_rows[index] {
                         FindNoteRow::File { path, match_hint } => {
-                            // Preserve the existing fresh heading check; no document-content cache.
-                            let has_headings = fs::read_to_string(path)
-                                .map(|contents| {
-                                    contents
-                                        .lines()
-                                        .any(|line| parse_heading_line(line).is_some())
-                                })
-                                .unwrap_or(false);
+                            let has_headings = file_has_headings(path);
                             let prefix = if has_headings {
                                 if self.find_note_expanded_files.contains(path) {
                                     "▾ "
