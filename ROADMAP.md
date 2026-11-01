@@ -90,3 +90,13 @@ teclado y la snappiness; no sacrificar texto del usuario por automatismos.
 Registrar el alcance y las limitaciones de cada entrega; no declarar recuperación
 sin pérdida de la última tecla ni protección absoluta contra escritores externos
 que no colaboran sin evidencia de esas garantías.
+
+## Ideas para más adelante (pedidas por el usuario, 2026-11-01)
+
+- **Modo monospace**: una buena fuente monoespaciada para el editor, con el
+  cursor como bloque completo (celda entera), opcional en Settings.
+- **Animación del cursor entre posiciones** (estilo Doom Emacs / Neovide):
+  el cursor se desliza al saltar de lugar en vez de teletransportarse. Con
+  toggle propio y sin sumar latencia: el texto se edita en el frame de la
+  tecla; sólo el dibujo del cursor se interpola, y la animación pide frames
+  únicamente mientras dura.
