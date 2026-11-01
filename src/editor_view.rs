@@ -187,18 +187,74 @@ impl EditorFont {
     }
 }
 
+/// Cursor colors offered in Settings (←/→ cycles them); any other color
+/// can be picked with the swatch button.
+pub(crate) const CURSOR_COLORS: [(&str, Color32); 7] = [
+    ("snow", Color32::from_rgb(236, 239, 244)),
+    ("frost", Color32::from_rgb(136, 192, 208)),
+    ("green", Color32::from_rgb(163, 190, 140)),
+    ("yellow", Color32::from_rgb(235, 203, 139)),
+    ("orange", Color32::from_rgb(208, 135, 112)),
+    ("red", Color32::from_rgb(191, 97, 106)),
+    ("purple", Color32::from_rgb(180, 142, 173)),
+];
+
 /// How the editor text and caret look; set from Settings.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct EditorLook {
     pub(crate) font: EditorFont,
     /// A full-cell block over the character instead of a thin line.
     pub(crate) block_cursor: bool,
     /// The caret glides to its new place instead of jumping.
     pub(crate) animate_cursor: bool,
+    /// A fading smear follows the gliding caret.
+    pub(crate) cursor_trail: bool,
+    pub(crate) cursor_color: Color32,
+}
+
+impl Default for EditorLook {
+    fn default() -> Self {
+        Self {
+            font: EditorFont::default(),
+            block_cursor: false,
+            animate_cursor: false,
+            cursor_trail: false,
+            cursor_color: CURSOR_COLORS[0].1,
+        }
+    }
+}
+
+/// `#rrggbb`, as saved in config.toml.
+pub(crate) fn color_to_hex(color: Color32) -> String {
+    format!("#{:02x}{:02x}{:02x}", color.r(), color.g(), color.b())
+}
+
+pub(crate) fn color_from_hex(value: &str) -> Option<Color32> {
+    let hex = value.trim().trim_matches('"').strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    let channel = |at: usize| u8::from_str_radix(hex.get(at..at + 2)?, 16).ok();
+    Some(Color32::from_rgb(channel(0)?, channel(2)?, channel(4)?))
+}
+
+/// The next (or previous) preset after `color`; custom colors start at snow.
+pub(crate) fn cycle_cursor_color(color: Color32, forward: bool) -> Color32 {
+    let count = CURSOR_COLORS.len();
+    let index = CURSOR_COLORS.iter().position(|(_, c)| *c == color);
+    let next = match (index, forward) {
+        (None, _) => 0,
+        (Some(i), true) => (i + 1) % count,
+        (Some(i), false) => (i + count - 1) % count,
+    };
+    CURSOR_COLORS[next].1
 }
 
 /// How long the caret takes to glide to a new place.
 const CURSOR_GLIDE_SECONDS: f64 = 0.09;
+/// With the trail on, the caret still lands after `CURSOR_GLIDE_SECONDS`;
+/// the trail's tail catches up a little later.
+const CURSOR_TRAIL_SECONDS: f64 = 0.16;
 
 pub(crate) struct EditorView {
     font_size: f32,
@@ -2993,30 +3049,56 @@ impl EditorView {
             };
             self.cursor_target = Some(target);
         }
+        // Ease-out cubic: fast start, gentle landing.
+        let ease = |t: f64| 1.0 - (1.0 - t.clamp(0.0, 1.0) as f32).powi(3);
+        let mut animating = false;
         let mut gliding = false;
+        let mut tail = None;
         let drawn = match self.cursor_glide {
             Some((from, started)) => {
-                let t = ((now - started) / CURSOR_GLIDE_SECONDS).clamp(0.0, 1.0) as f32;
-                if t >= 1.0 {
+                let elapsed = now - started;
+                let total = if self.look.cursor_trail {
+                    CURSOR_TRAIL_SECONDS
+                } else {
+                    CURSOR_GLIDE_SECONDS
+                };
+                if elapsed >= total {
                     self.cursor_glide = None;
                     target
                 } else {
-                    gliding = true;
-                    // Ease-out cubic: fast start, gentle landing.
-                    let eased = 1.0 - (1.0 - t).powi(3);
-                    from + (target - from) * eased
+                    animating = true;
+                    gliding = elapsed < CURSOR_GLIDE_SECONDS;
+                    if self.look.cursor_trail {
+                        tail = Some(from + (target - from) * ease(elapsed / CURSOR_TRAIL_SECONDS));
+                    }
+                    from + (target - from) * ease(elapsed / CURSOR_GLIDE_SECONDS)
                 }
             }
             None => target,
         };
         self.cursor_drawn = Some(drawn);
-        let at = egui::pos2(rect.left() + drawn.x, rect.top() + drawn.y - self.scroll_y);
-        let color = Color32::from_rgb(236, 239, 244);
+        let to_screen = |p: Pos2| egui::pos2(rect.left() + p.x, rect.top() + p.y - self.scroll_y);
+        let at = to_screen(drawn);
+        let color = self.look.cursor_color;
+        // The caret's shape at a given top-left corner.
+        let shape = |at: Pos2| {
+            if self.look.block_cursor {
+                egui::Rect::from_min_size(
+                    egui::pos2(at.x, at.y + 1.0),
+                    egui::vec2(cell_width, line_height - 2.0),
+                )
+            } else {
+                egui::Rect::from_min_size(
+                    egui::pos2(at.x - 0.75, at.y + 3.0),
+                    egui::vec2(1.5, line_height - 6.0),
+                )
+            }
+        };
+        if let Some(tail) = tail {
+            paint_cursor_trail(painter, shape(to_screen(tail)), shape(at), color);
+        }
         if self.look.block_cursor {
-            let block = egui::Rect::from_min_size(
-                egui::pos2(at.x, at.y + 1.0),
-                egui::vec2(cell_width, line_height - 2.0),
-            );
+            let block = shape(at);
             if gliding {
                 painter.rect_filled(block, 1.0, color.gamma_multiply(0.75));
             } else {
@@ -3042,12 +3124,12 @@ impl EditorView {
         }
         // The caret does not blink: once it has landed, drawing it schedules
         // no frame, so an idle editor presents nothing until input arrives.
-        if gliding {
+        if animating {
             painter.ctx().request_repaint();
         }
     }
 
-    /// (drawn, target, gliding) for tests.
+    /// (drawn, target, animating) for tests.
     #[cfg(test)]
     pub(crate) fn cursor_state(&self) -> (Option<Pos2>, Option<Pos2>, bool) {
         (self.cursor_drawn, self.cursor_target, self.cursor_glide.is_some())
@@ -3361,6 +3443,28 @@ fn text_input_from_events(events: &[egui::Event]) -> Option<String> {
             }
         }
     }
+}
+
+
+/// A smear from where the caret was (transparent) to where it is (about
+/// half opaque): every edge of the caret's shape swept from tail to head.
+fn paint_cursor_trail(painter: &egui::Painter, tail: egui::Rect, head: egui::Rect, color: Color32) {
+    let corners = |r: egui::Rect| [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()];
+    let (tail, head) = (corners(tail), corners(head));
+    let faint = Color32::TRANSPARENT;
+    let strong = color.gamma_multiply(0.45);
+    let mut mesh = egui::Mesh::default();
+    for edge in 0..4 {
+        let next = (edge + 1) % 4;
+        let base = mesh.vertices.len() as u32;
+        mesh.colored_vertex(tail[edge], faint);
+        mesh.colored_vertex(tail[next], faint);
+        mesh.colored_vertex(head[next], strong);
+        mesh.colored_vertex(head[edge], strong);
+        mesh.add_triangle(base, base + 1, base + 2);
+        mesh.add_triangle(base, base + 2, base + 3);
+    }
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 #[cfg(test)]

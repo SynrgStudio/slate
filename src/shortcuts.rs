@@ -1220,7 +1220,7 @@ impl SlateApp {
         }
 
         if settings_next {
-            self.selected_setting = (self.selected_setting + 1).min(14 + footer_ui::FIELDS.len());
+            self.selected_setting = (self.selected_setting + 1).min(16 + footer_ui::FIELDS.len());
             return;
         }
 
@@ -1249,6 +1249,14 @@ impl SlateApp {
                 }),
                 24 => self.set_editor_look(editor_view::EditorLook {
                     animate_cursor: false,
+                    ..self.editor_look
+                }),
+                25 => self.set_editor_look(editor_view::EditorLook {
+                    cursor_color: editor_view::cycle_cursor_color(self.editor_look.cursor_color, false),
+                    ..self.editor_look
+                }),
+                26 => self.set_editor_look(editor_view::EditorLook {
+                    cursor_trail: false,
                     ..self.editor_look
                 }),
                 _ => {}
@@ -1314,6 +1322,22 @@ impl SlateApp {
                 24 => self.set_editor_look(editor_view::EditorLook {
                     animate_cursor: if settings_activate {
                         !self.editor_look.animate_cursor
+                    } else {
+                        true
+                    },
+                    ..self.editor_look
+                }),
+                25 => self.set_editor_look(editor_view::EditorLook {
+                    cursor_color: if settings_activate {
+                        editor_view::CURSOR_COLORS[0].1
+                    } else {
+                        editor_view::cycle_cursor_color(self.editor_look.cursor_color, true)
+                    },
+                    ..self.editor_look
+                }),
+                26 => self.set_editor_look(editor_view::EditorLook {
+                    cursor_trail: if settings_activate {
+                        !self.editor_look.cursor_trail
                     } else {
                         true
                     },

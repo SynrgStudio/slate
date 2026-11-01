@@ -6157,6 +6157,22 @@ impl SlateApp {
                         });
                     }
                 }
+                "cursor_trail" => {
+                    if let Some(enabled) = Self::parse_config_bool(value) {
+                        self.apply_editor_look(editor_view::EditorLook {
+                            cursor_trail: enabled,
+                            ..self.editor_look
+                        });
+                    }
+                }
+                "cursor_color" => {
+                    if let Some(color) = editor_view::color_from_hex(value) {
+                        self.apply_editor_look(editor_view::EditorLook {
+                            cursor_color: color,
+                            ..self.editor_look
+                        });
+                    }
+                }
                 "command_history_limit" => {
                     if let Ok(limit) = value.trim().parse::<usize>() {
                         self.command_history_limit = clamp_history_limit(limit);
@@ -6389,10 +6405,12 @@ impl SlateApp {
         );
         contents.push_str(&format!("editor_font_size = {}\n", self.editor_font_size));
         contents.push_str(&format!(
-            "editor_font = \"{}\"\nblock_cursor = {}\ncursor_animation = {}\n",
+            "editor_font = \"{}\"\nblock_cursor = {}\ncursor_animation = {}\ncursor_trail = {}\ncursor_color = \"{}\"\n",
             self.editor_look.font.config_value(),
             self.editor_look.block_cursor,
-            self.editor_look.animate_cursor
+            self.editor_look.animate_cursor,
+            self.editor_look.cursor_trail,
+            editor_view::color_to_hex(self.editor_look.cursor_color)
         ));
         contents.push_str(&format!(
             "periscope_everything = {}\n",
@@ -6492,10 +6510,15 @@ impl SlateApp {
     fn set_editor_look(&mut self, look: editor_view::EditorLook) {
         self.apply_editor_look(look);
         let summary = format!(
-            "Editor: {} · {} cursor{}",
+            "Editor: {} · {} {} cursor{}{}",
             look.font.label(),
+            editor_view::CURSOR_COLORS
+                .iter()
+                .find(|(_, color)| *color == look.cursor_color)
+                .map_or_else(|| editor_view::color_to_hex(look.cursor_color), |(name, _)| (*name).to_string()),
             if look.block_cursor { "block" } else { "line" },
-            if look.animate_cursor { " · animated" } else { "" }
+            if look.animate_cursor { " · animated" } else { "" },
+            if look.animate_cursor && look.cursor_trail { " with trail" } else { "" }
         );
         self.status = match self.save_settings() {
             Ok(()) => summary,

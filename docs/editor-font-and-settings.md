@@ -44,5 +44,11 @@ temporary directory.
   ←/→) stays instant, and text is always drawn in the frame of the key; only
   the caret is interpolated. The animation runs in document coordinates, so
   scrolling never animates it, and it asks for frames only while gliding.
-- Saved as `editor_font = "hack" | "jetbrains-mono"`, `block_cursor` and
-  `cursor_animation` in `config.toml`; all off/Hack by default.
+- **Cursor color**: seven swatches (←/→ cycles them, Enter goes back to
+  snow) plus a picker for any color.
+- **Cursor trail while it glides**: a fading smear from where the cursor was
+  to where it is. The cursor still lands at 90 ms; the trail's tail catches
+  up by 160 ms, then nothing is drawn or scheduled. Needs animation on.
+- Saved as `editor_font = "hack" | "jetbrains-mono"`, `block_cursor`,
+  `cursor_animation`, `cursor_trail` and `cursor_color = "#rrggbb"` in
+  `config.toml`; all off, Hack and snow by default.

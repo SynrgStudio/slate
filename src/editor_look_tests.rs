@@ -19,6 +19,8 @@ impl Fixture {
         let root = std::env::temp_dir().join(format!("slate-look-{}", crate::test_unique()));
         fs::create_dir_all(&root).unwrap();
         app.settings_path_override = Some(root.join("config.toml"));
+        // SlateApp::new read the user's real config; start from the defaults.
+        app.apply_editor_look(editor_view::EditorLook::default());
         app.buffer.set_text(text.into());
         app.buffer.set_cursor(0);
         app.focus_editor_once = true;
@@ -118,6 +120,8 @@ fn jetbrains_mono_changes_the_text_metrics_and_everything_persists() {
         font: editor_view::EditorFont::JetBrainsMono,
         block_cursor: true,
         animate_cursor: false,
+        cursor_trail: true,
+        cursor_color: editor_view::CURSOR_COLORS[3].1,
     });
     f.frame_after(0.016);
     let jetbrains = f.cursor().1.unwrap();
@@ -127,6 +131,8 @@ fn jetbrains_mono_changes_the_text_metrics_and_everything_persists() {
     assert!(config.contains("editor_font = \"jetbrains-mono\""), "{config}");
     assert!(config.contains("block_cursor = true"));
     assert!(config.contains("cursor_animation = false"));
+    assert!(config.contains("cursor_trail = true"));
+    assert!(config.contains("cursor_color = \"#ebcb8b\""), "{config}");
     f.app.editor_look = Default::default();
     f.app.load_settings();
     assert_eq!(
@@ -135,6 +141,47 @@ fn jetbrains_mono_changes_the_text_metrics_and_everything_persists() {
             font: editor_view::EditorFont::JetBrainsMono,
             block_cursor: true,
             animate_cursor: false,
+            cursor_trail: true,
+            cursor_color: editor_view::CURSOR_COLORS[3].1,
         }
     );
+}
+
+#[test]
+fn with_a_trail_the_cursor_lands_on_time_and_the_trail_catches_up() {
+    let mut f = Fixture::new("uno
+dos
+tres
+cuatro
+cinco
+");
+    f.app.apply_editor_look(editor_view::EditorLook {
+        cursor_trail: true,
+        ..animated()
+    });
+    f.frame_after(0.016);
+    f.app.buffer.move_to_bottom();
+    f.frame_after(0.0);
+    f.frame_after(0.1);
+    let (drawn, target, animating) = f.cursor();
+    assert_eq!(drawn, target, "the cursor itself has landed after 90 ms");
+    assert!(animating, "the trail is still catching up");
+    f.frame_after(0.1);
+    assert!(!f.cursor().2, "then everything rests");
+}
+
+#[test]
+fn cursor_colors_round_trip_and_cycle() {
+    for (_, color) in editor_view::CURSOR_COLORS {
+        let hex = editor_view::color_to_hex(color);
+        assert_eq!(editor_view::color_from_hex(&hex), Some(color));
+    }
+    assert_eq!(editor_view::color_from_hex("\"#12aBcd\""), Some(egui::Color32::from_rgb(0x12, 0xab, 0xcd)));
+    assert_eq!(editor_view::color_from_hex("nope"), None);
+    let first = editor_view::CURSOR_COLORS[0].1;
+    let last = editor_view::CURSOR_COLORS[editor_view::CURSOR_COLORS.len() - 1].1;
+    assert_eq!(editor_view::cycle_cursor_color(first, false), last);
+    assert_eq!(editor_view::cycle_cursor_color(last, true), first);
+    let custom = egui::Color32::from_rgb(1, 2, 3);
+    assert_eq!(editor_view::cycle_cursor_color(custom, true), first);
 }

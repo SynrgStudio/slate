@@ -441,7 +441,25 @@ impl SlateApp {
                                     ui.set_width(ui.available_width());let mut enabled=look.animate_cursor;
                                     if ui.checkbox(&mut enabled,RichText::new("Animate cursor jumps").font(FontId::monospace(14.0))).changed() {self.selected_setting=24;self.set_editor_look(editor_view::EditorLook{animate_cursor:enabled,..look});}
                                 });setting_rects.push(row.response.rect);
-                                ui.label(RichText::new("The cursor glides when it jumps; typing stays instant. Text is never delayed.").font(FontId::monospace(13.0)).color(Color32::from_rgb(136,154,176)));
+                                let row=egui::Frame::new().fill(if self.selected_setting==25 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(RichText::new("Cursor color").font(FontId::monospace(14.0)));
+                                        for (name,color) in editor_view::CURSOR_COLORS {
+                                            let (swatch,response)=ui.allocate_exact_size(Vec2::splat(16.0),egui::Sense::click());
+                                            ui.painter().rect_filled(swatch.shrink(1.0),2.0,color);
+                                            if look.cursor_color==color {ui.painter().rect_stroke(swatch,2.0,egui::Stroke::new(1.5_f32,Color32::WHITE),egui::StrokeKind::Outside);}
+                                            if response.on_hover_text(name).clicked() {self.selected_setting=25;self.set_editor_look(editor_view::EditorLook{cursor_color:color,..look});}
+                                        }
+                                        let mut rgb=[look.cursor_color.r(),look.cursor_color.g(),look.cursor_color.b()];
+                                        if ui.color_edit_button_srgb(&mut rgb).on_hover_text("any color").changed() {self.selected_setting=25;self.set_editor_look(editor_view::EditorLook{cursor_color:Color32::from_rgb(rgb[0],rgb[1],rgb[2]),..look});}
+                                    });
+                                });setting_rects.push(row.response.rect);
+                                let row=egui::Frame::new().fill(if self.selected_setting==26 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
+                                    ui.set_width(ui.available_width());let mut enabled=look.cursor_trail;
+                                    if ui.checkbox(&mut enabled,RichText::new("Cursor trail while it glides").font(FontId::monospace(14.0))).changed() {self.selected_setting=26;self.set_editor_look(editor_view::EditorLook{cursor_trail:enabled,..look});}
+                                });setting_rects.push(row.response.rect);
+                                ui.label(RichText::new("The cursor glides when it jumps; typing stays instant. Text is never delayed. The trail needs animation on.").font(FontId::monospace(13.0)).color(Color32::from_rgb(136,154,176)));
                                 if reveal_selected {
                                     if let Some(rect) = setting_rects.get(self.selected_setting) { ui.scroll_to_rect(*rect, Some(egui::Align::Min)); }
                                 }
