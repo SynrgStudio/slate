@@ -420,6 +420,28 @@ impl SlateApp {
                                     if ui.checkbox(&mut enabled,RichText::new("Start hidden with Windows").font(FontId::monospace(14.0))).changed() {self.selected_setting=21;self.set_start_with_windows(enabled);}
                                 });setting_rects.push(row.response.rect);
                                 ui.label(RichText::new("Makes the first open of the day instant too. Current user only; off by default.").font(FontId::monospace(13.0)).color(Color32::from_rgb(136,154,176)));
+                                ui.add_space(10.0);
+                                ui.label(RichText::new("Editor · font and cursor").font(FontId::monospace(14.0)).color(Color32::from_rgb(136,192,208)));
+                                let look=self.editor_look;
+                                let row=egui::Frame::new().fill(if self.selected_setting==22 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new("Font").font(FontId::monospace(14.0)));
+                                        for font in [editor_view::EditorFont::Hack, editor_view::EditorFont::JetBrainsMono] {
+                                            let sample=RichText::new(font.label()).font(FontId::new(14.0,font.family()));
+                                            if ui.selectable_label(look.font==font,sample).clicked() {self.selected_setting=22;self.set_editor_look(editor_view::EditorLook{font,..look});}
+                                        }
+                                    });
+                                });setting_rects.push(row.response.rect);
+                                let row=egui::Frame::new().fill(if self.selected_setting==23 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
+                                    ui.set_width(ui.available_width());let mut enabled=look.block_cursor;
+                                    if ui.checkbox(&mut enabled,RichText::new("Block cursor (covers the whole character)").font(FontId::monospace(14.0))).changed() {self.selected_setting=23;self.set_editor_look(editor_view::EditorLook{block_cursor:enabled,..look});}
+                                });setting_rects.push(row.response.rect);
+                                let row=egui::Frame::new().fill(if self.selected_setting==24 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
+                                    ui.set_width(ui.available_width());let mut enabled=look.animate_cursor;
+                                    if ui.checkbox(&mut enabled,RichText::new("Animate cursor jumps").font(FontId::monospace(14.0))).changed() {self.selected_setting=24;self.set_editor_look(editor_view::EditorLook{animate_cursor:enabled,..look});}
+                                });setting_rects.push(row.response.rect);
+                                ui.label(RichText::new("The cursor glides when it jumps; typing stays instant. Text is never delayed.").font(FontId::monospace(13.0)).color(Color32::from_rgb(136,154,176)));
                                 if reveal_selected {
                                     if let Some(rect) = setting_rects.get(self.selected_setting) { ui.scroll_to_rect(*rect, Some(egui::Align::Min)); }
                                 }

@@ -138,9 +138,79 @@ pub(crate) fn clamp_editor_font_size(size: f32) -> f32 {
     }
 }
 
+/// Name of the embedded JetBrains Mono family (assets/fonts, SIL OFL).
+pub(crate) const JETBRAINS_MONO: &str = "JetBrains Mono";
+
+/// The editor's text font. Both are monospaced; Hack is egui's built-in one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum EditorFont {
+    #[default]
+    Hack,
+    JetBrainsMono,
+}
+
+impl EditorFont {
+    pub(crate) fn family(self) -> FontFamily {
+        match self {
+            Self::Hack => FontFamily::Monospace,
+            Self::JetBrainsMono => FontFamily::Name(JETBRAINS_MONO.into()),
+        }
+    }
+
+    pub(crate) fn config_value(self) -> &'static str {
+        match self {
+            Self::Hack => "hack",
+            Self::JetBrainsMono => "jetbrains-mono",
+        }
+    }
+
+    pub(crate) fn from_config(value: &str) -> Option<Self> {
+        match value.trim().trim_matches('"') {
+            "hack" => Some(Self::Hack),
+            "jetbrains-mono" => Some(Self::JetBrainsMono),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Hack => "Hack",
+            Self::JetBrainsMono => "JetBrains Mono",
+        }
+    }
+
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Hack => Self::JetBrainsMono,
+            Self::JetBrainsMono => Self::Hack,
+        }
+    }
+}
+
+/// How the editor text and caret look; set from Settings.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) struct EditorLook {
+    pub(crate) font: EditorFont,
+    /// A full-cell block over the character instead of a thin line.
+    pub(crate) block_cursor: bool,
+    /// The caret glides to its new place instead of jumping.
+    pub(crate) animate_cursor: bool,
+}
+
+/// How long the caret takes to glide to a new place.
+const CURSOR_GLIDE_SECONDS: f64 = 0.09;
+
 pub(crate) struct EditorView {
     font_size: f32,
     font_size_changed: bool,
+    look: EditorLook,
+    /// Where the caret is going and where it was last drawn, in content
+    /// coordinates (x from the text area's left edge, y from the document
+    /// top), so scrolling never animates it.
+    cursor_target: Option<Pos2>,
+    cursor_drawn: Option<Pos2>,
+    /// Glide in progress: start position and start time.
+    cursor_glide: Option<(Pos2, f64)>,
     row_layout: RefCell<Option<RowLayout>>,
     fence_layout: RefCell<Option<FenceLayout>>,
     scroll_y: f32,
@@ -178,6 +248,10 @@ impl EditorView {
         Self {
             font_size: DEFAULT_EDITOR_FONT_SIZE,
             font_size_changed: false,
+            look: EditorLook::default(),
+            cursor_target: None,
+            cursor_drawn: None,
+            cursor_glide: None,
             row_layout: RefCell::new(None),
             fence_layout: RefCell::new(None),
             scroll_y: 0.0,
@@ -273,6 +347,19 @@ impl EditorView {
         }
     }
 
+    pub(crate) fn set_look(&mut self, look: EditorLook) {
+        if look.font != self.look.font {
+            // Cached rows were measured with the other font.
+            *self.row_layout.borrow_mut() = None;
+            *self.fence_layout.borrow_mut() = None;
+            self.font_size_changed = true;
+        }
+        if !look.animate_cursor {
+            self.cursor_glide = None;
+        }
+        self.look = look;
+    }
+
     pub(crate) fn observe_buffer(&mut self, buffer: &EditorBuffer) {
         if self
             .target_cursor
@@ -331,7 +418,7 @@ impl EditorView {
         self.last_cursor_pos = None;
         self.last_text_input = None;
 
-        let font = FontId::new(self.font_size, FontFamily::Monospace);
+        let font = FontId::new(self.font_size, self.look.font.family());
         let gutter_font = FontId::new(LINE_NUMBER_FONT_SIZE, FontFamily::Monospace);
         let line_height =
             ui.fonts_mut(|fonts| fonts.row_height(&font).max(fonts.row_height(&gutter_font))) + 2.0;
@@ -704,6 +791,8 @@ impl EditorView {
                 line_height,
                 &font,
             );
+        } else {
+            self.forget_cursor_position();
         }
 
         if let Some(started) = render_started {
@@ -2867,20 +2956,107 @@ impl EditorView {
     ) {
         let row_index = self.row_index_for_byte(rows, buffer.cursor());
         let Some(row) = rows.get(row_index).copied() else {
+            self.forget_cursor_position();
             return;
         };
         let y = rect.top() + row_index as f32 * line_height - self.scroll_y;
         if y + line_height < rect.top() || y > rect.bottom() {
+            // Off screen: when it comes back it appears in place, no glide.
+            self.forget_cursor_position();
             return;
         }
-        let x = self.visual_x_for_byte(painter, buffer, row, buffer.cursor(), text_x, font);
+        let cursor = buffer.cursor();
+        let x = self.visual_x_for_byte(painter, buffer, row, cursor, text_x, font);
         self.last_cursor_pos = Some(egui::pos2(x, y + line_height));
-        painter.line_segment(
-            [egui::pos2(x, y + 3.0), egui::pos2(x, y + line_height - 3.0)],
-            Stroke::new(1.5_f32, Color32::from_rgb(236, 239, 244)),
-        );
-        // The caret does not blink, so drawing it does not schedule another frame:
-        // an idle editor presents nothing until input or a timer asks for it.
+
+        // The character under the caret (a space at the end of a line).
+        let under = buffer.as_str()[cursor..row.end]
+            .chars()
+            .next()
+            .filter(|c| *c != '\n' && *c != '\r');
+        let cell_width = {
+            let glyph = under.map_or_else(|| " ".to_string(), |c| c.to_string());
+            self.text_width(painter, &glyph, font).max(1.0)
+        };
+
+        let target = egui::pos2(x - rect.left(), row_index as f32 * line_height);
+        let now = painter.ctx().input(|input| input.time);
+        if self.cursor_target != Some(target) {
+            let from = self.cursor_drawn;
+            // Typing moves one cell at a time: that stays instant and crisp.
+            let typing_step = from.is_some_and(|from| {
+                from.y == target.y && (target.x - from.x).abs() <= cell_width * 1.5
+            });
+            self.cursor_glide = match from {
+                Some(from) if self.look.animate_cursor && !typing_step => Some((from, now)),
+                _ => None,
+            };
+            self.cursor_target = Some(target);
+        }
+        let mut gliding = false;
+        let drawn = match self.cursor_glide {
+            Some((from, started)) => {
+                let t = ((now - started) / CURSOR_GLIDE_SECONDS).clamp(0.0, 1.0) as f32;
+                if t >= 1.0 {
+                    self.cursor_glide = None;
+                    target
+                } else {
+                    gliding = true;
+                    // Ease-out cubic: fast start, gentle landing.
+                    let eased = 1.0 - (1.0 - t).powi(3);
+                    from + (target - from) * eased
+                }
+            }
+            None => target,
+        };
+        self.cursor_drawn = Some(drawn);
+        let at = egui::pos2(rect.left() + drawn.x, rect.top() + drawn.y - self.scroll_y);
+        let color = Color32::from_rgb(236, 239, 244);
+        if self.look.block_cursor {
+            let block = egui::Rect::from_min_size(
+                egui::pos2(at.x, at.y + 1.0),
+                egui::vec2(cell_width, line_height - 2.0),
+            );
+            if gliding {
+                painter.rect_filled(block, 1.0, color.gamma_multiply(0.75));
+            } else {
+                painter.rect_filled(block, 1.0, color);
+                if let Some(c) = under.filter(|c| !c.is_whitespace()) {
+                    painter.text(
+                        egui::pos2(at.x, at.y + line_height * 0.5),
+                        egui::Align2::LEFT_CENTER,
+                        c,
+                        font.clone(),
+                        Color32::from_rgb(30, 36, 48),
+                    );
+                }
+            }
+        } else {
+            painter.line_segment(
+                [
+                    egui::pos2(at.x, at.y + 3.0),
+                    egui::pos2(at.x, at.y + line_height - 3.0),
+                ],
+                Stroke::new(1.5_f32, color),
+            );
+        }
+        // The caret does not blink: once it has landed, drawing it schedules
+        // no frame, so an idle editor presents nothing until input arrives.
+        if gliding {
+            painter.ctx().request_repaint();
+        }
+    }
+
+    /// (drawn, target, gliding) for tests.
+    #[cfg(test)]
+    pub(crate) fn cursor_state(&self) -> (Option<Pos2>, Option<Pos2>, bool) {
+        (self.cursor_drawn, self.cursor_target, self.cursor_glide.is_some())
+    }
+
+    fn forget_cursor_position(&mut self) {
+        self.cursor_target = None;
+        self.cursor_drawn = None;
+        self.cursor_glide = None;
     }
 
     pub(crate) fn text_width(&self, painter: &egui::Painter, text: &str, font: &FontId) -> f32 {

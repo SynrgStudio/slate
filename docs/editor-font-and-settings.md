@@ -29,3 +29,20 @@ keyboard font adjustments, command-palette chrome, and gutter/text centering at
 8, 12, 24 and 32 pt. Row height accommodates both editor and gutter fonts, so
 small text does not make line numbers overlap. Test config writes use a unique
 temporary directory.
+
+## Font and cursor (Settings → Editor · font and cursor)
+
+- **Font**: Hack (egui's built-in monospace, the default) or **JetBrains Mono**
+  (embedded from `assets/fonts/JetBrainsMonoNL-Regular.ttf`, the no-ligature
+  build, SIL Open Font License in `assets/fonts/JetBrainsMono-OFL.txt`). The
+  usual monospace fonts stay behind it for symbols and emoji it lacks. It
+  applies to the editor, link preview and Scratch; dialogs keep their font.
+- **Block cursor**: a full character cell with the character drawn inverted,
+  instead of the 1.5 px line.
+- **Animate cursor jumps**: the cursor glides (90 ms, ease-out) to a new place
+  — clicks, line jumps, search, Ctrl+Home/End. Moving one character (typing,
+  ←/→) stays instant, and text is always drawn in the frame of the key; only
+  the caret is interpolated. The animation runs in document coordinates, so
+  scrolling never animates it, and it asks for frames only while gliding.
+- Saved as `editor_font = "hack" | "jetbrains-mono"`, `block_cursor` and
+  `cursor_animation` in `config.toml`; all off/Hack by default.

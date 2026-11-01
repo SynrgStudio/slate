@@ -727,6 +727,7 @@ impl SlateApp {
 
     fn restore_document(&mut self, mut doc: DocumentState) {
         doc.editor_view.set_font_size(self.editor_font_size);
+        doc.editor_view.set_look(self.editor_look);
         self.buffer = doc.buffer;
         self.editor_view = doc.editor_view;
         self.path = doc.path;

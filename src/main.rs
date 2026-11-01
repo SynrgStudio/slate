@@ -31,6 +31,8 @@ mod form_dialogs;
 #[cfg(test)]
 mod frame_bench_tests;
 #[cfg(test)]
+mod editor_look_tests;
+#[cfg(test)]
 mod large_document_tests;
 mod notice_ui;
 mod preview_layout;
@@ -918,6 +920,7 @@ struct SlateApp {
     selected_setting: usize,
     settings_last_selected: Option<usize>,
     editor_font_size: f32,
+    editor_look: editor_view::EditorLook,
     footer_options: footer_ui::Options,
     footer_counts_cache: Option<(u64, u64, usize, usize)>,
     footer_status_seen: String,
@@ -1159,6 +1162,7 @@ impl SlateApp {
             selected_setting: 0,
             settings_last_selected: None,
             editor_font_size: editor_view::DEFAULT_EDITOR_FONT_SIZE,
+            editor_look: editor_view::EditorLook::default(),
             footer_options: footer_ui::Options::default(),
             footer_counts_cache: None,
             footer_status_seen: "Ready".into(),
@@ -6129,6 +6133,30 @@ impl SlateApp {
                         self.apply_editor_font_size(size);
                     }
                 }
+                "editor_font" => {
+                    if let Some(font) = editor_view::EditorFont::from_config(value) {
+                        self.apply_editor_look(editor_view::EditorLook {
+                            font,
+                            ..self.editor_look
+                        });
+                    }
+                }
+                "block_cursor" => {
+                    if let Some(enabled) = Self::parse_config_bool(value) {
+                        self.apply_editor_look(editor_view::EditorLook {
+                            block_cursor: enabled,
+                            ..self.editor_look
+                        });
+                    }
+                }
+                "cursor_animation" => {
+                    if let Some(enabled) = Self::parse_config_bool(value) {
+                        self.apply_editor_look(editor_view::EditorLook {
+                            animate_cursor: enabled,
+                            ..self.editor_look
+                        });
+                    }
+                }
                 "command_history_limit" => {
                     if let Ok(limit) = value.trim().parse::<usize>() {
                         self.command_history_limit = clamp_history_limit(limit);
@@ -6361,6 +6389,12 @@ impl SlateApp {
         );
         contents.push_str(&format!("editor_font_size = {}\n", self.editor_font_size));
         contents.push_str(&format!(
+            "editor_font = \"{}\"\nblock_cursor = {}\ncursor_animation = {}\n",
+            self.editor_look.font.config_value(),
+            self.editor_look.block_cursor,
+            self.editor_look.animate_cursor
+        ));
+        contents.push_str(&format!(
             "periscope_everything = {}\n",
             self.periscope_everything
         ));
@@ -6446,6 +6480,27 @@ impl SlateApp {
         self.editor_view.set_font_size(self.editor_font_size);
         self.link_preview_view.set_font_size(self.editor_font_size);
         self.scratch_view.set_font_size(self.editor_font_size);
+    }
+
+    fn apply_editor_look(&mut self, look: editor_view::EditorLook) {
+        self.editor_look = look;
+        self.editor_view.set_look(look);
+        self.link_preview_view.set_look(look);
+        self.scratch_view.set_look(look);
+    }
+
+    fn set_editor_look(&mut self, look: editor_view::EditorLook) {
+        self.apply_editor_look(look);
+        let summary = format!(
+            "Editor: {} · {} cursor{}",
+            look.font.label(),
+            if look.block_cursor { "block" } else { "line" },
+            if look.animate_cursor { " · animated" } else { "" }
+        );
+        self.status = match self.save_settings() {
+            Ok(()) => summary,
+            Err(err) => format!("{summary}; settings save failed: {err}"),
+        };
     }
 
     fn set_editor_font_size(&mut self, size: f32) {
@@ -10905,6 +10960,27 @@ fn setup_style(ctx: &egui::Context) {
             .or_default()
             .insert(0, "noto_sans".to_string());
     }
+
+    // JetBrains Mono for the editor when chosen in Settings; the usual
+    // monospace fonts stay behind it for symbols and emoji it lacks.
+    fonts.font_data.insert(
+        "jetbrains_mono".to_string(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/JetBrainsMonoNL-Regular.ttf"
+        ))),
+    );
+    let mut editor_family = vec!["jetbrains_mono".to_string()];
+    editor_family.extend(
+        fonts
+            .families
+            .get(&FontFamily::Monospace)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    fonts.families.insert(
+        FontFamily::Name(editor_view::JETBRAINS_MONO.into()),
+        editor_family,
+    );
 
     ctx.set_fonts(fonts);
 

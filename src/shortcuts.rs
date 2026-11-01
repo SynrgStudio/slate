@@ -1220,7 +1220,7 @@ impl SlateApp {
         }
 
         if settings_next {
-            self.selected_setting = (self.selected_setting + 1).min(11 + footer_ui::FIELDS.len());
+            self.selected_setting = (self.selected_setting + 1).min(14 + footer_ui::FIELDS.len());
             return;
         }
 
@@ -1239,6 +1239,18 @@ impl SlateApp {
                 19 => self.set_periscope_everything(false),
                 20 => self.set_resident(false),
                 21 => self.set_start_with_windows(false),
+                22 => self.set_editor_look(editor_view::EditorLook {
+                    font: self.editor_look.font.next(),
+                    ..self.editor_look
+                }),
+                23 => self.set_editor_look(editor_view::EditorLook {
+                    block_cursor: false,
+                    ..self.editor_look
+                }),
+                24 => self.set_editor_look(editor_view::EditorLook {
+                    animate_cursor: false,
+                    ..self.editor_look
+                }),
                 _ => {}
             }
             return;
@@ -1286,6 +1298,26 @@ impl SlateApp {
                     !self.start_with_windows
                 } else {
                     true
+                }),
+                22 => self.set_editor_look(editor_view::EditorLook {
+                    font: self.editor_look.font.next(),
+                    ..self.editor_look
+                }),
+                23 => self.set_editor_look(editor_view::EditorLook {
+                    block_cursor: if settings_activate {
+                        !self.editor_look.block_cursor
+                    } else {
+                        true
+                    },
+                    ..self.editor_look
+                }),
+                24 => self.set_editor_look(editor_view::EditorLook {
+                    animate_cursor: if settings_activate {
+                        !self.editor_look.animate_cursor
+                    } else {
+                        true
+                    },
+                    ..self.editor_look
                 }),
                 _ => {}
             }
