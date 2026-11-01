@@ -2,7 +2,7 @@
 use super::*;
 fn fixture(ctx: &egui::Context) -> SlateApp {
     let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-    let mut app = SlateApp::new(&cc, None, true, false, None);
+    let mut app = SlateApp::new(&cc, None, true, None);
     app.apply_editor_font_size(editor_view::DEFAULT_EDITOR_FONT_SIZE);
     app.buffer.set_text("untouched main text".into());
     app.scratch_buffer.set_text("scratch text\n".repeat(300));

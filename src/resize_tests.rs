@@ -5,7 +5,7 @@ use super::*;
 fn benchmark_large_preview_resize() {
     let ctx = egui::Context::default();
     let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-    let mut app = SlateApp::new(&cc, None, true, false, None);
+    let mut app = SlateApp::new(&cc, None, true, None);
     app.buffer
         .set_text(fs::read_to_string("D:/slate-baselines/large-document-5m.md").unwrap());
     for (pass, width) in [900.0, 900.0, 880.0, 860.0, 840.0, 820.0, 800.0, 800.0]

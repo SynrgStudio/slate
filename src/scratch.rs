@@ -7,8 +7,6 @@ use std::{
 use chrono::Local;
 use eframe::egui::{self, Color32, FontFamily, FontId, RichText, Stroke};
 
-use crate::markdown::parse_checkbox_line;
-
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ScratchEntry {
     pub(crate) heading: Option<String>,
@@ -66,61 +64,6 @@ pub(crate) fn feedback_toast(ctx: &egui::Context, until: Option<f64>, message: &
         });
 }
 
-pub(crate) fn normalize_quickadd_task_line(text: &str) -> Option<String> {
-    let text = text.trim();
-    if text.is_empty() {
-        return None;
-    }
-    if let Some(parsed) = parse_checkbox_line(text) {
-        if parsed.text.trim().is_empty() {
-            return None;
-        }
-        let mut line = text.to_string();
-        append_default_task_tags(&mut line, parsed.text);
-        return Some(line);
-    }
-    let mut line = format!("- [ ] {text}");
-    append_default_task_tags(&mut line, text);
-    Some(line)
-}
-
-fn append_default_task_tags(line: &mut String, body: &str) {
-    let has_extra = body.split_whitespace().any(|word| {
-        word.starts_with('#')
-            || word.starts_with('@')
-            || matches!(
-                word.to_ascii_uppercase().as_str(),
-                "ALTA" | "MEDIA" | "BAJA"
-            )
-            || word.starts_with("due:")
-            || word.starts_with("scheduled:")
-    });
-    let default_tags = if has_extra {
-        ["task"].as_slice()
-    } else {
-        ["task", "inbox"].as_slice()
-    };
-    let missing_tags = default_tags
-        .iter()
-        .filter(|tag| {
-            !line
-                .split_whitespace()
-                .any(|word| word.eq_ignore_ascii_case(&format!("#{tag}")))
-        })
-        .collect::<Vec<_>>();
-    if missing_tags.is_empty() {
-        return;
-    }
-    line.push(' ');
-    line.push_str(
-        &missing_tags
-            .into_iter()
-            .map(|tag| format!("#{tag}"))
-            .collect::<Vec<_>>()
-            .join(" "),
-    );
-}
-
 pub(crate) fn format_capture_entry(title: &str, text: &str) -> String {
     let title = title.trim();
     if title.is_empty() {
@@ -128,36 +71,6 @@ pub(crate) fn format_capture_entry(title: &str, text: &str) -> String {
     } else {
         format!("**{title}**\n\n{}", text.trim_end())
     }
-}
-
-/// Splits scratch text into Flow quickadds (`:qa`, `:quickadd` or `:inbox`
-/// lines, and checkbox lines) and the rest. Each quickadd keeps its original
-/// line, so one that fails can be put back.
-pub(crate) fn split_quickadds(text: &str) -> (Vec<(String, String)>, String) {
-    let mut quickadds = Vec::new();
-    let mut remaining = String::new();
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix(':') {
-            let rest = rest.trim_start();
-            // Any other line starting with ':' is just text.
-            let task = ["quickadd ", "qa ", "inbox "]
-                .iter()
-                .find_map(|command| rest.strip_prefix(command))
-                .map(str::trim);
-            if let Some(task) = task.filter(|task| !task.is_empty()) {
-                quickadds.push((task.to_string(), line.to_string()));
-                continue;
-            }
-        }
-        if parse_checkbox_line(trimmed).is_some_and(|checkbox| !checkbox.text.trim().is_empty()) {
-            quickadds.push((trimmed.to_string(), line.to_string()));
-            continue;
-        }
-        remaining.push_str(line);
-        remaining.push('\n');
-    }
-    (quickadds, remaining.trim_end().to_string())
 }
 
 pub(crate) fn append_text_to_archive(path: &Path, text: &str) -> Result<(), String> {
@@ -250,49 +163,6 @@ pub(crate) fn serialize_entries(entries: &[ScratchEntry]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn scratch_split_quickadds_extracts_colon_commands() {
-        let (quickadds, remaining) = split_quickadds(
-            "nota\n:quickadd comprar pan #casa\n: inbox llamar\n[] testeo @proyectocasa\nfin",
-        );
-        assert_eq!(
-            quickadds
-                .iter()
-                .map(|(task, _)| task.as_str())
-                .collect::<Vec<_>>(),
-            vec!["comprar pan #casa", "llamar", "[] testeo @proyectocasa"]
-        );
-        assert_eq!(
-            quickadds[1].1, ": inbox llamar",
-            "the original line is kept"
-        );
-        assert_eq!(remaining, "nota\nfin");
-        // Other lines that start with ':' are text, not tasks.
-        let (quickadds, remaining) = split_quickadds(":) hola\n:qa\n:note: idea\nhttp://x");
-        assert!(quickadds.is_empty());
-        assert_eq!(remaining, ":) hola\n:qa\n:note: idea\nhttp://x");
-    }
-
-    #[test]
-    fn quickadd_normalization_adds_flow_default_tags() {
-        assert_eq!(
-            normalize_quickadd_task_line("comprar pan"),
-            Some("- [ ] comprar pan #task #inbox".to_string())
-        );
-        assert_eq!(
-            normalize_quickadd_task_line("comprar pan @casa"),
-            Some("- [ ] comprar pan @casa #task".to_string())
-        );
-        assert_eq!(
-            normalize_quickadd_task_line("- [ ] ya tagueada #task"),
-            Some("- [ ] ya tagueada #task".to_string())
-        );
-        assert_eq!(
-            normalize_quickadd_task_line("[] testeo @proyectocasa"),
-            Some("[] testeo @proyectocasa #task".to_string())
-        );
-    }
 
     #[test]
     fn scratch_entries_round_trip() {

@@ -12,7 +12,7 @@ impl Fixture {
         let cc = eframe::CreationContext::_new_kittest(ctx.clone());
         // Built as scratch so the user's real "reopen last file" setting is not
         // applied, then switched to a main editor window.
-        let mut app = SlateApp::new(&cc, None, true, false, None);
+        let mut app = SlateApp::new(&cc, None, true, None);
         app.scratch = false;
         let root = std::env::temp_dir().join(format!(
             "slate-resident-{}-{}",
@@ -63,14 +63,14 @@ impl Drop for Fixture {
 #[test]
 fn closing_the_window_hides_it_and_keeps_the_tabs() {
     let mut f = Fixture::new();
-    f.app.agenda_open = true;
+    f.app.find_note_open = true;
     let commands = f.close();
     assert!(commands.contains(&egui::ViewportCommand::CancelClose));
     assert!(commands.contains(&egui::ViewportCommand::Visible(false)));
     assert!(f.app.window_hidden);
     assert_eq!(f.app.path, Some(f.root.join("note.md")));
     assert_eq!(f.app.buffer.as_str(), "hola\n");
-    assert!(!f.app.agenda_open, "transient panels close");
+    assert!(!f.app.find_note_open, "transient panels close");
     assert!(f.root.join("config.toml").exists(), "settings persisted");
     assert!(f.root.join("session.json").exists(), "tabs persisted");
 }

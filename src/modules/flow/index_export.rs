@@ -32,7 +32,9 @@ pub(crate) fn request(root: &std::path::Path, database: &std::path::Path) {
                         add(request);
                     }
                     for (root, database) in pending {
-                        if let Err(err) = crate::flow::export_database_index(&root, &database) {
+                        if let Err(err) =
+                            crate::modules::flow::export_database_index(&root, &database)
+                        {
                             crate::perf_log::mark(
                                 "flow.tsv_export.failed",
                                 &format!("root={root:?} error={err}"),

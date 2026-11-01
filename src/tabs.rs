@@ -304,19 +304,6 @@ impl SlateApp {
             .collect()
     }
 
-    /// The agenda shows unsaved tasks of every tab, not only the active one.
-    pub(super) fn overlay_inactive_tab_agenda_items(&self, items: &mut Vec<AgendaItem>) {
-        for doc in self.tabs.list.iter().filter_map(|tab| tab.doc.as_ref()) {
-            let Some(path) = doc.path.as_deref() else {
-                continue;
-            };
-            if doc.dirty && flow::should_index_flow_path(path) {
-                let root = Self::flow_project_root_for_path(path);
-                agenda::overlay_live_buffer_items(items, path, &root, doc.buffer.as_str());
-            }
-        }
-    }
-
     fn aliases_path(&self) -> Option<PathBuf> {
         #[cfg(test)]
         return self
@@ -428,9 +415,7 @@ impl SlateApp {
                 if doc.buffer.revision == pending.revision {
                     doc.dirty = false;
                 }
-                let text = doc.buffer.as_str().to_string();
                 self.remember_recent_file(pending.path.clone());
-                self.queue_flow_index_text(&pending.path, text);
                 let _ = self.save_settings();
                 self.status = format!("Saved {}", pending.path.display());
                 if let Err(error) =
@@ -910,8 +895,6 @@ impl SlateApp {
         self.observe_document_safety(0.0, true);
         let blank = DocumentState::blank(self.editor_font_size);
         self.footer_counts = Default::default();
-        self.flow_inline_org_mode = None;
-        self.flow_inline_org_anchor = None;
         self.link_inline_anchor = None;
         self.duplicate_placement = None;
         self.pending_bidirectional_link_source_line = None;
@@ -1133,13 +1116,10 @@ impl SlateApp {
                     self.tabs.active -= 1;
                 }
             }
-            let refresh_daily = matches!(destination, OpenDestination::Daily { .. }) && !self.dirty;
-            let still_loading = self.pending_file_open.is_some();
-            if !refresh_daily && !still_loading {
+            if self.pending_file_open.is_none() {
                 self.apply_open_destination(destination.clone());
-                return false;
             }
-            return refresh_daily;
+            return false;
         }
         if !self.active_tab_is_blank() {
             self.new_tab();
@@ -1172,7 +1152,7 @@ impl SlateApp {
     }
 
     pub(super) fn save_session(&self) {
-        if self.scratch || self.standalone_agenda || !(cfg!(test) || owns_session()) {
+        if self.scratch || !(cfg!(test) || owns_session()) {
             return;
         }
         let Some(file) = self.session_path() else {
@@ -1239,7 +1219,7 @@ impl SlateApp {
     /// Ctrl+Tab / Ctrl+Shift+Tab, Ctrl+1…9 (9 = last) and Ctrl+wheel.
     /// Called while Ctrl is held; consumes the events it uses.
     pub(super) fn handle_tab_switch_input(&mut self, ctx: &egui::Context) -> bool {
-        if self.scratch || self.standalone_agenda {
+        if self.scratch {
             return false;
         }
         let mut step = 0isize;

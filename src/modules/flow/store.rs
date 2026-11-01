@@ -2,7 +2,7 @@
 #[cfg(test)]
 #[path = "store_tests.rs"]
 mod tests;
-use crate::flow::{FlowKnownFile, FlowTask};
+use crate::modules::flow::{FlowKnownFile, FlowTask};
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use std::{
     cell::RefCell,
@@ -102,7 +102,7 @@ impl CacheWriter {
                             task.line_number,
                             task.line_index,
                             task.kind.as_str(),
-                            crate::flow::flow_item_state_label(task),
+                            crate::modules::flow::flow_item_state_label(task),
                             task.title,
                             task.raw_text,
                             task.tags.join(","),

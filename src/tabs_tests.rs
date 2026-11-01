@@ -12,7 +12,7 @@ impl Fixture {
         let cc = eframe::CreationContext::_new_kittest(ctx.clone());
         // Built as scratch so the user's real "reopen last file" setting is not
         // applied, then switched to a main editor window.
-        let mut app = SlateApp::new(&cc, None, true, false, None);
+        let mut app = SlateApp::new(&cc, None, true, None);
         app.scratch = false;
         let root = std::env::temp_dir().join(format!(
             "slate-tabs-{}-{}",
@@ -496,24 +496,6 @@ fn a_file_changed_on_disk_while_its_tab_was_inactive_is_flagged_when_shown() {
     }
     assert!(f.app.file_conflict.is_some(), "conflict flagged on return");
     assert_eq!(f.app.buffer.as_str(), "alpha\n", "editor text is kept");
-}
-
-#[test]
-fn the_agenda_sees_unsaved_tasks_of_every_tab() {
-    let mut f = Fixture::new();
-    let a = f.file("a.md", "");
-    let b = f.file("b.md", "");
-    f.open(&a);
-    f.app.buffer.set_text("- [ ] comprar pan\n".into());
-    f.app.dirty = true;
-    f.open(&b);
-    f.app.buffer.set_text("- [ ] llamar a Ana\n".into());
-    f.app.dirty = true;
-    let mut items = Vec::new();
-    f.app.overlay_current_buffer_agenda_items(&mut items);
-    let mut titles: Vec<_> = items.iter().map(|item| item.title.clone()).collect();
-    titles.sort();
-    assert_eq!(titles, ["comprar pan", "llamar a Ana"]);
 }
 
 fn run_command_line(f: &mut Fixture, line: &str) {

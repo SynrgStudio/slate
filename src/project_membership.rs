@@ -178,8 +178,6 @@ impl SlateApp {
             || self.link_preview_open
             || self.scratch_modal_open
             || self.capture_modal_open
-            || self.flow_item_edit.is_some()
-            || self.standalone_agenda
             || self.link_assist_open
         {
             self.status = "Close the current dialog before creating a project".into();
@@ -193,7 +191,6 @@ impl SlateApp {
         self.settings_open = false;
         self.find_note_open = false;
         self.doc_tasks_open = false;
-        self.agenda_open = false;
         self.link_heading_picker_open = false;
         self.scratch_entries_open = false;
         self.open_file_picker_at(self.project_root(), FilePickerMode::SetPeriscopeProject);

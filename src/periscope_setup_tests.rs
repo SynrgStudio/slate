@@ -15,7 +15,7 @@ impl Fixture {
         let cache = root.join("cache/paths.sqlite3");
         let ctx = egui::Context::default();
         let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-        let mut app = SlateApp::new(&cc, None, true, false, None);
+        let mut app = SlateApp::new(&cc, None, true, None);
         app.periscope_engine = periscope_backend::Manager::new(cache.clone());
         app.periscope_roots = vec![root.join("files")];
         app.periscope_everything = false;

@@ -14,8 +14,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use eframe::egui;
 
-use crate::agenda::{self, AgendaItem};
-use crate::{flow, flow_runtime};
+use crate::modules::agenda::{self, AgendaItem};
+use crate::modules::flow::{self as flow, runtime as flow_runtime};
 
 enum Job {
     Heartbeat {
@@ -63,7 +63,6 @@ pub(crate) enum Report {
 pub(crate) struct AgendaSynced {
     /// Fresh cache items when the agenda panel was open at request time.
     pub(crate) items: Option<Vec<AgendaItem>>,
-    pub(crate) daily_error: Option<String>,
 }
 
 pub(crate) struct FlowWorker {
@@ -195,28 +194,15 @@ fn agenda_sync(
     contents: &str,
     load_items: bool,
 ) -> Result<AgendaSynced, String> {
-    let old_items = agenda::load_items_from_cache(sqlite_path, project_root).unwrap_or_default();
-    let summary = flow::update_flow_index_for_file(project_root, sqlite_path, path, contents)?;
-    let daily_error = record_daily_events(path, &old_items, &summary).err();
+    // Logging captures/completions to the daily log was done here through
+    // the editor; that link is gone until Daily comes back as a module.
+    flow::update_flow_index_for_file(project_root, sqlite_path, path, contents)?;
     let items = if load_items {
         agenda::load_items_from_cache(sqlite_path, project_root).ok()
     } else {
         None
     };
-    Ok(AgendaSynced { items, daily_error })
-}
-
-#[cfg(not(test))]
-use crate::record_flow_daily_events as record_daily_events;
-
-/// Tests must not append to the user's real daily log.
-#[cfg(test)]
-fn record_daily_events(
-    _path: &std::path::Path,
-    _old_items: &[AgendaItem],
-    _summary: &flow::FlowIndexSummary,
-) -> Result<(), String> {
-    Ok(())
+    Ok(AgendaSynced { items })
 }
 
 /// Keeps only the newest job per kind and file, moved to the newest position.

@@ -9,7 +9,7 @@ impl Fixture {
     fn new() -> Self {
         let ctx = egui::Context::default();
         let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-        let mut app = SlateApp::new(&cc, None, true, false, None);
+        let mut app = SlateApp::new(&cc, None, true, None);
         let root = std::env::temp_dir().join(format!(
             "slate-safety-ui-{}-{}",
             std::process::id(),

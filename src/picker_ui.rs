@@ -44,7 +44,6 @@ impl SlateApp {
                         FilePickerMode::AddLance => "add lance",
                         FilePickerMode::Browse => "files",
                         FilePickerMode::InsertMarkdownLink => "insert link file",
-                        FilePickerMode::Refile => "refile target",
                         FilePickerMode::SetPeriscopeProject => "create project",
                     };
                     (

@@ -97,11 +97,17 @@ Slate should feel like opening a clean terminal and writing.
 - `:capture` captures the current selection, or the current line if there is no selection, with optional context/title.
 - `:scratch-entries` reviews and deletes archived scratch entries.
 
-### Slate Flow knowledge-work lane
+### Slate Flow knowledge-work lane (disabled while it is rebuilt)
 
 Slate Flow is the local-first knowledge layer over ordinary Markdown files.
 
-Current commands and workflows include:
+> **Not available right now.** Flow, the agenda, daily logs, quickadd,
+> refile, backlinks and mentions were taken out of the core on 2026-11-01
+> to be rebuilt as modules on top of it, one at a time. The code is kept
+> in `src/modules/`; see [`src/modules/README.md`](src/modules/README.md).
+> Everything below describes how they worked before.
+
+Commands and workflows (before the cut):
 
 - `:agenda` — task agenda over Markdown tasks.
 - `:quickadd` / `:qa` / `:inbox` — append a task to the current Flow inbox.
@@ -314,6 +320,9 @@ Open the command line with `Ctrl+.`. Commands may be typed with or without the l
 ```
 
 ### Markdown/knowledge commands
+
+The agenda, quickadd, daily, refile, backlinks, mentions and flow-* commands
+are unavailable while Flow is rebuilt as a module (see above).
 
 ```text
 :open-link / :olink / :follow-link    open Markdown link under cursor
@@ -671,11 +680,7 @@ Important source modules:
 | `src/file_dialogs.rs` | Slate-owned open/save picker behavior |
 | `src/periscope.rs` | Project/home file search and path scoring |
 | `src/scratch.rs` | Scratch/capture/archive helpers |
-| `src/flow.rs` | Flow task/index data model |
-| `src/flow_runtime.rs` | Flow runtime paths/cache helpers |
-| `src/flow_edit.rs` | Flow source-edit helpers |
-| `src/agenda.rs` | Agenda query/cache helpers |
-| `src/daily.rs` | Daily log/reflection helpers |
+| `src/modules/` | Optional modules (Flow, Agenda, Daily), disconnected while they are rebuilt; see its README |
 | `src/link_ui.rs` | Link/backlink/mention/find-note UI helpers |
 
 ---

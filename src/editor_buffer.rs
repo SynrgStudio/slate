@@ -677,6 +677,7 @@ impl EditorBuffer {
         self.replace_selection_or_range(self.cursor, next, "");
     }
 
+    #[allow(dead_code)]
     pub(crate) fn replace_current_line(&mut self, replacement: &str, cursor_column: usize) -> bool {
         let line_index = self.line_index_for_byte(self.cursor);
         let start = self.line_start(line_index);

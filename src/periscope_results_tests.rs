@@ -9,7 +9,7 @@ fn result_dialog_list_is_contained_at_small_and_screenshot_sizes_and_wheel_prese
     ] {
         let ctx = egui::Context::default();
         let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-        let mut app = SlateApp::new(&cc, None, true, false, None);
+        let mut app = SlateApp::new(&cc, None, true, None);
         app.buffer.set_text("unsaved text must remain".into());
         app.dirty = true;
         app.periscope_open = true;

@@ -9,11 +9,6 @@ pub(crate) enum Command {
     LanceAdd,
     LanceNext,
     LancePrev,
-    FlowRescan,
-    FlowRebuild,
-    Daily,
-    Refile,
-    QuickAdd,
     Save,
     SaveAs,
     Scratch,
@@ -30,9 +25,6 @@ pub(crate) enum Command {
     PreviewOn,
     PreviewOff,
     DocTasks,
-    Agenda,
-    Backlinks,
-    Mentions,
     FindNote,
     OpenLink,
     CloseBuffer,
@@ -162,41 +154,6 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
         palette_command: Some(Command::Periscope),
     },
     CommandSpec {
-        name: "flow-rescan",
-        aliases: &["flow-index"],
-        summary: "Rescan current Flow scope into .slate and agenda cache",
-        hint: ":flow-rescan",
-        palette_command: Some(Command::FlowRescan),
-    },
-    CommandSpec {
-        name: "flow-rebuild",
-        aliases: &["flow-reindex"],
-        summary: "Rebuild current Flow scope index and agenda cache",
-        hint: ":flow-rebuild",
-        palette_command: Some(Command::FlowRebuild),
-    },
-    CommandSpec {
-        name: "daily",
-        aliases: &["daily-log", "journal"],
-        summary: "Open the monthly Daily reflection log",
-        hint: ":daily [today|yesterday|YYYY-MM-DD|refresh]",
-        palette_command: Some(Command::Daily),
-    },
-    CommandSpec {
-        name: "refile",
-        aliases: &["rf"],
-        summary: "Copy current Flow line to another Markdown file and link both sides",
-        hint: ":refile",
-        palette_command: Some(Command::Refile),
-    },
-    CommandSpec {
-        name: "quickadd",
-        aliases: &["qa", "inbox"],
-        summary: "Append a Slate Flow task to the current inbox",
-        hint: ":quickadd comprar pan #casa ALTA",
-        palette_command: Some(Command::QuickAdd),
-    },
-    CommandSpec {
         name: "open-last",
         aliases: &["last", "ol"],
         summary: "Open last file",
@@ -281,20 +238,6 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
         palette_command: Some(Command::PreviewOff),
     },
     CommandSpec {
-        name: "backlinks",
-        aliases: &["bl"],
-        summary: "Show Markdown links pointing to the current file",
-        hint: ":backlinks",
-        palette_command: Some(Command::Backlinks),
-    },
-    CommandSpec {
-        name: "mentions",
-        aliases: &["refs"],
-        summary: "Show textual mentions of the current file",
-        hint: ":mentions",
-        palette_command: Some(Command::Mentions),
-    },
-    CommandSpec {
         name: "find-note",
         aliases: &["fn", "note-find"],
         summary: "Find Markdown notes by file, heading, or content",
@@ -314,13 +257,6 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
         summary: "Browse current-document checkboxes",
         hint: ":doc-tasks",
         palette_command: Some(Command::DocTasks),
-    },
-    CommandSpec {
-        name: "agenda",
-        aliases: &["ag"],
-        summary: "Open Slate Flow agenda",
-        hint: ":agenda [#tag|@project|overdue]",
-        palette_command: Some(Command::Agenda),
     },
     CommandSpec {
         name: "find",
@@ -489,11 +425,6 @@ pub(crate) fn command_name(command: Command) -> &'static str {
         Command::LanceAdd => "lance-add",
         Command::LanceNext => "lance-next",
         Command::LancePrev => "lance-prev",
-        Command::FlowRescan => "flow-rescan",
-        Command::FlowRebuild => "flow-rebuild",
-        Command::Daily => "daily",
-        Command::Refile => "refile",
-        Command::QuickAdd => "quickadd",
         Command::Save => "save",
         Command::SaveAs => "save-as",
         Command::Scratch => "scratch",
@@ -510,9 +441,6 @@ pub(crate) fn command_name(command: Command) -> &'static str {
         Command::PreviewOn => "preview-on",
         Command::PreviewOff => "preview-off",
         Command::DocTasks => "doc-tasks",
-        Command::Agenda => "agenda",
-        Command::Backlinks => "backlinks",
-        Command::Mentions => "mentions",
         Command::FindNote => "find-note",
         Command::OpenLink => "open-link",
         Command::CloseBuffer => "close",
@@ -709,10 +637,6 @@ pub(crate) enum CommandLineAction {
     /// `:alias NAME` names the current file inside Slate; `:alias` clears it.
     Alias(String),
     OpenBufferPath(String),
-    QuickAdd(Option<String>),
-    Daily {
-        target: String,
-    },
     LanceSlot(usize),
     LanceAddPath(String),
     OpenLast,
@@ -720,9 +644,6 @@ pub(crate) enum CommandLineAction {
         query: String,
     },
     SetPreview(Option<bool>),
-    Agenda {
-        filter: String,
-    },
     FindNote {
         query: String,
     },
@@ -798,16 +719,6 @@ pub(crate) fn parse_command_line(raw: &str) -> CommandLineAction {
         "project" | "create-project" | "new-project" => {
             CommandLineAction::Run(Command::CreateProject)
         }
-        "flow-rescan" | "flow-index" => CommandLineAction::Run(Command::FlowRescan),
-        "flow-rebuild" | "flow-reindex" => CommandLineAction::Run(Command::FlowRebuild),
-        "daily" | "daily-log" | "journal" => CommandLineAction::Daily {
-            target: remaining_args(parts),
-        },
-        "refile" | "rf" => CommandLineAction::Run(Command::Refile),
-        "quickadd" | "qa" | "inbox" => {
-            let text = remaining_args(parts);
-            CommandLineAction::QuickAdd((!text.trim().is_empty()).then_some(text))
-        }
         "lance" | "lc" | "marks" => {
             let arg = parts.next();
             if let Some(slot) = arg.and_then(|value| value.parse::<usize>().ok()) {
@@ -836,11 +747,6 @@ pub(crate) fn parse_command_line(raw: &str) -> CommandLineAction {
         "preview-on" | "md-on" => CommandLineAction::Run(Command::PreviewOn),
         "preview-off" | "md-off" => CommandLineAction::Run(Command::PreviewOff),
         "doc-tasks" | "tasks" => CommandLineAction::Run(Command::DocTasks),
-        "agenda" | "ag" => CommandLineAction::Agenda {
-            filter: remaining_args(parts),
-        },
-        "backlinks" | "bl" => CommandLineAction::Run(Command::Backlinks),
-        "mentions" | "refs" => CommandLineAction::Run(Command::Mentions),
         "find-note" | "fn" | "note-find" => CommandLineAction::FindNote {
             query: remaining_args(parts),
         },
@@ -916,24 +822,24 @@ mod tests {
     #[test]
     fn canonical_command_name_resolves_aliases() {
         assert_eq!(canonical_command_name("w"), Some("save"));
-        assert_eq!(canonical_command_name(":ag"), Some("agenda"));
+        assert_eq!(canonical_command_name(":ps"), Some("periscope"));
         assert_eq!(canonical_command_name("missing"), None);
     }
 
     #[test]
     fn matching_specs_prefers_usage_for_empty_query() {
-        let specs = matching_command_specs("", 1, |name| if name == "agenda" { 100 } else { 0 });
-        assert_eq!(specs.first().map(|spec| spec.name), Some("agenda"));
+        let specs = matching_command_specs("", 1, |name| if name == "periscope" { 100 } else { 0 });
+        assert_eq!(specs.first().map(|spec| spec.name), Some("periscope"));
     }
 
     #[test]
     fn best_token_can_complete_aliases() {
         let spec = COMMAND_SPECS
             .iter()
-            .find(|spec| spec.name == "agenda")
+            .find(|spec| spec.name == "periscope")
             .unwrap();
-        assert_eq!(best_command_token(spec, "ag"), Some("ag"));
-        assert_eq!(best_command_token(spec, "agen"), Some("agenda"));
+        assert_eq!(best_command_token(spec, "ps"), Some("ps"));
+        assert_eq!(best_command_token(spec, "peri"), Some("periscope"));
     }
 
     #[test]
@@ -957,22 +863,8 @@ mod tests {
             CommandLineAction::OpenPath("docs/read me.md".to_string())
         );
         assert_eq!(
-            parse_command_line(":quickadd comprar pan #task"),
-            CommandLineAction::QuickAdd(Some("comprar pan #task".to_string()))
-        );
-        assert_eq!(
-            parse_command_line(":quickadd"),
-            CommandLineAction::QuickAdd(None)
-        );
-        assert_eq!(
             parse_command_line(":lance 3"),
             CommandLineAction::LanceSlot(3)
-        );
-        assert_eq!(
-            parse_command_line(":agenda #task @casa"),
-            CommandLineAction::Agenda {
-                filter: "#task @casa".to_string()
-            }
         );
     }
 
@@ -1026,12 +918,12 @@ mod tests {
         assert_eq!(usages[0].last_used, 120);
         assert!(command_usage_boost(&usages, "save", 120) > 0);
 
-        let parsed = parse_command_usage("ag|3|90").unwrap();
+        let parsed = parse_command_usage("ps|3|90").unwrap();
         merge_command_usage(&mut usages, parsed);
         assert!(
             usages
                 .iter()
-                .any(|usage| usage.name == "agenda" && usage.count == 3)
+                .any(|usage| usage.name == "periscope" && usage.count == 3)
         );
     }
 }

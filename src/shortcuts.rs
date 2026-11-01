@@ -7,10 +7,6 @@ impl SlateApp {
             self.handle_periscope_setup_input(ctx);
             return;
         }
-        if flow_error::handle_input(ctx) {
-            self.suppress_editor_keyboard_once = true;
-            return;
-        }
         if self.recovery_open || self.file_conflict.is_some() {
             return;
         }
@@ -37,15 +33,7 @@ impl SlateApp {
             return;
         }
 
-        if self.handle_agenda_org_keyboard(ctx) {
-            return;
-        }
-
         if self.handle_link_inline_keyboard(ctx) {
-            return;
-        }
-
-        if self.flow_item_edit.is_some() {
             return;
         }
 
@@ -95,22 +83,6 @@ impl SlateApp {
         let mut doc_task_open = false;
         let mut doc_task_cycle = false;
         let mut doc_task_backspace = false;
-        let mut agenda_previous = false;
-        let mut agenda_next = false;
-        let mut agenda_open = false;
-        let mut agenda_cycle = false;
-        let mut agenda_edit = false;
-        let mut agenda_refile = false;
-        let mut agenda_previous_day = false;
-        let mut agenda_next_day = false;
-        let mut agenda_previous_week = false;
-        let mut agenda_next_week = false;
-        let mut agenda_today = false;
-        let mut agenda_toggle_focus = false;
-        let mut agenda_cycle_tab = false;
-        let mut agenda_toggle_done = false;
-        let mut agenda_org_tag = false;
-        let mut agenda_org_project = false;
         let mut file_previous = false;
         let mut file_next = false;
         let mut file_open = false;
@@ -181,7 +153,6 @@ impl SlateApp {
             && !self.recent_picker_open
             && !self.lance_open
             && !self.doc_tasks_open
-            && !self.agenda_open
             && !self.file_picker_open
             && !self.find_note_open
             && !self.link_heading_picker_open
@@ -258,116 +229,6 @@ impl SlateApp {
                     });
                 }
                 doc_task_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
-            }
-            if self.agenda_open && !self.file_picker_open && !self.link_heading_picker_open {
-                agenda_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
-                agenda_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
-                agenda_previous_day |= i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft);
-                agenda_next_day |= i.consume_key(egui::Modifiers::NONE, Key::ArrowRight);
-                agenda_previous_week |= i.consume_key(egui::Modifiers::NONE, Key::PageUp);
-                agenda_next_week |= i.consume_key(egui::Modifiers::NONE, Key::PageDown);
-                agenda_today |= i.consume_key(egui::Modifiers::NONE, Key::Home);
-                agenda_toggle_done |= i.consume_key(egui::Modifiers::NONE, Key::X);
-                agenda_refile |= i.consume_key(egui::Modifiers::NONE, Key::R);
-                agenda_org_tag |= i.events.iter().any(|event| {
-                    matches!(event, egui::Event::Text(text) if text == "#")
-                });
-                agenda_org_project |= i.events.iter().any(|event| {
-                    matches!(event, egui::Event::Text(text) if text == "@")
-                });
-                if agenda_org_tag || agenda_org_project {
-                    i.events.retain(|event| {
-                        !matches!(event, egui::Event::Text(text) if text == "#" || text == "@")
-                    });
-                }
-                agenda_cycle_tab |= i.events.iter().any(|event| {
-                    matches!(
-                        event,
-                        egui::Event::Key {
-                            key: Key::Tab,
-                            pressed: true,
-                            repeat: false,
-                            modifiers,
-                            ..
-                        } if !modifiers.ctrl && !modifiers.command && !modifiers.alt && modifiers.shift
-                    )
-                });
-                agenda_toggle_focus |= i.events.iter().any(|event| {
-                    matches!(
-                        event,
-                        egui::Event::Key {
-                            key: Key::Tab,
-                            pressed: true,
-                            repeat: false,
-                            modifiers,
-                            ..
-                        } if !modifiers.ctrl && !modifiers.command && !modifiers.alt && !modifiers.shift
-                    )
-                });
-                if agenda_toggle_focus || agenda_cycle_tab {
-                    i.events.retain(|event| {
-                        !matches!(
-                            event,
-                            egui::Event::Key {
-                                key: Key::Tab,
-                                pressed: true,
-                                ..
-                            }
-                        )
-                    });
-                }
-                let ctrl_held = i.modifiers.ctrl || i.modifiers.command;
-                agenda_cycle |= i.events.iter().any(|event| {
-                    matches!(
-                        event,
-                        egui::Event::Key {
-                            key: Key::Enter,
-                            pressed: true,
-                            repeat: false,
-                            modifiers,
-                            ..
-                        } if ctrl_held || modifiers.ctrl || modifiers.command
-                    )
-                });
-                agenda_edit |= i.events.iter().any(|event| {
-                    matches!(
-                        event,
-                        egui::Event::Key {
-                            key: Key::Enter,
-                            pressed: true,
-                            repeat: false,
-                            modifiers,
-                            ..
-                        } if !modifiers.ctrl && !modifiers.command && !modifiers.alt && modifiers.shift
-                    )
-                });
-                agenda_open |= !agenda_cycle && !agenda_edit
-                    && i.events.iter().any(|event| {
-                        matches!(
-                            event,
-                            egui::Event::Key {
-                                key: Key::Enter,
-                                pressed: true,
-                                repeat: false,
-                                modifiers,
-                                ..
-                            } if !ctrl_held && !modifiers.ctrl && !modifiers.command && !modifiers.alt && !modifiers.shift
-                        )
-                    });
-                agenda_open |= i.consume_key(egui::Modifiers::NONE, Key::Space);
-                if agenda_cycle || agenda_edit || agenda_open {
-                    i.events.retain(|event| {
-                        !matches!(
-                            event,
-                            egui::Event::Key {
-                                key: Key::Enter,
-                                pressed: true,
-                                repeat: false,
-                                ..
-                            }
-                        )
-                    });
-                }
             }
             if self.file_picker_open {
                 file_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
@@ -659,23 +520,12 @@ impl SlateApp {
                 } else if self.doc_tasks_open {
                     self.doc_tasks_open = false;
                     self.focus_editor_once = true;
-                } else if self.agenda_open {
-                    if self.standalone_agenda {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        return;
-                    }
-                    self.agenda_open = false;
-                    self.focus_editor_once = true;
                 } else if self.file_picker_open {
                     self.file_picker_open = false;
                     self.pending_project_file_path = None;
                     self.pending_open_heading_fragment = None;
                     if self.file_picker_mode == FilePickerMode::InsertMarkdownLink {
                         self.cancel_link_assist();
-                    }
-                    if self.file_picker_mode == FilePickerMode::Refile {
-                        self.pending_refile = None;
-                        self.pending_refile_destination = None;
                     }
                     self.focus_editor_once = true;
                 } else if self.periscope_open {
@@ -709,7 +559,6 @@ impl SlateApp {
                     self.focus_editor_once = true;
                 } else if self.pending_action.is_some() {
                     self.pending_action = None;
-                    self.pending_daily_target = None;
                     self.focus_editor_once = true;
                 } else if self.pending_file_open.is_some() {
                     self.cancel_file_open();
@@ -813,10 +662,6 @@ impl SlateApp {
 
         if self.save_as_open {
             self.handle_save_as_text_input(ctx);
-        }
-
-        if self.handle_flow_inline_org_keyboard(ctx) {
-            return;
         }
 
         if link_assist_cancel || link_web_cancel || link_heading_cancel {
@@ -1130,96 +975,13 @@ impl SlateApp {
             return;
         }
 
-        if agenda_org_tag {
-            self.open_agenda_org_autocomplete(AgendaOrgMode::Tag);
-            return;
-        }
-
-        if agenda_org_project {
-            self.open_agenda_org_autocomplete(AgendaOrgMode::Project);
-            return;
-        }
-
-        if agenda_previous {
-            self.move_agenda_selection(-1);
-            return;
-        }
-
-        if agenda_next {
-            self.move_agenda_selection(1);
-            return;
-        }
-
-        if agenda_previous_day {
-            self.move_agenda_week_window(-1);
-            return;
-        }
-
-        if agenda_next_day {
-            self.move_agenda_week_window(1);
-            return;
-        }
-
-        if agenda_previous_week {
-            self.move_agenda_week_window(-1);
-            return;
-        }
-
-        if agenda_next_week {
-            self.move_agenda_week_window(1);
-            return;
-        }
-
-        if agenda_today {
-            self.jump_agenda_to_today();
-            return;
-        }
-
-        if agenda_cycle_tab {
-            self.cycle_agenda_tab();
-            return;
-        }
-
-        if agenda_toggle_focus {
-            self.toggle_agenda_focus();
-            return;
-        }
-
-        if agenda_toggle_done {
-            self.toggle_agenda_done_visibility();
-            return;
-        }
-
-        if agenda_edit {
-            self.open_selected_flow_item_edit();
-            return;
-        }
-
-        if agenda_refile {
-            self.start_refile_selected_agenda_item();
-            return;
-        }
-
-        if agenda_cycle {
-            self.cycle_selected_agenda_item();
-            return;
-        }
-
-        if agenda_open {
-            self.activate_selected_agenda_row();
-            if self.standalone_agenda && !self.agenda_open {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-            return;
-        }
-
         if settings_previous {
             self.selected_setting = self.selected_setting.saturating_sub(1);
             return;
         }
 
         if settings_next {
-            self.selected_setting = (self.selected_setting + 1).min(21 + footer_ui::FIELDS.len());
+            self.selected_setting = (self.selected_setting + 1).min(20 + footer_ui::FIELDS.len());
             return;
         }
 
@@ -1231,55 +993,54 @@ impl SlateApp {
                 3 => self.set_wrap_mode(false),
                 4 => self.set_preview_mode(false),
                 5 => self.set_markdown_live_rendering(false),
-                6 => self.set_virtual_references_enabled(false),
-                7 => self.set_reopen_last_file_on_startup(false),
-                8 => self.set_editor_font_size(self.editor_font_size - 1.0),
-                9..=18 => self.set_footer_option(self.selected_setting - 9, false),
-                19 => self.set_periscope_everything(false),
-                20 => self.set_resident(false),
-                21 => self.set_start_with_windows(false),
-                22 => self.set_editor_look(editor_view::EditorLook {
+                6 => self.set_reopen_last_file_on_startup(false),
+                7 => self.set_editor_font_size(self.editor_font_size - 1.0),
+                8..=17 => self.set_footer_option(self.selected_setting - 8, false),
+                18 => self.set_periscope_everything(false),
+                19 => self.set_resident(false),
+                20 => self.set_start_with_windows(false),
+                21 => self.set_editor_look(editor_view::EditorLook {
                     font: self.editor_look.font.next(),
                     ..self.editor_look
                 }),
-                23 => self.set_editor_look(editor_view::EditorLook {
+                22 => self.set_editor_look(editor_view::EditorLook {
                     block_cursor: false,
                     ..self.editor_look
                 }),
-                24 => self.set_editor_look(editor_view::EditorLook {
+                23 => self.set_editor_look(editor_view::EditorLook {
                     animate_cursor: false,
                     ..self.editor_look
                 }),
-                25 => self.set_editor_look(editor_view::EditorLook {
+                24 => self.set_editor_look(editor_view::EditorLook {
                     cursor_color: editor_view::cycle_cursor_color(
                         self.editor_look.cursor_color,
                         false,
                     ),
                     ..self.editor_look
                 }),
-                26 => self.set_editor_look(editor_view::EditorLook {
+                25 => self.set_editor_look(editor_view::EditorLook {
                     cursor_trail: false,
                     ..self.editor_look
                 }),
-                27 => self.set_editor_look(editor_view::EditorLook {
+                26 => self.set_editor_look(editor_view::EditorLook {
                     cursor_trail_weight: editor_view::clamp_trail_weight(
                         self.editor_look.cursor_trail_weight.saturating_sub(1),
                     ),
                     ..self.editor_look
                 }),
-                28 => self.set_editor_look(editor_view::EditorLook {
+                27 => self.set_editor_look(editor_view::EditorLook {
                     cursor_trail_typing: false,
                     ..self.editor_look
                 }),
-                29 => self.set_editor_look(editor_view::EditorLook {
+                28 => self.set_editor_look(editor_view::EditorLook {
                     cursor_stretch: false,
                     ..self.editor_look
                 }),
-                30 => self.set_editor_look(editor_view::EditorLook {
+                29 => self.set_editor_look(editor_view::EditorLook {
                     cursor_pulse: false,
                     ..self.editor_look
                 }),
-                31 => self.set_editor_look(editor_view::EditorLook {
+                30 => self.set_editor_look(editor_view::EditorLook {
                     syntax_highlighting: false,
                     ..self.editor_look
                 }),
@@ -1302,15 +1063,14 @@ impl SlateApp {
                 3 => self.set_wrap_mode(!self.wrap),
                 4 => self.set_preview_mode(!self.preview),
                 5 => self.set_markdown_live_rendering(!self.markdown_live_rendering),
-                6 => self.set_virtual_references_enabled(!self.virtual_references_enabled),
-                7 => self.set_reopen_last_file_on_startup(!self.reopen_last_file_on_startup),
-                8 => self.set_editor_font_size(if settings_activate {
+                6 => self.set_reopen_last_file_on_startup(!self.reopen_last_file_on_startup),
+                7 => self.set_editor_font_size(if settings_activate {
                     editor_view::DEFAULT_EDITOR_FONT_SIZE
                 } else {
                     self.editor_font_size + 1.0
                 }),
-                9..=18 => {
-                    let index = self.selected_setting - 9;
+                8..=17 => {
+                    let index = self.selected_setting - 8;
                     self.set_footer_option(
                         index,
                         if settings_activate {
@@ -1320,26 +1080,26 @@ impl SlateApp {
                         },
                     );
                 }
-                19 => self.set_periscope_everything(if settings_activate {
+                18 => self.set_periscope_everything(if settings_activate {
                     !self.periscope_everything
                 } else {
                     true
                 }),
-                20 => self.set_resident(if settings_activate {
+                19 => self.set_resident(if settings_activate {
                     !self.resident
                 } else {
                     true
                 }),
-                21 => self.set_start_with_windows(if settings_activate {
+                20 => self.set_start_with_windows(if settings_activate {
                     !self.start_with_windows
                 } else {
                     true
                 }),
-                22 => self.set_editor_look(editor_view::EditorLook {
+                21 => self.set_editor_look(editor_view::EditorLook {
                     font: self.editor_look.font.next(),
                     ..self.editor_look
                 }),
-                23 => self.set_editor_look(editor_view::EditorLook {
+                22 => self.set_editor_look(editor_view::EditorLook {
                     block_cursor: if settings_activate {
                         !self.editor_look.block_cursor
                     } else {
@@ -1347,7 +1107,7 @@ impl SlateApp {
                     },
                     ..self.editor_look
                 }),
-                24 => self.set_editor_look(editor_view::EditorLook {
+                23 => self.set_editor_look(editor_view::EditorLook {
                     animate_cursor: if settings_activate {
                         !self.editor_look.animate_cursor
                     } else {
@@ -1355,7 +1115,7 @@ impl SlateApp {
                     },
                     ..self.editor_look
                 }),
-                25 => self.set_editor_look(editor_view::EditorLook {
+                24 => self.set_editor_look(editor_view::EditorLook {
                     cursor_color: if settings_activate {
                         editor_view::CURSOR_COLORS[0].1
                     } else {
@@ -1363,7 +1123,7 @@ impl SlateApp {
                     },
                     ..self.editor_look
                 }),
-                26 => self.set_editor_look(editor_view::EditorLook {
+                25 => self.set_editor_look(editor_view::EditorLook {
                     cursor_trail: if settings_activate {
                         !self.editor_look.cursor_trail
                     } else {
@@ -1371,7 +1131,7 @@ impl SlateApp {
                     },
                     ..self.editor_look
                 }),
-                27 => self.set_editor_look(editor_view::EditorLook {
+                26 => self.set_editor_look(editor_view::EditorLook {
                     cursor_trail_weight: if settings_activate {
                         editor_view::DEFAULT_TRAIL_WEIGHT
                     } else {
@@ -1379,7 +1139,7 @@ impl SlateApp {
                     },
                     ..self.editor_look
                 }),
-                28 => self.set_editor_look(editor_view::EditorLook {
+                27 => self.set_editor_look(editor_view::EditorLook {
                     cursor_trail_typing: if settings_activate {
                         !self.editor_look.cursor_trail_typing
                     } else {
@@ -1387,7 +1147,7 @@ impl SlateApp {
                     },
                     ..self.editor_look
                 }),
-                29 => self.set_editor_look(editor_view::EditorLook {
+                28 => self.set_editor_look(editor_view::EditorLook {
                     cursor_stretch: if settings_activate {
                         !self.editor_look.cursor_stretch
                     } else {
@@ -1395,7 +1155,7 @@ impl SlateApp {
                     },
                     ..self.editor_look
                 }),
-                30 => self.set_editor_look(editor_view::EditorLook {
+                29 => self.set_editor_look(editor_view::EditorLook {
                     cursor_pulse: if settings_activate {
                         !self.editor_look.cursor_pulse
                     } else {
@@ -1403,7 +1163,7 @@ impl SlateApp {
                     },
                     ..self.editor_look
                 }),
-                31 => self.set_editor_look(editor_view::EditorLook {
+                30 => self.set_editor_look(editor_view::EditorLook {
                     syntax_highlighting: if settings_activate {
                         !self.editor_look.syntax_highlighting
                     } else {

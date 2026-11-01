@@ -1,9 +1,9 @@
 //! Streaming background indexing: one schema setup/connection, at most 32 files per transaction.
-use crate::{
-    flow, flow_runtime,
-    flow_store::{CacheWriter, Document},
-    perf_log,
+use crate::modules::flow::{
+    self as flow, runtime as flow_runtime,
+    store::{CacheWriter, Document},
 };
+use crate::perf_log;
 use std::{
     collections::HashSet,
     fs,

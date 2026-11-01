@@ -12,56 +12,6 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
-fn item(line_index: usize, title: &str) -> AgendaItem {
-    AgendaItem {
-        kind: "task".into(),
-        path: PathBuf::from("C:/notes/tasks.md"),
-        relative_path: "tasks.md".into(),
-        line_number: line_index + 1,
-        line_index,
-        state: "open".into(),
-        title: title.into(),
-        tags: Vec::new(),
-        projects: Vec::new(),
-        priority: None,
-        due: None,
-        scheduled: None,
-        heading: None,
-    }
-}
-
-fn tag(line: &mut String) -> bool {
-    line.push_str(" #x");
-    true
-}
-
-#[test]
-fn agenda_edits_find_their_task_and_keep_line_endings() {
-    // Indexed on line 1; a line was inserted above since.
-    let text = "# Tareas\r\nnueva línea\r\n- [ ] comprar pan\r\n- [ ] llamar\r\n";
-    let edited = SlateApp::edit_flow_item_text(text, &item(1, "comprar pan"), tag)
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        edited,
-        "# Tareas\r\nnueva línea\r\n- [ ] comprar pan #x\r\n- [ ] llamar\r\n"
-    );
-    // Its line now holds something else and it is nowhere: never overwrite.
-    let gone = "# Tareas\n- [ ] otra cosa\n";
-    assert!(SlateApp::edit_flow_item_text(gone, &item(1, "comprar pan"), tag).is_err());
-    // No change asked: nothing to write.
-    assert_eq!(
-        SlateApp::edit_flow_item_text("- [ ] comprar pan\n", &item(0, "comprar pan"), |_| false),
-        Ok(None)
-    );
-    // The nearest of two equal titles is the one.
-    let twice = "- [ ] a\n- [ ] x\n- [ ] b\n- [ ] c\n- [ ] x\n";
-    let edited = SlateApp::edit_flow_item_text(twice, &item(3, "x"), tag)
-        .unwrap()
-        .unwrap();
-    assert_eq!(edited, "- [ ] a\n- [ ] x\n- [ ] b\n- [ ] c\n- [ ] x #x\n");
-}
-
 #[test]
 fn blocks_go_under_headings_in_crlf_files_without_changing_line_endings() {
     let dir = temp_dir("crlf");
@@ -91,7 +41,7 @@ fn blocks_go_under_headings_in_crlf_files_without_changing_line_endings() {
 fn app() -> SlateApp {
     let ctx = egui::Context::default();
     let cc = eframe::CreationContext::_new_kittest(ctx);
-    let mut app = SlateApp::new(&cc, None, true, false, None);
+    let mut app = SlateApp::new(&cc, None, true, None);
     app.settings_path_override = Some(temp_dir("settings").join("config.toml"));
     app
 }

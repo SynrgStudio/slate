@@ -142,7 +142,6 @@ impl SlateApp {
             || self.pending_action.is_some()
             || self.recovery_open
             || self.file_conflict.is_some()
-            || self.flow_item_edit.is_some()
         {
             return;
         }

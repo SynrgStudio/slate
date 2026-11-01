@@ -44,7 +44,7 @@ fn draw(app: &mut SlateApp, ctx: &egui::Context, pass: usize, pointer: egui::Pos
 }
 fn fixture(ctx: &egui::Context) -> SlateApp {
     let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-    let mut app = SlateApp::new(&cc, None, true, false, None);
+    let mut app = SlateApp::new(&cc, None, true, None);
     let mut text = String::from("# Heading\n\n| Column | Value |\n| --- | --- |\n");
     for n in 0..35 {
         text.push_str(&format!("| row {n} | table value |\n"));

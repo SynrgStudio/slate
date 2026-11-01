@@ -10,8 +10,6 @@ mod async_open_tests;
 mod bug_fix_tests;
 mod commands;
 #[cfg(test)]
-mod daily_events_tests;
-#[cfg(test)]
 mod dialog_tests;
 mod dialog_ui;
 mod document_safety;
@@ -53,26 +51,20 @@ mod settings_writer;
 mod tabs_tests;
 #[cfg(test)]
 use settings_tests::SettingsDialogGeometry;
-mod agenda_ui;
 mod aliases;
 mod drive_picker;
 mod everything_inventory;
 mod everything_ipc;
-mod flow_api;
-mod modules;
-// Optional modules, reachable under their old names while the core still
-// calls them directly.
-pub(crate) use modules::flow::{
-    batch as flow_batch, edit as flow_edit, runtime as flow_runtime, store as flow_store,
-    worker as flow_worker,
-};
-pub(crate) use modules::{agenda, daily, flow};
-mod flow_error;
+// Optional modules: dormant until they are reconnected through the core's
+// hooks (see src/modules/README.md).
 mod goto;
 mod help_ui;
-mod index_export;
 mod link_ui;
 mod markdown;
+mod markdown_files;
+#[allow(dead_code)]
+mod modules;
+use markdown_files::{append_markdown_block, append_markdown_block_to_heading};
 mod parallel;
 mod perf_hud;
 mod perf_log;
@@ -105,14 +97,9 @@ mod tabs;
 mod window_drag;
 mod window_ui;
 
-use flow_api::{
-    append_flow_edit_request, append_flow_open_request, append_flow_organization_request,
-};
 use std::{
     collections::HashSet,
     fs,
-    hash::{Hash, Hasher},
-    io::Write,
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
     sync::mpsc::{self, Receiver, TryRecvError},
@@ -120,14 +107,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use agenda::{AgendaDatedRow, AgendaFocus, AgendaItem, AgendaTab};
-use chrono::{Datelike, Duration, Local, NaiveDate};
 use commands::{
     COMMAND_SPECS, Command, CommandLineAction, CommandLineNumberMode, CommandSpec, CommandUsage,
     best_command_token, clamp_history_limit, command_name, command_prefix, fuzzy_score,
     parse_command_line,
 };
-use daily::{DailyEvent, DailyEventKind};
 use editor_buffer::EditorBuffer;
 use editor_view::{EditorView, LineNumberMode};
 use eframe::egui::{
@@ -135,10 +119,6 @@ use eframe::egui::{
     text::{LayoutJob, LayoutSection, TextFormat},
 };
 use file_dialogs::FilePickerMode;
-use flow_edit::{
-    FlowItemEditState, FlowOrgMode as AgendaOrgMode, org_query_at_cursor, org_token_span_at_cursor,
-    organization_suggestions, organization_token, replace_org_token_at_cursor,
-};
 use goto::GotoTarget;
 use link_ui::{LinkAssistChoice, LinkHeadingOption};
 use markdown::{
@@ -301,19 +281,8 @@ fn main() -> eframe::Result {
     perf_log::mark("startup.environment_ready", "");
 
     let raw_args = std::env::args().skip(1).collect::<Vec<_>>();
-    if raw_args.first().map(String::as_str) == Some("flow-api") {
-        let result = flow_api::run_flow_api(&raw_args[1..]);
-        index_export::flush();
-        perf_log::flush();
-        if let Err(err) = result {
-            eprintln!("{err}");
-            std::process::exit(1);
-        }
-        return Ok(());
-    }
 
     let mut scratch = false;
-    let mut standalone_agenda = false;
     let mut new_window = false;
     let mut background = false;
     let mut position: Option<egui::Pos2> = None;
@@ -326,7 +295,6 @@ fn main() -> eframe::Result {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--scratch" | "-s" => scratch = true,
-            "--agenda" | "--ag" => standalone_agenda = true,
             "--new-window" | "-n" => new_window = true,
             "--background" => background = true,
             "--handoff" => handoff = args.next().map(PathBuf::from),
@@ -347,8 +315,7 @@ fn main() -> eframe::Result {
         }
     }
 
-    let use_single_instance =
-        !scratch && !standalone_agenda && !new_window && SlateApp::config_single_instance_enabled();
+    let use_single_instance = !scratch && !new_window && SlateApp::config_single_instance_enabled();
     if background {
         // Start-with-Windows entry: only useful as the resident primary, and
         // never shows anything when Slate is already running.
@@ -391,7 +358,7 @@ fn main() -> eframe::Result {
             return Ok(());
         }
         spare::set_starting_as_spare();
-    } else if new_window && !scratch && !standalone_agenda {
+    } else if new_window && !scratch {
         // A ready hidden window shows itself in milliseconds.
         let request = single_instance::OpenRequest {
             path: path
@@ -414,17 +381,9 @@ fn main() -> eframe::Result {
         prewarm_gpu();
     }
 
-    let title = if scratch {
-        "Slate Scratch"
-    } else if standalone_agenda {
-        "Slate Agenda"
-    } else {
-        "Slate"
-    };
+    let title = if scratch { "Slate Scratch" } else { "Slate" };
     let size = if scratch {
         [760.0, 460.0]
-    } else if standalone_agenda {
-        [900.0, 620.0]
     } else {
         [900.0, 560.0]
     };
@@ -440,11 +399,7 @@ fn main() -> eframe::Result {
             .with_icon(icon.clone())
             .with_decorations(false)
             .with_inner_size(size)
-            .with_min_inner_size(if standalone_agenda {
-                [620.0, 360.0]
-            } else {
-                [420.0, 260.0]
-            }),
+            .with_min_inner_size([420.0, 260.0]),
         vsync: false,
         renderer,
         #[cfg(feature = "wgpu")]
@@ -468,7 +423,7 @@ fn main() -> eframe::Result {
             native_options(renderer),
             Box::new(move |cc| {
                 app_started.set(true);
-                let mut app = SlateApp::new(cc, path, scratch, standalone_agenda, startup_line);
+                let mut app = SlateApp::new(cc, path, scratch, startup_line);
                 if use_single_instance {
                     app.start_instance_server(&cc.egui_ctx);
                     app.enable_resident(cc, background);
@@ -478,7 +433,7 @@ fn main() -> eframe::Result {
                 }
                 if let Some(owner) = spare_owner {
                     app.become_spare(cc, owner);
-                } else if !scratch && !standalone_agenda {
+                } else if !scratch {
                     app.tab_drop_server = tab_drop::listen(&cc.egui_ctx);
                 }
                 Ok(Box::new(app))
@@ -495,97 +450,12 @@ fn main() -> eframe::Result {
         result = run(eframe::Renderer::Glow);
     }
     settings_writer::flush();
-    index_export::flush();
     perf_log::mark(
         "process.ui_loop_exit",
         if result.is_ok() { "ok" } else { "error" },
     );
     perf_log::flush();
     result
-}
-
-/// Appends Captured/Completed daily events for tasks that are new or newly
-/// done in `summary` compared with the cached `old_items`.
-pub(crate) fn record_flow_daily_events(
-    path: &Path,
-    old_items: &[AgendaItem],
-    summary: &flow::FlowIndexSummary,
-) -> Result<(), String> {
-    for event in flow_daily_events(path, old_items, summary) {
-        daily::append_event(&event)?;
-    }
-    Ok(())
-}
-
-/// What a Flow file update means for the daily log: tasks captured (new)
-/// and completed.
-pub(crate) fn flow_daily_events(
-    path: &Path,
-    old_items: &[AgendaItem],
-    summary: &flow::FlowIndexSummary,
-) -> Vec<DailyEvent> {
-    let mut events = Vec::new();
-    let relative_path = summary.known_file.path.clone();
-    // Items are matched by title, not line: inserting a line above a task
-    // must not log it again. A changed title on a line that lost its old
-    // item is an edit of that item, not a new capture.
-    let mut old_by_title: std::collections::HashMap<&str, Vec<&AgendaItem>> =
-        std::collections::HashMap::new();
-    for item in old_items.iter().filter(|item| item.path == path) {
-        old_by_title
-            .entry(item.title.as_str())
-            .or_default()
-            .push(item);
-    }
-    let mut unmatched = Vec::new();
-    let mut matched = Vec::new();
-    for task in &summary.tasks {
-        match old_by_title
-            .get_mut(task.title.as_str())
-            .and_then(|items| items.pop())
-        {
-            Some(old) => matched.push((task, Some(old))),
-            None => unmatched.push(task),
-        }
-    }
-    let leftover: std::collections::HashMap<usize, &AgendaItem> = old_by_title
-        .into_values()
-        .flatten()
-        .map(|item| (item.line_index, item))
-        .collect();
-    for task in unmatched {
-        matched.push((task, leftover.get(&task.line_index).copied()));
-    }
-    matched.sort_by_key(|(task, _)| task.line_index);
-
-    for (task, old) in matched {
-        let source = format!("{}:{}", relative_path, task.line_number);
-        let source_link = Some(format!("{}#L{}", path.display(), task.line_number));
-        let event_kind = if old.is_none() {
-            Some(DailyEventKind::Captured)
-        } else if task.kind == flow::FlowItemKind::Task
-            && old.map(|item| item.state.as_str()) != Some("done")
-            && task.state == CheckboxState::Done
-        {
-            Some(DailyEventKind::Completed)
-        } else {
-            None
-        };
-
-        let Some(kind) = event_kind else {
-            continue;
-        };
-        let event = DailyEvent::now(
-            kind,
-            task.title.clone(),
-            task.tags.clone(),
-            task.projects.clone(),
-            source,
-            source_link,
-        );
-        events.push(event);
-    }
-    events
 }
 
 fn collect_link_target_files(root: &Path, out: &mut Vec<PathBuf>, limit: usize) {
@@ -670,182 +540,10 @@ fn is_markdown_like_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn absolutize_path(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| {
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .map(|cwd| cwd.join(path))
-                .unwrap_or_else(|_| path.to_path_buf())
-        }
-    })
-}
-
-fn line_has_backlink_to_current(
-    line: &str,
-    source_file: &Path,
-    current_path: &Path,
-    current_abs: &Path,
-) -> bool {
-    parse_markdown_link_spans(line).into_iter().any(|span| {
-        let target = &line[span.target_start..span.target_end];
-        if link_ui::is_http_url(target) {
-            return false;
-        }
-        let path_part = target
-            .split_once('#')
-            .map(|(path, _)| path)
-            .unwrap_or(target);
-        if path_part.trim().is_empty() {
-            return false;
-        }
-        let resolved = link_ui::resolve_markdown_link_path(path_part, Some(source_file));
-        let resolved_abs = absolutize_path(&resolved);
-        resolved_abs == current_abs || resolved_abs == absolutize_path(current_path)
-    })
-}
-
-fn line_mentions_current(line: &str, current_path: &Path) -> bool {
-    let lower = line.to_ascii_lowercase();
-    let file_name = current_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let stem = current_path
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let path = current_path.display().to_string().to_ascii_lowercase();
-    (!file_name.is_empty() && lower.contains(&file_name))
-        || (!stem.is_empty() && lower.contains(&stem))
-        || lower.contains(&path)
-}
-
-fn line_start_offsets(contents: &str) -> Vec<usize> {
-    let mut offsets = vec![0];
-    for (index, ch) in contents.char_indices() {
-        if ch == '\n' && index + 1 < contents.len() {
-            offsets.push(index + 1);
-        }
-    }
-    offsets
-}
-
-/// Edits a text file (missing: empty) with `\n` line endings, writes it
-/// back with the endings it had, atomically, and returns what was written.
-fn edit_text_file(
-    path: &Path,
-    edit: impl FnOnce(&mut String) -> Result<(), String>,
-) -> Result<String, String> {
-    let original = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(err) => return Err(err.to_string()),
-    };
-    let crlf = original.contains("\r\n");
-    let mut text = if crlf {
-        original.replace("\r\n", "\n")
-    } else {
-        original
-    };
-    edit(&mut text)?;
-    if crlf {
-        text = text.replace('\n', "\r\n");
-    }
-    safe_file::atomic_replace(path, text.as_bytes())?;
-    Ok(text)
-}
-
-fn append_markdown_block(path: &Path, block: &str) -> Result<(), String> {
-    edit_text_file(path, |contents| {
-        append_markdown_block_to_string(contents, block);
-        Ok(())
-    })
-    .map(drop)
-}
-
-fn append_markdown_block_to_heading(
-    path: &Path,
-    heading: &link_ui::LinkHeadingOption,
-    block: &str,
-) -> Result<(), String> {
-    edit_text_file(path, |contents| {
-        let insert_at = markdown_heading_insert_offset(contents, heading).unwrap_or(contents.len());
-        let mut insertion = String::new();
-        if insert_at > 0 && !contents[..insert_at].ends_with('\n') {
-            insertion.push('\n');
-        }
-        insertion.push('\n');
-        insertion.push_str(block.trim_end());
-        insertion.push('\n');
-        contents.insert_str(insert_at, &insertion);
-        Ok(())
-    })
-    .map(drop)
-}
-
-fn append_markdown_block_to_string(contents: &mut String, block: &str) {
-    if !contents.is_empty() && !contents.ends_with('\n') {
-        contents.push('\n');
-    }
-    if !contents.is_empty() {
-        contents.push('\n');
-    }
-    contents.push_str(block.trim_end());
-    contents.push('\n');
-}
-
-fn markdown_heading_insert_offset(
-    contents: &str,
-    heading: &link_ui::LinkHeadingOption,
-) -> Option<usize> {
-    let heading_line_start = contents
-        .lines()
-        .take(heading.line_index)
-        .map(|line| line.len() + 1)
-        .sum::<usize>();
-    let search_start = contents[heading_line_start..]
-        .find('\n')
-        .map(|offset| heading_line_start + offset + 1)
-        .unwrap_or(contents.len());
-    let mut byte = search_start;
-    for line in contents[search_start..].split_inclusive('\n') {
-        let line_without_newline = line.trim_end_matches('\n');
-        if let Some(next_heading) = parse_heading_line(line_without_newline) {
-            if next_heading.level <= heading.level {
-                return Some(byte);
-            }
-        }
-        byte += line.len();
-    }
-    Some(contents.len())
-}
-
-fn json_string(value: &str) -> String {
-    let mut out = String::from("\"");
-    for ch in value.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            ch if ch.is_control() => out.push_str(&format!("\\u{:04x}", ch as u32)),
-            ch => out.push(ch),
-        }
-    }
-    out.push('"');
-    out
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LinkHeadingPickerMode {
     InsertLink,
     BidirectionalLink,
-    Refile,
 }
 
 #[derive(Clone)]
@@ -869,7 +567,6 @@ enum PendingAction {
     OpenLast,
     OpenRecent,
     OpenProjectFile,
-    OpenDaily,
     CloseTab,
     Quit,
 }
@@ -928,31 +625,15 @@ impl PendingAction {
             PendingAction::OpenProjectFile => {
                 "buffer has unsaved changes; open selected file anyway?"
             }
-            PendingAction::OpenDaily => "buffer has unsaved changes; open Daily anyway?",
             PendingAction::CloseTab => "tab has unsaved changes; close it anyway?",
             PendingAction::Quit => "buffer has unsaved changes; close anyway?",
         }
     }
 }
 
-/// What happened to scratch text: how many quickadds went to the inbox,
-/// and the text that could not be saved (quickadds and archive text).
-struct ScratchFlush {
-    quickadded: usize,
-    left: Option<String>,
-}
-
 struct DuplicatePlacement {
     snapshot: String,
     was_dirty: bool,
-}
-
-#[derive(Clone)]
-struct RefileDraft {
-    source_path: PathBuf,
-    source_line_number: usize,
-    source_line_index: usize,
-    text: String,
 }
 
 #[derive(Clone)]
@@ -963,24 +644,10 @@ struct DocTask {
     text: String,
 }
 
-struct FlowBackgroundResult {
-    root: PathBuf,
-    indexed_files: usize,
-    indexed_tasks: usize,
-    errors: usize,
-    first_error: Option<String>,
-}
-
 struct FileCursorPosition {
     path: PathBuf,
     line_index: usize,
     column: usize,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ReferenceResultKind {
-    Backlinks,
-    Mentions,
 }
 
 #[derive(Clone)]
@@ -988,11 +655,6 @@ enum OpenDestination {
     Restore,
     Line(usize),
     Fragment(String),
-    Daily {
-        date: chrono::NaiveDate,
-        refreshing: bool,
-    },
-    Agenda(usize),
 }
 
 struct PendingFileOpen {
@@ -1016,16 +678,11 @@ struct SlateApp {
     wrap: bool,
     focus_editor_once: bool,
     scratch: bool,
-    standalone_agenda: bool,
     scratch_close_after: Option<f64>,
-    /// Quickadds made by the last scratch-window archive (for its toast).
-    scratch_quickadded: usize,
-    feedback_toast_message: &'static str,
-    agenda_updated_toast_until: Option<f64>,
-    pending_flow_agenda_sync_at: Option<f64>,
+    /// "Scratch archived" toast shown while the scratch window closes.
+    scratch_toast_until: Option<f64>,
     pending_action: Option<PendingAction>,
     file_loader: file_loader::Loader,
-    flow_heartbeat_attempt: Option<(PathBuf, std::time::Instant)>,
     preview_sync: scroll_sync::PreviewSync,
     preview_layout: preview_layout::Layout,
     preview_tops: Vec<f32>,
@@ -1102,7 +759,6 @@ struct SlateApp {
     /// Set by :quit-all / the tray menu: the next close really exits.
     quit_for_real: bool,
     start_with_windows: bool,
-    flow_worker: flow_worker::FlowWorker,
     tabs: tabs::Tabs,
     aliases: aliases::Aliases,
     /// An open action that continues in a freshly opened tab this frame.
@@ -1110,10 +766,6 @@ struct SlateApp {
     /// Ctrl+wheel accumulator so touchpads switch one tab per gesture step.
     tab_wheel: f32,
     markdown_live_rendering: bool,
-    virtual_references_enabled: bool,
-    virtual_references_collapsed: bool,
-    virtual_backlinks_collapsed: bool,
-    virtual_mentions_collapsed: bool,
     last_opened_path: Option<PathBuf>,
     last_open_dir: Option<PathBuf>,
     recent_files: Vec<PathBuf>,
@@ -1129,34 +781,11 @@ struct SlateApp {
     doc_tasks_open: bool,
     doc_task_query: String,
     selected_doc_task_line: usize,
-    agenda_open: bool,
-    agenda_items: Vec<AgendaItem>,
-    selected_agenda_item: usize,
-    agenda_filter: String,
-    agenda_start_offset_days: i64,
-    agenda_focus: AgendaFocus,
-    agenda_tab: AgendaTab,
-    agenda_selected_dated_row: usize,
-    agenda_selected_inbox_item: usize,
-    agenda_selected_tab_items: [usize; 5],
-    agenda_expanded_dates: HashSet<NaiveDate>,
-    agenda_show_done: bool,
-    agenda_scroll_to_selected: bool,
-    agenda_org_mode: Option<AgendaOrgMode>,
-    agenda_org_query: String,
-    selected_agenda_org_suggestion: usize,
-    flow_inline_org_mode: Option<AgendaOrgMode>,
-    flow_inline_org_anchor: Option<usize>,
-    selected_flow_inline_org_suggestion: usize,
     link_inline_anchor: Option<usize>,
     link_inline_files: Vec<PathBuf>,
     selected_link_inline_suggestion: usize,
     pending_bidirectional_link_source_line: Option<usize>,
     link_heading_target_path: Option<PathBuf>,
-    flow_item_edit: Option<FlowItemEditState>,
-    flow_background_rx: Option<Receiver<FlowBackgroundResult>>,
-    flow_background_root: Option<PathBuf>,
-    flow_background_loading: bool,
     file_picker_open: bool,
     file_picker_mode: FilePickerMode,
     file_picker_dir: PathBuf,
@@ -1187,9 +816,6 @@ struct SlateApp {
     find_note_expanded_files: HashSet<PathBuf>,
     pending_project_file_path: Option<PathBuf>,
     pending_open_heading_fragment: Option<String>,
-    pending_daily_target: Option<String>,
-    pending_refile: Option<RefileDraft>,
-    pending_refile_destination: Option<PathBuf>,
     link_assist_open: bool,
     link_assist_choice: LinkAssistChoice,
     link_assist_trigger_start: Option<usize>,
@@ -1245,7 +871,6 @@ impl SlateApp {
         cc: &eframe::CreationContext<'_>,
         path: Option<PathBuf>,
         scratch: bool,
-        standalone_agenda: bool,
         startup_line: Option<usize>,
     ) -> Self {
         let mut timing = perf_log::Span::new("startup.app_constructor", "");
@@ -1268,15 +893,10 @@ impl SlateApp {
             wrap: true,
             focus_editor_once: true,
             scratch,
-            standalone_agenda,
             scratch_close_after: None,
-            scratch_quickadded: 0,
-            feedback_toast_message: "Agenda updated",
-            agenda_updated_toast_until: None,
-            pending_flow_agenda_sync_at: None,
+            scratch_toast_until: None,
             pending_action: None,
             file_loader: file_loader::Loader::new(cc.egui_ctx.clone()),
-            flow_heartbeat_attempt: None,
             preview_sync: scroll_sync::PreviewSync::default(),
             preview_layout: preview_layout::Layout::default(),
             preview_tops: Vec::new(),
@@ -1347,7 +967,6 @@ impl SlateApp {
             hide_on_first_frame: false,
             quit_for_real: false,
             start_with_windows: resident::autostart_enabled(),
-            flow_worker: flow_worker::FlowWorker::start(cc.egui_ctx.clone()),
             tabs: tabs::Tabs::default(),
             // Tests never read the user's aliases.
             aliases: if cfg!(test) {
@@ -1362,10 +981,6 @@ impl SlateApp {
             pending_tab_action: None,
             tab_wheel: 0.0,
             markdown_live_rendering: true,
-            virtual_references_enabled: true,
-            virtual_references_collapsed: false,
-            virtual_backlinks_collapsed: false,
-            virtual_mentions_collapsed: false,
             last_opened_path: None,
             last_open_dir: None,
             recent_files: Vec::new(),
@@ -1381,34 +996,11 @@ impl SlateApp {
             doc_tasks_open: false,
             doc_task_query: String::new(),
             selected_doc_task_line: 0,
-            agenda_open: false,
-            agenda_items: Vec::new(),
-            selected_agenda_item: 0,
-            agenda_filter: String::new(),
-            agenda_start_offset_days: 0,
-            agenda_focus: AgendaFocus::Dated,
-            agenda_tab: AgendaTab::Agenda,
-            agenda_selected_dated_row: 0,
-            agenda_selected_inbox_item: 0,
-            agenda_selected_tab_items: [0; 5],
-            agenda_expanded_dates: HashSet::new(),
-            agenda_show_done: false,
-            agenda_scroll_to_selected: false,
-            agenda_org_mode: None,
-            agenda_org_query: String::new(),
-            selected_agenda_org_suggestion: 0,
-            flow_inline_org_mode: None,
-            flow_inline_org_anchor: None,
-            selected_flow_inline_org_suggestion: 0,
             link_inline_anchor: None,
             link_inline_files: Vec::new(),
             selected_link_inline_suggestion: 0,
             pending_bidirectional_link_source_line: None,
             link_heading_target_path: None,
-            flow_item_edit: None,
-            flow_background_rx: None,
-            flow_background_root: None,
-            flow_background_loading: false,
             file_picker_open: false,
             file_picker_mode: FilePickerMode::Browse,
             file_picker_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -1439,9 +1031,6 @@ impl SlateApp {
             find_note_expanded_files: HashSet::new(),
             pending_project_file_path: None,
             pending_open_heading_fragment: None,
-            pending_daily_target: None,
-            pending_refile: None,
-            pending_refile_destination: None,
             link_assist_open: false,
             link_assist_choice: LinkAssistChoice::File,
             link_assist_trigger_start: None,
@@ -1504,12 +1093,6 @@ impl SlateApp {
                     .map(OpenDestination::Line)
                     .unwrap_or(OpenDestination::Restore),
             );
-        } else if standalone_agenda {
-            // Standalone agenda should be a view over the latest published Flow
-            // cache. Do not immediately rescan from disk here: an open Slate
-            // editor may have just published unsaved in-memory Flow items, and
-            // a disk rescan would make those live agenda rows disappear.
-            app.open_agenda();
         } else if !scratch
             && !spare::starting_as_spare()
             && !(tabs::owns_session() && app.restore_session())
@@ -1533,8 +1116,6 @@ impl SlateApp {
             .unwrap_or("untitled");
         if self.scratch && self.path.is_none() {
             format!("{}Slate Scratch", if self.dirty { "*" } else { "" })
-        } else if self.standalone_agenda && self.path.is_none() {
-            "Slate Agenda".to_string()
         } else {
             format!("{}{} — Slate", if self.dirty { "*" } else { "" }, name)
         }
@@ -1746,7 +1327,6 @@ impl SlateApp {
             &mut self.recent_picker_open,
             &mut self.lance_open,
             &mut self.doc_tasks_open,
-            &mut self.agenda_open,
             &mut self.file_picker_open,
             &mut self.periscope_open,
             &mut self.periscope_prompt_open,
@@ -1843,10 +1423,7 @@ impl SlateApp {
     }
 
     fn request_file_open(&mut self, path: PathBuf, destination: OpenDestination) {
-        if !self.scratch
-            && !self.standalone_agenda
-            && !self.prepare_tab_for_open(&path, &destination)
-        {
+        if !self.scratch && !self.prepare_tab_for_open(&path, &destination) {
             return;
         }
         self.start_file_load(path, destination);
@@ -1857,12 +1434,6 @@ impl SlateApp {
             OpenDestination::Restore => {}
             OpenDestination::Line(line) => self.goto_startup_line(line),
             OpenDestination::Fragment(fragment) => self.jump_to_markdown_fragment(&fragment),
-            OpenDestination::Daily { date, .. } => self.jump_to_daily_day(date),
-            OpenDestination::Agenda(line_index) => {
-                let line = line_index.min(self.buffer.line_count().saturating_sub(1));
-                self.buffer.set_cursor(self.buffer.line_end(line));
-                self.editor_view.request_scroll_to_cursor(&self.buffer);
-            }
         }
         self.focus_editor_once = true;
     }
@@ -1961,57 +1532,19 @@ impl SlateApp {
                     self.last_open_dir = path.parent().map(PathBuf::from);
                     self.dirty = false;
                     self.search_state = None;
-                    self.pending_flow_agenda_sync_at = None;
                     self.restore_cursor_position_for_path(&path);
                     self.remember_recent_file(path.clone());
                     loaded.timing.step("apply_buffer_restore_cursor_and_recent");
                     self.perf_hud.record_open(loaded.timing.elapsed());
-                    // The opened file's Flow cache entry is written by the background
-                    // rescan thread (first, before the folder scan): SQLite commits
-                    // and fsyncs must not block the first frame of a just-opened file.
-                    let indexes_flow = flow::should_index_flow_path(&path);
-                    let live =
-                        indexes_flow.then(|| (path.clone(), self.buffer.as_str().to_string()));
-                    self.start_flow_background_scan_with_live(
-                        Self::flow_project_root_for_path(&path),
-                        false,
-                        live,
-                    );
-                    loaded.timing.step("schedule_background_rescan");
                     let _ = self.save_settings();
                     loaded.timing.step("save_settings");
                     self.focus_editor_once = true;
-                    self.status = if indexes_flow {
-                        format!(
-                            "Opened {} · indexing Flow · scanning folder…",
-                            path.display()
-                        )
-                    } else {
-                        format!("Opened {} · scanning folder…", path.display())
-                    };
+                    self.status = format!("Opened {}", path.display());
                     match pending.destination {
                         OpenDestination::Restore => {}
                         OpenDestination::Line(line) => self.goto_startup_line(line),
                         OpenDestination::Fragment(fragment) => {
                             self.jump_to_markdown_fragment(&fragment)
-                        }
-                        OpenDestination::Daily { date, refreshing } => {
-                            self.jump_to_daily_day(date);
-                            self.status = format!(
-                                "Daily {} at {date}: {}",
-                                if refreshing {
-                                    "refreshed/opened"
-                                } else {
-                                    "opened"
-                                },
-                                path.display()
-                            );
-                        }
-                        OpenDestination::Agenda(line_index) => {
-                            let line = line_index.min(self.buffer.line_count().saturating_sub(1));
-                            self.buffer.set_cursor(self.buffer.line_end(line));
-                            self.editor_view.request_scroll_to_cursor(&self.buffer);
-                            self.status = format!("Jumped to agenda item on line {}", line + 1);
                         }
                     }
                     loaded.timing.step("apply_destination");
@@ -2027,307 +1560,6 @@ impl SlateApp {
                 }
             }
         }
-    }
-
-    fn start_refile_current_line(&mut self) {
-        let Some(source_path) = self.path.clone() else {
-            self.status = "Refile needs a saved source file".to_string();
-            return;
-        };
-        if self.dirty {
-            self.status = "Save current buffer before refile".to_string();
-            return;
-        }
-        let line_index = self.buffer.line_index_for_byte(self.buffer.cursor());
-        let text = self.buffer.line(line_index).trim().to_string();
-        self.start_refile_draft(source_path, line_index, text);
-    }
-
-    fn start_refile_selected_agenda_item(&mut self) {
-        let Some(index) = self.selected_agenda_task_index() else {
-            self.status = "Agenda refile: no item selected".to_string();
-            return;
-        };
-        let Some(item) = self.agenda_items.get(index).cloned() else {
-            self.status = "Agenda refile: no item selected".to_string();
-            return;
-        };
-        if self.path.as_ref() == Some(&item.path) && self.dirty {
-            self.status = "Save current source buffer before agenda refile".to_string();
-            return;
-        }
-        let text = if self.path.as_ref() == Some(&item.path) {
-            self.buffer.line(item.line_index).trim().to_string()
-        } else {
-            match fs::read_to_string(&item.path) {
-                Ok(contents) => contents
-                    .lines()
-                    .nth(item.line_index)
-                    .map(str::trim)
-                    .unwrap_or("")
-                    .to_string(),
-                Err(err) => {
-                    self.status = format!("Agenda refile failed reading source: {err}");
-                    return;
-                }
-            }
-        };
-        self.start_refile_draft(item.path, item.line_index, text);
-    }
-
-    fn start_refile_draft(&mut self, source_path: PathBuf, line_index: usize, text: String) {
-        if text.trim().is_empty() {
-            self.status = "Refile needs a non-empty source line".to_string();
-            return;
-        }
-        self.pending_refile = Some(RefileDraft {
-            source_path,
-            source_line_number: line_index + 1,
-            source_line_index: line_index,
-            text,
-        });
-        self.open_file_picker_at(self.project_root(), FilePickerMode::Refile);
-        self.status = "Refile: choose destination Markdown file".to_string();
-    }
-
-    fn open_refile_heading_picker_or_finish(&mut self, destination: PathBuf) {
-        let is_markdown = destination
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .map(|extension| matches!(extension.to_lowercase().as_str(), "md" | "markdown"))
-            .unwrap_or(false);
-        if !is_markdown {
-            self.finish_refile_to_path(destination, None);
-            return;
-        }
-        let headings = fs::read_to_string(&destination)
-            .map(|contents| link_ui::markdown_heading_options(&contents))
-            .unwrap_or_default();
-        if headings.is_empty() {
-            self.finish_refile_to_path(destination, None);
-            return;
-        }
-        self.pending_refile_destination = Some(destination.clone());
-        self.link_heading_picker_open = true;
-        self.link_heading_picker_mode = LinkHeadingPickerMode::Refile;
-        self.link_heading_base_target =
-            link_ui::markdown_link_target_for_file(&destination, self.path.as_deref());
-        self.link_heading_options = headings;
-        self.selected_link_heading = 0;
-        self.focus_editor_once = false;
-        self.status = "Refile: choose heading or append to whole file".to_string();
-    }
-
-    fn finish_refile_to_selected_target(&mut self, heading: Option<link_ui::LinkHeadingOption>) {
-        let Some(destination) = self.pending_refile_destination.take() else {
-            self.status = "No pending refile target".to_string();
-            self.pending_refile = None;
-            return;
-        };
-        self.finish_refile_to_path(destination, heading);
-    }
-
-    fn finish_refile_to_path(
-        &mut self,
-        destination: PathBuf,
-        heading: Option<link_ui::LinkHeadingOption>,
-    ) {
-        let Some(draft) = self.pending_refile.take() else {
-            self.status = "No pending refile".to_string();
-            return;
-        };
-        if tabs::same_file(&destination, &draft.source_path) {
-            self.status = "Refile target is the same file".to_string();
-            return;
-        }
-        let source_label = draft
-            .source_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| format!("{name}:{}", draft.source_line_number))
-            .unwrap_or_else(|| {
-                format!(
-                    "{}:{}",
-                    draft.source_path.display(),
-                    draft.source_line_number
-                )
-            });
-        let source_target_for_destination = format!(
-            "{}#L{}",
-            link_ui::markdown_link_target_for_file(&draft.source_path, Some(&destination)),
-            draft.source_line_number
-        );
-        let source_target_for_daily = format!(
-            "{}#L{}",
-            draft.source_path.display(),
-            draft.source_line_number
-        );
-        let mut target_for_source =
-            link_ui::markdown_link_target_for_file(&destination, Some(&draft.source_path));
-        let mut target_for_daily = destination.display().to_string();
-        if let Some(heading) = heading.as_ref() {
-            target_for_source.push('#');
-            target_for_source.push_str(&heading.anchor);
-            target_for_daily.push('#');
-            target_for_daily.push_str(&heading.anchor);
-        }
-        let base_target_label = destination
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("refile target");
-        let target_label = heading
-            .as_ref()
-            .map(|heading| format!("{base_target_label}#{}", heading.text))
-            .unwrap_or_else(|| base_target_label.to_string());
-        let block = format!(
-            "{}\n  - source: [{}]({})\n",
-            draft.text.trim(),
-            source_label,
-            source_target_for_destination
-        );
-        let append_result = if let Some(heading) = heading.as_ref() {
-            append_markdown_block_to_heading(&destination, heading, &block)
-        } else {
-            append_markdown_block(&destination, &block)
-        };
-        if let Err(err) = append_result {
-            self.status = format!("Refile failed: {err}");
-            return;
-        }
-
-        let backlink = format!(
-            "  - refiled to: [{}]({})\n",
-            target_label, target_for_source
-        );
-        if let Err(err) = self.insert_refile_backlink(&draft, &backlink) {
-            self.status = format!("Refile backlink failed: {err}");
-            return;
-        }
-        let _ = self.refresh_flow_index_for_path(
-            &destination,
-            &fs::read_to_string(&destination).unwrap_or_default(),
-        );
-        self.schedule_current_flow_buffer_agenda_sync_later();
-        let daily_event = DailyEvent::now(
-            DailyEventKind::Organized,
-            draft.text.trim().to_string(),
-            Vec::new(),
-            Vec::new(),
-            source_label,
-            Some(source_target_for_daily),
-        )
-        .with_target(target_label, Some(target_for_daily));
-        let _ = daily::append_event(&daily_event);
-        if self.agenda_open {
-            if let Ok(mut items) = self.load_agenda_items() {
-                self.overlay_current_buffer_agenda_items(&mut items);
-                self.agenda_items = items;
-                self.clamp_agenda_selection();
-            }
-        }
-        self.status = format!("Refiled non-destructively to {}", destination.display());
-    }
-
-    fn insert_refile_backlink(
-        &mut self,
-        draft: &RefileDraft,
-        backlink: &str,
-    ) -> Result<(), String> {
-        if self.path.as_ref() == Some(&draft.source_path) {
-            let insert_at = if draft.source_line_index + 1 < self.buffer.line_count() {
-                self.buffer.line_start(draft.source_line_index + 1)
-            } else {
-                self.buffer.as_str().len()
-            };
-            self.buffer.set_cursor(insert_at);
-            let needs_leading_newline = insert_at == self.buffer.as_str().len()
-                && !self.buffer.as_str().is_empty()
-                && !self.buffer.as_str().ends_with('\n');
-            let source_note = if needs_leading_newline {
-                format!("\n{backlink}")
-            } else {
-                backlink.to_string()
-            };
-            self.buffer.insert_text(&source_note);
-            self.dirty = true;
-            // Refile asked for a saved source and wrote everything else to
-            // disk: the backlink is saved too, not left as a new change.
-            self.save_path(draft.source_path.clone());
-            self.schedule_current_flow_buffer_agenda_sync_later();
-            return Ok(());
-        }
-
-        let contents = edit_text_file(&draft.source_path, |contents| {
-            // The line may have moved since the refile started.
-            let lines: Vec<&str> = contents.lines().collect();
-            let line = (0..=lines.len())
-                .find_map(|distance| {
-                    [
-                        draft.source_line_index.checked_sub(distance),
-                        Some(draft.source_line_index + distance).filter(|_| distance > 0),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .find(|index| {
-                        lines
-                            .get(*index)
-                            .is_some_and(|line| line.trim() == draft.text)
-                    })
-                })
-                .ok_or_else(|| "the source line changed on disk".to_string())?;
-            let insert_at = line_start_offsets(contents)
-                .get(line + 1)
-                .copied()
-                .unwrap_or(contents.len());
-            let needs_leading_newline =
-                insert_at == contents.len() && !contents.is_empty() && !contents.ends_with('\n');
-            let source_note = if needs_leading_newline {
-                format!("\n{backlink}")
-            } else {
-                backlink.to_string()
-            };
-            contents.insert_str(insert_at, &source_note);
-            Ok(())
-        })?;
-        let _ = self.refresh_flow_index_for_path(&draft.source_path, &contents);
-        Ok(())
-    }
-
-    fn schedule_current_flow_buffer_agenda_sync_later(&mut self) {
-        self.pending_flow_agenda_sync_at = Some(0.0);
-    }
-
-    fn open_daily_with_target(&mut self, raw_target: &str) {
-        if self.dirty {
-            self.pending_daily_target = Some(raw_target.to_string());
-            self.confirm(PendingAction::OpenDaily);
-            return;
-        }
-        let target = match daily::parse_open_target(raw_target) {
-            Ok(target) => target,
-            Err(err) => {
-                self.status = err;
-                return;
-            }
-        };
-        let date = daily::resolve_open_date(&target);
-        let path = match daily::ensure_monthly_document(date) {
-            Ok(path) => path,
-            Err(err) => {
-                self.status = err;
-                return;
-            }
-        };
-        let refreshing = matches!(target, daily::DailyOpenTarget::Refresh);
-        self.request_file_open(path, OpenDestination::Daily { date, refreshing });
-    }
-
-    fn jump_to_daily_day(&mut self, date: chrono::NaiveDate) {
-        let Some(byte) = daily::day_heading_byte(self.buffer.as_str(), date) else {
-            return;
-        };
-        self.buffer.set_cursor(byte);
-        self.editor_view.request_scroll_to_cursor(&self.buffer);
     }
 
     fn goto_startup_line(&mut self, line_number: usize) {
@@ -2372,476 +1604,6 @@ impl SlateApp {
             .line_col_to_byte(entry.line_index + 1, entry.column + 1);
         self.buffer.set_cursor(byte);
         self.editor_view.request_scroll_to_cursor(&self.buffer);
-    }
-
-    fn queue_flow_index_after_save(&mut self, path: &Path) {
-        let text = self.buffer.as_str().to_string();
-        self.queue_flow_index_text(path, text);
-    }
-
-    fn queue_flow_index_text(&mut self, path: &Path, text: String) {
-        if !flow::should_index_flow_path(path) {
-            return;
-        }
-        let project_root = Self::flow_project_root_for_path(path);
-        let Ok(sqlite_path) = Self::flow_sqlite_path_for_root(&project_root) else {
-            return;
-        };
-        self.flow_worker
-            .save_index(project_root, sqlite_path, path.to_path_buf(), text);
-    }
-
-    fn queue_flow_agenda_sync(&mut self) {
-        let Some(path) = self.path.clone() else {
-            return;
-        };
-        if !flow::should_index_flow_path(&path) {
-            return;
-        }
-        let project_root = Self::flow_project_root_for_path(&path);
-        let Ok(sqlite_path) = Self::flow_sqlite_path_for_root(&project_root) else {
-            return;
-        };
-        self.flow_worker.agenda_sync(
-            project_root,
-            sqlite_path,
-            path,
-            self.buffer.as_str().to_string(),
-            self.agenda_open,
-        );
-    }
-
-    fn poll_flow_writer(&mut self, ctx: &egui::Context) {
-        for report in self.flow_worker.take_reports() {
-            match report {
-                flow_worker::Report::SaveIndex { path, result } => match result {
-                    Ok(summary) => {
-                        let saved = format!("Saved {}", path.display());
-                        if self.status == saved {
-                            self.status =
-                                format!("{saved} · indexed {} Flow tasks", summary.tasks.len());
-                        }
-                    }
-                    Err(err) => {
-                        perf_log::mark("flow.save_cache_update_failed", &err);
-                        if flow_store::is_busy_error(&err) && self.path.as_ref() == Some(&path) {
-                            self.schedule_current_flow_buffer_agenda_sync_later();
-                        }
-                    }
-                },
-                flow_worker::Report::AgendaSync { path, result } => {
-                    if self.path.as_ref() != Some(&path) {
-                        continue;
-                    }
-                    match result {
-                        Ok(synced) => {
-                            if let Some(err) = synced.daily_error {
-                                self.status = err;
-                            }
-                            if let (true, Some(mut items)) = (self.agenda_open, synced.items) {
-                                self.overlay_current_buffer_agenda_items(&mut items);
-                                self.agenda_items = items;
-                                self.clamp_agenda_selection();
-                            }
-                            self.show_agenda_updated_toast(ctx);
-                        }
-                        Err(err) if flow_store::is_busy_error(&err) => {
-                            self.pending_flow_agenda_sync_at = Some(ctx.input(|i| i.time) + 0.15);
-                            ctx.request_repaint_after(std::time::Duration::from_millis(160));
-                            perf_log::mark("flow.ui_sync.retry", &err);
-                            self.status = "Flow sync pending…".to_string();
-                        }
-                        Err(err) => self.status = format!("Flow agenda update failed: {err}"),
-                    }
-                }
-            }
-        }
-    }
-
-    fn refresh_flow_index_for_path(
-        &self,
-        path: &Path,
-        contents: &str,
-    ) -> Result<Option<flow::FlowIndexSummary>, String> {
-        if !flow::should_index_flow_path(path) {
-            return Ok(None);
-        }
-        let project_root = Self::flow_project_root_for_path(path);
-        let sqlite_path = Self::flow_sqlite_path_for_root(&project_root)?;
-        flow::update_flow_index_for_file(&project_root, &sqlite_path, path, contents).map(Some)
-    }
-
-    fn record_daily_events_for_flow_update(
-        &mut self,
-        path: &Path,
-        old_items: &[AgendaItem],
-        summary: &flow::FlowIndexSummary,
-    ) {
-        if let Err(err) = record_flow_daily_events(path, old_items, summary) {
-            self.status = err;
-        }
-    }
-
-    fn flow_project_root_for_path(path: &Path) -> PathBuf {
-        let mut dir = path
-            .parent()
-            .map(PathBuf::from)
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
-        loop {
-            if dir.join(".git").is_dir() {
-                return dir;
-            }
-            if !dir.pop() {
-                return path
-                    .parent()
-                    .map(PathBuf::from)
-                    .or_else(|| std::env::current_dir().ok())
-                    .unwrap_or_else(|| PathBuf::from("."));
-            }
-        }
-    }
-
-    fn flow_sqlite_path_for_root(root: &Path) -> Result<PathBuf, String> {
-        let Some(mut sqlite_path) = dirs_next::data_dir() else {
-            return Err("Flow index failed: no data dir".to_string());
-        };
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        root.display().to_string().hash(&mut hasher);
-        sqlite_path.push("slate");
-        sqlite_path.push("flow");
-        sqlite_path.push(format!("scope-{:016x}", hasher.finish()));
-        sqlite_path.push("agenda.db");
-        Ok(sqlite_path)
-    }
-
-    fn flow_sqlite_path(&self) -> Result<PathBuf, String> {
-        Self::flow_sqlite_path_for_root(&self.flow_scope_root())
-    }
-
-    fn flow_scope_root(&self) -> PathBuf {
-        self.path
-            .as_ref()
-            .map(|path| Self::flow_project_root_for_path(path))
-            .or_else(|| self.detect_project_root())
-            .unwrap_or_else(|| self.project_root())
-    }
-
-    fn collect_flow_markdown_files(root: &Path, out: &mut Vec<PathBuf>, limit: usize) {
-        if out.len() >= limit {
-            return;
-        }
-        let Ok(entries) = fs::read_dir(root) else {
-            return;
-        };
-        for entry in entries.filter_map(Result::ok) {
-            if out.len() >= limit {
-                return;
-            }
-            let path = entry.path();
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("");
-            if path.is_dir() {
-                if file_dialogs::default_should_skip_dir(name) {
-                    continue;
-                }
-                Self::collect_flow_markdown_files(&path, out, limit);
-            } else if path.is_file() && flow::should_index_flow_path(&path) {
-                out.push(path);
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn start_flow_background_rescan(&mut self, root: PathBuf) {
-        self.start_flow_background_scan(root, false);
-    }
-
-    fn start_flow_background_scan(&mut self, root: PathBuf, rebuild: bool) {
-        self.start_flow_background_scan_with_live(root, rebuild, None);
-    }
-
-    /// Indexes one in-memory buffer off the UI thread, retrying briefly while
-    /// another writer holds the SQLite lock.
-    fn index_live_flow_buffer(root: &Path, sqlite_path: &Path, path: &Path, contents: &str) {
-        let mut timing = perf_log::Span::new("flow.live_index", &format!("path={path:?}"));
-        for attempt in 0..5 {
-            match flow::update_flow_index_for_file(root, sqlite_path, path, contents) {
-                Ok(_) => break,
-                Err(err) if flow_store::is_busy_error(&err) && attempt < 4 => {
-                    thread::sleep(std::time::Duration::from_millis(100));
-                }
-                Err(err) => {
-                    perf_log::mark("flow.open_cache_update_failed", &err);
-                    break;
-                }
-            }
-        }
-        timing.step("indexed");
-    }
-
-    fn start_flow_background_scan_with_live(
-        &mut self,
-        root: PathBuf,
-        rebuild: bool,
-        live: Option<(PathBuf, String)>,
-    ) {
-        let Ok(sqlite_path) = Self::flow_sqlite_path_for_root(&root) else {
-            return;
-        };
-        if self.flow_background_loading && self.flow_background_root.as_ref() == Some(&root) {
-            if let Some((path, contents)) = live {
-                thread::spawn(move || {
-                    Self::index_live_flow_buffer(&root, &sqlite_path, &path, &contents)
-                });
-            }
-            return;
-        }
-        let (tx, rx) = mpsc::channel();
-        self.flow_background_rx = Some(rx);
-        self.flow_background_root = Some(root.clone());
-        self.flow_background_loading = true;
-        let protected = self.path.iter().cloned().collect::<Vec<_>>();
-        thread::spawn(move || {
-            if let Some((path, contents)) = live {
-                Self::index_live_flow_buffer(&root, &sqlite_path, &path, &contents);
-            }
-            let mut timing =
-                perf_log::Span::new("flow.background_rescan", &format!("root={root:?}"));
-            let mut files = Vec::new();
-            Self::collect_flow_markdown_files(&root, &mut files, 20_000);
-            timing.step("collect_markdown_files");
-            let summary = flow_batch::index_files_with_rebuild(
-                &root,
-                &sqlite_path,
-                &files,
-                &protected,
-                rebuild,
-            )
-            .unwrap_or_else(|err| flow_batch::ScanSummary {
-                errors: 1,
-                first_error: Some(err),
-                ..Default::default()
-            });
-            timing.step("read_and_index_files");
-            perf_log::mark(
-                "flow.background_rescan.result",
-                &format!(
-                    "root={root:?} indexed_files={} indexed_tasks={} errors={} batches={} skipped_live={}",
-                    summary.indexed_files,
-                    summary.indexed_tasks,
-                    summary.errors,
-                    summary.batches,
-                    summary.skipped_live
-                ),
-            );
-            let _ = tx.send(FlowBackgroundResult {
-                root,
-                indexed_files: summary.indexed_files,
-                indexed_tasks: summary.indexed_tasks,
-                errors: summary.errors,
-                first_error: summary.first_error,
-            });
-        });
-    }
-
-    fn poll_flow_background_rescan(&mut self, ctx: &egui::Context) {
-        let Some(rx) = &self.flow_background_rx else {
-            return;
-        };
-        match rx.try_recv() {
-            Ok(result) => {
-                perf_log::mark(
-                    "flow.background_rescan.ui_received",
-                    &format!("root={:?}", result.root),
-                );
-                self.flow_background_rx = None;
-                self.flow_background_root = None;
-                self.flow_background_loading = false;
-                if self.agenda_open || self.standalone_agenda {
-                    if let Ok(items) = self.load_agenda_items() {
-                        self.agenda_items = items;
-                        self.clamp_agenda_selection();
-                        if self.standalone_agenda {
-                            self.agenda_open = true;
-                            self.focus_editor_once = false;
-                        }
-                    }
-                }
-                if let Some(err) = result.first_error.as_ref() {
-                    perf_log::mark("flow.background_rescan.failure_reported", err);
-                    if result.indexed_files == 0 {
-                        flow_error::offer(ctx, err, false);
-                        self.status = "Flow no disponible (ver aviso/log)".to_string();
-                        return;
-                    }
-                }
-                self.status = format!(
-                    "Flow ready: indexed {} files, {} tasks in {}{}",
-                    result.indexed_files,
-                    result.indexed_tasks,
-                    result.root.display(),
-                    if result.errors > 0 {
-                        format!(", {} errors", result.errors)
-                    } else {
-                        String::new()
-                    }
-                );
-            }
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => {
-                self.flow_background_rx = None;
-                self.flow_background_root = None;
-                self.flow_background_loading = false;
-                self.status = "Flow background scan failed".to_string();
-            }
-        }
-    }
-
-    fn flow_rescan_current_scope(&mut self, rebuild: bool, _ctx: &egui::Context) {
-        if self.dirty {
-            self.status = "Save current buffer before Flow rescan".to_string();
-            return;
-        }
-        if self.flow_background_loading {
-            self.status = "Flow scan already in progress".to_string();
-            return;
-        }
-        let root = self.flow_scope_root();
-        if self
-            .path
-            .as_ref()
-            .is_some_and(|p| flow::should_index_flow_path(p))
-        {
-            self.schedule_current_flow_buffer_agenda_sync_later();
-        }
-        self.start_flow_background_scan(root, rebuild);
-        self.status = if rebuild {
-            "Flow rebuild in background…"
-        } else {
-            "Flow rescan in background…"
-        }
-        .to_string();
-    }
-
-    fn flow_inbox_path(&self) -> PathBuf {
-        self.flow_scope_root().join("inbox.md")
-    }
-
-    fn is_current_path(&self, path: &Path) -> bool {
-        let Some(current) = &self.path else {
-            return false;
-        };
-        if current == path {
-            return true;
-        }
-        match (current.canonicalize(), path.canonicalize()) {
-            (Ok(current), Ok(path)) => current == path,
-            _ => false,
-        }
-    }
-
-    fn append_flow_task_to_current_buffer(&mut self, task_line: &str) {
-        let needs_leading_newline =
-            !self.buffer.as_str().is_empty() && !self.buffer.as_str().ends_with('\n');
-        let prefix = if self.buffer.as_str().trim().is_empty() {
-            "# Inbox\n\n"
-        } else if needs_leading_newline {
-            "\n"
-        } else {
-            ""
-        };
-        let insertion = format!("{prefix}{task_line}\n");
-        self.buffer.set_cursor(self.buffer.as_str().len());
-        self.buffer.insert_text(&insertion);
-        self.dirty = true;
-        self.editor_view.request_scroll_to_cursor(&self.buffer);
-    }
-
-    fn quickadd_flow_task(&mut self, text: &str) -> bool {
-        let Some(task_line) = scratch::normalize_quickadd_task_line(text) else {
-            self.status = "Quickadd cancelled".to_string();
-            return false;
-        };
-        let path = self.flow_inbox_path();
-
-        if self.is_current_path(&path) {
-            self.append_flow_task_to_current_buffer(&task_line);
-            if self.agenda_open {
-                if let Ok(items) = self.load_agenda_items() {
-                    self.agenda_items = items;
-                    self.clamp_agenda_selection();
-                }
-            }
-            self.status = format!("Quickadded to current inbox buffer: {task_line}");
-            return true;
-        }
-
-        if let Some(dir) = path.parent() {
-            if let Err(err) = fs::create_dir_all(dir) {
-                self.status = format!("Quickadd failed: {err}");
-                return false;
-            }
-        }
-
-        let needs_header = !path.exists()
-            || fs::metadata(&path)
-                .map(|metadata| metadata.len() == 0)
-                .unwrap_or(true);
-        // A file that does not end in a newline would glue the task onto
-        // its last line.
-        let ends_with_newline = || -> std::io::Result<bool> {
-            use std::io::{Read, Seek};
-            let mut file = fs::File::open(&path)?;
-            file.seek(std::io::SeekFrom::End(-1))?;
-            let mut last = [0u8];
-            file.read_exact(&mut last)?;
-            Ok(last[0] == b'\n')
-        };
-        let entry = if needs_header {
-            format!("# Inbox\n\n{task_line}\n")
-        } else if ends_with_newline().unwrap_or(true) {
-            format!("{task_line}\n")
-        } else {
-            format!("\n{task_line}\n")
-        };
-
-        match fs::OpenOptions::new().create(true).append(true).open(&path) {
-            Ok(mut file) => {
-                if let Err(err) = file.write_all(entry.as_bytes()) {
-                    self.status = format!("Quickadd failed: {err}");
-                    return false;
-                }
-            }
-            Err(err) => {
-                self.status = format!("Quickadd failed: {err}");
-                return false;
-            }
-        }
-
-        match fs::read_to_string(&path)
-            .map_err(|err| err.to_string())
-            .and_then(|contents| {
-                self.refresh_flow_index_for_path(&path, &contents)
-                    .map(|_| ())
-            }) {
-            Ok(()) => {
-                if self.agenda_open {
-                    if let Ok(items) = self.load_agenda_items() {
-                        self.agenda_items = items;
-                        self.clamp_agenda_selection();
-                    }
-                }
-                self.status = format!("Quickadded to {}", path.display());
-                true
-            }
-            Err(err) => {
-                self.status = format!("Quickadded, Flow index failed: {err}");
-                true
-            }
-        }
     }
 
     fn open_find_note_results(&mut self, query: &str) {
@@ -3025,90 +1787,6 @@ impl SlateApp {
             self.selected_find_note_row = 0;
             self.refresh_find_note_results();
         }
-    }
-
-    fn open_reference_results(&mut self, kind: ReferenceResultKind) {
-        let Some(current_path) = self.path.clone() else {
-            self.status = "References need a saved current file".to_string();
-            return;
-        };
-        let title = match kind {
-            ReferenceResultKind::Backlinks => "Backlinks",
-            ReferenceResultKind::Mentions => "Mentions",
-        };
-        let document = self.reference_results_document(kind, &current_path);
-        self.link_preview_buffer.set_text(document);
-        self.link_preview_path = None;
-        self.link_preview_dirty = false;
-        self.link_preview_heading_fragment = None;
-        self.link_preview_heading_text = Some(title.to_string());
-        self.link_preview_open = true;
-        self.focus_link_preview_once = true;
-        self.focus_editor_once = false;
-        self.status = format!("{title} for {}", current_path.display());
-    }
-
-    fn reference_results_document(&self, kind: ReferenceResultKind, current_path: &Path) -> String {
-        let root = self.project_root();
-        let current_name = current_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("current file");
-        let title = match kind {
-            ReferenceResultKind::Backlinks => "Backlinks",
-            ReferenceResultKind::Mentions => "Mentions",
-        };
-        let rows = self.reference_rows(kind, current_path);
-
-        let mut doc = format!("# {title} — {current_name}\n\n");
-        if rows.is_empty() {
-            doc.push_str("No results.\n");
-            return doc;
-        }
-        for (file, line_number, line) in rows {
-            let label = file
-                .strip_prefix(&root)
-                .unwrap_or(&file)
-                .display()
-                .to_string();
-            let target = format!("{}#L{}", file.display(), line_number);
-            doc.push_str(&format!("- [{}:{}]({})\n", label, line_number, target));
-            doc.push_str(&format!("  - {}\n", line));
-        }
-        doc
-    }
-
-    fn reference_rows(
-        &self,
-        kind: ReferenceResultKind,
-        current_path: &Path,
-    ) -> Vec<(PathBuf, usize, String)> {
-        let root = self.project_root();
-        let current_abs = absolutize_path(current_path);
-        let mut files = Vec::new();
-        collect_link_target_files(&root, &mut files, 20_000);
-        files.retain(|path| is_markdown_like_path(path) && absolutize_path(path) != current_abs);
-        files.sort();
-        files.dedup();
-
-        let mut rows = Vec::new();
-        for file in files {
-            let Ok(contents) = fs::read_to_string(&file) else {
-                continue;
-            };
-            for (line_index, line) in contents.lines().enumerate() {
-                let matched = match kind {
-                    ReferenceResultKind::Backlinks => {
-                        line_has_backlink_to_current(line, &file, current_path, &current_abs)
-                    }
-                    ReferenceResultKind::Mentions => line_mentions_current(line, current_path),
-                };
-                if matched {
-                    rows.push((file.clone(), line_index + 1, line.trim().to_string()));
-                }
-            }
-        }
-        rows
     }
 
     fn markdown_link_target_at_byte(&self, byte: usize) -> Option<&str> {
@@ -3611,8 +2289,6 @@ impl SlateApp {
         self.link_assist_web_open = false;
         self.link_heading_picker_open = false;
         self.link_heading_picker_mode = LinkHeadingPickerMode::InsertLink;
-        self.pending_refile = None;
-        self.pending_refile_destination = None;
         self.pending_bidirectional_link_source_line = None;
         self.link_heading_target_path = None;
         self.link_assist_web_url.clear();
@@ -3704,9 +2380,6 @@ impl SlateApp {
                 if let Some(path) = self.link_heading_target_path.take() {
                     self.write_reciprocal_markdown_link(&path, selected_heading.as_ref());
                 }
-            }
-            LinkHeadingPickerMode::Refile => {
-                self.finish_refile_to_selected_target(selected_heading)
             }
         }
     }
@@ -3844,53 +2517,12 @@ impl SlateApp {
             return false;
         }
 
-        let text = self.buffer.as_str().to_string();
-        let flushed = self.flush_scratch_text(&text);
-        self.scratch_quickadded = flushed.quickadded;
-        match flushed.left {
-            None => {
-                self.dirty = false;
-                true
-            }
-            Some(left) => {
-                // Only what did not make it stays, so trying again does not
-                // add the same tasks twice.
-                if left != text {
-                    self.buffer.set_text(left);
-                }
-                false
-            }
-        }
-    }
-
-    /// Sends scratch text where it goes: quickadd lines to the Flow inbox,
-    /// the rest to the scratch archive.
-    fn flush_scratch_text(&mut self, text: &str) -> ScratchFlush {
-        let (quickadds, remaining) = scratch::split_quickadds(text);
-        let mut quickadded = 0usize;
-        let mut failed = Vec::new();
-        for (task, line) in quickadds {
-            if self.quickadd_flow_task(&task) {
-                quickadded += 1;
-            } else {
-                failed.push(line);
-            }
-        }
-        let archived =
-            !remaining.trim().is_empty() && self.append_text_to_scratch_archive(&remaining);
-        if !remaining.trim().is_empty() && !archived {
-            failed.push(remaining);
-        }
-        if failed.is_empty() {
-            if quickadded > 0 && archived {
-                self.status = format!("Scratch archived · quickadded {quickadded} Flow tasks");
-            } else if quickadded > 0 {
-                self.status = format!("Quickadded {quickadded} Flow tasks");
-            }
-        }
-        ScratchFlush {
-            quickadded,
-            left: (!failed.is_empty()).then(|| failed.join("\n")),
+        let text = self.buffer.as_str().trim_end().to_string();
+        if self.append_text_to_scratch_archive(&text) {
+            self.dirty = false;
+            true
+        } else {
+            false
         }
     }
 
@@ -3911,12 +2543,7 @@ impl SlateApp {
             self.status = previous_status;
             let until = ctx.input(|input| input.time) + 0.4;
             self.scratch_close_after = Some(until);
-            self.agenda_updated_toast_until = Some(until);
-            self.feedback_toast_message = if self.scratch_quickadded > 0 {
-                "Agenda updated"
-            } else {
-                "Scratch archived"
-            };
+            self.scratch_toast_until = Some(until);
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         } else if !self.dirty {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -3925,281 +2552,8 @@ impl SlateApp {
         }
     }
 
-    fn show_agenda_updated_toast(&mut self, ctx: &egui::Context) {
-        self.agenda_updated_toast_until = Some(ctx.input(|input| input.time) + 0.4);
-        self.feedback_toast_message = "Agenda updated";
-        ctx.request_repaint_after(std::time::Duration::from_millis(50));
-    }
-
-    fn schedule_current_flow_buffer_agenda_sync(&mut self, ctx: &egui::Context) {
-        let Some(path) = self.path.clone() else {
-            return;
-        };
-        if !flow::should_index_flow_path(&path) {
-            return;
-        }
-        self.pending_flow_agenda_sync_at = Some(ctx.input(|input| input.time) + 0.8);
-        ctx.request_repaint_after(std::time::Duration::from_millis(850));
-    }
-
-    fn poll_pending_flow_agenda_sync(&mut self, ctx: &egui::Context) {
-        let Some(sync_at) = self.pending_flow_agenda_sync_at else {
-            return;
-        };
-        let now = ctx.input(|input| input.time);
-        if now < sync_at {
-            let remaining_ms = ((sync_at - now) * 1000.0).max(25.0) as u64;
-            ctx.request_repaint_after(std::time::Duration::from_millis(remaining_ms.min(850)));
-            return;
-        }
-        self.pending_flow_agenda_sync_at = None;
-        // Debounced typing sync: index, daily events and agenda reload run on
-        // the Flow writer thread, so resuming typing never waits on SQLite.
-        self.queue_flow_agenda_sync();
-    }
-
-    fn sync_current_flow_buffer_to_agenda(&mut self, ctx: &egui::Context) {
-        let Some(path) = self.path.clone() else {
-            return;
-        };
-        if !flow::should_index_flow_path(&path) {
-            return;
-        }
-        self.publish_current_flow_buffer_to_agenda(ctx);
-    }
-
-    fn publish_current_flow_buffer_to_agenda(&mut self, ctx: &egui::Context) {
-        let Some(path) = self.path.clone() else {
-            return;
-        };
-        let old_items = self.load_agenda_items().unwrap_or_default();
-        let summary = match self.refresh_flow_index_for_path(&path, self.buffer.as_str()) {
-            Ok(summary) => summary,
-            Err(err) => {
-                if flow_store::is_busy_error(&err) {
-                    self.pending_flow_agenda_sync_at = Some(ctx.input(|i| i.time) + 0.15);
-                    ctx.request_repaint_after(std::time::Duration::from_millis(160));
-                    perf_log::mark("flow.ui_sync.retry", &err);
-                    self.status = "Flow sync pending…".to_string();
-                } else {
-                    self.status = format!("Flow agenda update failed: {err}");
-                }
-                return;
-            }
-        };
-        if let Some(summary) = summary.as_ref() {
-            self.record_daily_events_for_flow_update(&path, &old_items, summary);
-        }
-        if self.agenda_open {
-            if let Ok(mut items) = self.load_agenda_items() {
-                self.overlay_current_buffer_agenda_items(&mut items);
-                self.agenda_items = items;
-                self.clamp_agenda_selection();
-            }
-        }
-        self.show_agenda_updated_toast(ctx);
-    }
-
-    fn publish_active_flow_buffer_heartbeat(&mut self) {
-        let Some(current_path) = self.path.clone() else {
-            return;
-        };
-        if self.standalone_agenda || !flow::should_index_flow_path(&current_path) {
-            return;
-        }
-        if self
-            .flow_heartbeat_attempt
-            .as_ref()
-            .is_some_and(|(path, last)| {
-                path == &current_path && last.elapsed() < std::time::Duration::from_secs(3)
-            })
-        {
-            return;
-        }
-        self.flow_heartbeat_attempt = Some((current_path.clone(), std::time::Instant::now()));
-        let scope = Self::flow_project_root_for_path(&current_path);
-        let Ok(sqlite_path) = Self::flow_sqlite_path_for_root(&scope) else {
-            return;
-        };
-        self.flow_worker.heartbeat(sqlite_path, scope, current_path);
-    }
-
-    fn flow_item_is_active_in_live_editor(&self, item: &AgendaItem) -> bool {
-        let Ok(sqlite_path) = Self::flow_sqlite_path_for_root(&self.flow_scope_root()) else {
-            return false;
-        };
-        flow_runtime::active_buffer_contains(&sqlite_path, &item.relative_path)
-    }
-
-    fn poll_flow_open_requests(&mut self) {
-        let Some(current_path) = self.path.clone() else {
-            return;
-        };
-        if !flow::should_index_flow_path(&current_path) {
-            return;
-        }
-        let scope = Self::flow_project_root_for_path(&current_path);
-        let Ok(sqlite_path) = Self::flow_sqlite_path_for_root(&scope) else {
-            return;
-        };
-        let Some((requests_path, requests, remaining)) =
-            flow_runtime::drain_open_requests_for_path(&sqlite_path, &scope, &current_path)
-        else {
-            return;
-        };
-        let opened_line = requests.last().map(|request| {
-            request
-                .line_index
-                .min(self.buffer.line_count().saturating_sub(1))
-        });
-        flow_runtime::finish_request_drain(&requests_path, remaining);
-        if let Some(line) = opened_line {
-            self.buffer.set_cursor(self.buffer.line_end(line));
-            self.editor_view.request_scroll_to_cursor(&self.buffer);
-            self.focus_editor_once = true;
-            self.status = format!("Agenda jumped to open buffer line {}", line + 1);
-        }
-    }
-
-    fn poll_flow_completion_requests(&mut self, ctx: &egui::Context) {
-        let Some(current_path) = self.path.clone() else {
-            return;
-        };
-        if !flow::should_index_flow_path(&current_path) {
-            return;
-        }
-        let scope = Self::flow_project_root_for_path(&current_path);
-        let Ok(sqlite_path) = Self::flow_sqlite_path_for_root(&scope) else {
-            return;
-        };
-        let Some((requests_path, requests, mut remaining)) =
-            flow_runtime::drain_completion_requests_for_path(&sqlite_path, &scope, &current_path)
-        else {
-            return;
-        };
-        let mut applied = false;
-        for request in requests {
-            if self.apply_flow_completion_to_buffer(request.line_index, &request.title) {
-                applied = true;
-            } else {
-                remaining.push(request.raw);
-            }
-        }
-        flow_runtime::finish_request_drain(&requests_path, remaining);
-        if applied {
-            self.dirty = true;
-            self.search_state = None;
-            self.publish_current_flow_buffer_to_agenda(ctx);
-        }
-    }
-
-    fn poll_flow_organization_requests(&mut self, ctx: &egui::Context) {
-        let Some(current_path) = self.path.clone() else {
-            return;
-        };
-        if !flow::should_index_flow_path(&current_path) {
-            return;
-        }
-        let scope = Self::flow_project_root_for_path(&current_path);
-        let Ok(sqlite_path) = Self::flow_sqlite_path_for_root(&scope) else {
-            return;
-        };
-        let Some((requests_path, requests, mut remaining)) =
-            flow_runtime::drain_organization_requests_for_path(&sqlite_path, &scope, &current_path)
-        else {
-            return;
-        };
-        let mut applied = false;
-        for request in requests {
-            if self.apply_flow_token_to_buffer(request.line_index, &request.value) {
-                applied = true;
-            } else {
-                remaining.push(request.raw);
-            }
-        }
-        flow_runtime::finish_request_drain(&requests_path, remaining);
-        if applied {
-            self.dirty = true;
-            self.search_state = None;
-            self.publish_current_flow_buffer_to_agenda(ctx);
-        }
-    }
-
-    fn poll_flow_edit_requests(&mut self, ctx: &egui::Context) {
-        let Some(current_path) = self.path.clone() else {
-            return;
-        };
-        if !flow::should_index_flow_path(&current_path) {
-            return;
-        }
-        let scope = Self::flow_project_root_for_path(&current_path);
-        let Ok(sqlite_path) = Self::flow_sqlite_path_for_root(&scope) else {
-            return;
-        };
-        let Some((requests_path, requests, mut remaining)) =
-            flow_runtime::drain_edit_requests_for_path(&sqlite_path, &scope, &current_path)
-        else {
-            return;
-        };
-        let mut applied = false;
-        for request in requests {
-            if self.apply_flow_line_edit_to_buffer(request.line_index, &request.value) {
-                applied = true;
-            } else {
-                remaining.push(request.raw);
-            }
-        }
-        flow_runtime::finish_request_drain(&requests_path, remaining);
-        if applied {
-            self.dirty = true;
-            self.search_state = None;
-            self.publish_current_flow_buffer_to_agenda(ctx);
-        }
-    }
-
-    fn apply_flow_line_edit_to_buffer(&mut self, line_index: usize, replacement: &str) -> bool {
-        if line_index >= self.buffer.line_count() {
-            return false;
-        }
-        let line_start = self.buffer.line_start(line_index);
-        let line_end = self.buffer.line_end(line_index);
-        self.buffer
-            .replace_selection_or_range(line_start, line_end, replacement);
-        true
-    }
-
-    fn apply_flow_completion_to_buffer(&mut self, line_index: usize, title: &str) -> bool {
-        let candidate_indices = [line_index, line_index.saturating_sub(1), line_index + 1];
-        for index in candidate_indices {
-            let line = self.buffer.line(index);
-            let Some(parsed) = parse_checkbox_line(line) else {
-                continue;
-            };
-            if parsed.state == CheckboxState::Done {
-                return true;
-            }
-            let Some(task) = flow::parse_flow_task_line(line, index, None) else {
-                continue;
-            };
-            if task.title != title {
-                continue;
-            }
-            let line_start = self.buffer.line_start(index);
-            let marker_start = line_start + parsed.indent.len() + parsed.task_prefix.len();
-            let marker_end = marker_start + parsed.marker.len();
-            self.buffer
-                .replace_selection_or_range(marker_start, marker_end, "[x]");
-            return true;
-        }
-        false
-    }
-
     fn scratch_feedback_toast(&self, ctx: &egui::Context) {
-        scratch::feedback_toast(
-            ctx,
-            self.agenda_updated_toast_until,
-            self.feedback_toast_message,
-        );
+        scratch::feedback_toast(ctx, self.scratch_toast_until, "Scratch archived");
     }
 
     fn archive_scratch_modal(&mut self) {
@@ -4211,17 +2565,12 @@ impl SlateApp {
             self.focus_editor_once = true;
             return;
         }
-        let text = self.scratch_buffer.as_str().to_string();
-        match self.flush_scratch_text(&text).left {
-            None => {
-                self.forget_project_buffer(self.scratch_buffer.identity);
-                self.scratch_buffer.clear();
-                self.scratch_modal_open = false;
-                self.focus_editor_once = true;
-            }
-            // Only what did not make it stays in the modal.
-            Some(left) if left != text => self.scratch_buffer.set_text(left),
-            Some(_) => {}
+        let text = self.scratch_buffer.as_str().trim_end().to_string();
+        if self.append_text_to_scratch_archive(&text) {
+            self.forget_project_buffer(self.scratch_buffer.identity);
+            self.scratch_buffer.clear();
+            self.scratch_modal_open = false;
+            self.focus_editor_once = true;
         }
     }
 
@@ -4517,9 +2866,6 @@ impl SlateApp {
                 self.dirty = false;
                 self.remember_recent_file(path.clone());
                 self.adopt_tab_alias(&path);
-                // The Flow index refresh runs on the Flow writer thread; the
-                // task count is appended to the status when it reports back.
-                self.queue_flow_index_after_save(&path);
                 let _ = self.save_settings();
                 self.status = format!("Saved {}", path.display());
                 if let Err(error) = self.persist_saved_project(&path, project) {
@@ -4925,1069 +3271,6 @@ impl SlateApp {
         }
     }
 
-    fn open_agenda(&mut self) {
-        self.open_agenda_with_filter(String::new());
-    }
-
-    fn open_agenda_with_filter(&mut self, filter: String) {
-        self.shortcut_help_open = false;
-        self.palette_open = false;
-        self.recent_picker_open = false;
-        self.file_picker_open = false;
-        self.save_as_open = false;
-        self.scratch_modal_open = false;
-        self.scratch_entries_open = false;
-        self.capture_modal_open = false;
-        self.command_line_focused = false;
-        self.focus_command_line_once = false;
-        self.command_history_index = None;
-        self.ctrl_layer_active = false;
-        self.ctrl_layer_sequence.clear();
-        self.agenda_filter = filter.trim().to_string();
-        self.agenda_start_offset_days = 0;
-        self.agenda_tab = AgendaTab::Agenda;
-        self.agenda_focus = AgendaFocus::Dated;
-        self.agenda_selected_dated_row =
-            Local::now().date_naive().weekday().num_days_from_monday() as usize;
-        self.agenda_selected_inbox_item = 0;
-        self.agenda_selected_tab_items = [0; 5];
-        self.agenda_org_mode = None;
-        self.agenda_org_query.clear();
-        self.selected_agenda_org_suggestion = 0;
-        self.flow_item_edit = None;
-        self.agenda_scroll_to_selected = false;
-
-        match self.load_agenda_items() {
-            Ok(mut items) => {
-                self.overlay_current_buffer_agenda_items(&mut items);
-                self.agenda_items = items;
-                self.clamp_agenda_selection();
-                self.agenda_open = true;
-                self.focus_editor_once = false;
-                let visible_count = self.agenda_visible_item_indices().len();
-                self.status = if self.agenda_filter.is_empty() {
-                    format!("{} Flow agenda tasks", visible_count)
-                } else {
-                    format!(
-                        "{} Flow agenda tasks matching {}",
-                        visible_count, self.agenda_filter
-                    )
-                };
-            }
-            Err(err) => {
-                let mut items = Vec::new();
-                self.overlay_current_buffer_agenda_items(&mut items);
-                if items.is_empty() {
-                    self.agenda_open = false;
-                    self.agenda_items.clear();
-                    self.status = err;
-                    self.focus_editor_once = true;
-                } else {
-                    self.agenda_items = items;
-                    self.clamp_agenda_selection();
-                    self.agenda_open = true;
-                    self.focus_editor_once = false;
-                    self.status = "Flow agenda from current buffer".to_string();
-                }
-            }
-        }
-    }
-
-    fn load_agenda_items(&self) -> Result<Vec<AgendaItem>, String> {
-        agenda::load_items_from_cache(&self.flow_sqlite_path()?, &self.flow_scope_root())
-    }
-
-    fn overlay_current_buffer_agenda_items(&self, items: &mut Vec<AgendaItem>) {
-        let Some(path) = self.path.as_ref() else {
-            return;
-        };
-        if !flow::should_index_flow_path(path) {
-            return;
-        }
-
-        let root = Self::flow_project_root_for_path(path);
-        agenda::overlay_live_buffer_items(items, path, &root, self.buffer.as_str());
-        self.overlay_inactive_tab_agenda_items(items);
-    }
-
-    fn agenda_visible_item_indices(&self) -> Vec<usize> {
-        agenda::visible_item_indices(
-            &self.agenda_items,
-            self.agenda_tab,
-            &self.agenda_filter,
-            self.agenda_show_done,
-        )
-    }
-
-    fn agenda_week_start(&self) -> NaiveDate {
-        agenda::week_start(self.agenda_start_offset_days)
-    }
-
-    fn agenda_items_for_date(&self, date: NaiveDate) -> Vec<usize> {
-        agenda::item_indices_for_date(
-            &self.agenda_items,
-            self.agenda_tab,
-            &self.agenda_filter,
-            self.agenda_show_done,
-            date,
-        )
-    }
-
-    fn agenda_inbox_item_indices(&self) -> Vec<usize> {
-        agenda::inbox_item_indices(
-            &self.agenda_items,
-            self.agenda_tab,
-            &self.agenda_filter,
-            self.agenda_show_done,
-        )
-    }
-
-    fn agenda_flat_item_indices(&self) -> Vec<usize> {
-        self.agenda_visible_item_indices()
-    }
-
-    fn agenda_dated_rows(&self) -> Vec<AgendaDatedRow> {
-        agenda::dated_rows(
-            &self.agenda_items,
-            self.agenda_tab,
-            &self.agenda_filter,
-            self.agenda_show_done,
-            self.agenda_start_offset_days,
-            &self.agenda_expanded_dates,
-        )
-    }
-
-    fn clamp_agenda_selection(&mut self) {
-        agenda::clamp_selection(
-            &self.agenda_items,
-            self.agenda_tab,
-            &self.agenda_filter,
-            self.agenda_show_done,
-            self.agenda_start_offset_days,
-            &self.agenda_expanded_dates,
-            &mut self.agenda_selected_dated_row,
-            &mut self.agenda_selected_inbox_item,
-            &mut self.agenda_selected_tab_items,
-        );
-    }
-
-    fn move_agenda_selection(&mut self, delta: isize) {
-        self.agenda_scroll_to_selected = agenda::move_selection(
-            &self.agenda_items,
-            self.agenda_tab,
-            self.agenda_focus,
-            &self.agenda_filter,
-            self.agenda_show_done,
-            self.agenda_start_offset_days,
-            &self.agenda_expanded_dates,
-            &mut self.agenda_selected_dated_row,
-            &mut self.agenda_selected_inbox_item,
-            &mut self.agenda_selected_tab_items,
-            delta,
-        );
-    }
-
-    fn move_agenda_week_window(&mut self, delta_weeks: i64) {
-        self.agenda_start_offset_days = self
-            .agenda_start_offset_days
-            .saturating_add(delta_weeks.saturating_mul(7));
-        self.agenda_expanded_dates.clear();
-        self.agenda_selected_dated_row = 0;
-        self.agenda_focus = AgendaFocus::Dated;
-        let start_date = self.agenda_week_start();
-        self.status = format!("Agenda week starts {start_date}");
-        self.agenda_scroll_to_selected = false;
-    }
-
-    fn jump_agenda_to_today(&mut self) {
-        self.agenda_start_offset_days = 0;
-        self.agenda_selected_dated_row =
-            Local::now().date_naive().weekday().num_days_from_monday() as usize;
-        self.agenda_focus = AgendaFocus::Dated;
-        self.status = "Agenda week: current".to_string();
-        self.agenda_scroll_to_selected = false;
-    }
-
-    fn toggle_agenda_focus(&mut self) {
-        if self.agenda_tab != AgendaTab::Agenda {
-            return;
-        }
-        self.agenda_focus = match self.agenda_focus {
-            AgendaFocus::Dated => AgendaFocus::Inbox,
-            AgendaFocus::Inbox => AgendaFocus::Dated,
-        };
-        self.clamp_agenda_selection();
-        self.agenda_scroll_to_selected = true;
-        self.status = match self.agenda_focus {
-            AgendaFocus::Dated => "Agenda focus: dated week".to_string(),
-            AgendaFocus::Inbox => "Agenda focus: no-date items".to_string(),
-        };
-    }
-
-    fn cycle_agenda_tab(&mut self) {
-        let current = AgendaTab::ALL
-            .iter()
-            .position(|tab| *tab == self.agenda_tab)
-            .unwrap_or(0);
-        self.agenda_tab = AgendaTab::ALL[(current + 1) % AgendaTab::ALL.len()];
-        self.clamp_agenda_selection();
-        self.agenda_scroll_to_selected = true;
-        self.status = format!("Agenda tab: {}", self.agenda_tab.label());
-    }
-
-    fn toggle_agenda_done_visibility(&mut self) {
-        self.agenda_show_done = !self.agenda_show_done;
-        self.clamp_agenda_selection();
-        self.agenda_scroll_to_selected = true;
-        self.status = if self.agenda_show_done {
-            "Agenda: showing done tasks".to_string()
-        } else {
-            "Agenda: hiding done tasks".to_string()
-        };
-    }
-
-    fn activate_selected_agenda_row(&mut self) {
-        if self.agenda_tab != AgendaTab::Agenda {
-            let indices = self.agenda_flat_item_indices();
-            let tab_index = self.agenda_tab.index();
-            let Some(index) = indices
-                .get(self.agenda_selected_tab_items[tab_index])
-                .copied()
-            else {
-                self.status = format!("No {} item selected", self.agenda_tab.label());
-                return;
-            };
-            self.jump_to_agenda_item_index(index);
-            return;
-        }
-
-        match self.agenda_focus {
-            AgendaFocus::Dated => {
-                let rows = self.agenda_dated_rows();
-                let Some(row) = rows.get(self.agenda_selected_dated_row).copied() else {
-                    self.status = "No dated agenda row".to_string();
-                    return;
-                };
-                match row {
-                    AgendaDatedRow::Day(date) => {
-                        if !self.agenda_expanded_dates.insert(date) {
-                            self.agenda_expanded_dates.remove(&date);
-                            self.status = format!("Collapsed {}", date.format("%A %-d %B"));
-                        } else {
-                            let count = self.agenda_items_for_date(date).len();
-                            self.status = format!(
-                                "Expanded {} · {} task{}",
-                                date.format("%A %-d %B"),
-                                count,
-                                if count == 1 { "" } else { "s" }
-                            );
-                        }
-                        self.clamp_agenda_selection();
-                    }
-                    AgendaDatedRow::Task(index) => self.jump_to_agenda_item_index(index),
-                }
-            }
-            AgendaFocus::Inbox => {
-                let indices = self.agenda_inbox_item_indices();
-                let Some(index) = indices.get(self.agenda_selected_inbox_item).copied() else {
-                    self.status = "No no-date task selected".to_string();
-                    return;
-                };
-                self.jump_to_agenda_item_index(index);
-            }
-        }
-    }
-
-    fn selected_agenda_task_index(&self) -> Option<usize> {
-        agenda::selected_item_index(
-            &self.agenda_items,
-            self.agenda_tab,
-            self.agenda_focus,
-            &self.agenda_filter,
-            self.agenda_show_done,
-            self.agenda_start_offset_days,
-            &self.agenda_expanded_dates,
-            self.agenda_selected_dated_row,
-            self.agenda_selected_inbox_item,
-            &self.agenda_selected_tab_items,
-        )
-    }
-
-    fn agenda_org_suggestions(&self) -> Vec<String> {
-        let values = self
-            .agenda_items
-            .iter()
-            .flat_map(|item| match self.agenda_org_mode {
-                Some(AgendaOrgMode::Tag) => item.tags.clone(),
-                Some(AgendaOrgMode::Project) => item.projects.clone(),
-                None => Vec::new(),
-            });
-        organization_suggestions(values, &self.agenda_org_query)
-    }
-
-    fn all_flow_org_values(&self, mode: AgendaOrgMode) -> Vec<String> {
-        let current_path = self.path.as_ref();
-        let mut values = self
-            .agenda_items
-            .iter()
-            .filter(|item| current_path.map(|path| item.path != *path).unwrap_or(true))
-            .flat_map(|item| match mode {
-                AgendaOrgMode::Tag => item.tags.clone(),
-                AgendaOrgMode::Project => item.projects.clone(),
-            })
-            .collect::<Vec<_>>();
-        values.extend(self.current_buffer_flow_org_values(
-            mode,
-            self.current_flow_inline_org_token_global_range(mode),
-        ));
-        values
-    }
-
-    fn current_buffer_flow_org_values(
-        &self,
-        mode: AgendaOrgMode,
-        exclude: Option<std::ops::Range<usize>>,
-    ) -> Vec<String> {
-        let prefix = match mode {
-            AgendaOrgMode::Tag => '#',
-            AgendaOrgMode::Project => '@',
-        };
-        let mut values = Vec::new();
-        let mut line_start = 0;
-        for line in self.buffer.as_str().split('\n') {
-            if Self::line_supports_flow_inline_org(line) {
-                let mut index = 0;
-                while index < line.len() {
-                    let Some(ch) = line[index..].chars().next() else {
-                        break;
-                    };
-                    if ch != prefix {
-                        index += ch.len_utf8();
-                        continue;
-                    }
-                    if index > 0 {
-                        if let Some((_, before)) = line[..index].char_indices().next_back() {
-                            if !before.is_whitespace() && !matches!(before, '(' | '[' | '{') {
-                                index += ch.len_utf8();
-                                continue;
-                            }
-                        }
-                    }
-                    let value_start = index + ch.len_utf8();
-                    let mut end = value_start;
-                    while end < line.len() {
-                        let Some(next) = line[end..].chars().next() else {
-                            break;
-                        };
-                        if next.is_alphanumeric() || matches!(next, '-' | '_' | '/' | '.') {
-                            end += next.len_utf8();
-                        } else {
-                            break;
-                        }
-                    }
-                    let global_range = line_start + index..line_start + end;
-                    let overlaps_excluded = exclude
-                        .as_ref()
-                        .map(|excluded| {
-                            global_range.start < excluded.end && excluded.start < global_range.end
-                        })
-                        .unwrap_or(false);
-                    if !overlaps_excluded && end > value_start {
-                        values.push(line[value_start..end].to_string());
-                    }
-                    index = end.max(index + ch.len_utf8());
-                }
-            }
-            line_start += line.len() + 1;
-        }
-        values
-    }
-
-    fn flow_inline_org_suggestions(&self) -> Vec<String> {
-        let Some((mode, query)) = self.current_flow_inline_org_token() else {
-            return Vec::new();
-        };
-        if self.current_flow_inline_org_token_is_complete_existing(mode) {
-            return Vec::new();
-        }
-        let query = query.trim().to_ascii_lowercase();
-        let mut values = self.all_flow_org_values(mode);
-        values.sort_by_key(|value| value.to_ascii_lowercase());
-        values.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
-        values
-            .into_iter()
-            .filter(|value| query.is_empty() || value.to_ascii_lowercase().contains(&query))
-            .filter(|value| !self.current_line_has_org_value(mode, value))
-            .collect()
-    }
-
-    fn current_flow_inline_org_token_span(
-        &self,
-        mode: AgendaOrgMode,
-    ) -> Option<(std::ops::Range<usize>, usize)> {
-        let (line_index, column) = self.buffer.cursor_line_col();
-        let line = self.buffer.line(line_index);
-        let (range, _) = org_token_span_at_cursor(line, column, mode)?;
-        let cursor_byte = line
-            .char_indices()
-            .nth(column)
-            .map(|(index, _)| index)
-            .unwrap_or(line.len());
-        Some((range, cursor_byte))
-    }
-
-    fn current_flow_inline_org_token_global_start(&self, mode: AgendaOrgMode) -> Option<usize> {
-        self.current_flow_inline_org_token_global_range(mode)
-            .map(|range| range.start)
-    }
-
-    fn current_flow_inline_org_token_global_range(
-        &self,
-        mode: AgendaOrgMode,
-    ) -> Option<std::ops::Range<usize>> {
-        let (line_index, _) = self.buffer.cursor_line_col();
-        let (range, _) = self.current_flow_inline_org_token_span(mode)?;
-        let line_start = self.buffer.line_start(line_index);
-        Some(line_start + range.start..line_start + range.end)
-    }
-
-    fn current_flow_inline_org_token_is_complete_existing(&self, mode: AgendaOrgMode) -> bool {
-        let (line_index, _) = self.buffer.cursor_line_col();
-        let line = self.buffer.line(line_index);
-        let Some((range, _)) = self.current_flow_inline_org_token_span(mode) else {
-            return false;
-        };
-        let prefix_len = match mode {
-            AgendaOrgMode::Tag => '#'.len_utf8(),
-            AgendaOrgMode::Project => '@'.len_utf8(),
-        };
-        let value = line[range.start + prefix_len..range.end].trim();
-        !value.is_empty()
-            && self
-                .all_flow_org_values(mode)
-                .iter()
-                .any(|known| known.eq_ignore_ascii_case(value))
-    }
-
-    fn current_line_has_org_value(&self, mode: AgendaOrgMode, value: &str) -> bool {
-        if value.trim().is_empty() {
-            return false;
-        }
-        let (line_index, _) = self.buffer.cursor_line_col();
-        let prefix = match mode {
-            AgendaOrgMode::Tag => '#',
-            AgendaOrgMode::Project => '@',
-        };
-        self.buffer.line(line_index).split_whitespace().any(|word| {
-            word.strip_prefix(prefix)
-                .map(|candidate| {
-                    let candidate = candidate.trim_end_matches(|ch: char| {
-                        !ch.is_alphanumeric() && !matches!(ch, '-' | '_' | '/' | '.')
-                    });
-                    candidate.eq_ignore_ascii_case(value.trim())
-                })
-                .unwrap_or(false)
-        })
-    }
-
-    fn current_flow_inline_org_token(&self) -> Option<(AgendaOrgMode, String)> {
-        let (line_index, column) = self.buffer.cursor_line_col();
-        let line = self.buffer.line(line_index);
-        if !Self::line_supports_flow_inline_org(line) {
-            return None;
-        }
-        for mode in [AgendaOrgMode::Tag, AgendaOrgMode::Project] {
-            if let Some(query) = org_query_at_cursor(line, column, mode) {
-                return Some((mode, query));
-            }
-        }
-        None
-    }
-
-    fn line_supports_flow_inline_org(line: &str) -> bool {
-        let trimmed = line.trim_start();
-        parse_checkbox_line(line).is_some()
-            || trimmed.starts_with(":note")
-            || trimmed.starts_with(":nota")
-            || trimmed.starts_with(":idea")
-            || trimmed.starts_with(": ")
-    }
-
-    fn refresh_flow_inline_org_state(&mut self, typed: Option<&str>) {
-        let current = self.current_flow_inline_org_token();
-        let current_query_empty = current
-            .as_ref()
-            .map(|(_, query)| query.trim().is_empty())
-            .unwrap_or(true);
-        let explicit_trigger = typed.and_then(|text| {
-            text.chars().rev().find_map(|ch| match ch {
-                '#' => Some(AgendaOrgMode::Tag),
-                '@' => Some(AgendaOrgMode::Project),
-                _ => None,
-            })
-        });
-        let mut next_anchor = self.flow_inline_org_anchor;
-        let next_mode = match (
-            self.flow_inline_org_mode,
-            explicit_trigger,
-            current.as_ref(),
-        ) {
-            (_, Some(trigger), Some((current_mode, _))) if trigger == *current_mode => {
-                next_anchor = self.current_flow_inline_org_token_global_start(trigger);
-                Some(trigger)
-            }
-            (Some(active), _, Some((current_mode, _))) if active == *current_mode => {
-                let current_anchor = self.current_flow_inline_org_token_global_start(active);
-                if current_anchor.is_some() && current_anchor == self.flow_inline_org_anchor {
-                    Some(active)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
-        if next_mode != self.flow_inline_org_mode {
-            self.selected_flow_inline_org_suggestion = 0;
-        }
-        self.flow_inline_org_mode = next_mode;
-        self.flow_inline_org_anchor = next_mode.and(next_anchor);
-        if next_mode.is_none() {
-            self.close_flow_inline_org_autocomplete();
-            return;
-        }
-        let suggestions = self.flow_inline_org_suggestions();
-        if suggestions.is_empty() {
-            if current_query_empty {
-                return;
-            }
-            self.close_flow_inline_org_autocomplete();
-            return;
-        }
-        let len = suggestions.len();
-        self.selected_flow_inline_org_suggestion = self
-            .selected_flow_inline_org_suggestion
-            .min(len.saturating_sub(1));
-    }
-
-    fn close_flow_inline_org_autocomplete(&mut self) {
-        self.flow_inline_org_mode = None;
-        self.flow_inline_org_anchor = None;
-        self.selected_flow_inline_org_suggestion = 0;
-    }
-
-    fn confirm_flow_inline_org_autocomplete(&mut self, ctx: &egui::Context) {
-        let Some((mode, query)) = self.current_flow_inline_org_token() else {
-            self.close_flow_inline_org_autocomplete();
-            return;
-        };
-        let suggestions = self.flow_inline_org_suggestions();
-        let value = suggestions
-            .get(self.selected_flow_inline_org_suggestion)
-            .cloned()
-            .unwrap_or(query);
-        let Some(token) = organization_token(mode, &value) else {
-            self.close_flow_inline_org_autocomplete();
-            return;
-        };
-        let (line_index, column) = self.buffer.cursor_line_col();
-        let line_start = self.buffer.line_start(line_index);
-        let mut line = self.buffer.line(line_index).to_string();
-        let next_column = replace_org_token_at_cursor(&mut line, column, mode, &token);
-        let line_end = self.buffer.line_end(line_index);
-        self.buffer
-            .replace_selection_or_range(line_start, line_end, &line);
-        let next_byte = line_start
-            + line
-                .char_indices()
-                .nth(next_column)
-                .map(|(index, _)| index)
-                .unwrap_or(line.len());
-        self.buffer.set_cursor(next_byte);
-        self.dirty = true;
-        self.search_state = None;
-        self.editor_view.request_scroll_to_cursor(&self.buffer);
-        self.sync_current_flow_buffer_to_agenda(ctx);
-        self.close_flow_inline_org_autocomplete();
-        self.status = format!("Inserted {token}");
-    }
-
-    fn open_agenda_org_autocomplete(&mut self, mode: AgendaOrgMode) {
-        if self.selected_agenda_task_index().is_none() {
-            self.status = "No agenda item selected".to_string();
-            return;
-        }
-        self.agenda_org_mode = Some(mode);
-        self.agenda_org_query.clear();
-        self.selected_agenda_org_suggestion = 0;
-        self.status = match mode {
-            AgendaOrgMode::Tag => "Agenda tag autocomplete (#)".to_string(),
-            AgendaOrgMode::Project => "Agenda project autocomplete (@)".to_string(),
-        };
-    }
-
-    fn close_agenda_org_autocomplete(&mut self) {
-        self.agenda_org_mode = None;
-        self.agenda_org_query.clear();
-        self.selected_agenda_org_suggestion = 0;
-    }
-
-    fn confirm_agenda_org_autocomplete(&mut self, ctx: &egui::Context) {
-        let Some(mode) = self.agenda_org_mode else {
-            return;
-        };
-        let Some(index) = self.selected_agenda_task_index() else {
-            self.close_agenda_org_autocomplete();
-            return;
-        };
-        let suggestions = self.agenda_org_suggestions();
-        let value = suggestions
-            .get(self.selected_agenda_org_suggestion)
-            .cloned()
-            .unwrap_or_else(|| self.agenda_org_query.trim().to_string());
-        let Some(token) = organization_token(mode, &value) else {
-            self.close_agenda_org_autocomplete();
-            return;
-        };
-        self.close_agenda_org_autocomplete();
-        self.append_token_to_agenda_item(index, &token, ctx);
-    }
-
-    fn open_selected_flow_item_edit(&mut self) {
-        let Some(index) = self.selected_agenda_task_index() else {
-            self.status = "No agenda item selected".to_string();
-            return;
-        };
-        let Some(item) = self.agenda_items.get(index).cloned() else {
-            self.status = "No agenda item selected".to_string();
-            return;
-        };
-        match self.agenda_item_source_line(&item) {
-            Ok(line) => {
-                self.flow_item_edit = Some(FlowItemEditState::new(index, line));
-                self.close_agenda_org_autocomplete();
-                self.status = "Editing Flow item · Ctrl+Enter save · Esc cancel".to_string();
-            }
-            Err(err) => self.status = err,
-        }
-    }
-
-    fn agenda_item_source_line(&self, item: &AgendaItem) -> Result<String, String> {
-        if self.path.as_ref() == Some(&item.path) {
-            return Ok(self.buffer.line(item.line_index).to_string());
-        }
-        let contents = fs::read_to_string(&item.path)
-            .map_err(|err| format!("Flow edit read failed: {err}"))?;
-        contents
-            .lines()
-            .nth(item.line_index)
-            .map(str::to_string)
-            .ok_or_else(|| "Flow edit line not found".to_string())
-    }
-
-    fn confirm_flow_item_edit(&mut self, index: usize, replacement: String, ctx: &egui::Context) {
-        self.flow_item_edit = None;
-        self.replace_agenda_item_source_line(index, &replacement, ctx);
-    }
-
-    fn replace_agenda_item_source_line(
-        &mut self,
-        index: usize,
-        replacement: &str,
-        ctx: &egui::Context,
-    ) {
-        let Some(item) = self.agenda_items.get(index).cloned() else {
-            return;
-        };
-        if self.standalone_agenda && self.flow_item_is_active_in_live_editor(&item) {
-            match append_flow_edit_request(&self.flow_scope_root(), &item, replacement) {
-                Ok(()) => {
-                    self.status = format!(
-                        "Requested edit for {}:{}",
-                        item.relative_path, item.line_number
-                    );
-                    return;
-                }
-                Err(err) => {
-                    self.status = err;
-                    return;
-                }
-            }
-        }
-        if self.path.as_ref() == Some(&item.path) {
-            if self.apply_flow_line_edit_to_buffer(item.line_index, replacement) {
-                self.dirty = true;
-                self.publish_current_flow_buffer_to_agenda(ctx);
-                self.status = "Flow item edited".to_string();
-            }
-            return;
-        }
-        match Self::replace_flow_line_in_file(&self.flow_scope_root(), &item, replacement) {
-            Ok(()) => {
-                self.status = format!("Edited {}:{}", item.relative_path, item.line_number);
-                if let Ok(mut items) = self.load_agenda_items() {
-                    self.overlay_current_buffer_agenda_items(&mut items);
-                    self.agenda_items = items;
-                    self.clamp_agenda_selection();
-                }
-            }
-            Err(err) => {
-                self.status = err;
-                self.reindex_agenda_item_file(&item);
-            }
-        }
-    }
-
-    fn append_token_to_agenda_item(&mut self, index: usize, token: &str, ctx: &egui::Context) {
-        let Some(item) = self.agenda_items.get(index).cloned() else {
-            return;
-        };
-        if self.standalone_agenda && self.flow_item_is_active_in_live_editor(&item) {
-            match append_flow_organization_request(&self.flow_scope_root(), &item, token) {
-                Ok(()) => {
-                    self.status = format!(
-                        "Requested {token} for {}:{}",
-                        item.relative_path, item.line_number
-                    );
-                    return;
-                }
-                Err(err) => {
-                    self.status = err;
-                    return;
-                }
-            }
-        }
-        if self.path.as_ref() == Some(&item.path) {
-            if self.apply_flow_token_to_buffer(item.line_index, token) {
-                self.dirty = true;
-                self.publish_current_flow_buffer_to_agenda(ctx);
-                self.status = format!("Added {token} to agenda item");
-            }
-            return;
-        }
-        match Self::append_flow_token_to_file(&self.flow_scope_root(), &item, token) {
-            Ok(()) => {
-                self.status = format!(
-                    "Added {token} to {}:{}",
-                    item.relative_path, item.line_number
-                );
-                if let Ok(mut items) = self.load_agenda_items() {
-                    self.overlay_current_buffer_agenda_items(&mut items);
-                    self.agenda_items = items;
-                    self.clamp_agenda_selection();
-                }
-            }
-            Err(err) => {
-                self.status = err;
-                self.reindex_agenda_item_file(&item);
-            }
-        }
-    }
-
-    /// The file of `item` changed under the agenda: index it as it is now
-    /// and show the agenda again.
-    fn reindex_agenda_item_file(&mut self, item: &AgendaItem) {
-        if let Ok(contents) = fs::read_to_string(&item.path) {
-            let _ = self.refresh_flow_index_for_path(&item.path, &contents);
-        }
-        if let Ok(mut items) = self.load_agenda_items() {
-            self.overlay_current_buffer_agenda_items(&mut items);
-            self.agenda_items = items;
-            self.clamp_agenda_selection();
-        }
-    }
-
-    fn apply_flow_token_to_buffer(&mut self, line_index: usize, token: &str) -> bool {
-        let candidate_indices = [line_index, line_index.saturating_sub(1), line_index + 1];
-        for index in candidate_indices {
-            if index >= self.buffer.line_count() {
-                continue;
-            }
-            let line = self.buffer.line(index).to_string();
-            if line
-                .split_whitespace()
-                .any(|word| word.eq_ignore_ascii_case(token))
-            {
-                return true;
-            }
-            if parse_checkbox_line(&line).is_none()
-                && flow::parse_flow_note_or_idea_line(&line, index, None).is_none()
-            {
-                continue;
-            }
-            let line_end = self.buffer.line_end(index);
-            self.buffer.set_cursor(line_end);
-            self.buffer.insert_text(&format!(" {token}"));
-            return true;
-        }
-        false
-    }
-
-    fn replace_flow_line_in_file(
-        scope: &Path,
-        item: &AgendaItem,
-        replacement: &str,
-    ) -> Result<(), String> {
-        Self::rewrite_flow_item_line(scope, item, |line| {
-            *line = replacement.to_string();
-            true
-        })
-    }
-
-    fn append_flow_token_to_file(
-        scope: &Path,
-        item: &AgendaItem,
-        token: &str,
-    ) -> Result<(), String> {
-        Self::rewrite_flow_item_line(scope, item, |line| {
-            if line
-                .split_whitespace()
-                .any(|word| word.eq_ignore_ascii_case(token))
-            {
-                return false;
-            }
-            line.push(' ');
-            line.push_str(token);
-            true
-        })
-    }
-
-    /// Changes the line of a Flow item in its file (not open here) and
-    /// reindexes it. The item is looked for where the index last saw it and
-    /// then nearby, by title: the file may have changed since, and another
-    /// line must never be overwritten. Line endings stay as they were and
-    /// the file is replaced atomically.
-    fn rewrite_flow_item_line(
-        scope: &Path,
-        item: &AgendaItem,
-        edit: impl FnOnce(&mut String) -> bool,
-    ) -> Result<(), String> {
-        let contents = fs::read_to_string(&item.path)
-            .map_err(|err| format!("Flow edit read failed: {err}"))?;
-        let Some(next) = Self::edit_flow_item_text(&contents, item, edit)? else {
-            return Ok(());
-        };
-        safe_file::atomic_replace(&item.path, next.as_bytes())
-            .map_err(|err| format!("Flow edit write failed: {err}"))?;
-        flow::update_flow_index_for_file(
-            scope,
-            &Self::flow_sqlite_path_for_root(scope)?,
-            &item.path,
-            &next,
-        )?;
-        Ok(())
-    }
-
-    /// `contents` with the line of `item` edited (None when `edit` changed
-    /// nothing), keeping its line endings.
-    fn edit_flow_item_text(
-        contents: &str,
-        item: &AgendaItem,
-        edit: impl FnOnce(&mut String) -> bool,
-    ) -> Result<Option<String>, String> {
-        let eol = if contents.contains("\r\n") {
-            "\r\n"
-        } else {
-            "\n"
-        };
-        let body = contents.strip_suffix(eol).unwrap_or(contents);
-        let mut lines: Vec<String> = body.split(eol).map(str::to_string).collect();
-        let Some(index) = Self::find_flow_item_line(&lines, item) else {
-            return Err(format!(
-                "{}:{} changed on disk; agenda refreshed, try again",
-                item.relative_path, item.line_number
-            ));
-        };
-        if !edit(&mut lines[index]) {
-            return Ok(None);
-        }
-        let mut next = lines.join(eol);
-        if contents.ends_with(eol) {
-            next.push_str(eol);
-        }
-        Ok(Some(next))
-    }
-
-    /// The line that holds `item` now: where it was indexed, or the closest
-    /// line with the same title.
-    fn find_flow_item_line(lines: &[String], item: &AgendaItem) -> Option<usize> {
-        let title_at = |index: usize| {
-            let line = lines.get(index)?;
-            flow::parse_flow_task_line(line, index, None)
-                .or_else(|| flow::parse_flow_note_or_idea_line(line, index, None))
-                .map(|parsed| parsed.title)
-        };
-        let matches = |index: usize| title_at(index).is_some_and(|title| title == item.title);
-        (0..=lines.len()).find_map(|distance| {
-            [
-                item.line_index.checked_sub(distance),
-                Some(item.line_index + distance).filter(|_| distance > 0),
-            ]
-            .into_iter()
-            .flatten()
-            .find(|index| matches(*index))
-        })
-    }
-
-    fn jump_to_agenda_item_index(&mut self, index: usize) {
-        let Some(item) = self.agenda_items.get(index).cloned() else {
-            self.status = "No agenda item selected".to_string();
-            return;
-        };
-        if self.standalone_agenda {
-            self.open_agenda_item_in_main_slate(&item);
-            return;
-        }
-        if self.path.as_ref() != Some(&item.path) {
-            if self.dirty {
-                self.status = "Save current buffer before agenda jump".to_string();
-                return;
-            }
-            self.request_file_open(item.path.clone(), OpenDestination::Agenda(item.line_index));
-            self.agenda_open = false;
-            self.focus_editor_once = true;
-            return;
-        }
-        self.cancel_file_open();
-        let line = item
-            .line_index
-            .min(self.buffer.line_count().saturating_sub(1));
-        self.buffer.set_cursor(self.buffer.line_end(line));
-        self.editor_view.request_scroll_to_cursor(&self.buffer);
-        self.agenda_open = false;
-        self.focus_editor_once = true;
-        self.status = format!("Jumped to agenda item on line {}", line + 1);
-    }
-
-    fn open_agenda_item_in_main_slate(&mut self, item: &AgendaItem) {
-        if self.flow_item_is_active_in_live_editor(item) {
-            if append_flow_open_request(
-                &self.flow_scope_root(),
-                &item.relative_path,
-                item.line_index,
-            )
-            .is_ok()
-            {
-                self.status = format!(
-                    "Jumping existing Slate window to {}:{}",
-                    item.relative_path, item.line_number
-                );
-                self.agenda_open = false;
-                self.focus_editor_once = false;
-                return;
-            }
-        }
-
-        let line_number = item.line_index.saturating_add(1).to_string();
-        #[cfg(target_os = "windows")]
-        let slate_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("slate.exe"));
-        #[cfg(not(target_os = "windows"))]
-        let slate_bin = dirs_next::home_dir()
-            .map(|home| home.join(".local/bin/slate"))
-            .filter(|path| path.exists())
-            .unwrap_or_else(|| PathBuf::from("slate"));
-        match ProcessCommand::new(&slate_bin)
-            .arg(&item.path)
-            .arg("--line")
-            .arg(&line_number)
-            .spawn()
-        {
-            Ok(_) => {
-                self.status = format!("Opening {}:{}", item.path.display(), line_number);
-                self.agenda_open = false;
-                self.focus_editor_once = false;
-            }
-            Err(err) => {
-                self.status = format!("Agenda open failed: {err}");
-            }
-        }
-    }
-
-    fn cycle_selected_agenda_item(&mut self) {
-        let Some(index) = self.selected_agenda_task_index() else {
-            self.status = "Select an agenda task before cycling it".to_string();
-            return;
-        };
-        let Some(item) = self.agenda_items.get(index).cloned() else {
-            self.status = "No agenda item selected".to_string();
-            return;
-        };
-        if item.kind != "task" {
-            self.status = format!("Agenda cycle only applies to tasks, not {}", item.kind);
-            return;
-        }
-        if self.path.as_ref() == Some(&item.path) {
-            // Unsaved edits may have moved it: find it by its title.
-            let lines: Vec<String> = (0..self.buffer.line_count())
-                .map(|index| self.buffer.line(index).to_string())
-                .collect();
-            let Some(line) = Self::find_flow_item_line(&lines, &item) else {
-                self.status = format!(
-                    "Agenda cycle failed: {} is no longer in this buffer",
-                    item.title
-                );
-                return;
-            };
-            if !EditorView::cycle_checkbox_at_line(&mut self.buffer, line) {
-                self.status = format!("Agenda cycle failed: no checkbox on line {}", line + 1);
-                return;
-            }
-            self.search_state = None;
-            // Unsaved changes are the user's to save: only a clean file is
-            // saved right away.
-            let was_dirty = self.dirty;
-            self.dirty = true;
-            if !was_dirty {
-                self.save_path(item.path.clone());
-            }
-        } else {
-            let mut cycled = false;
-            let result = Self::rewrite_flow_item_line(&self.flow_scope_root(), &item, |line| {
-                let mut buffer = EditorBuffer::from_text(line.clone());
-                cycled = EditorView::cycle_checkbox_at_line(&mut buffer, 0);
-                if cycled {
-                    *line = buffer.as_str().to_string();
-                }
-                cycled
-            });
-            if let Err(err) = result {
-                self.status = format!("Agenda cycle failed: {err}");
-                self.reindex_agenda_item_file(&item);
-                return;
-            }
-            if !cycled {
-                self.status = format!(
-                    "Agenda cycle failed: no checkbox on {}:{}",
-                    item.relative_path, item.line_number
-                );
-                return;
-            }
-        }
-
-        match self.load_agenda_items() {
-            Ok(mut items) => {
-                self.overlay_current_buffer_agenda_items(&mut items);
-                self.agenda_items = items;
-                self.clamp_agenda_selection();
-                self.agenda_scroll_to_selected = true;
-                let state = self
-                    .agenda_items
-                    .iter()
-                    .find(|candidate| {
-                        candidate.path == item.path && candidate.line_index == item.line_index
-                    })
-                    .map(|item| agenda::state_marker(&item.state))
-                    .unwrap_or("[ ]");
-                self.status = format!(
-                    "Cycled agenda task to {state} on {}:{}",
-                    item.relative_path, item.line_number
-                );
-            }
-            Err(err) => {
-                self.status = format!("Agenda cycle updated source but reload failed: {err}");
-            }
-        }
-    }
-
     fn project_root(&self) -> PathBuf {
         self.path
             .as_ref()
@@ -6119,10 +3402,6 @@ impl SlateApp {
                 self.file_picker_open = false;
                 self.open_link_heading_picker_or_insert(&path, target);
             }
-            FilePickerMode::Refile => {
-                self.file_picker_open = false;
-                self.open_refile_heading_picker_or_finish(path);
-            }
             FilePickerMode::OpenBuffer => {
                 self.file_picker_open = false;
                 self.open_link_preview(path, None);
@@ -6176,24 +3455,6 @@ impl SlateApp {
         self.periscope_open = false;
         self.periscope_prompt_open = true;
         self.status = "Document has a project · choose project or global".into();
-    }
-
-    // Git detection remains for Flow's existing scope semantics, not Periscope membership.
-    fn detect_project_root(&self) -> Option<PathBuf> {
-        let mut dir = self
-            .path
-            .as_ref()
-            .and_then(|path| path.parent().map(PathBuf::from))
-            .or_else(|| self.last_open_dir.clone())
-            .or_else(|| std::env::current_dir().ok())?;
-        loop {
-            if dir.join(".git").is_dir() {
-                return Some(dir);
-            }
-            if !dir.pop() {
-                return None;
-            }
-        }
     }
 
     fn open_global_periscope(&mut self) {
@@ -6672,26 +3933,6 @@ impl SlateApp {
                         self.markdown_live_rendering = enabled;
                     }
                 }
-                "virtual_references_enabled" => {
-                    if let Some(enabled) = Self::parse_config_bool(value) {
-                        self.virtual_references_enabled = enabled;
-                    }
-                }
-                "virtual_references_collapsed" => {
-                    if let Some(enabled) = Self::parse_config_bool(value) {
-                        self.virtual_references_collapsed = enabled;
-                    }
-                }
-                "virtual_backlinks_collapsed" => {
-                    if let Some(enabled) = Self::parse_config_bool(value) {
-                        self.virtual_backlinks_collapsed = enabled;
-                    }
-                }
-                "virtual_mentions_collapsed" => {
-                    if let Some(enabled) = Self::parse_config_bool(value) {
-                        self.virtual_mentions_collapsed = enabled;
-                    }
-                }
                 "last_opened_path" => {
                     let value = Self::parse_config_string(value);
                     if !value.is_empty() {
@@ -6830,7 +4071,7 @@ impl SlateApp {
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
         self.save_session();
         let mut contents = format!(
-            "command_history_limit = {}\nline_number_mode = \"{}\"\nword_wrap = {}\npreview_mode = {}\nctrl_shift_move_mode = \"{}\"\nreopen_last_file_on_startup = {}\nsingle_instance = {}\nresident = {}\nmarkdown_live_rendering = {}\nvirtual_references_enabled = {}\nvirtual_references_collapsed = {}\nvirtual_backlinks_collapsed = {}\nvirtual_mentions_collapsed = {}\nlast_opened_path = \"{}\"\nlast_open_dir = \"{}\"\n",
+            "command_history_limit = {}\nline_number_mode = \"{}\"\nword_wrap = {}\npreview_mode = {}\nctrl_shift_move_mode = \"{}\"\nreopen_last_file_on_startup = {}\nsingle_instance = {}\nresident = {}\nmarkdown_live_rendering = {}\nlast_opened_path = \"{}\"\nlast_open_dir = \"{}\"\n",
             self.command_history_limit,
             self.line_number_mode.config_value(),
             self.wrap,
@@ -6840,10 +4081,6 @@ impl SlateApp {
             self.single_instance,
             self.resident,
             self.markdown_live_rendering,
-            self.virtual_references_enabled,
-            self.virtual_references_collapsed,
-            self.virtual_backlinks_collapsed,
-            self.virtual_mentions_collapsed,
             Self::escape_config_string(
                 &self
                     .last_opened_path
@@ -7106,53 +4343,6 @@ impl SlateApp {
         }
     }
 
-    fn set_virtual_references_enabled(&mut self, enabled: bool) {
-        self.virtual_references_enabled = enabled;
-        match self.save_settings() {
-            Ok(_) => {
-                self.status = if self.virtual_references_enabled {
-                    "Virtual backlinks/mentions on"
-                } else {
-                    "Virtual backlinks/mentions hidden"
-                }
-                .to_string()
-            }
-            Err(err) => self.status = format!("Settings save failed: {err}"),
-        }
-    }
-
-    fn save_virtual_reference_collapse_state(&mut self, status: &str) {
-        match self.save_settings() {
-            Ok(_) => self.status = status.to_string(),
-            Err(err) => self.status = format!("Settings save failed: {err}"),
-        }
-    }
-
-    fn handle_virtual_reference_click(&mut self, line: &str) {
-        if line.contains("Backlinks") {
-            self.virtual_backlinks_collapsed = !self.virtual_backlinks_collapsed;
-            self.save_virtual_reference_collapse_state(if self.virtual_backlinks_collapsed {
-                "Backlinks collapsed"
-            } else {
-                "Backlinks expanded"
-            });
-        } else if line.contains("Mentions") {
-            self.virtual_mentions_collapsed = !self.virtual_mentions_collapsed;
-            self.save_virtual_reference_collapse_state(if self.virtual_mentions_collapsed {
-                "Mentions collapsed"
-            } else {
-                "Mentions expanded"
-            });
-        } else {
-            self.virtual_references_collapsed = !self.virtual_references_collapsed;
-            self.save_virtual_reference_collapse_state(if self.virtual_references_collapsed {
-                "Virtual references collapsed"
-            } else {
-                "Virtual references expanded"
-            });
-        }
-    }
-
     fn now_timestamp() -> i64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -7199,9 +4389,6 @@ impl SlateApp {
         if command != Command::DocTasks {
             self.doc_tasks_open = false;
         }
-        if command != Command::Agenda {
-            self.agenda_open = false;
-        }
         if command != Command::Lance {
             self.lance_open = false;
         }
@@ -7214,7 +4401,7 @@ impl SlateApp {
 
         match command {
             Command::New => {
-                if self.scratch || self.standalone_agenda {
+                if self.scratch {
                     if self.dirty {
                         self.confirm(PendingAction::New);
                     } else {
@@ -7238,11 +4425,6 @@ impl SlateApp {
             Command::LanceAdd => self.lance_add_current(),
             Command::LanceNext => self.open_next_lance_file(1),
             Command::LancePrev => self.open_next_lance_file(-1),
-            Command::FlowRescan => self.flow_rescan_current_scope(false, ctx),
-            Command::FlowRebuild => self.flow_rescan_current_scope(true, ctx),
-            Command::Daily => self.open_daily_with_target(""),
-            Command::Refile => self.start_refile_current_line(),
-            Command::QuickAdd => self.open_scratch_modal(),
             Command::Save => self.save_in_background(ctx),
             Command::SaveAs => self.open_save_as_modal(),
             Command::Scratch => self.open_scratch_modal(),
@@ -7255,9 +4437,6 @@ impl SlateApp {
             Command::PreviewOn => self.set_preview_mode(true),
             Command::PreviewOff => self.set_preview_mode(false),
             Command::DocTasks => self.open_doc_tasks(),
-            Command::Agenda => self.open_agenda(),
-            Command::Backlinks => self.open_reference_results(ReferenceResultKind::Backlinks),
-            Command::Mentions => self.open_reference_results(ReferenceResultKind::Mentions),
             Command::FindNote => self.open_find_note_results(""),
             Command::OpenLink => self.open_link_under_cursor(),
             Command::LineNumbersAbsolute => self.set_line_number_mode(LineNumberMode::Absolute),
@@ -7392,19 +4571,6 @@ impl SlateApp {
                 let expanded = Self::resolve_command_path(&path);
                 self.open_link_preview(expanded, None);
             }
-            CommandLineAction::QuickAdd(text) => {
-                self.record_command_usage("quickadd");
-                if let Some(text) = text {
-                    self.quickadd_flow_task(&text);
-                } else {
-                    self.open_scratch_modal();
-                    self.status = "Scratch quickadd: start a line with :task text".to_string();
-                }
-            }
-            CommandLineAction::Daily { target } => {
-                self.record_command_usage("daily");
-                self.open_daily_with_target(&target);
-            }
             CommandLineAction::LanceSlot(slot) => {
                 self.record_command_usage("lance");
                 self.open_lance_slot(slot);
@@ -7432,10 +4598,6 @@ impl SlateApp {
                 }
                 None => self.run_command(Command::TogglePreview, ctx),
             },
-            CommandLineAction::Agenda { filter } => {
-                self.record_command_usage("agenda");
-                self.open_agenda_with_filter(filter);
-            }
             CommandLineAction::FindNote { query } => {
                 self.record_command_usage("find-note");
                 self.open_find_note_results(&query);
@@ -7848,14 +5010,12 @@ impl SlateApp {
 
     fn confirm(&mut self, action: PendingAction) {
         if !self.scratch
-            && !self.standalone_agenda
             && matches!(
                 action,
                 PendingAction::Open
                     | PendingAction::OpenLast
                     | PendingAction::OpenRecent
                     | PendingAction::OpenProjectFile
-                    | PendingAction::OpenDaily
             )
         {
             // The unsaved document stays in its tab; continue in a new one.
@@ -7891,10 +5051,6 @@ impl SlateApp {
                     );
                 }
             }
-            PendingAction::OpenDaily => {
-                let target = self.pending_daily_target.take().unwrap_or_default();
-                self.open_daily_with_target(&target);
-            }
             PendingAction::CloseTab => self.close_active_tab_now(),
             PendingAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
@@ -7925,11 +5081,6 @@ impl SlateApp {
             return;
         }
         self.finish_background_save();
-        if self.standalone_agenda {
-            self.agenda_open = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
-        }
         if self.scratch_close_after.is_some() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             return;
@@ -7953,32 +5104,6 @@ impl SlateApp {
         }
     }
 
-    fn close_standalone_agenda_if_requested(&mut self, ctx: &egui::Context) -> bool {
-        if !self.standalone_agenda {
-            return false;
-        }
-        let should_close = ctx.input_mut(|i| {
-            if self.flow_item_edit.is_some() && i.consume_key(egui::Modifiers::NONE, Key::Escape) {
-                self.flow_item_edit = None;
-                return false;
-            }
-            if self.agenda_org_mode.is_some() && i.consume_key(egui::Modifiers::NONE, Key::Escape) {
-                self.close_agenda_org_autocomplete();
-                return false;
-            }
-            i.consume_key(egui::Modifiers::NONE, Key::Escape)
-                || i.consume_key(egui::Modifiers::CTRL, Key::W)
-                || i.consume_key(egui::Modifiers::CTRL, Key::Q)
-                || i.viewport().close_requested()
-        });
-        if should_close {
-            self.agenda_open = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return true;
-        }
-        false
-    }
-
     fn layer_allowed(&self) -> bool {
         !self.command_line_focused
             && !self.focus_command_line_once
@@ -7987,7 +5112,6 @@ impl SlateApp {
             && !self.recent_picker_open
             && !self.lance_open
             && !self.doc_tasks_open
-            && !self.agenda_open
             && !self.file_picker_open
             && !self.periscope_open
             && !self.periscope_prompt_open
@@ -8389,7 +5513,6 @@ impl SlateApp {
             && !self.recent_picker_open
             && !self.lance_open
             && !self.doc_tasks_open
-            && !self.agenda_open
             && !self.file_picker_open
             && !self.periscope_open
             && !self.periscope_prompt_open
@@ -8852,150 +5975,6 @@ impl SlateApp {
         handled
     }
 
-    fn handle_flow_inline_org_keyboard(&mut self, ctx: &egui::Context) -> bool {
-        if self.flow_inline_org_mode.is_none() {
-            return false;
-        }
-        let mut handled = false;
-        let mut previous = false;
-        let mut next = false;
-        let mut tab_next = false;
-        let mut tab_previous = false;
-        let mut confirm = false;
-        let mut cancel = false;
-        ctx.input_mut(|input| {
-            previous |= input.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
-            next |= input.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
-            tab_next |= input.consume_key(egui::Modifiers::NONE, Key::Tab);
-            tab_previous |= input.consume_key(egui::Modifiers::SHIFT, Key::Tab);
-            confirm |= input.consume_key(egui::Modifiers::NONE, Key::Enter);
-            cancel |= input.consume_key(egui::Modifiers::NONE, Key::Escape);
-        });
-        let len = self.flow_inline_org_suggestions().len().max(1);
-        if previous {
-            self.selected_flow_inline_org_suggestion =
-                self.selected_flow_inline_org_suggestion.saturating_sub(1);
-            handled = true;
-        }
-        if next {
-            self.selected_flow_inline_org_suggestion =
-                (self.selected_flow_inline_org_suggestion + 1).min(len.saturating_sub(1));
-            handled = true;
-        }
-        if tab_next {
-            self.selected_flow_inline_org_suggestion =
-                (self.selected_flow_inline_org_suggestion + 1) % len;
-            handled = true;
-        }
-        if tab_previous {
-            self.selected_flow_inline_org_suggestion =
-                if self.selected_flow_inline_org_suggestion == 0 {
-                    len.saturating_sub(1)
-                } else {
-                    self.selected_flow_inline_org_suggestion.saturating_sub(1)
-                };
-            handled = true;
-        }
-        if cancel {
-            self.close_flow_inline_org_autocomplete();
-            handled = true;
-        }
-        if confirm {
-            self.confirm_flow_inline_org_autocomplete(ctx);
-            handled = true;
-        }
-        handled
-    }
-
-    fn handle_agenda_org_keyboard(&mut self, ctx: &egui::Context) -> bool {
-        if !self.agenda_open || self.agenda_org_mode.is_none() {
-            return false;
-        }
-        let mut handled = false;
-        let mut confirm = false;
-        let mut cancel = false;
-        let mut previous = false;
-        let mut next = false;
-        let mut tab_next = false;
-        let mut tab_previous = false;
-        let mut backspace = false;
-        let mut typed = String::new();
-        ctx.input_mut(|input| {
-            previous |= input.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
-            next |= input.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
-            tab_next |= input.consume_key(egui::Modifiers::NONE, Key::Tab);
-            tab_previous |= input.consume_key(egui::Modifiers::SHIFT, Key::Tab);
-            confirm |= input.consume_key(egui::Modifiers::NONE, Key::Enter);
-            confirm |= input.consume_key(egui::Modifiers::NONE, Key::Space);
-            cancel |= input.consume_key(egui::Modifiers::NONE, Key::Escape);
-            backspace |= input.consume_key(egui::Modifiers::NONE, Key::Backspace);
-            for event in &input.events {
-                if let egui::Event::Text(text) = event {
-                    typed.push_str(text);
-                }
-            }
-            if !typed.is_empty() {
-                input
-                    .events
-                    .retain(|event| !matches!(event, egui::Event::Text(_)));
-            }
-        });
-        if previous {
-            self.selected_agenda_org_suggestion =
-                self.selected_agenda_org_suggestion.saturating_sub(1);
-            handled = true;
-        }
-        if next {
-            let len = self.agenda_org_suggestions().len().max(1);
-            self.selected_agenda_org_suggestion =
-                (self.selected_agenda_org_suggestion + 1).min(len.saturating_sub(1));
-            handled = true;
-        }
-        if tab_next {
-            let len = self.agenda_org_suggestions().len().max(1);
-            self.selected_agenda_org_suggestion = (self.selected_agenda_org_suggestion + 1) % len;
-            handled = true;
-        }
-        if tab_previous {
-            let len = self.agenda_org_suggestions().len().max(1);
-            self.selected_agenda_org_suggestion = if self.selected_agenda_org_suggestion == 0 {
-                len.saturating_sub(1)
-            } else {
-                self.selected_agenda_org_suggestion.saturating_sub(1)
-            };
-            handled = true;
-        }
-        if backspace {
-            self.agenda_org_query.pop();
-            self.selected_agenda_org_suggestion = 0;
-            handled = true;
-        }
-        if !typed.is_empty() {
-            for ch in typed.chars() {
-                if ch.is_alphanumeric() || matches!(ch, '-' | '_' | '/' | '.') {
-                    self.agenda_org_query.push(ch);
-                }
-            }
-            self.selected_agenda_org_suggestion = 0;
-            handled = true;
-        }
-        if cancel {
-            self.close_agenda_org_autocomplete();
-            handled = true;
-        }
-        if confirm {
-            self.confirm_agenda_org_autocomplete(ctx);
-            handled = true;
-        }
-        if self.agenda_org_mode.is_some() {
-            let len = self.agenda_org_suggestions().len().max(1);
-            self.selected_agenda_org_suggestion = self
-                .selected_agenda_org_suggestion
-                .min(len.saturating_sub(1));
-        }
-        handled
-    }
-
     fn focus_find_command_line(&mut self) {
         self.shortcut_help_open = false;
         self.palette_open = false;
@@ -9273,7 +6252,6 @@ impl SlateApp {
         }
         if go_back {
             self.pending_action = None;
-            self.pending_daily_target = None;
             self.focus_editor_once = true;
             return;
         }
@@ -9572,7 +6550,6 @@ impl SlateApp {
                                 LinkHeadingPickerMode::BidirectionalLink => {
                                     "bidirectional link heading"
                                 }
-                                LinkHeadingPickerMode::Refile => "refile heading",
                             };
                             let hint = match self.link_heading_picker_mode {
                                 LinkHeadingPickerMode::InsertLink => {
@@ -9580,9 +6557,6 @@ impl SlateApp {
                                 }
                                 LinkHeadingPickerMode::BidirectionalLink => {
                                     "Enter chooses where to write the reciprocal link"
-                                }
-                                LinkHeadingPickerMode::Refile => {
-                                    "Enter on first option appends to the end of the file"
                                 }
                             };
                             ui.label(RichText::new(title).font(title_font).color(accent));
@@ -9606,9 +6580,6 @@ impl SlateApp {
                                         }
                                         LinkHeadingPickerMode::BidirectionalLink => {
                                             "No usar headers · backlink al final".to_string()
-                                        }
-                                        LinkHeadingPickerMode::Refile => {
-                                            "No usar headers · append al final".to_string()
                                         }
                                     }
                                 } else {
@@ -10423,107 +7394,6 @@ impl SlateApp {
                     });
             });
     }
-
-    fn flow_inline_org_suggestion_popup(&mut self, ctx: &egui::Context) {
-        let Some(active_mode) = self.flow_inline_org_mode else {
-            return;
-        };
-        let Some((mode, query)) = self.current_flow_inline_org_token() else {
-            return;
-        };
-        if mode != active_mode
-            || self.current_flow_inline_org_token_global_start(mode) != self.flow_inline_org_anchor
-        {
-            return;
-        }
-        let suggestions = self.flow_inline_org_suggestions();
-        if suggestions.is_empty() {
-            return;
-        }
-        let prefix = match mode {
-            AgendaOrgMode::Tag => "#",
-            AgendaOrgMode::Project => "@",
-        };
-        let title = match mode {
-            AgendaOrgMode::Tag => "tag",
-            AgendaOrgMode::Project => "project",
-        };
-        let row_font = FontId::new(13.0, FontFamily::Monospace);
-        let small_font = FontId::new(11.0, FontFamily::Monospace);
-        let text = Color32::from_rgb(218, 224, 235);
-        let muted = Color32::from_rgb(126, 136, 157);
-        let accent = Color32::from_rgb(154, 185, 235);
-        let screen = ctx.content_rect();
-        let popup_width = (screen.width() * 0.28).clamp(220.0, 340.0);
-        let row_count = suggestions.len().min(7) as f32;
-        let popup_height = 36.0 + row_count * 22.0;
-        let cursor_pos = self
-            .editor_view
-            .last_cursor_pos()
-            .unwrap_or_else(|| egui::pos2(screen.left() + 44.0, screen.bottom() - 54.0));
-        let mut popup_pos = cursor_pos + Vec2::new(10.0, 8.0);
-        if popup_pos.x + popup_width > screen.right() - 12.0 {
-            popup_pos.x = (screen.right() - popup_width - 12.0).max(screen.left() + 12.0);
-        }
-        if popup_pos.y + popup_height > screen.bottom() - 34.0 {
-            popup_pos.y = (cursor_pos.y - popup_height - 8.0).max(screen.top() + 12.0);
-        }
-        egui::Area::new("flow_inline_org_suggestions".into())
-            .fixed_pos(popup_pos)
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(13, 17, 24))
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(53, 66, 86)))
-                    .corner_radius(7.0)
-                    .inner_margin(egui::Margin::symmetric(7, 6))
-                    .show(ui, |ui| {
-                        ui.set_width(popup_width);
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(title).font(small_font.clone()).color(muted));
-                            ui.label(
-                                RichText::new(format!("{prefix}{query}"))
-                                    .font(small_font.clone())
-                                    .color(accent),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        RichText::new("↑↓/Tab · Enter")
-                                            .font(small_font.clone())
-                                            .color(muted),
-                                    );
-                                },
-                            );
-                        });
-                        ui.add_space(4.0);
-                        for (index, suggestion) in suggestions.iter().take(7).enumerate() {
-                            let selected = index == self.selected_flow_inline_org_suggestion;
-                            let (rect, response) = ui.allocate_exact_size(
-                                Vec2::new(ui.available_width(), 22.0),
-                                egui::Sense::click(),
-                            );
-                            if response.clicked() {
-                                self.selected_flow_inline_org_suggestion = index;
-                                self.confirm_flow_inline_org_autocomplete(ctx);
-                                break;
-                            }
-                            let painter = ui.painter_at(rect);
-                            if selected {
-                                painter.rect_filled(rect, 4.0, Color32::from_rgb(42, 56, 76));
-                            }
-                            painter.text(
-                                egui::pos2(rect.left() + 7.0, rect.center().y),
-                                egui::Align2::LEFT_CENTER,
-                                format!("{prefix}{suggestion}"),
-                                row_font.clone(),
-                                if selected { text } else { muted },
-                            );
-                        }
-                    });
-            });
-    }
 }
 
 impl eframe::App for SlateApp {
@@ -10597,29 +7467,6 @@ impl SlateApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.last_window_title = title;
         }
-        // Hidden in the tray, nothing is being edited: no heartbeat and no
-        // timed wake-ups. Tray clicks, forwarded launches and background
-        // workers request their own frames.
-        if !self.window_hidden {
-            self.publish_active_flow_buffer_heartbeat();
-        }
-        if !self.window_hidden
-            && !self.standalone_agenda
-            && self
-                .path
-                .as_ref()
-                .is_some_and(|p| flow::should_index_flow_path(p))
-        {
-            ctx.request_repaint_after(std::time::Duration::from_secs(3));
-        }
-        ui_timing.step("publish_flow_heartbeat");
-        self.poll_flow_background_rescan(&ctx);
-        self.poll_flow_writer(&ctx);
-        self.poll_flow_open_requests();
-        self.poll_flow_completion_requests(&ctx);
-        self.poll_flow_organization_requests(&ctx);
-        self.poll_flow_edit_requests(&ctx);
-        self.poll_pending_flow_agenda_sync(&ctx);
         self.poll_background_save(&ctx);
         self.poll_file_open(&ctx);
         self.poll_instance_requests(&ctx);
@@ -10640,9 +7487,6 @@ impl SlateApp {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
         ui_timing.step("poll_background_and_requests");
-        if self.flow_background_loading {
-            ctx.request_repaint();
-        }
         if let Some(close_after) = self.scratch_close_after {
             let now = ctx.input(|input| input.time);
             if now >= close_after {
@@ -10652,22 +7496,19 @@ impl SlateApp {
                 ctx.request_repaint_after(std::time::Duration::from_millis(50));
             }
         }
-        if let Some(toast_until) = self.agenda_updated_toast_until {
+        if let Some(toast_until) = self.scratch_toast_until {
             let now = ctx.input(|input| input.time);
             if now >= toast_until {
-                self.agenda_updated_toast_until = None;
+                self.scratch_toast_until = None;
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_millis(50));
             }
         }
         self.handle_window_close_request(&ctx);
-        if self.close_standalone_agenda_if_requested(&ctx) {
-            return;
-        }
         if !window_ui::renaming_tab(&ctx) {
             self.shortcuts(&ctx);
         }
-        let labels = if self.scratch || self.standalone_agenda {
+        let labels = if self.scratch {
             Vec::new()
         } else {
             self.tab_labels()
@@ -10703,25 +7544,11 @@ impl SlateApp {
             return;
         }
 
-        if self.standalone_agenda {
-            egui::CentralPanel::default()
-                .frame(
-                    egui::Frame::new()
-                        .fill(Color32::from_rgb(30, 36, 48))
-                        .inner_margin(0.0),
-                )
-                .show_inside(ui, |_ui| {});
-            self.agenda_dialog(&ctx);
-            flow_error::show(&ctx);
-            return;
-        }
-
         if self.pending_action.is_some() {
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(Color32::from_rgb(30, 36, 48)))
                 .show_inside(ui, |_ui| {});
             self.confirm_action_dialog(&ctx);
-            flow_error::show(&ctx);
             return;
         }
 
@@ -10805,7 +7632,6 @@ impl SlateApp {
                     .and_then(highlight::Lang::from_path)
                     .is_some();
                 let editor_keyboard_enabled = self.duplicate_placement.is_none()
-                    && !flow_error::is_open(&ctx)
                     && !self.suppress_editor_keyboard_once
                     && !command_line_active
                     && !self.palette_open
@@ -10813,7 +7639,6 @@ impl SlateApp {
                     && !self.recent_picker_open
                     && !self.lance_open
                     && !self.doc_tasks_open
-                    && !self.agenda_open
                     && !self.file_picker_open
                     && !self.periscope_open
                     && !self.periscope_prompt_open
@@ -10859,7 +7684,6 @@ impl SlateApp {
                                     && !self.recent_picker_open
                                     && !self.lance_open
                                     && !self.doc_tasks_open
-                                    && !self.agenda_open
                                     && !self.file_picker_open
                                     && !self.periscope_open
                                     && !self.periscope_prompt_open
@@ -10878,18 +7702,12 @@ impl SlateApp {
                                 if changed {
                                     self.dirty = true;
                                     self.search_state = None;
-                                    if self.editor_view.take_flow_agenda_update_request() {
-                                        self.schedule_current_flow_buffer_agenda_sync(&ctx);
-                                    }
                                 }
                                 if let Some(byte) = self.editor_view.take_link_click_byte() {
                                     self.open_markdown_link_at_byte(byte);
                                 }
                                 if let Some(target) = self.editor_view.take_link_click_target() {
                                     self.open_markdown_link_target(&target);
-                                }
-                                if let Some(line) = self.editor_view.take_virtual_line_click() {
-                                    self.handle_virtual_reference_click(&line);
                                 }
                                 if let Some(trigger_start) = self.editor_view.take_link_assist_trigger_start() {
                                     self.open_link_assist(trigger_start);
@@ -10898,7 +7716,6 @@ impl SlateApp {
                                 if !self.detect_inline_bidirectional_link_command(typed.as_deref()) {
                                     self.refresh_link_inline_state(typed.as_deref());
                                 }
-                                self.refresh_flow_inline_org_state(typed.as_deref());
                                 columns[1].vertical(|ui| self.preview_ui(ui));
                             });
                         } else {
@@ -10920,7 +7737,6 @@ impl SlateApp {
                                 && !self.recent_picker_open
                                 && !self.lance_open
                                 && !self.doc_tasks_open
-                                && !self.agenda_open
                                 && !self.file_picker_open
                                 && !self.periscope_open
                                 && !self.periscope_prompt_open
@@ -10939,18 +7755,12 @@ impl SlateApp {
                             if changed {
                                 self.dirty = true;
                                 self.search_state = None;
-                                if self.editor_view.take_flow_agenda_update_request() {
-                                    self.schedule_current_flow_buffer_agenda_sync(&ctx);
-                                }
                             }
                             if let Some(byte) = self.editor_view.take_link_click_byte() {
                                 self.open_markdown_link_at_byte(byte);
                             }
                             if let Some(target) = self.editor_view.take_link_click_target() {
                                 self.open_markdown_link_target(&target);
-                            }
-                            if let Some(line) = self.editor_view.take_virtual_line_click() {
-                                self.handle_virtual_reference_click(&line);
                             }
                             if let Some(trigger_start) = self.editor_view.take_link_assist_trigger_start() {
                                 self.open_link_assist(trigger_start);
@@ -10959,12 +7769,10 @@ impl SlateApp {
                             if !self.detect_inline_bidirectional_link_command(typed.as_deref()) {
                                 self.refresh_link_inline_state(typed.as_deref());
                             }
-                            self.refresh_flow_inline_org_state(typed.as_deref());
                         }
                     },
                 );
 
-                self.flow_inline_org_suggestion_popup(&ctx);
                 self.link_inline_suggestion_popup(&ctx);
 
                 let base_mode = if self.preview { "preview" } else { "edit" };
@@ -11399,7 +8207,6 @@ impl SlateApp {
                         let action = match self.link_heading_picker_mode {
                             LinkHeadingPickerMode::InsertLink => "insert",
                             LinkHeadingPickerMode::BidirectionalLink => "link both ways",
-                            LinkHeadingPickerMode::Refile => "refile",
                         };
                         (format!("link heading  ↑↓ select · Enter {action} · Esc cancel · first option = whole file/end"), footer_accent)
                     } else if self.link_preview_open {
@@ -11412,8 +8219,6 @@ impl SlateApp {
                         ("scratch entries  ↑↓ select · Ctrl+D/Delete delete · Esc close".to_string(), footer_accent)
                     } else if self.capture_modal_open {
                         ("capture  type optional title · Enter archive · Esc cancel".to_string(), footer_accent)
-                    } else if self.agenda_open {
-                        ("agenda  Tab segment · ↑↓ move · ←→ week · Enter open · Ctrl+Enter cycle · r refile · x show done · Esc close".to_string(), footer_accent)
                     } else {
                         (
                             "command  Ctrl+. enter · Ctrl+H help · w · q · wq"
@@ -11440,33 +8245,9 @@ impl SlateApp {
         self.scratch_modal_dialog(&ctx);
         self.capture_dialog(&ctx);
         self.scratch_entries_dialog(&ctx);
-        self.agenda_dialog(&ctx);
         self.scratch_feedback_toast(&ctx);
         self.observe_document_safety(ctx.input(|i| i.time), false);
-        flow_error::show(&ctx);
     }
-}
-
-fn split_cache_list(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .collect()
-}
-
-fn non_empty_string(value: &str) -> Option<String> {
-    let value = value.trim();
-    (!value.is_empty()).then(|| value.to_string())
-}
-
-fn parse_cache_date(value: &str) -> Option<NaiveDate> {
-    let value = value.trim();
-    if value.is_empty() {
-        return None;
-    }
-    NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()
 }
 
 fn setup_style(ctx: &egui::Context) {

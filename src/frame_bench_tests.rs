@@ -38,7 +38,7 @@ fn benchmark_typing_frame() {
 fn typing_frame(label: &str, text: String, path: Option<&str>, highlight: bool) {
     let ctx = egui::Context::default();
     let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-    let mut app = SlateApp::new(&cc, None, true, false, None);
+    let mut app = SlateApp::new(&cc, None, true, None);
     app.scratch = false;
     app.settings_path_override = Some(std::env::temp_dir().join("slate-frame-bench.toml"));
     app.preview = path.is_none();
@@ -176,7 +176,7 @@ fn benchmark_wgpu_adapters() {
 fn benchmark_glyph_first_use() {
     let ctx = egui::Context::default();
     let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-    let mut app = SlateApp::new(&cc, None, true, false, None);
+    let mut app = SlateApp::new(&cc, None, true, None);
     app.scratch = false;
     app.settings_path_override = Some(std::env::temp_dir().join("slate-glyph-bench.toml"));
     app.buffer.set_text("# Nota\n\nhola\n".into());

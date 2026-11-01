@@ -11,7 +11,7 @@ impl Fixture {
     fn new() -> Self {
         let ctx = egui::Context::default();
         let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-        let mut app = SlateApp::new(&cc, None, true, false, None);
+        let mut app = SlateApp::new(&cc, None, true, None);
         let root = std::env::temp_dir().join(format!(
             "slate-async-open-{}-{}",
             std::process::id(),
@@ -69,13 +69,6 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.app.cancel_file_open();
-        if let Some(rx) = self.app.flow_background_rx.take() {
-            let _ = rx.recv_timeout(Duration::from_secs(5));
-        }
-        index_export::flush();
-        if let Ok(cache) = SlateApp::flow_sqlite_path_for_root(&self.root) {
-            let _ = fs::remove_dir_all(cache.parent().unwrap());
-        }
         let _ = fs::remove_dir_all(&self.root);
     }
 }
@@ -319,7 +312,7 @@ fn constructor_defers_startup_file_and_line_until_read_finishes() {
     let mut f = Fixture::new();
     let path = f.file("startup.cmd", "one\ntwo\nthree\nfour\n");
     let cc = eframe::CreationContext::_new_kittest(f.ctx.clone());
-    f.app = SlateApp::new(&cc, Some(path.clone()), true, false, Some(3));
+    f.app = SlateApp::new(&cc, Some(path.clone()), true, Some(3));
     f.app.settings_path_override = Some(f.root.join("test-config.toml"));
     assert!(f.app.path.is_none());
     assert_eq!(f.app.buffer.as_str(), "");
@@ -355,15 +348,9 @@ fn direct_open_refuses_to_discard_an_already_dirty_buffer() {
 fn startup_line_and_navigation_destinations_apply_after_loading() {
     let mut f = Fixture::new();
     let path = f.file("destination.cmd", "# Log\n\n## 2026-10-10\ntext\n");
-    let date = chrono::NaiveDate::from_ymd_opt(2026, 10, 10).unwrap();
     for destination in [
         OpenDestination::Line(3),
         OpenDestination::Fragment("L3".into()),
-        OpenDestination::Daily {
-            date,
-            refreshing: false,
-        },
-        OpenDestination::Agenda(2),
     ] {
         f.app.request_file_open(path.clone(), destination);
         assert!(f.app.pending_file_open.is_some());

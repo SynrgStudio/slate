@@ -47,7 +47,7 @@ impl Fixture {
     fn new() -> Self {
         let ctx = egui::Context::default();
         let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-        let mut app = SlateApp::new(&cc, None, true, false, None);
+        let mut app = SlateApp::new(&cc, None, true, None);
         let root = std::env::temp_dir().join(format!(
             "slate-footer-{}-{}",
             std::process::id(),
@@ -311,7 +311,7 @@ fn context_and_message_expiry_do_not_change_command_buffer_or_document() {
 fn keyboard_toggles_footer_settings_and_last_row_is_reachable() {
     let mut f = Fixture::new();
     f.app.settings_open = true;
-    f.app.selected_setting = 9;
+    f.app.selected_setting = 8;
     let key = |key| egui::Event::Key {
         key,
         physical_key: Some(key),
@@ -327,7 +327,7 @@ fn keyboard_toggles_footer_settings_and_last_row_is_reachable() {
         |ctx| f.app.shortcuts(ctx),
     );
     assert!(!f.app.footer_options.enabled[0]);
-    f.app.selected_setting = 17;
+    f.app.selected_setting = 16;
     let _ = f.ctx.run(
         egui::RawInput {
             events: vec![key(Key::ArrowDown)],
@@ -335,13 +335,13 @@ fn keyboard_toggles_footer_settings_and_last_row_is_reachable() {
         },
         |ctx| f.app.shortcuts(ctx),
     );
-    assert_eq!(f.app.selected_setting, 18);
+    assert_eq!(f.app.selected_setting, 17);
 }
 #[test]
 fn last_footer_checkbox_is_visible_in_small_settings_dialog() {
     let mut f = Fixture::new();
     f.app.settings_open = true;
-    f.app.selected_setting = 18;
+    f.app.selected_setting = 17;
     for pass in 0..15 {
         let _ = f.ctx.run(
             egui::RawInput {
@@ -359,7 +359,7 @@ fn last_footer_checkbox_is_visible_in_small_settings_dialog() {
         .ctx
         .data(|d| d.get_temp::<settings_tests::SettingsDialogGeometry>("settings_geometry".into()))
         .unwrap();
-    assert_eq!(geo.rows.len(), 32);
-    assert!(geo.body.contains_rect(geo.rows[18]), "{geo:?}");
+    assert_eq!(geo.rows.len(), 31);
+    assert!(geo.body.contains_rect(geo.rows[17]), "{geo:?}");
     assert!(geo.frame.contains_rect(geo.footer));
 }

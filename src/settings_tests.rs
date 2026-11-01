@@ -21,7 +21,7 @@ impl Default for SettingsDialogGeometry {
 }
 fn app(ctx: &egui::Context) -> SlateApp {
     let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-    let mut app = SlateApp::new(&cc, None, true, false, None);
+    let mut app = SlateApp::new(&cc, None, true, None);
     app.settings_open = true;
     app
 }
@@ -74,13 +74,13 @@ fn settings_bounds_fixed_chrome_and_selection_reveal_at_small_and_large_sizes() 
         assert!(before.frame.contains_rect(before.footer));
         assert!(before.body.top() >= before.header.bottom());
         assert!(before.body.bottom() <= before.footer.top());
-        assert_eq!(before.rows.len(), 22 + footer_ui::FIELDS.len());
+        assert_eq!(before.rows.len(), 21 + footer_ui::FIELDS.len());
         assert!(
             before.rows[0].width() >= before.body.width() - 2.0,
             "unused right column: {:?}",
             before
         );
-        app.selected_setting = 8;
+        app.selected_setting = 7;
         let mut after = before.clone();
         for n in 10..25 {
             after = draw(&mut app, &ctx, size, n as f64 * 0.05, vec![]);
@@ -89,22 +89,22 @@ fn settings_bounds_fixed_chrome_and_selection_reveal_at_small_and_large_sizes() 
         assert_eq!(before.header, after.header);
         assert_eq!(before.footer, after.footer);
         assert!(
-            after.body.intersects(after.rows[8]),
+            after.body.intersects(after.rows[7]),
             "selected row invisible: {:?}",
             after
         );
         assert!(
-            after.rows[8].top() >= after.body.top() - 1.0,
+            after.rows[7].top() >= after.body.top() - 1.0,
             "selected controls clipped: {:?}",
             after
         );
         // The last row (start with Windows) is reachable too.
-        app.selected_setting = 21;
+        app.selected_setting = 20;
         for n in 25..40 {
             after = draw(&mut app, &ctx, size, n as f64 * 0.05, vec![]);
         }
         assert!(
-            after.body.contains_rect(after.rows[21]),
+            after.body.contains_rect(after.rows[20]),
             "last row invisible: {:?}",
             after
         );
@@ -227,7 +227,7 @@ fn font_setting_roundtrips_clamps_and_keyboard_adjusts_without_changing_text() {
         app.set_editor_font_size(size);
         assert_eq!(app.editor_font_size, expected);
     }
-    app.selected_setting = 8;
+    app.selected_setting = 7;
     for (key, expected) in [
         (Key::ArrowRight, 13.0),
         (Key::ArrowLeft, 12.0),

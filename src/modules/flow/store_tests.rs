@@ -19,8 +19,8 @@ impl Fixture {
     fn doc(&self, name: &str, text: &str) -> Document {
         let path = self.0.join(name);
         fs::write(&path, text).unwrap();
-        let tasks = crate::flow::parse_flow_tasks(text);
-        let known_file = crate::flow::build_known_file(&self.0, &path, text, &tasks);
+        let tasks = crate::modules::flow::parse_flow_tasks(text);
+        let known_file = crate::modules::flow::build_known_file(&self.0, &path, text, &tasks);
         Document {
             known_file,
             tasks,
@@ -43,9 +43,9 @@ fn asynchronous_exports_converge_to_latest_committed_metadata() {
             .map(|n| format!("- [ ] task {n}\n"))
             .collect::<String>();
         writer.write_batch(&[f.doc("live.md", &text)]).unwrap();
-        crate::index_export::request(&f.0, &f.db());
+        crate::modules::flow::index_export::request(&f.0, &f.db());
     }
-    crate::index_export::flush();
+    crate::modules::flow::index_export::flush();
     let index = fs::read_to_string(f.0.join(".slate/index.tsv")).unwrap();
     let row = index
         .lines()
@@ -68,7 +68,7 @@ fn embedded_rows_preserve_quotes_unicode_tabs_and_nulls() {
     assert_eq!(rows[0].heading, "heading\twith\nnewlines");
     assert_eq!(rows[0].priority, "");
     assert!(rows[0].source_snippet.contains('\t'));
-    let agenda = crate::agenda::load_items_from_cache(&f.db(), &f.0).unwrap();
+    let agenda = crate::modules::agenda::load_items_from_cache(&f.db(), &f.0).unwrap();
     assert_eq!(agenda[0].title, expected);
 }
 
@@ -180,8 +180,9 @@ fn bounded_scan_preserves_unsaved_live_buffers_and_exports_once() {
         live.tasks[0].title = "unsaved editor task".into();
         writer.write_batch(&[live]).unwrap();
     }
-    crate::flow_runtime::publish_active_buffer_heartbeat(&f.db(), &f.0, &paths[0]).unwrap();
-    let summary = crate::flow_batch::index_files(&f.0, &f.db(), &paths, &[]).unwrap();
+    crate::modules::flow::runtime::publish_active_buffer_heartbeat(&f.db(), &f.0, &paths[0])
+        .unwrap();
+    let summary = crate::modules::flow::batch::index_files(&f.0, &f.db(), &paths, &[]).unwrap();
     assert_eq!(summary.errors, 0);
     assert_eq!(summary.indexed_files, 69);
     assert_eq!(summary.skipped_live, 1);
@@ -202,7 +203,8 @@ fn bounded_scan_preserves_unsaved_live_buffers_and_exports_once() {
         70
     );
     let rebuilt =
-        crate::flow_batch::index_files_with_rebuild(&f.0, &f.db(), &paths, &[], true).unwrap();
+        crate::modules::flow::batch::index_files_with_rebuild(&f.0, &f.db(), &paths, &[], true)
+            .unwrap();
     assert_eq!(rebuilt.errors, 0);
     assert_eq!(rebuilt.skipped_live, 1);
     assert_eq!(read_tasks(&f.db()).unwrap().len(), 70);

@@ -14,7 +14,7 @@ impl Fixture {
     fn new(text: &str) -> Box<Self> {
         let ctx = egui::Context::default();
         let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-        let mut app = SlateApp::new(&cc, None, true, false, None);
+        let mut app = SlateApp::new(&cc, None, true, None);
         app.scratch = false;
         let root = std::env::temp_dir().join(format!("slate-look-{}", crate::test_unique()));
         fs::create_dir_all(&root).unwrap();

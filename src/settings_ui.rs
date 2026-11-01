@@ -285,48 +285,7 @@ impl SlateApp {
 
                                 ui.add_space(6.0);
                                 setting_rects.push(row.response.rect);
-                                let virtual_refs_selected = self.selected_setting == 6;
-                                let row = egui::Frame::new()
-                                    .fill(if virtual_refs_selected { selected_fill } else { normal_fill })
-                                    .inner_margin(6.0)
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new(if virtual_refs_selected { ">" } else { " " })
-                                                    .font(FontId::new(14.0, FontFamily::Monospace))
-                                                    .color(Color32::from_rgb(136, 192, 208)),
-                                            );
-                                            ui.label(
-                                                RichText::new("Virtual backlinks/mentions")
-                                                    .font(FontId::new(14.0, FontFamily::Monospace))
-                                                    .color(Color32::from_rgb(216, 222, 233)),
-                                            );
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    if ui
-                                                        .button(if self.virtual_references_enabled { "show" } else { "hide" })
-                                                        .on_hover_text("Render the virtual Backlinks/Mentions section at the end of saved Markdown files")
-                                                        .clicked()
-                                                    {
-                                                        self.set_virtual_references_enabled(
-                                                            !self.virtual_references_enabled,
-                                                        );
-                                                    }
-                                                },
-                                            );
-                                        });
-                                        ui.add_space(4.0);
-                                        ui.label(
-                                            RichText::new("Shows a non-saved end-of-file references section. Click the virtual header, Backlinks, or Mentions to collapse/expand.")
-                                                .font(FontId::new(13.0, FontFamily::Monospace))
-                                                .color(Color32::from_rgb(136, 154, 176)),
-                                        );
-                                    });
-
-                                ui.add_space(6.0);
-                                setting_rects.push(row.response.rect);
-                                let reopen_selected = self.selected_setting == 7;
+                                let reopen_selected = self.selected_setting == 6;
                                 let row = egui::Frame::new()
                                     .fill(if reopen_selected { selected_fill } else { normal_fill })
                                     .inner_margin(6.0)
@@ -366,7 +325,7 @@ impl SlateApp {
                                     });
                                 setting_rects.push(row.response.rect);
                                 ui.add_space(6.0);
-                                let font_selected = self.selected_setting == 8;
+                                let font_selected = self.selected_setting == 7;
                                 let row = egui::Frame::new()
                                     .fill(if font_selected { selected_fill } else { normal_fill })
                                     .inner_margin(6)
@@ -389,59 +348,59 @@ impl SlateApp {
                                 ui.label(RichText::new("Secondary fields hide first when space is tight. Hover the footer for all details.").font(FontId::new(13.0,FontFamily::Monospace)).color(Color32::from_rgb(136,154,176)));
                                 for (index,(_,label)) in footer_ui::FIELDS.iter().enumerate() {
                                     ui.add_space(6.0);
-                                    let selected=self.selected_setting==index+9;
+                                    let selected=self.selected_setting==index+8;
                                     let row=egui::Frame::new().fill(if selected {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
                                         ui.set_width(ui.available_width());
                                         ui.horizontal(|ui| {
                                             ui.label(RichText::new(if selected {">"} else {" "}).monospace().color(Color32::from_rgb(136,192,208)));
                                             let mut enabled=self.footer_options.enabled[index];
-                                            if ui.checkbox(&mut enabled,RichText::new(*label).font(FontId::new(14.0,FontFamily::Monospace))).changed() {self.selected_setting=index+9;self.set_footer_option(index,enabled);}
+                                            if ui.checkbox(&mut enabled,RichText::new(*label).font(FontId::new(14.0,FontFamily::Monospace))).changed() {self.selected_setting=index+8;self.set_footer_option(index,enabled);}
                                         });
                                     });
                                     setting_rects.push(row.response.rect);
                                 }
                                 ui.add_space(10.0);
                                 ui.label(RichText::new("Periscope · file index").font(FontId::monospace(14.0)).color(Color32::from_rgb(136,192,208)));
-                                let row=egui::Frame::new().fill(if self.selected_setting==19 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
+                                let row=egui::Frame::new().fill(if self.selected_setting==18 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
                                     ui.set_width(ui.available_width());let mut enabled=self.periscope_everything;
-                                    if ui.checkbox(&mut enabled,RichText::new("Use Everything when available").font(FontId::monospace(14.0))).changed() {self.selected_setting=19;self.set_periscope_everything(enabled);}
+                                    if ui.checkbox(&mut enabled,RichText::new("Use Everything when available").font(FontId::monospace(14.0))).changed() {self.selected_setting=18;self.set_periscope_everything(enabled);}
                                 });setting_rects.push(row.response.rect);
                                 ui.label(RichText::new("Otherwise: SQLite metadata index in the background. No service is installed.").font(FontId::monospace(13.0)).color(Color32::from_rgb(136,154,176)));
                                 ui.label(RichText::new(if self.periscope_roots.is_empty() {"Global scope: local fixed drives (Windows).".into()} else {format!("Global scope: {}",self.periscope_roots.iter().map(|root|root.display().to_string()).collect::<Vec<_>>().join(" · "))}).font(FontId::monospace(13.0)).color(Color32::from_rgb(136,154,176)));
                                 ui.add_space(10.0);
                                 ui.label(RichText::new("Window · resident mode").font(FontId::monospace(14.0)).color(Color32::from_rgb(136,192,208)));
-                                let row=egui::Frame::new().fill(if self.selected_setting==20 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
+                                let row=egui::Frame::new().fill(if self.selected_setting==19 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
                                     ui.set_width(ui.available_width());let mut enabled=self.resident;
-                                    if ui.checkbox(&mut enabled,RichText::new("Keep running in the tray when closed").font(FontId::monospace(14.0))).changed() {self.selected_setting=20;self.set_resident(enabled);}
+                                    if ui.checkbox(&mut enabled,RichText::new("Keep running in the tray when closed").font(FontId::monospace(14.0))).changed() {self.selected_setting=19;self.set_resident(enabled);}
                                 });setting_rects.push(row.response.rect);
                                 ui.label(RichText::new("Reopening is instant (~20 ms instead of ~300 ms). Quit for real from the tray icon or :quit-all.").font(FontId::monospace(13.0)).color(Color32::from_rgb(136,154,176)));
-                                let row=egui::Frame::new().fill(if self.selected_setting==21 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
+                                let row=egui::Frame::new().fill(if self.selected_setting==20 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
                                     ui.set_width(ui.available_width());let mut enabled=self.start_with_windows;
-                                    if ui.checkbox(&mut enabled,RichText::new("Start hidden with Windows").font(FontId::monospace(14.0))).changed() {self.selected_setting=21;self.set_start_with_windows(enabled);}
+                                    if ui.checkbox(&mut enabled,RichText::new("Start hidden with Windows").font(FontId::monospace(14.0))).changed() {self.selected_setting=20;self.set_start_with_windows(enabled);}
                                 });setting_rects.push(row.response.rect);
                                 ui.label(RichText::new("Makes the first open of the day instant too. Current user only; off by default.").font(FontId::monospace(13.0)).color(Color32::from_rgb(136,154,176)));
                                 ui.add_space(10.0);
                                 ui.label(RichText::new("Editor · font and cursor").font(FontId::monospace(14.0)).color(Color32::from_rgb(136,192,208)));
                                 let look=self.editor_look;
-                                let row=egui::Frame::new().fill(if self.selected_setting==22 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
+                                let row=egui::Frame::new().fill(if self.selected_setting==21 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
                                     ui.set_width(ui.available_width());
                                     ui.horizontal(|ui| {
                                         ui.label(RichText::new("Font").font(FontId::monospace(14.0)));
                                         for font in [editor_view::EditorFont::Hack, editor_view::EditorFont::JetBrainsMono] {
                                             let sample=RichText::new(font.label()).font(FontId::new(14.0,font.family()));
-                                            if ui.selectable_label(look.font==font,sample).clicked() {self.selected_setting=22;self.set_editor_look(editor_view::EditorLook{font,..look});}
+                                            if ui.selectable_label(look.font==font,sample).clicked() {self.selected_setting=21;self.set_editor_look(editor_view::EditorLook{font,..look});}
                                         }
                                     });
                                 });setting_rects.push(row.response.rect);
-                                let row=egui::Frame::new().fill(if self.selected_setting==23 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
+                                let row=egui::Frame::new().fill(if self.selected_setting==22 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
                                     ui.set_width(ui.available_width());let mut enabled=look.block_cursor;
-                                    if ui.checkbox(&mut enabled,RichText::new("Block cursor (covers the whole character)").font(FontId::monospace(14.0))).changed() {self.selected_setting=23;self.set_editor_look(editor_view::EditorLook{block_cursor:enabled,..look});}
+                                    if ui.checkbox(&mut enabled,RichText::new("Block cursor (covers the whole character)").font(FontId::monospace(14.0))).changed() {self.selected_setting=22;self.set_editor_look(editor_view::EditorLook{block_cursor:enabled,..look});}
+                                });setting_rects.push(row.response.rect);
+                                let row=egui::Frame::new().fill(if self.selected_setting==23 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
+                                    ui.set_width(ui.available_width());let mut enabled=look.animate_cursor;
+                                    if ui.checkbox(&mut enabled,RichText::new("Animate cursor jumps").font(FontId::monospace(14.0))).changed() {self.selected_setting=23;self.set_editor_look(editor_view::EditorLook{animate_cursor:enabled,..look});}
                                 });setting_rects.push(row.response.rect);
                                 let row=egui::Frame::new().fill(if self.selected_setting==24 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
-                                    ui.set_width(ui.available_width());let mut enabled=look.animate_cursor;
-                                    if ui.checkbox(&mut enabled,RichText::new("Animate cursor jumps").font(FontId::monospace(14.0))).changed() {self.selected_setting=24;self.set_editor_look(editor_view::EditorLook{animate_cursor:enabled,..look});}
-                                });setting_rects.push(row.response.rect);
-                                let row=egui::Frame::new().fill(if self.selected_setting==25 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
                                     ui.set_width(ui.available_width());
                                     ui.horizontal_wrapped(|ui| {
                                         ui.label(RichText::new("Cursor color").font(FontId::monospace(14.0)));
@@ -449,39 +408,39 @@ impl SlateApp {
                                             let (swatch,response)=ui.allocate_exact_size(Vec2::splat(16.0),egui::Sense::click());
                                             ui.painter().rect_filled(swatch.shrink(1.0),2.0,color);
                                             if look.cursor_color==color {ui.painter().rect_stroke(swatch,2.0,egui::Stroke::new(1.5_f32,Color32::WHITE),egui::StrokeKind::Outside);}
-                                            if response.on_hover_text(name).clicked() {self.selected_setting=25;self.set_editor_look(editor_view::EditorLook{cursor_color:color,..look});}
+                                            if response.on_hover_text(name).clicked() {self.selected_setting=24;self.set_editor_look(editor_view::EditorLook{cursor_color:color,..look});}
                                         }
                                         let mut rgb=[look.cursor_color.r(),look.cursor_color.g(),look.cursor_color.b()];
-                                        if ui.color_edit_button_srgb(&mut rgb).on_hover_text("any color").changed() {self.selected_setting=25;self.set_editor_look(editor_view::EditorLook{cursor_color:Color32::from_rgb(rgb[0],rgb[1],rgb[2]),..look});}
+                                        if ui.color_edit_button_srgb(&mut rgb).on_hover_text("any color").changed() {self.selected_setting=24;self.set_editor_look(editor_view::EditorLook{cursor_color:Color32::from_rgb(rgb[0],rgb[1],rgb[2]),..look});}
                                     });
                                 });setting_rects.push(row.response.rect);
-                                let row=egui::Frame::new().fill(if self.selected_setting==26 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
+                                let row=egui::Frame::new().fill(if self.selected_setting==25 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
                                     ui.set_width(ui.available_width());let mut enabled=look.cursor_trail;
-                                    if ui.checkbox(&mut enabled,RichText::new("Cursor trail while it glides").font(FontId::monospace(14.0))).changed() {self.selected_setting=26;self.set_editor_look(editor_view::EditorLook{cursor_trail:enabled,..look});}
+                                    if ui.checkbox(&mut enabled,RichText::new("Cursor trail while it glides").font(FontId::monospace(14.0))).changed() {self.selected_setting=25;self.set_editor_look(editor_view::EditorLook{cursor_trail:enabled,..look});}
                                 });setting_rects.push(row.response.rect);
-                                let row=egui::Frame::new().fill(if self.selected_setting==27 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
+                                let row=egui::Frame::new().fill(if self.selected_setting==26 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
                                     ui.set_width(ui.available_width());
                                     ui.horizontal(|ui| {
                                         ui.label(RichText::new("Trail weight").font(FontId::monospace(14.0)));
                                         let mut weight=look.cursor_trail_weight;
-                                        if ui.add(egui::Slider::new(&mut weight,1..=5)).changed() {self.selected_setting=27;self.set_editor_look(editor_view::EditorLook{cursor_trail_weight:weight,..look});}
+                                        if ui.add(egui::Slider::new(&mut weight,1..=5)).changed() {self.selected_setting=26;self.set_editor_look(editor_view::EditorLook{cursor_trail_weight:weight,..look});}
                                     });
                                 });setting_rects.push(row.response.rect);
-                                let row=egui::Frame::new().fill(if self.selected_setting==28 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
+                                let row=egui::Frame::new().fill(if self.selected_setting==27 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
                                     ui.set_width(ui.available_width());let mut enabled=look.cursor_trail_typing;
-                                    if ui.checkbox(&mut enabled,RichText::new("Trail while typing too").font(FontId::monospace(14.0))).changed() {self.selected_setting=28;self.set_editor_look(editor_view::EditorLook{cursor_trail_typing:enabled,..look});}
+                                    if ui.checkbox(&mut enabled,RichText::new("Trail while typing too").font(FontId::monospace(14.0))).changed() {self.selected_setting=27;self.set_editor_look(editor_view::EditorLook{cursor_trail_typing:enabled,..look});}
+                                });setting_rects.push(row.response.rect);
+                                let row=egui::Frame::new().fill(if self.selected_setting==28 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
+                                    ui.set_width(ui.available_width());let mut enabled=look.cursor_stretch;
+                                    if ui.checkbox(&mut enabled,RichText::new("Stretch toward the jump").font(FontId::monospace(14.0))).changed() {self.selected_setting=28;self.set_editor_look(editor_view::EditorLook{cursor_stretch:enabled,..look});}
                                 });setting_rects.push(row.response.rect);
                                 let row=egui::Frame::new().fill(if self.selected_setting==29 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
-                                    ui.set_width(ui.available_width());let mut enabled=look.cursor_stretch;
-                                    if ui.checkbox(&mut enabled,RichText::new("Stretch toward the jump").font(FontId::monospace(14.0))).changed() {self.selected_setting=29;self.set_editor_look(editor_view::EditorLook{cursor_stretch:enabled,..look});}
+                                    ui.set_width(ui.available_width());let mut enabled=look.cursor_pulse;
+                                    if ui.checkbox(&mut enabled,RichText::new("Pulse where it lands").font(FontId::monospace(14.0))).changed() {self.selected_setting=29;self.set_editor_look(editor_view::EditorLook{cursor_pulse:enabled,..look});}
                                 });setting_rects.push(row.response.rect);
                                 let row=egui::Frame::new().fill(if self.selected_setting==30 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
-                                    ui.set_width(ui.available_width());let mut enabled=look.cursor_pulse;
-                                    if ui.checkbox(&mut enabled,RichText::new("Pulse where it lands").font(FontId::monospace(14.0))).changed() {self.selected_setting=30;self.set_editor_look(editor_view::EditorLook{cursor_pulse:enabled,..look});}
-                                });setting_rects.push(row.response.rect);
-                                let row=egui::Frame::new().fill(if self.selected_setting==31 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
                                     ui.set_width(ui.available_width());let mut enabled=look.syntax_highlighting;
-                                    if ui.checkbox(&mut enabled,RichText::new("Syntax highlighting (Rust, Python, JS/TS)").font(FontId::monospace(14.0))).changed() {self.selected_setting=31;self.set_editor_look(editor_view::EditorLook{syntax_highlighting:enabled,..look});}
+                                    if ui.checkbox(&mut enabled,RichText::new("Syntax highlighting (Rust, Python, JS/TS)").font(FontId::monospace(14.0))).changed() {self.selected_setting=30;self.set_editor_look(editor_view::EditorLook{syntax_highlighting:enabled,..look});}
                                 });setting_rects.push(row.response.rect);
                                 ui.label(RichText::new("The cursor glides when it jumps and lands at 90 ms. Text is never delayed: only the cursor and its trail animate. Weight 1–5: longer, stronger trail; Enter resets to 3.").font(FontId::monospace(13.0)).color(Color32::from_rgb(136,154,176)));
                                 if reveal_selected {

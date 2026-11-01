@@ -6,7 +6,7 @@ use std::{
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use eframe::egui::{self, Color32, FontId, Vec2};
 
-use crate::{flow, markdown::CheckboxState};
+use crate::{markdown::CheckboxState, modules::flow};
 
 #[derive(Clone)]
 pub(crate) struct AgendaItem {
@@ -312,7 +312,7 @@ pub(crate) fn load_items_from_cache(
     if !sqlite_path.exists() {
         return Err("No Flow agenda cache yet. Run :flow-rescan first.".to_string());
     }
-    let mut items = crate::flow_store::read_tasks(sqlite_path)?
+    let mut items = crate::modules::flow::store::read_tasks(sqlite_path)?
         .into_iter()
         .map(|row| AgendaItem {
             path: root.join(&row.path),

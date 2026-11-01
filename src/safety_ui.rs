@@ -115,7 +115,6 @@ impl SlateApp {
         self.recovery_open = false;
         self.focus_editor_once = true;
         self.editor_view.request_scroll_to_cursor(&self.buffer);
-        self.schedule_current_flow_buffer_agenda_sync_later();
         self.observe_document_safety(0.0, true); // Durable new checkpoint precedes retiring original.
         self.status = "Recovered unsaved text; source file not overwritten".into();
     }

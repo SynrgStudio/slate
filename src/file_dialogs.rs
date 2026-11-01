@@ -13,7 +13,6 @@ pub(crate) enum FilePickerMode {
     AddLance,
     Browse,
     InsertMarkdownLink,
-    Refile,
     SetPeriscopeProject,
 }
 

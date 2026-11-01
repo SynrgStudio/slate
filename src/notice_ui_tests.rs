@@ -6,7 +6,7 @@ use crate::{
 };
 fn app(ctx: &egui::Context) -> SlateApp {
     let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-    SlateApp::new(&cc, None, true, false, None)
+    SlateApp::new(&cc, None, true, None)
 }
 fn records(app: &mut SlateApp) {
     app.recovery_open = true;

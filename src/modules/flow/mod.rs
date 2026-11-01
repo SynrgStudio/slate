@@ -2,6 +2,7 @@
 
 pub(crate) mod batch;
 pub(crate) mod edit;
+pub(crate) mod index_export;
 pub(crate) mod runtime;
 pub(crate) mod store;
 pub(crate) mod worker;
@@ -264,7 +265,7 @@ pub(crate) fn update_flow_index_for_file(
     let known_file = build_known_file(project_root, path, contents, &tasks);
     write_sqlite_cache(sqlite_path, &known_file, &tasks, contents)?;
     let index_path = project_root.join(".slate").join("index.tsv");
-    crate::index_export::request(project_root, sqlite_path);
+    index_export::request(project_root, sqlite_path);
 
     Ok(FlowIndexSummary {
         project_root: project_root.to_path_buf(),
@@ -389,19 +390,19 @@ fn write_sqlite_cache(
     tasks: &[FlowTask],
     contents: &str,
 ) -> Result<(), String> {
-    let document = crate::flow_store::Document {
+    let document = crate::modules::flow::store::Document {
         known_file: known_file.clone(),
         tasks: tasks.to_vec(),
         contents: contents.to_string(),
     };
-    crate::flow_store::with_writer(sqlite_path, |writer| writer.write_batch(&[document]))
+    crate::modules::flow::store::with_writer(sqlite_path, |writer| writer.write_batch(&[document]))
 }
 
 /// Export the rebuildable TSV once after a scan, from committed DB rows rather
 /// than a stale snapshot. Serialize exporters with individual UI updates.
 pub(crate) fn export_cache_index(
     root: &Path,
-    writer: &crate::flow_store::CacheWriter,
+    writer: &crate::modules::flow::store::CacheWriter,
 ) -> Result<(), String> {
     let _guard = INDEX_WRITE_LOCK.lock().map_err(|e| e.to_string())?;
     let dir = root.join(".slate");
@@ -416,7 +417,7 @@ pub(crate) fn export_cache_index(
 
 pub(crate) fn export_database_index(root: &Path, database: &Path) -> Result<(), String> {
     let _guard = INDEX_WRITE_LOCK.lock().map_err(|e| e.to_string())?;
-    let entries = crate::flow_store::read_known_files(database)?
+    let entries = crate::modules::flow::store::read_known_files(database)?
         .into_iter()
         .map(|file| (file.path.clone(), file))
         .collect();
@@ -768,11 +769,11 @@ mod tests {
 
         assert_eq!(summary.known_file.path, "notes.md");
         assert_eq!(summary.tasks.len(), 1);
-        crate::index_export::flush();
+        index_export::flush();
         assert!(summary.index_path.exists());
         assert!(sqlite_path.exists());
 
-        let rows = crate::flow_store::read_tasks(&sqlite_path).unwrap();
+        let rows = crate::modules::flow::store::read_tasks(&sqlite_path).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(
             format!("{}|{}|{}", rows[0].title, rows[0].due, rows[0].priority),

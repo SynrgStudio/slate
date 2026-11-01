@@ -11,7 +11,7 @@ impl Fixture {
         fs::create_dir_all(root.join("project")).unwrap();
         let ctx = egui::Context::default();
         let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-        let mut app = SlateApp::new(&cc, None, true, false, None);
+        let mut app = SlateApp::new(&cc, None, true, None);
         app.settings_path_override = Some(root.join("config.toml"));
         app.buffer.set_text("happy unsaved document".into());
         app.dirty = true;
@@ -85,7 +85,7 @@ fn explicit_save_as_carries_membership_across_restart_even_outside_the_folder() 
     );
     assert!(!f.app.dirty);
     let cc = eframe::CreationContext::_new_kittest(f.ctx.clone());
-    let mut other = SlateApp::new(&cc, None, true, false, None);
+    let mut other = SlateApp::new(&cc, None, true, None);
     other.settings_path_override = Some(f.root.join("config.toml"));
     other.path = Some(destination);
     assert_eq!(other.document_project(), Some(f.root.join("project")));

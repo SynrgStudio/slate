@@ -1359,7 +1359,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let ctx = eframe::egui::Context::default();
         let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-        let mut app = crate::SlateApp::new(&cc, None, true, false, None);
+        let mut app = crate::SlateApp::new(&cc, None, true, None);
         app.settings_path_override = Some(root.join("settings.toml"));
         app.periscope_roots = vec![root.join("notes_100%")];
         app.set_periscope_everything(false);
@@ -1369,7 +1369,7 @@ mod tests {
         assert!(!app.periscope_everything);
         assert_eq!(app.periscope_roots, vec![root.join("notes_100%")]);
         app.settings_open = true;
-        app.selected_setting = 19;
+        app.selected_setting = 18;
         let _ = ctx.run(
             eframe::egui::RawInput {
                 events: vec![eframe::egui::Event::Key {
@@ -1395,7 +1395,7 @@ mod tests {
         fs::write(root.join("latest.md"), "latest").unwrap();
         let ctx = eframe::egui::Context::default();
         let cc = eframe::CreationContext::_new_kittest(ctx);
-        let mut app = crate::SlateApp::new(&cc, None, true, false, None);
+        let mut app = crate::SlateApp::new(&cc, None, true, None);
         app.periscope_engine = Manager::new(root.join("cache/index.sqlite3"));
         app.periscope_everything = false;
         app.periscope_roots = vec![root.clone()];

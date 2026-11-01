@@ -1,37 +1,10 @@
 use super::*;
 
 #[test]
-fn background_index_uses_embedded_sqlite() {
-    let ctx = egui::Context::default();
-    let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-    let mut app = SlateApp::new(&cc, None, true, false, None);
-    let root = std::env::temp_dir().join(format!(
-        "slate-embedded-test-{}-{}",
-        std::process::id(),
-        crate::test_unique()
-    ));
-    fs::create_dir_all(&root).unwrap();
-    fs::write(root.join("notes.md"), "- [ ] embedded task\n").unwrap();
-    app.start_flow_background_rescan(root.clone());
-    let rx = app.flow_background_rx.take().unwrap();
-    let result = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-    assert_eq!(result.errors, 0, "{:?}", result.first_error);
-    assert_eq!(result.indexed_files, 1);
-    assert_eq!(result.indexed_tasks, 1);
-    let cache = SlateApp::flow_sqlite_path_for_root(&root).unwrap();
-    assert_eq!(
-        flow_store::read_tasks(&cache).unwrap()[0].title,
-        "embedded task"
-    );
-    let _ = fs::remove_dir_all(&root);
-    let _ = fs::remove_dir_all(cache.parent().unwrap());
-}
-
-#[test]
 fn root_left_and_shortcut_open_drives_and_escape_preserves_file_picker() {
     let ctx = egui::Context::default();
     let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-    let mut app = SlateApp::new(&cc, None, true, false, None);
+    let mut app = SlateApp::new(&cc, None, true, None);
     app.file_picker_open = true;
     app.file_picker_mode = FilePickerMode::OpenBuffer;
     app.file_picker_dir = if cfg!(windows) {
@@ -75,7 +48,7 @@ fn root_left_and_shortcut_open_drives_and_escape_preserves_file_picker() {
 fn wheel_scrolls_only_rows_without_moving_chrome_or_selection() {
     let ctx = egui::Context::default();
     let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-    let mut app = SlateApp::new(&cc, None, true, false, None);
+    let mut app = SlateApp::new(&cc, None, true, None);
     app.file_picker_open = true;
     app.file_picker_dir = PathBuf::from("picker-test-directory");
     app.file_query.clear();
@@ -158,7 +131,7 @@ fn picker_fits_window_and_keeps_keyboard_selection_visible() {
         let ctx = egui::Context::default();
         let cc = eframe::CreationContext::_new_kittest(ctx.clone());
         // Scratch suppresses automatic document restore; no settings are written.
-        let mut app = SlateApp::new(&cc, None, true, false, None);
+        let mut app = SlateApp::new(&cc, None, true, None);
         app.file_picker_open = true;
         app.file_picker_dir = PathBuf::from("picker-test-directory");
         app.file_query.clear();

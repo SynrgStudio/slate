@@ -17,7 +17,7 @@ impl Fixture {
         .unwrap();
         let ctx = egui::Context::default();
         let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-        let mut app = SlateApp::new(&cc, None, true, false, None);
+        let mut app = SlateApp::new(&cc, None, true, None);
         app.settings_path_override = Some(root.join("config.toml"));
         app.path = Some(root.join("current.md"));
         app.buffer.set_text("preserve unsaved text".into());
