@@ -1,5 +1,9 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+// egui allocates and frees many small vectors every frame.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod agenda;
 #[cfg(test)]
 mod async_open_tests;
@@ -24,6 +28,8 @@ mod find_note_ui_tests;
 mod footer_tests;
 mod footer_ui;
 mod form_dialogs;
+#[cfg(test)]
+mod frame_bench_tests;
 #[cfg(test)]
 mod large_document_tests;
 mod notice_ui;
@@ -202,6 +208,14 @@ fn low_latency_wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
         if cfg!(windows) && std::env::var_os("WGPU_BACKEND").is_none() {
             create_new.instance_descriptor.backends = wgpu::Backends::DX12;
         }
+        // wgpu's default reserves GPU memory in 64–256 MB blocks; Slate's
+        // buffers and font atlas need a few MB. Small blocks cut ~200 MB of
+        // committed memory, which matters while resident in the tray.
+        let base = create_new.device_descriptor.clone();
+        create_new.device_descriptor = std::sync::Arc::new(move |adapter| wgpu::DeviceDescriptor {
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            ..base(adapter)
+        });
     }
     options
 }
@@ -865,6 +879,9 @@ struct SlateApp {
     /// Resident mode is running in this process (tray icon installed).
     resident_active: bool,
     window_hidden: bool,
+    /// When the window was last shown from the tray: the next frame's start
+    /// logs how long the first visible frame took to build and paint.
+    shown_at: Option<std::time::Instant>,
     hide_on_first_frame: bool,
     /// Set by :quit-all / the tray menu: the next close really exits.
     quit_for_real: bool,
@@ -1095,6 +1112,7 @@ impl SlateApp {
             resident: true,
             resident_active: false,
             window_hidden: false,
+            shown_at: None,
             hide_on_first_frame: false,
             quit_for_real: false,
             start_with_windows: resident::autostart_enabled(),
@@ -1379,6 +1397,8 @@ impl SlateApp {
         self.window_hidden = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         perf_log::mark("resident.hidden", "");
+        #[cfg(not(test))]
+        resident::trim_memory_soon();
     }
 
     /// Shows the window (un-hides, un-minimizes, focuses) with its tabs.
@@ -1386,6 +1406,8 @@ impl SlateApp {
         if std::mem::take(&mut self.window_hidden) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             perf_log::mark("resident.shown", "");
+            self.shown_at = Some(std::time::Instant::now());
+            ctx.request_repaint();
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -9791,13 +9813,25 @@ impl SlateApp {
     fn ui_frame(&mut self, ui: &mut egui::Ui) {
         let mut ui_timing = perf_log::ui_frame();
         let ctx = ui.ctx().clone();
+        if let Some(shown) = self.shown_at.take() {
+            perf_log::mark(
+                "resident.first_frame_painted",
+                &format!("ms={:.3}", shown.elapsed().as_secs_f64() * 1000.0),
+            );
+        }
         let title = self.title();
         if title != self.last_window_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.last_window_title = title;
         }
-        self.publish_active_flow_buffer_heartbeat();
-        if !self.standalone_agenda
+        // Hidden in the tray, nothing is being edited: no heartbeat and no
+        // timed wake-ups. Tray clicks, forwarded launches and background
+        // workers request their own frames.
+        if !self.window_hidden {
+            self.publish_active_flow_buffer_heartbeat();
+        }
+        if !self.window_hidden
+            && !self.standalone_agenda
             && self
                 .path
                 .as_ref()
@@ -9825,7 +9859,9 @@ impl SlateApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
         self.poll_document_safety(&ctx);
-        ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        if !self.window_hidden {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
         ui_timing.step("poll_background_and_requests");
         if self.flow_background_loading {
             ctx.request_repaint();
@@ -10681,4 +10717,16 @@ fn setup_style(ctx: &egui::Context) {
     style.visuals.widgets.active.bg_fill = Color32::from_rgb(59, 66, 82);
     style.spacing.item_spacing = Vec2::new(8.0, 8.0);
     ctx.set_global_style(style);
+}
+
+/// A name part unique within the test run. Windows clocks tick every 100 ns,
+/// so parallel tests could otherwise share (and delete) a temp folder.
+#[cfg(test)]
+pub(crate) fn test_unique() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "{}-{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
 }

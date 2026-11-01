@@ -7,7 +7,7 @@ impl Fixture {
         let root = std::env::temp_dir().join(format!(
             "slate-store-{}-{}-{}",
             std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap(),
+            crate::test_unique(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&root).unwrap();

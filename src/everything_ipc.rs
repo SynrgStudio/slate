@@ -601,7 +601,7 @@ mod win {
         fn public_query_works_without_readiness_api_and_rejection_is_distinguished() {
             let name = format!(
                 "SlateEverythingMock{}",
-                chrono::Utc::now().timestamp_nanos_opt().unwrap()
+                crate::test_unique()
             );
             let stop = Arc::new(AtomicBool::new(false));
             let (tx, rx) = mpsc::channel();

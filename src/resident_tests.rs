@@ -17,7 +17,7 @@ impl Fixture {
         let root = std::env::temp_dir().join(format!(
             "slate-resident-{}-{}",
             std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+            crate::test_unique()
         ));
         fs::create_dir_all(&root).unwrap();
         app.settings_path_override = Some(root.join("config.toml"));

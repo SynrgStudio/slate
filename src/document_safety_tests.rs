@@ -5,7 +5,7 @@ impl Fixture {
         let root = std::env::temp_dir().join(format!(
             "slate-recovery-test-{}-{}",
             std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+            crate::test_unique()
         ));
         fs::create_dir_all(&root).unwrap();
         Self(root)

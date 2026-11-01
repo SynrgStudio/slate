@@ -200,7 +200,7 @@ fn font_setting_roundtrips_clamps_and_keyboard_adjusts_without_changing_text() {
     let root = std::env::temp_dir().join(format!(
         "slate-font-settings-{}-{}",
         std::process::id(),
-        chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        crate::test_unique()
     ));
     fs::create_dir_all(&root).unwrap();
     let config = root.join("config.toml");

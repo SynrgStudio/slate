@@ -9,7 +9,7 @@ impl Fixture {
     fn new() -> Self {
         let root = std::env::temp_dir().join(format!(
             "slate-project-ui-{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+            crate::test_unique()
         ));
         fs::create_dir_all(root.join("project")).unwrap();
         let ctx = egui::Context::default();

@@ -11,7 +11,7 @@ impl Fixture {
     fn new() -> Self {
         let root = std::env::temp_dir().join(format!(
             "slate-preparation-{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+            crate::test_unique()
         ));
         fs::create_dir_all(root.join("files")).unwrap();
         fs::write(root.join("files/café.md"), "private content stays on disk").unwrap();

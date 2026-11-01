@@ -8,7 +8,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
@@ -32,6 +32,8 @@ struct Shared {
     normal_provider:
         Option<fn(&str, usize, bool, &dyn Fn() -> bool) -> Result<everything_ipc::Page, String>>,
     pending: Mutex<Option<(u64, Request)>>,
+    /// Wakes the idle worker: a request arrived, or it must stop.
+    wake: Condvar,
     result: Mutex<Option<ResultSet>>,
     latest: AtomicU64,
     stop: AtomicBool,
@@ -57,6 +59,7 @@ impl Manager {
                 provider: everything_ipc::query_cancellable,
                 normal_provider: Some(everything_ipc::normal_query),
                 pending: Mutex::new(None),
+                wake: Condvar::new(),
                 result: Mutex::new(None),
                 latest: AtomicU64::new(0),
                 stop: AtomicBool::new(false),
@@ -68,6 +71,7 @@ impl Manager {
     pub fn request(&mut self, request: Request) -> u64 {
         let id = self.shared.latest.fetch_add(1, Ordering::Relaxed) + 1;
         *self.shared.pending.lock().unwrap() = Some((id, request));
+        self.shared.wake.notify_one();
         if !self.started {
             self.started = true;
             let shared = self.shared.clone();
@@ -87,7 +91,10 @@ impl Manager {
 }
 impl Drop for Manager {
     fn drop(&mut self) {
+        // Under the lock, so the worker cannot miss it between its check and its wait.
+        let _pending = self.shared.pending.lock().unwrap();
         self.shared.stop.store(true, Ordering::Relaxed);
+        self.shared.wake.notify_one();
     }
 }
 fn publish(shared: &Shared, id: u64, paths: Vec<PathBuf>, status: String) {
@@ -114,7 +121,18 @@ fn worker(shared: Arc<Shared>, cache: PathBuf) {
     let mut received = Instant::now();
     let mut needs_query = false;
     while !shared.stop.load(Ordering::Relaxed) {
-        let pending = shared.pending.lock().unwrap().take();
+        let pending = {
+            let mut pending = shared.pending.lock().unwrap();
+            // Nothing to search (Periscope closed or cancelled): sleep until
+            // the next request instead of polling.
+            if active.is_none() {
+                pending = shared
+                    .wake
+                    .wait_while(pending, |p| p.is_none() && !shared.stop.load(Ordering::Relaxed))
+                    .unwrap();
+            }
+            pending.take()
+        };
 
         if let Some(request) = pending {
             received = Instant::now();
@@ -988,7 +1006,7 @@ mod tests {
         let root = PathBuf::from("D:/slate");
         let base = std::env::temp_dir().join(format!(
             "slate-inventory-live-{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+            crate::test_unique()
         ));
         let cache = base.join("paths.sqlite3");
         let scan = import_scan(vec![root.clone()]);
@@ -1025,7 +1043,7 @@ mod tests {
     fn inventory_import_pages_all_paths_and_metadata_without_any_filesystem_inventory() {
         let base = std::env::temp_dir().join(format!(
             "slate-inventory-{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+            crate::test_unique()
         ));
         let root = base.join("does-not-exist");
         let cache = base.join("cache/index.sqlite3");
@@ -1065,7 +1083,7 @@ mod tests {
         for malformed in [false, true] {
             let base = std::env::temp_dir().join(format!(
                 "slate-inventory-interrupt-{}",
-                chrono::Utc::now().timestamp_nanos_opt().unwrap()
+                crate::test_unique()
             ));
             let root = base.join("no-filesystem-root");
             let cache = base.join("cache/index.sqlite3");
@@ -1113,7 +1131,7 @@ mod tests {
         for mode in 0..4 {
             let base = std::env::temp_dir().join(format!(
                 "slate-inventory-churn-{}",
-                chrono::Utc::now().timestamp_nanos_opt().unwrap()
+                crate::test_unique()
             ));
             let root = base.join("nonexistent-root");
             let cache = base.join("cache/index.sqlite3");
@@ -1160,7 +1178,7 @@ mod tests {
     fn native_inventory_only_requests_fallback_for_unindexed_roots() {
         let base = std::env::temp_dir().join(format!(
             "slate-inventory-mixed-{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+            crate::test_unique()
         ));
         let native = base.join("native-without-a-filesystem-root");
         let fallback = base.join("unindexed-root");
@@ -1244,7 +1262,7 @@ mod tests {
         CANCELLED.store(false, Ordering::SeqCst);
         let cache = std::env::temp_dir().join(format!(
             "slate-cancel-native-{}.sqlite3",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+            crate::test_unique()
         ));
         let mut manager = Manager::new(cache.clone());
         Arc::get_mut(&mut manager.shared).unwrap().normal_provider = Some(provider);
@@ -1285,7 +1303,7 @@ mod tests {
         }
         let cache = std::env::temp_dir().join(format!(
             "slate-empty-query-{}.sqlite3",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+            crate::test_unique()
         ));
         let mut manager = Manager::new(cache.clone());
         Arc::get_mut(&mut manager.shared).unwrap().provider = unexpected;
@@ -1312,7 +1330,7 @@ mod tests {
     fn inventory_cancel_and_out_of_scope_entries_do_not_mark_ready() {
         let base = std::env::temp_dir().join(format!(
             "slate-inventory-cancel-{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+            crate::test_unique()
         ));
         let root = base.join("root");
         let cache = base.join("cache/index.sqlite3");
@@ -1347,7 +1365,7 @@ mod tests {
     fn periscope_settings_roundtrip_roots_and_keyboard_toggle_use_owned_config() {
         let root = std::env::temp_dir().join(format!(
             "slate-periscope-config-{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+            crate::test_unique()
         ));
         fs::create_dir_all(&root).unwrap();
         let ctx = eframe::egui::Context::default();
@@ -1383,7 +1401,7 @@ mod tests {
     fn app_applies_only_latest_search_and_keeps_dirty_main_when_open_is_requested() {
         let root = std::env::temp_dir().join(format!(
             "slate-periscope-ui-{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+            crate::test_unique()
         ));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("earlier.md"), "earlier").unwrap();
@@ -1428,7 +1446,7 @@ mod tests {
     fn unavailable_everything_automatically_falls_back_without_touching_documents() {
         let root = std::env::temp_dir().join(format!(
             "slate-periscope-fallback-{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+            crate::test_unique()
         ));
         fs::create_dir_all(&root).unwrap();
         let document = root.join("needle.md");
@@ -1466,7 +1484,7 @@ mod tests {
     fn coalescing_returns_latest_query_and_cancel_discards_late_result() {
         let root = std::env::temp_dir().join(format!(
             "slate-periscope-worker-{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+            crate::test_unique()
         ));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("café.md"), "not read by scanner").unwrap();

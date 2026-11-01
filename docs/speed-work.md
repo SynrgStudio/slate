@@ -64,6 +64,16 @@ document size and undo history size. It refreshes every 250 ms only while open.
   picker, Periscope and preview UIs plus the `flow-api` CLI moved to their own
   modules unchanged; the dead `lance_dialog` / `file_picker_dialog` were removed.
 - Compiler warnings 85 → 0 in normal builds (remaining test-only deprecations).
+- **mimalloc** as the global allocator: egui builds and frees many small
+  vectors every frame. A/B on the same machine, best of several runs
+  (`cargo test --release benchmark_ -- --ignored --nocapture`):
+  typing frame with preview (`benchmark_typing_frame`, app UI + tessellation)
+  0.92 → 0.61 ms; edit in the middle of the 5 MB fixture 1.1 → 0.8 ms;
+  resize step 14.2 → 12.9 ms; parallel find "e" 5.9 → 3.4–4.4 ms.
+- Rejected: `lto = "fat"` measured within 5 % of thin LTO (0.63 vs 0.61 ms
+  typing) for a 2.4× longer release build. `panic = "abort"` was not adopted:
+  a panic in a background thread would take the window and its unsaved text
+  down with it instead of only that thread.
 
 ## 5. Startup
 
@@ -98,7 +108,8 @@ context: ~300–350 ms on this machine, Slate's own constructor < 0.5 ms.
     first made reopening take ~120 ms; the window is now shown with
     `ShowWindowAsync` the moment the request arrives (2 ms from the forwarding
     process's acknowledgement to visible), and egui syncs on the next frame.
-  - Hidden cost: ~31 ms CPU per 5 s, ~165 MB working set.
+  - Hidden cost, first version: ~31 ms CPU per 5 s, ~165 MB working set.
+    See section 8 for what it is now.
   - `:quit-all` or the tray's "Quit Slate" really exit. Settings → "Keep
     running in the tray when closed" turns it off; "Start hidden with Windows"
     adds `slate --background` to the current user's Run key (off by default).
@@ -154,3 +165,31 @@ RTX 3090, ~100–360 keystrokes per window.
 
 See [adr/text-buffer-representation.md](adr/text-buffer-representation.md):
 keep a single `String` + line index for now.
+
+## 8. Memory and idle while resident
+
+Measured on the hidden test desktop, wgpu renderer, small note open:
+
+| | before | after |
+|---|---|---|
+| committed (private) memory | 336 MB | 156–160 MB |
+| working set while visible | 169–201 MB | 109–141 MB |
+| working set while hidden | same as visible | 5–15 MB |
+| CPU while hidden, 10 s | ~60 ms | one 15.6 ms scheduler tick |
+| window visible after `slate` | 23–27 ms | 15–29 ms |
+
+- **GPU memory blocks.** wgpu's default `MemoryHints::Performance` reserves
+  64 MB host-visible and 128 MB device blocks; `MemoryUsage` uses 4 / 8 MB
+  blocks, plenty for egui's buffers and font atlas. glow, for comparison,
+  commits ~112 MB.
+- **No timed wake-ups while hidden.** The per-second repaint and the 3 s Flow
+  heartbeat stop while the window is in the tray; tray clicks, forwarded
+  launches and background workers request their own frames.
+- **Working set handed back.** Two seconds after hiding (once the hide has
+  been drawn) Slate calls `EmptyWorkingSet` on itself. Pages come back on
+  demand: the first frame after reopening (`resident.first_frame_painted` in
+  the performance log) takes ~4–8 ms instead of ~4–5.5 ms.
+- **Periscope worker sleeps.** After the first Periscope search its query
+  thread polled every 10–15 ms for the rest of the session; it now waits on a
+  condition variable until the next request.
+

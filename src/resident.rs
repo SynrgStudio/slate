@@ -24,6 +24,7 @@ pub(crate) fn take_quit_request() -> bool {
 #[cfg(windows)]
 pub(crate) use win::{
     allow_foreground_handoff, autostart_enabled, install, remove_tray, set_autostart, show_now,
+    trim_memory_soon,
 };
 
 #[cfg(not(windows))]
@@ -32,6 +33,8 @@ pub(crate) fn install(_cc: &eframe::CreationContext<'_>) {}
 pub(crate) fn remove_tray() {}
 #[cfg(not(windows))]
 pub(crate) fn show_now() {}
+#[cfg(not(windows))]
+pub(crate) fn trim_memory_soon() {}
 #[cfg(not(windows))]
 pub(crate) fn allow_foreground_handoff() {}
 #[cfg(not(windows))]
@@ -165,6 +168,8 @@ mod win {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetModuleHandleW(name: *const u16) -> Handle;
+        fn GetCurrentProcess() -> Handle;
+        fn K32EmptyWorkingSet(process: Handle) -> i32;
     }
     #[link(name = "advapi32")]
     unsafe extern "system" {
@@ -297,6 +302,22 @@ mod win {
                 ShowWindowAsync(hwnd, 5); // SW_SHOW
             }
         }
+    }
+
+    /// Hands the hidden window's memory back to Windows once the hide has
+    /// been drawn. Pages come back on demand if the window is shown again.
+    pub(crate) fn trim_memory_soon() {
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let hwnd = hwnd();
+            // SAFETY: plain Win32 calls on our own window and process.
+            unsafe {
+                if !hwnd.is_null() && IsWindowVisible(hwnd) == 0 {
+                    K32EmptyWorkingSet(GetCurrentProcess());
+                    crate::perf_log::mark("resident.trimmed", "");
+                }
+            }
+        });
     }
 
     fn wake() {
