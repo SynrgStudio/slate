@@ -90,6 +90,19 @@ context: ~300–350 ms on this machine, Slate's own constructor < 0.5 ms.
   always start their own window.
 - **Renderer startup cost.** wgpu reaches the app constructor in ~465–500 ms
   versus ~300–400 ms for glow. Accepted for the latency win in section 6.
+- **GPU prewarm.** Measured in isolation (`benchmark_wgpu_startup`): DX12
+  instance ~23 ms, adapter selection ~200 ms (wgpu creates a probe device on
+  the GPU *and* on Microsoft's software renderer), device ~90 ms, egui shader
+  ~15 ms. A helper thread now starts the instance and adapter probe at the
+  top of `main` while eframe creates the window; D3D12 keeps one device per
+  adapter per process, so wgpu's own probe finds the driver already up.
+  `main` → first UI frame, 6 alternating runs each: median 402 → 336 ms.
+  Also prewarming the device and shader was slower (402 ms): it competes
+  with eframe instead of overlapping. `SLATE_PREWARM=0` turns it off.
+- **Settings and session written off the UI thread.** Opening a file saved
+  `config.toml` and the fsynced `session.json` on the UI thread: 20.5 ms in
+  the first frame. `src/settings_writer.rs` keeps the newest contents per file
+  on one writer thread, flushed before the process exits: 0.26 ms.
 - **Flow index off the UI thread on open.** Opening a Markdown file wrote the
   Flow SQLite cache (commit + fsync) on the UI thread: 6–12 ms per open, 47 ms on
   the first open in a folder. It now runs first on the existing background rescan

@@ -2420,6 +2420,7 @@ dependencies = [
  "eframe",
  "memchr",
  "mimalloc",
+ "pollster",
  "raw-window-handle",
  "rusqlite",
  "serde",

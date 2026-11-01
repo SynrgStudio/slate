@@ -71,3 +71,60 @@ fn benchmark_typing_frame() {
         times.iter().sum::<f64>() / times.len() as f64
     );
 }
+
+/// Where the ~0.5 s of a cold wgpu window start goes (run on its own: each
+/// step is only cold once per process).
+#[test]
+#[ignore = "manual: cargo test --release wgpu_startup -- --ignored --nocapture"]
+fn benchmark_wgpu_startup() {
+    use eframe::egui_wgpu::wgpu;
+    let total = std::time::Instant::now();
+    let mut last = std::time::Instant::now();
+    let mut step = |name: &str| {
+        println!("WGPU_STARTUP {name} ms={:.1}", last.elapsed().as_secs_f64() * 1000.0);
+        last = std::time::Instant::now();
+    };
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::DX12,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    step("instance");
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        ..Default::default()
+    }))
+    .unwrap();
+    step(&format!("adapter ({})", adapter.get_info().name));
+    let (device, _queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        memory_hints: wgpu::MemoryHints::MemoryUsage,
+        ..Default::default()
+    }))
+    .unwrap();
+    step("device");
+    let _renderer = eframe::egui_wgpu::Renderer::new(
+        &device,
+        wgpu::TextureFormat::Bgra8Unorm,
+        Default::default(),
+    );
+    step("egui renderer (shader + pipeline)");
+    println!("WGPU_STARTUP total ms={:.1}", total.elapsed().as_secs_f64() * 1000.0);
+}
+
+#[test]
+#[ignore = "manual: cargo test --release wgpu_adapters -- --ignored --nocapture"]
+fn benchmark_wgpu_adapters() {
+    use eframe::egui_wgpu::wgpu;
+    let started = std::time::Instant::now();
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::DX12,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    println!("ADAPTERS instance ms={:.1}", started.elapsed().as_secs_f64() * 1000.0);
+    let started = std::time::Instant::now();
+    let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::DX12));
+    println!("ADAPTERS enumerate ms={:.1}", started.elapsed().as_secs_f64() * 1000.0);
+    for adapter in adapters {
+        let info = adapter.get_info();
+        println!("ADAPTERS {} {:?} {:?}", info.name, info.device_type, info.backend);
+    }
+}

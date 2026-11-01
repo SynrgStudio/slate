@@ -39,6 +39,7 @@ mod preview_scroll_tests;
 #[cfg(test)]
 mod resize_tests;
 mod safe_file;
+mod settings_writer;
 #[cfg(test)]
 mod safety_integration_tests;
 mod safety_ui;
@@ -220,6 +221,50 @@ fn low_latency_wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
     options
 }
 
+/// Direct3D 12 started on a helper thread while eframe creates the window.
+/// D3D12 keeps one device per adapter per process, so when wgpu probes the
+/// adapters and creates its device a moment later, the driver is already up.
+#[cfg(all(windows, feature = "wgpu"))]
+type WarmGpu = std::thread::JoinHandle<Box<dyn std::any::Any + Send>>;
+#[cfg(all(windows, feature = "wgpu"))]
+static WARM_GPU: std::sync::Mutex<Option<WarmGpu>> = std::sync::Mutex::new(None);
+
+#[cfg(all(windows, feature = "wgpu"))]
+fn prewarm_gpu() {
+    use eframe::egui_wgpu::wgpu;
+    if std::env::var_os("SLATE_PREWARM").is_some_and(|v| v == "0")
+        || std::env::var_os("WGPU_BACKEND").is_some()
+    {
+        return;
+    }
+    let handle = std::thread::spawn(|| -> Box<dyn std::any::Any + Send> {
+        let started = std::time::Instant::now();
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::DX12,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::DX12));
+        perf_log::mark(
+            "startup.gpu_prewarmed",
+            &format!(
+                "ms={:.1} adapters={}",
+                started.elapsed().as_secs_f64() * 1000.0,
+                adapters.len()
+            ),
+        );
+        Box::new((instance, adapters))
+    });
+    *WARM_GPU.lock().unwrap() = Some(handle);
+}
+
+/// Called once the window has drawn: wgpu holds its own device by then.
+fn release_prewarmed_gpu() {
+    #[cfg(all(windows, feature = "wgpu"))]
+    if let Some(handle) = WARM_GPU.lock().unwrap().take() {
+        std::thread::spawn(move || drop(handle.join()));
+    }
+}
+
 /// Window/taskbar icon (assets/slate-256.png, from tools/generate_icon.py).
 /// A decode failure only costs the icon, never the start: egui-winit and
 /// eframe treat an empty `IconData` as "no icon".
@@ -306,6 +351,11 @@ fn main() -> eframe::Result {
         }
     }
 
+    #[cfg(all(windows, feature = "wgpu"))]
+    if selected_renderer() == eframe::Renderer::Wgpu {
+        prewarm_gpu();
+    }
+
     let title = if scratch {
         "Slate Scratch"
     } else if standalone_agenda {
@@ -381,6 +431,7 @@ fn main() -> eframe::Result {
         perf_log::mark("startup.renderer_fallback", &format!("glow after: {error}"));
         result = run(eframe::Renderer::Glow);
     }
+    settings_writer::flush();
     index_export::flush();
     perf_log::mark(
         "process.ui_loop_exit",
@@ -1397,7 +1448,6 @@ impl SlateApp {
         self.window_hidden = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         perf_log::mark("resident.hidden", "");
-        #[cfg(not(test))]
         resident::trim_memory_soon();
     }
 
@@ -6236,9 +6286,9 @@ impl SlateApp {
                 usage.name, usage.count, usage.last_used
             ));
         }
-        let tmp_path = path.with_extension("toml.tmp");
-        fs::write(&tmp_path, contents).map_err(|err| err.to_string())?;
-        fs::rename(&tmp_path, &path).map_err(|err| err.to_string())
+        // Off the UI thread; written before the process exits.
+        settings_writer::write(path, contents.into_bytes(), settings_writer::Durability::Quick);
+        Ok(())
     }
 
     fn set_command_history_limit(&mut self, limit: usize) {
@@ -9812,6 +9862,7 @@ impl eframe::App for SlateApp {
 impl SlateApp {
     fn ui_frame(&mut self, ui: &mut egui::Ui) {
         let mut ui_timing = perf_log::ui_frame();
+        release_prewarmed_gpu();
         let ctx = ui.ctx().clone();
         if let Some(shown) = self.shown_at.take() {
             perf_log::mark(

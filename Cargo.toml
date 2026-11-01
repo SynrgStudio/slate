@@ -7,6 +7,8 @@ edition = "2024"
 chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
 dirs-next = "2.0.0"
 memchr = "2"
+# Blocks on wgpu setup futures (GPU prewarm); already used by eframe.
+pollster = "0.4"
 mimalloc = { version = "0.1", default-features = false }
 raw-window-handle = "0.6"
 sha2 = "0.10"

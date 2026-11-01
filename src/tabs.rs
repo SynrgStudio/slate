@@ -931,7 +931,7 @@ impl SlateApp {
             }
         }
         if let Ok(json) = serde_json::to_vec_pretty(&session) {
-            let _ = safe_file::atomic_replace(&file, &json);
+            settings_writer::write(file, json, settings_writer::Durability::Synced);
         }
     }
 
