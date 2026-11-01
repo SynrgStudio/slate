@@ -224,8 +224,14 @@ Measured on the hidden test desktop, wgpu renderer, small note open:
   modification time or size changes.
 - **First use of a glyph** (accents, CJK, emoji): at most 0.13 ms more than
   typing it again (`benchmark_glyph_first_use`); nothing to prewarm.
-- **Still open: preview on huge documents.** Typing with the preview visible
-  on the 5 MB fixture costs ~21 ms per frame (vs ~0.8 ms without preview):
-  the preview walks all 27k lines every frame to place the visible ones.
-  Normal notes are unaffected (< 0.5 ms).
+- **Preview on huge documents.** Typing with the preview visible on the
+  5 MB fixture cost ~21 ms per frame: every frame re-read all 27k lines to
+  place the visible ones. The preview now keeps per-line metadata (kind,
+  fence and table structure, measured height) that an edit updates only for
+  the lines it touched; a frame lays out the visible stretch and covers the
+  rest with one empty allocation above and one below. Word and character
+  totals in the footer are kept per line the same way — they recounted the
+  whole document on every keystroke (~5 ms at 5 MB, ~1.2 ms on `main.rs`).
+  `benchmark_typing_frame`, p50: 5 MB with preview 21 → 0.55 ms; 5 MB
+  without preview 0.55 ms; `main.rs` 1.4 → 0.14 ms; a note 0.19 ms.
 

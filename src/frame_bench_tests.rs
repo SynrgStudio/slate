@@ -26,7 +26,8 @@ fn sample_note() -> String {
 fn benchmark_typing_frame() {
     typing_frame("note", sample_note(), None, true);
     if let Ok(text) = fs::read_to_string("D:/slate-baselines/large-document-5m.md") {
-        typing_frame("5MB", text, None, true);
+        typing_frame("5MB", text.clone(), None, true);
+        typing_frame("5MB no preview", text, Some("big.md"), true);
     }
     // A big real Rust file, coloured and not.
     let rust = fs::read_to_string("src/main.rs").unwrap();

@@ -250,18 +250,49 @@ fn footer_preferences_roundtrip_and_old_config_preserves_compact_defaults() {
 #[test]
 fn default_footer_does_not_recount_large_document_each_frame() {
     let mut f = Fixture::new();
-    f.app.buffer.set_text("café words\n".repeat(100_000));
+    f.app.buffer.set_text(
+        "café words
+"
+        .repeat(100_000),
+    );
     draw(&mut f, 900.0, "edit", vec![]);
-    assert!(f.app.footer_counts_cache.is_none());
+    assert!(f.app.footer_counts.revision().is_none());
     f.app.footer_options.enabled[6] = true;
     draw(&mut f, 900.0, "edit", vec![]);
-    let cache = f.app.footer_counts_cache.unwrap();
-    assert_eq!(cache.2, 200_000);
+    let revision = f.app.footer_counts.revision();
+    assert_eq!(f.app.footer_counts(), (200_000, 1_100_000));
     draw(&mut f, 900.0, "edit", vec![]);
-    assert_eq!(f.app.footer_counts_cache.unwrap(), cache);
+    assert_eq!(f.app.footer_counts.revision(), revision);
     f.app.buffer.insert_text("new ");
     draw(&mut f, 900.0, "edit", vec![]);
-    assert_ne!(f.app.footer_counts_cache.unwrap().1, cache.1);
+    assert_ne!(f.app.footer_counts.revision(), revision);
+}
+#[test]
+fn word_and_character_counts_follow_edits_like_a_full_recount() {
+    let mut f = Fixture::new();
+    f.app.buffer.set_text(
+        "one two
+
+three café
+  four  "
+            .into(),
+    );
+    let full = |text: &str| (text.split_whitespace().count(), text.chars().count());
+    assert_eq!(f.app.footer_counts(), full(f.app.buffer.as_str()));
+    f.app.buffer.set_cursor(4);
+    f.app.buffer.insert_text(
+        "big
+new lines ",
+    );
+    assert_eq!(f.app.footer_counts(), full(f.app.buffer.as_str()));
+    f.app.buffer.set_selection(0, 12);
+    f.app.buffer.backspace();
+    assert_eq!(f.app.footer_counts(), full(f.app.buffer.as_str()));
+    f.app.buffer.undo();
+    f.app.buffer.undo();
+    assert_eq!(f.app.footer_counts(), full(f.app.buffer.as_str()));
+    f.app.buffer.set_text("fresh text".into());
+    assert_eq!(f.app.footer_counts(), (2, 10));
 }
 #[test]
 fn context_and_message_expiry_do_not_change_command_buffer_or_document() {

@@ -28,7 +28,7 @@ pub(crate) struct DocumentState {
     disk_base: Option<safe_file::Fingerprint>,
     file_conflict: Option<(document_safety::Slot, PathBuf)>,
     preview_sync: scroll_sync::PreviewSync,
-    preview_heights: preview_layout::Heights,
+    preview_layout: preview_layout::Layout,
     search_state: Option<SearchState>,
     recovery_origin: Option<PathBuf>,
     periscope_project_root: Option<PathBuf>,
@@ -48,7 +48,7 @@ impl DocumentState {
             disk_base: None,
             file_conflict: None,
             preview_sync: scroll_sync::PreviewSync::default(),
-            preview_heights: preview_layout::Heights::default(),
+            preview_layout: preview_layout::Layout::default(),
             search_state: None,
             recovery_origin: None,
             periscope_project_root: None,
@@ -702,7 +702,7 @@ impl SlateApp {
         // Latest text is durable before the checkpoint changes role.
         self.observe_document_safety(0.0, true);
         let blank = DocumentState::blank(self.editor_font_size);
-        self.footer_counts_cache = None;
+        self.footer_counts = Default::default();
         self.flow_inline_org_mode = None;
         self.flow_inline_org_anchor = None;
         self.link_inline_anchor = None;
@@ -717,7 +717,7 @@ impl SlateApp {
             disk_base: self.disk_base.take(),
             file_conflict: self.file_conflict.take(),
             preview_sync: std::mem::take(&mut self.preview_sync),
-            preview_heights: std::mem::take(&mut self.preview_heights),
+            preview_layout: std::mem::take(&mut self.preview_layout),
             search_state: self.search_state.take(),
             recovery_origin: self.recovery_origins.remove(&document_safety::Slot::Main),
             periscope_project_root: self.periscope_project_root.take(),
@@ -735,7 +735,7 @@ impl SlateApp {
         self.disk_base = doc.disk_base;
         self.file_conflict = doc.file_conflict;
         self.preview_sync = doc.preview_sync;
-        self.preview_heights = doc.preview_heights;
+        self.preview_layout = doc.preview_layout;
         self.search_state = doc.search_state;
         if let Some(origin) = doc.recovery_origin {
             self.recovery_origins

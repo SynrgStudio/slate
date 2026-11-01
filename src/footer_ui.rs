@@ -180,22 +180,8 @@ impl SlateApp {
             Err(error) => error,
         };
     }
-    fn footer_counts(&mut self) -> (usize, usize) {
-        let key = (self.buffer.identity, self.buffer.revision);
-        if self
-            .footer_counts_cache
-            .as_ref()
-            .is_none_or(|(id, revision, _, _)| (*id, *revision) != key)
-        {
-            self.footer_counts_cache = Some((
-                key.0,
-                key.1,
-                self.buffer.as_str().split_whitespace().count(),
-                self.buffer.as_str().chars().count(),
-            ));
-        }
-        let (_, _, words, characters) = self.footer_counts_cache.unwrap();
-        (words, characters)
+    pub(super) fn footer_counts(&mut self) -> (usize, usize) {
+        self.footer_counts.sync(&self.buffer)
     }
     pub(super) fn compact_footer(
         &mut self,
@@ -409,5 +395,77 @@ impl SlateApp {
                 },
             )
         });
+    }
+}
+
+/// Word and character totals kept per line, so an edit only recounts the
+/// lines it touched instead of the whole document.
+#[derive(Default)]
+pub(crate) struct DocumentCounts {
+    key: Option<(u64, u64)>,
+    lines: Vec<(u32, u32)>,
+    words: usize,
+    characters: usize,
+}
+
+impl DocumentCounts {
+    fn count(line: &str) -> (u32, u32) {
+        (
+            line.split_whitespace().count() as u32,
+            line.chars().count() as u32,
+        )
+    }
+
+    /// Words and characters (newlines included) of the buffer.
+    pub(crate) fn sync(&mut self, buffer: &EditorBuffer) -> (usize, usize) {
+        let key = (buffer.identity, buffer.revision);
+        if self.key != Some(key) {
+            let count = buffer.line_count();
+            let edges = self
+                .key
+                .filter(|(identity, _)| *identity == buffer.identity)
+                .and_then(|(_, revision)| buffer.unchanged_layout_edges(revision));
+            let (prefix, removed_end) = match edges {
+                Some((prefix, suffix)) => {
+                    let old = self.lines.len();
+                    let prefix = prefix.min(old).min(count);
+                    let suffix = suffix.min(old - prefix).min(count - prefix);
+                    (prefix, old - suffix)
+                }
+                None => {
+                    self.words = 0;
+                    self.characters = 0;
+                    (0, self.lines.len())
+                }
+            };
+            let suffix = self.lines.len() - removed_end;
+            let fresh: Vec<_> = (prefix..count - suffix)
+                .map(|index| Self::count(buffer.line(index)))
+                .collect();
+            let removed: Vec<_> = self
+                .lines
+                .splice(prefix..removed_end, fresh.iter().copied())
+                .collect();
+            if edges.is_some() {
+                for (words, characters) in removed {
+                    self.words -= words as usize;
+                    self.characters -= characters as usize;
+                }
+            }
+            for (words, characters) in fresh {
+                self.words += words as usize;
+                self.characters += characters as usize;
+            }
+            self.key = Some(key);
+        }
+        (
+            self.words,
+            self.characters + self.lines.len().saturating_sub(1),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn revision(&self) -> Option<u64> {
+        self.key.map(|(_, revision)| revision)
     }
 }

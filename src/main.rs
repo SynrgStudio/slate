@@ -136,10 +136,10 @@ use flow_edit::{
 use goto::GotoTarget;
 use link_ui::{LinkAssistChoice, LinkHeadingOption};
 use markdown::{
-    CheckboxState, TableAlignment, is_markdown_separator, is_markdown_table_start,
-    markdown_link_target_at_byte, parse_blockquote_line, parse_checkbox_line,
-    parse_fenced_code_marker, parse_heading_line, parse_inline_code_spans, parse_list_line,
-    parse_markdown_link_spans, parse_markdown_table_separator, split_markdown_table_row,
+    CheckboxState, TableAlignment, is_markdown_separator, markdown_link_target_at_byte,
+    parse_blockquote_line, parse_checkbox_line, parse_fenced_code_marker, parse_heading_line,
+    parse_inline_code_spans, parse_list_line, parse_markdown_link_spans,
+    parse_markdown_table_separator, split_markdown_table_row,
 };
 use periscope::{PeriscopeMode, PeriscopeRow};
 use scratch::ScratchEntry;
@@ -908,7 +908,8 @@ struct SlateApp {
     file_loader: file_loader::Loader,
     flow_heartbeat_attempt: Option<(PathBuf, std::time::Instant)>,
     preview_sync: scroll_sync::PreviewSync,
-    preview_heights: preview_layout::Heights,
+    preview_layout: preview_layout::Layout,
+    preview_tops: Vec<f32>,
     document_safety: document_safety::Manager,
     disk_base: Option<safe_file::Fingerprint>,
     modal_disk_base: Option<safe_file::Fingerprint>,
@@ -929,7 +930,7 @@ struct SlateApp {
     editor_font_size: f32,
     editor_look: editor_view::EditorLook,
     footer_options: footer_ui::Options,
-    footer_counts_cache: Option<(u64, u64, usize, usize)>,
+    footer_counts: footer_ui::DocumentCounts,
     footer_status_seen: String,
     footer_status_since: Option<std::time::Instant>,
     command_line: String,
@@ -1139,7 +1140,8 @@ impl SlateApp {
             file_loader: file_loader::Loader::new(cc.egui_ctx.clone()),
             flow_heartbeat_attempt: None,
             preview_sync: scroll_sync::PreviewSync::default(),
-            preview_heights: preview_layout::Heights::default(),
+            preview_layout: preview_layout::Layout::default(),
+            preview_tops: Vec::new(),
             document_safety: {
                 #[cfg(test)]
                 {
@@ -1171,7 +1173,7 @@ impl SlateApp {
             editor_font_size: editor_view::DEFAULT_EDITOR_FONT_SIZE,
             editor_look: editor_view::EditorLook::default(),
             footer_options: footer_ui::Options::default(),
-            footer_counts_cache: None,
+            footer_counts: Default::default(),
             footer_status_seen: "Ready".into(),
             footer_status_since: None,
             command_line: String::new(),
