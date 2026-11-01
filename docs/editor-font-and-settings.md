@@ -66,3 +66,23 @@ temporary directory.
   `cursor_trail_typing`, `cursor_stretch`, `cursor_pulse` and
   `cursor_color = "#rrggbb"` in
   `config.toml`; all off, Hack and snow by default.
+
+## Syntax highlighting (Settings → "Syntax highlighting")
+
+Built in, no language server (`src/highlight.rs`): a small lexer per language
+colours keywords, types, functions, strings, numbers, constants, comments and
+macros/attributes/decorators. Rust (`rust`, `rs`), Python (`py`, `python`),
+JavaScript (`js`, `jsx`, `mjs`, `cjs`) and TypeScript (`ts`, `tsx`).
+
+- **Code files** (`.rs`, `.py`, `.js`, `.ts`…) are coloured whole and are no
+  longer rendered as Markdown (a Python `# comment` used to become a heading).
+- **Notes**: fenced blocks with a known language tag are coloured; other
+  fences stay plain, and so does the fence line itself.
+- Line by line: only what a line leaves open (block comment, multi-line or
+  raw string, Python triple quotes, JS template) carries to the next. The
+  state at the start of each line is cached up to the last line drawn, and an
+  edit keeps the entries before the first changed line. Fragments colour the
+  same as whole programs.
+- Cost: typing in Slate's own 11k-line `main.rs`, 1.24 ms per frame coloured
+  vs 1.22 ms plain (`benchmark_typing_frame`).
+- The rendered preview pane does not colour code yet.

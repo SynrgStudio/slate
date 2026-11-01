@@ -125,6 +125,7 @@ fn jetbrains_mono_changes_the_text_metrics_and_everything_persists() {
         cursor_trail_typing: true,
         cursor_stretch: true,
         cursor_pulse: true,
+        syntax_highlighting: true,
         cursor_color: editor_view::CURSOR_COLORS[3].1,
     });
     f.frame_after(0.016);
@@ -154,6 +155,7 @@ fn jetbrains_mono_changes_the_text_metrics_and_everything_persists() {
             cursor_trail_typing: true,
             cursor_stretch: true,
             cursor_pulse: true,
+            syntax_highlighting: true,
             cursor_color: editor_view::CURSOR_COLORS[3].1,
         }
     );
@@ -268,6 +270,7 @@ fn a_pulse_follows_a_jump_but_not_typing() {
     let mut f = Fixture::new("uno\ndos\ntres\n");
     f.app.apply_editor_look(editor_view::EditorLook {
         cursor_pulse: true,
+        syntax_highlighting: true,
         ..Default::default()
     });
     f.frame_after(0.016);
@@ -280,4 +283,65 @@ fn a_pulse_follows_a_jump_but_not_typing() {
     f.frame_after(0.3);
     f.frame_after(0.016);
     assert!(!f.app.editor_view.cursor_pulsing(), "and then it rests");
+}
+
+fn kinds(
+    view: &editor_view::EditorView,
+    buffer: &EditorBuffer,
+    line: usize,
+) -> Option<Vec<(String, highlight::Token)>> {
+    let text = buffer.line(line).to_string();
+    view.line_highlight(buffer, line).map(|tokens| {
+        tokens
+            .into_iter()
+            .map(|(range, token)| (text[range].to_string(), token))
+            .collect()
+    })
+}
+
+#[test]
+fn code_files_are_coloured_and_edits_recolour_the_lines_below() {
+    let mut view = editor_view::EditorView::new();
+    view.set_look(editor_view::EditorLook::default());
+    view.set_file_language(Some(highlight::Lang::Rust));
+    let mut buffer = EditorBuffer::from_text("fn a() {}\nlet x = 1;\n// end\n".into());
+    assert_eq!(
+        kinds(&view, &buffer, 1).unwrap()[0],
+        ("let".to_string(), highlight::Token::Keyword)
+    );
+    // Opening a block comment on line 0 turns the following lines into comment.
+    buffer.set_cursor(0);
+    buffer.insert_text("/* ");
+    assert_eq!(
+        kinds(&view, &buffer, 1).unwrap(),
+        vec![("let x = 1;".to_string(), highlight::Token::Comment)]
+    );
+    assert!(buffer.undo());
+    assert_eq!(
+        kinds(&view, &buffer, 1).unwrap()[0],
+        ("let".to_string(), highlight::Token::Keyword)
+    );
+}
+
+#[test]
+fn notes_colour_only_fenced_blocks_with_a_known_language() {
+    let mut view = editor_view::EditorView::new();
+    view.set_look(editor_view::EditorLook::default());
+    let buffer = EditorBuffer::from_text(
+        "# def title\n```py\ndef go():\n```\n```toml\nkey = 1\n```\nlet after\n".into(),
+    );
+    assert_eq!(kinds(&view, &buffer, 0), None, "prose is not code");
+    assert_eq!(kinds(&view, &buffer, 1), None, "the fence line itself");
+    assert_eq!(
+        kinds(&view, &buffer, 2).unwrap()[0],
+        ("def".to_string(), highlight::Token::Keyword)
+    );
+    assert_eq!(kinds(&view, &buffer, 5), None, "unknown languages stay plain");
+    assert_eq!(kinds(&view, &buffer, 7), None, "after the block it is prose again");
+
+    view.set_look(editor_view::EditorLook {
+        syntax_highlighting: false,
+        ..Default::default()
+    });
+    assert_eq!(kinds(&view, &buffer, 2), None, "the toggle turns it off");
 }

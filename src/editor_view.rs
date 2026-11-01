@@ -218,6 +218,8 @@ pub(crate) struct EditorLook {
     pub(crate) cursor_stretch: bool,
     /// A ring expands and fades where the caret lands after a jump.
     pub(crate) cursor_pulse: bool,
+    /// Colour code files and fenced code blocks.
+    pub(crate) syntax_highlighting: bool,
     pub(crate) cursor_color: Color32,
 }
 
@@ -238,6 +240,7 @@ impl Default for EditorLook {
             cursor_trail_typing: false,
             cursor_stretch: false,
             cursor_pulse: false,
+            syntax_highlighting: true,
             cursor_color: CURSOR_COLORS[0].1,
         }
     }
@@ -290,6 +293,24 @@ fn trail_opacity(weight: u8) -> f32 {
     0.12 + 0.11 * f32::from(clamp_trail_weight(weight))
 }
 
+/// Highlighting state at the start of each line, filled lazily up to the
+/// last line drawn. An edit keeps the entries before the first changed line.
+struct HighlightCache {
+    identity: u64,
+    revision: u64,
+    file_lang: Option<crate::highlight::Lang>,
+    entries: Vec<HighlightEntry>,
+}
+
+#[derive(Clone, Copy)]
+struct HighlightEntry {
+    /// The language of this line, if it is code to colour.
+    lang: Option<crate::highlight::Lang>,
+    /// Inside a fenced block (Markdown), whether or not its language is known.
+    in_fence: bool,
+    state: crate::highlight::LineState,
+}
+
 /// A caret animation in progress, in content coordinates.
 #[derive(Clone, Copy)]
 struct CursorGlide {
@@ -310,6 +331,9 @@ pub(crate) struct EditorView {
     cursor_target: Option<Pos2>,
     cursor_drawn: Option<Pos2>,
     cursor_glide: Option<CursorGlide>,
+    /// Language of the whole file (code files); `None` for notes.
+    file_lang: Option<crate::highlight::Lang>,
+    highlight_cache: RefCell<Option<HighlightCache>>,
     /// When the landing ring starts (it may be scheduled for the end of a glide).
     cursor_pulse_at: Option<f64>,
     /// Where the trail's tail was last drawn, so a new keystroke continues
@@ -356,6 +380,8 @@ impl EditorView {
             cursor_target: None,
             cursor_drawn: None,
             cursor_glide: None,
+            file_lang: None,
+            highlight_cache: RefCell::new(None),
             cursor_pulse_at: None,
             cursor_tail: None,
             row_layout: RefCell::new(None),
@@ -451,6 +477,144 @@ impl EditorView {
             self.font_size = size;
             self.font_size_changed = true;
         }
+    }
+
+    /// The language of the open file, from its extension (`None` for notes).
+    pub(crate) fn set_file_language(&mut self, lang: Option<crate::highlight::Lang>) {
+        if self.file_lang != lang {
+            self.file_lang = lang;
+            *self.highlight_cache.borrow_mut() = None;
+        }
+    }
+
+    /// The coloured spans of one line, or `None` when it is not code.
+    pub(crate) fn line_highlight(
+        &self,
+        buffer: &EditorBuffer,
+        line_index: usize,
+    ) -> Option<Vec<(std::ops::Range<usize>, crate::highlight::Token)>> {
+        use crate::highlight::{LineState, highlight_line};
+        if !self.look.syntax_highlighting {
+            return None;
+        }
+        let mut cache = self.highlight_cache.borrow_mut();
+        let start = HighlightEntry {
+            lang: self.file_lang,
+            in_fence: false,
+            state: LineState::Normal,
+        };
+        let valid = match cache.as_mut() {
+            Some(cache)
+                if cache.identity == buffer.identity && cache.file_lang == self.file_lang =>
+            {
+                if cache.revision != buffer.revision {
+                    match buffer.unchanged_layout_edges(cache.revision) {
+                        // Entries describe the start of a line: those up to the
+                        // first changed line are still right.
+                        Some((prefix, _)) => cache.entries.truncate(prefix + 1),
+                        None => cache.entries.clear(),
+                    }
+                    cache.revision = buffer.revision;
+                }
+                true
+            }
+            _ => false,
+        };
+        if !valid {
+            *cache = Some(HighlightCache {
+                identity: buffer.identity,
+                revision: buffer.revision,
+                file_lang: self.file_lang,
+                entries: Vec::new(),
+            });
+        }
+        let cache = cache.as_mut().unwrap();
+        if cache.entries.is_empty() {
+            cache.entries.push(start);
+        }
+        while cache.entries.len() <= line_index {
+            let index = cache.entries.len() - 1;
+            let entry = cache.entries[index];
+            let line = buffer.line(index);
+            let next = if self.file_lang.is_some() {
+                HighlightEntry {
+                    state: highlight_line(entry.lang.unwrap(), entry.state, line).1,
+                    ..entry
+                }
+            } else if let Some(fence) = parse_fenced_code_marker(line) {
+                if entry.in_fence {
+                    HighlightEntry {
+                        lang: None,
+                        in_fence: false,
+                        state: LineState::Normal,
+                    }
+                } else {
+                    HighlightEntry {
+                        lang: crate::highlight::Lang::from_tag(fence.language),
+                        in_fence: true,
+                        state: LineState::Normal,
+                    }
+                }
+            } else if let Some(lang) = entry.lang {
+                HighlightEntry {
+                    state: highlight_line(lang, entry.state, line).1,
+                    ..entry
+                }
+            } else {
+                entry
+            };
+            cache.entries.push(next);
+        }
+        let entry = cache.entries[line_index];
+        let lang = entry.lang?;
+        if self.file_lang.is_none() && parse_fenced_code_marker(buffer.line(line_index)).is_some() {
+            return None;
+        }
+        Some(highlight_line(lang, entry.state, buffer.line(line_index)).0)
+    }
+
+    /// Paints one visual row with its code colours (`None` if not code).
+    fn paint_highlighted_row(
+        &self,
+        painter: &egui::Painter,
+        buffer: &EditorBuffer,
+        row: VisualRow,
+        text_x: f32,
+        y: f32,
+        line_height: f32,
+        font: &FontId,
+        plain: Color32,
+    ) -> bool {
+        let Some(tokens) = self.line_highlight(buffer, row.line_index) else {
+            return false;
+        };
+        let line_start = buffer.line_start(row.line_index);
+        let (from, to) = (row.start - line_start, row.end - line_start);
+        let line = buffer.line(row.line_index);
+        let mut job = egui::text::LayoutJob::default();
+        let mut at = from;
+        let mut append = |job: &mut egui::text::LayoutJob, end: usize, color: Color32| {
+            if end > at {
+                job.append(
+                    &line[at..end],
+                    0.0,
+                    egui::TextFormat::simple(font.clone(), color),
+                );
+                at = end;
+            }
+        };
+        for (range, token) in tokens {
+            if range.end <= from || range.start >= to {
+                continue;
+            }
+            append(&mut job, range.start.clamp(from, to), plain);
+            append(&mut job, range.end.min(to), token.color());
+        }
+        append(&mut job, to, plain);
+        let galley = painter.layout_job(job);
+        let top = y + (line_height - galley.size().y) * 0.5;
+        painter.galley(egui::pos2(text_x, top), galley, plain);
+        true
     }
 
     pub(crate) fn set_look(&mut self, look: EditorLook) {
@@ -2159,6 +2323,13 @@ impl EditorView {
     ) {
         let line_start = buffer.line_start(row.line_index);
         if !render_markdown {
+            // Code files, and fenced blocks while Markdown is shown raw.
+            if self.paint_highlighted_row(
+                    painter, buffer, row, text_x, y, line_height, font, text_color,
+                )
+            {
+                return;
+            }
             painter.text(
                 egui::pos2(text_x, y + line_height * 0.5),
                 egui::Align2::LEFT_CENTER,
@@ -2177,6 +2348,13 @@ impl EditorView {
                     self.code_block_range(buffer, cursor_line) == Some(line_range)
                 });
             if cursor_in_this_code_block {
+                if matches!(code_kind, CodeLineKind::Body)
+                    && self.paint_highlighted_row(
+                        painter, buffer, row, text_x, y, line_height, font, text_color,
+                    )
+                {
+                    return;
+                }
                 painter.text(
                     egui::pos2(text_x, y + line_height * 0.5),
                     egui::Align2::LEFT_CENTER,
@@ -2199,6 +2377,18 @@ impl EditorView {
                     return;
                 }
                 CodeLineKind::Body => {
+                    if self.paint_highlighted_row(
+                        painter,
+                        buffer,
+                        row,
+                        text_x,
+                        y,
+                        line_height,
+                        font,
+                        Color32::from_rgb(216, 222, 233),
+                    ) {
+                        return;
+                    }
                     painter.text(
                         egui::pos2(text_x, y + line_height * 0.5),
                         egui::Align2::LEFT_CENTER,

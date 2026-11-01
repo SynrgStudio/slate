@@ -28,6 +28,7 @@ mod find_note_ui_tests;
 mod footer_tests;
 mod footer_ui;
 mod form_dialogs;
+mod highlight;
 #[cfg(test)]
 mod frame_bench_tests;
 #[cfg(test)]
@@ -6197,6 +6198,14 @@ impl SlateApp {
                         });
                     }
                 }
+                "syntax_highlighting" => {
+                    if let Some(enabled) = Self::parse_config_bool(value) {
+                        self.apply_editor_look(editor_view::EditorLook {
+                            syntax_highlighting: enabled,
+                            ..self.editor_look
+                        });
+                    }
+                }
                 "cursor_color" => {
                     if let Some(color) = editor_view::color_from_hex(value) {
                         self.apply_editor_look(editor_view::EditorLook {
@@ -6437,7 +6446,7 @@ impl SlateApp {
         );
         contents.push_str(&format!("editor_font_size = {}\n", self.editor_font_size));
         contents.push_str(&format!(
-            "editor_font = \"{}\"\nblock_cursor = {}\ncursor_animation = {}\ncursor_trail = {}\ncursor_trail_weight = {}\ncursor_trail_typing = {}\ncursor_stretch = {}\ncursor_pulse = {}\ncursor_color = \"{}\"\n",
+            "editor_font = \"{}\"\nblock_cursor = {}\ncursor_animation = {}\ncursor_trail = {}\ncursor_trail_weight = {}\ncursor_trail_typing = {}\ncursor_stretch = {}\ncursor_pulse = {}\nsyntax_highlighting = {}\ncursor_color = \"{}\"\n",
             self.editor_look.font.config_value(),
             self.editor_look.block_cursor,
             self.editor_look.animate_cursor,
@@ -6446,6 +6455,7 @@ impl SlateApp {
             self.editor_look.cursor_trail_typing,
             self.editor_look.cursor_stretch,
             self.editor_look.cursor_pulse,
+            self.editor_look.syntax_highlighting,
             editor_view::color_to_hex(self.editor_look.cursor_color)
         ));
         contents.push_str(&format!(
@@ -10136,6 +10146,8 @@ impl SlateApp {
         let mut ui_timing = perf_log::ui_frame();
         release_prewarmed_gpu();
         let ctx = ui.ctx().clone();
+        self.editor_view
+            .set_file_language(self.path.as_deref().and_then(highlight::Lang::from_path));
         if let Some(shown) = self.shown_at.take() {
             perf_log::mark(
                 "resident.first_frame_painted",
@@ -10338,6 +10350,12 @@ impl SlateApp {
                 );
 
                 self.editor_view.observe_buffer(&self.buffer);
+                // Code files are coloured as code, never rendered as Markdown.
+                let is_code_file = self
+                    .path
+                    .as_deref()
+                    .and_then(highlight::Lang::from_path)
+                    .is_some();
                 let editor_keyboard_enabled = self.duplicate_placement.is_none()
                     && !flow_error::is_open(&ctx)
                     && !self.suppress_editor_keyboard_once
@@ -10445,7 +10463,7 @@ impl SlateApp {
                                 editor_keyboard_enabled,
                                 false,
                                 active_line_text_highlight,
-                                self.markdown_live_rendering,
+                                self.markdown_live_rendering && !is_code_file,
                                 None,
                             );
                             if self.focus_editor_once

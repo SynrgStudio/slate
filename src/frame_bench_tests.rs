@@ -22,19 +22,28 @@ fn sample_note() -> String {
 #[test]
 #[ignore = "manual release benchmark: cargo test --release frame_bench -- --ignored --nocapture"]
 fn benchmark_typing_frame() {
-    typing_frame("note", sample_note());
+    typing_frame("note", sample_note(), None, true);
     if let Ok(text) = fs::read_to_string("D:/slate-baselines/large-document-5m.md") {
-        typing_frame("5MB", text);
+        typing_frame("5MB", text, None, true);
     }
+    // A big real Rust file, coloured and not.
+    let rust = fs::read_to_string("src/main.rs").unwrap();
+    typing_frame("main.rs highlighted", rust.clone(), Some("main.rs"), true);
+    typing_frame("main.rs plain", rust, Some("main.rs"), false);
 }
 
-fn typing_frame(label: &str, text: String) {
+fn typing_frame(label: &str, text: String, path: Option<&str>, highlight: bool) {
     let ctx = egui::Context::default();
     let cc = eframe::CreationContext::_new_kittest(ctx.clone());
     let mut app = SlateApp::new(&cc, None, true, false, None);
     app.scratch = false;
     app.settings_path_override = Some(std::env::temp_dir().join("slate-frame-bench.toml"));
-    app.preview = true;
+    app.preview = path.is_none();
+    app.path = path.map(PathBuf::from);
+    app.apply_editor_look(editor_view::EditorLook {
+        syntax_highlighting: highlight,
+        ..Default::default()
+    });
     let len = text.len();
     app.buffer.set_text(text);
     let middle = app.buffer.as_str().len() / 2;
