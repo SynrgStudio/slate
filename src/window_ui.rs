@@ -100,6 +100,88 @@ pub enum TabAction {
 }
 
 const TAB_FONT: f32 = 12.0;
+const TAB_CORNERS: egui::CornerRadius = egui::CornerRadius {
+    nw: 6,
+    ne: 6,
+    sw: 0,
+    se: 0,
+};
+/// How far below the strip a dragged tab comes off it.
+const LIFT_DISTANCE: f32 = 12.0;
+/// Time constant of tabs sliding into their new places.
+const SLIDE_SECONDS: f32 = 0.045;
+
+/// A tab dragged off the strip: a card under the pointer that says what
+/// letting go does.
+struct Lifted {
+    card: egui::Rect,
+    text: String,
+    detach_ready: bool,
+}
+
+impl Lifted {
+    fn paint(&self, ctx: &egui::Context, font: &FontId) {
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Tooltip,
+            egui::Id::new("slate_tab_lifted"),
+        ));
+        let accent = Color32::from_rgb(136, 192, 208);
+        let border = if self.detach_ready {
+            accent
+        } else {
+            Color32::from_rgb(76, 86, 106)
+        };
+        painter.add(
+            egui::epaint::Shadow {
+                offset: [0, 4],
+                blur: 14,
+                spread: 0,
+                color: Color32::from_black_alpha(140),
+            }
+            .as_shape(self.card, 6),
+        );
+        painter.rect_filled(self.card, 6.0, Color32::from_rgb(36, 44, 58));
+        painter.rect_stroke(
+            self.card,
+            6.0,
+            egui::Stroke::new(1.0_f32, border),
+            egui::StrokeKind::Inside,
+        );
+        let mut job = egui::text::LayoutJob::simple_singleline(
+            self.text.clone(),
+            font.clone(),
+            Color32::from_rgb(216, 222, 233),
+        );
+        job.wrap.max_width = (self.card.width() - 20.0).max(8.0);
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        job.wrap.overflow_character = Some('…');
+        let galley = painter.layout_job(job);
+        painter.galley(
+            egui::pos2(
+                self.card.left() + 10.0,
+                self.card.center().y - galley.size().y / 2.0,
+            ),
+            galley,
+            Color32::WHITE,
+        );
+        let (hint, color) = if self.detach_ready {
+            ("Release: new window", accent)
+        } else {
+            (
+                "Drag out for a new window",
+                Color32::from_rgb(136, 154, 176),
+            )
+        };
+        painter.text(
+            egui::pos2(self.card.left() + 2.0, self.card.bottom() + 6.0),
+            egui::Align2::LEFT_TOP,
+            hint,
+            FontId::proportional(11.0),
+            color,
+        );
+    }
+}
 const RENAMING_TAB: &str = "slate_tab_renaming";
 
 /// True while a tab's alias is being typed: app shortcuts must not take its keys.
@@ -206,6 +288,12 @@ fn draw_tabs(
             rect
         })
         .collect();
+    let dt = ui.input(|i| i.stable_dt).min(0.1);
+    let latest = ui.input(|i| i.pointer.latest_pos());
+    let screen = ui.ctx().content_rect();
+    let mut sliding = false;
+    // A tab pulled off the strip, drawn after the others as a floating card.
+    let mut lifted: Option<Lifted> = None;
     for (index, tab) in tabs.iter().enumerate() {
         let rect = rects[index];
         let visible = rect.intersect(strip);
@@ -229,6 +317,72 @@ fn draw_tabs(
         let is_active = index == active;
         let dragging = response.dragged();
         let hovered = response.hovered() || close_hovered;
+        // Where the tab is drawn (strip coordinates, so scrolling does not
+        // animate): it slides toward its slot, and a dragged tab is carried
+        // by the pointer where it was grabbed.
+        let slot_x = rect.left() - strip.left() + offset;
+        let drawn_id = id.with("drawn_x");
+        let grab_id = id.with("grab");
+        if response.drag_started()
+            && let Some(pos) = ui.input(|i| i.pointer.press_origin())
+        {
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(grab_id, pos - rect.min));
+        }
+        let grab: Vec2 = ui
+            .ctx()
+            .data(|d| d.get_temp(grab_id))
+            .unwrap_or(rect.size() / 2.0);
+        let mut drawn: f32 = ui.ctx().data(|d| d.get_temp(drawn_id)).unwrap_or(slot_x);
+        let mut pulled_off = false;
+        let mut detach_ready = false;
+        match latest.filter(|_| dragging) {
+            Some(pos) => {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                pulled_off = pos.y > bar.bottom() + LIFT_DISTANCE || !screen.contains(pos);
+                detach_ready = !screen.expand(4.0).contains(pos);
+                let carried = (pos.x - grab.x).clamp(
+                    strip.left(),
+                    (strip.right() - rect.width()).max(strip.left()),
+                );
+                drawn = carried - strip.left() + offset;
+            }
+            None => {
+                drawn += (slot_x - drawn) * (1.0 - (-dt / SLIDE_SECONDS).exp());
+                if (slot_x - drawn).abs() < 0.5 {
+                    drawn = slot_x;
+                } else {
+                    sliding = true;
+                }
+            }
+        }
+        ui.ctx().data_mut(|d| d.insert_temp(drawn_id, drawn));
+        let shift = Vec2::new(drawn - slot_x, 0.0);
+        let shown = rect.translate(shift);
+        if pulled_off && let Some(pos) = latest {
+            // Its slot keeps an outline; the card follows the pointer, held
+            // inside the window when the pointer leaves it.
+            painter.rect_stroke(
+                rect,
+                TAB_CORNERS,
+                egui::Stroke::new(1.0_f32, Color32::from_rgb(58, 68, 86)),
+                egui::StrokeKind::Inside,
+            );
+            let card = egui::Rect::from_min_size(pos - grab, rect.size());
+            let room = screen.shrink(6.0);
+            let card = card.translate(Vec2::new(
+                (room.left() - card.left()).max(0.0) + (room.right() - card.right()).min(0.0),
+                (room.top() - card.top()).max(0.0)
+                    + (room.bottom() - card.bottom() - 26.0).min(0.0),
+            ));
+            lifted = Some(Lifted {
+                card,
+                text: tab.text.clone(),
+                detach_ready,
+            });
+        } else if dragging {
+            ui.ctx().request_repaint();
+        }
         let fill = if is_active || dragging {
             Some(Color32::from_rgb(36, 44, 58))
         } else if hovered {
@@ -236,17 +390,19 @@ fn draw_tabs(
         } else {
             None
         };
+        // The dragged tab is drawn above its neighbours.
+        let mut painter = if dragging {
+            ui.ctx()
+                .layer_painter(egui::LayerId::new(egui::Order::Foreground, id))
+                .with_clip_rect(strip)
+        } else {
+            painter.clone()
+        };
+        if pulled_off {
+            painter.set_invisible();
+        }
         if let Some(fill) = fill {
-            painter.rect_filled(
-                rect,
-                egui::CornerRadius {
-                    nw: 6,
-                    ne: 6,
-                    sw: 0,
-                    se: 0,
-                },
-                fill,
-            );
+            painter.rect_filled(shown, TAB_CORNERS, fill);
         }
         let text_color = if is_active {
             Color32::from_rgb(216, 222, 233)
@@ -310,17 +466,21 @@ fn draw_tabs(
         job.wrap.break_anywhere = true;
         job.wrap.overflow_character = Some('…');
         let galley = ui.painter().layout_job(job);
-        let text_pos = egui::pos2(rect.left() + 10.0, rect.center().y - galley.size().y / 2.0);
+        let text_pos = egui::pos2(
+            shown.left() + 10.0,
+            shown.center().y - galley.size().y / 2.0,
+        );
         painter
-            .with_clip_rect(rect.intersect(strip))
+            .with_clip_rect(shown.intersect(strip))
             .galley(text_pos, galley, text_color);
+        let close_shown = close_rect.translate(shift);
         if close_hovered {
-            painter.rect_filled(close_rect, 3.0, Color32::from_rgb(58, 68, 86));
+            painter.rect_filled(close_shown, 3.0, Color32::from_rgb(58, 68, 86));
         }
         if tab.dirty && !hovered {
-            painter.circle_filled(close_rect.center(), 3.5, Color32::from_rgb(235, 203, 139));
+            painter.circle_filled(close_shown.center(), 3.5, Color32::from_rgb(235, 203, 139));
         } else if is_active || hovered {
-            let c = close_rect.center();
+            let c = close_shown.center();
             let stroke = egui::Stroke::new(1.3_f32, text_color);
             painter.line_segment([c + Vec2::new(-3.5, -3.5), c + Vec2::new(3.5, 3.5)], stroke);
             painter.line_segment([c + Vec2::new(-3.5, 3.5), c + Vec2::new(3.5, -3.5)], stroke);
@@ -339,7 +499,7 @@ fn draw_tabs(
                     at: origin + pos.to_vec2(),
                 });
             }
-        } else if dragging {
+        } else if dragging && !pulled_off {
             // Reorder live: the tab follows the pointer across its neighbours.
             if let Some(pos) = pointer {
                 let target = drag_target(&rects, index, pos.x);
@@ -358,6 +518,22 @@ fn draw_tabs(
         #[cfg(test)]
         ui.ctx()
             .data_mut(|data| data.insert_temp(egui::Id::new(("tab_rect", index)), rect));
+        #[cfg(test)]
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(egui::Id::new(("tab_shown", index)), shown));
+    }
+    if sliding {
+        ui.ctx().request_repaint();
+    }
+    #[cfg(test)]
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(
+            egui::Id::new("tab_lifted"),
+            lifted.as_ref().map(|l| (l.card, l.detach_ready)),
+        )
+    });
+    if let Some(lifted) = lifted {
+        lifted.paint(ui.ctx(), &font);
     }
     // Scroll hints when tabs are hidden on either side.
     let fade = Color32::from_rgba_unmultiplied(22, 28, 37, 220);

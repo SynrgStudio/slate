@@ -68,3 +68,12 @@ document keeps its own durable checkpoint.
    window (single-instance owner) reads/writes `session.json`, so extra
    windows never clobber the session. Dropping a tab into another Slate
    window is not supported yet.
+5. Carried tabs (2026-11-01): a dragged tab is drawn under the pointer where
+   it was grabbed, above its neighbours, and the others slide into their new
+   places (~45 ms time constant; closing a tab slides the rest too). Pulled
+   more than 12 pt below the strip it comes off as a floating card that
+   follows the pointer — "Drag out for a new window" — and, once the pointer
+   leaves the window, the card is held at the window's edge with an accent
+   border and "Release: new window". Dropped back inside, it slides home.
+   With a ready spare (see `docs/speed-work.md`) the new window appears
+   about 30 ms after the release.

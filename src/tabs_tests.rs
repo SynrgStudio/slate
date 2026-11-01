@@ -382,6 +382,83 @@ fn a_dragged_tab_swaps_only_past_the_neighbours_centre() {
 }
 
 #[test]
+fn a_dragged_tab_is_carried_by_the_pointer_and_lifts_off_to_detach() {
+    let ctx = egui::Context::default();
+    let tabs: Vec<tabs::TabLabel> = ["one.md", "two.md", "three.md"]
+        .iter()
+        .enumerate()
+        .map(|(id, text)| tabs::TabLabel {
+            id: id as u64,
+            text: text.to_string(),
+            dirty: false,
+            tooltip: String::new(),
+            rename_text: String::new(),
+        })
+        .collect();
+    let mut time = 0.0;
+    let mut frame = |events: Vec<egui::Event>| {
+        time += 1.0 / 60.0;
+        let mut action = None;
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(900.0, 500.0),
+                )),
+                time: Some(time),
+                events,
+                ..Default::default()
+            },
+            |ui| action = window_ui::titlebar_with_tabs(ui, "Slate", &tabs, 0),
+        );
+        action
+    };
+    let get = |key: egui::Id| ctx.data(|d| d.get_temp::<egui::Rect>(key)).unwrap();
+    let button = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    frame(vec![]);
+    let first = get(egui::Id::new(("tab_rect", 0)));
+    let grab = first.left_center() + Vec2::new(20.0, 0.0);
+    frame(vec![egui::Event::PointerMoved(grab), button(grab, true)]);
+    // Carried: drawn under the pointer, not in its slot.
+    let along = grab + Vec2::new(30.0, 0.0);
+    assert_eq!(frame(vec![egui::Event::PointerMoved(along)]), None);
+    let shown = get(egui::Id::new(("tab_shown", 0)));
+    assert!(
+        (shown.left() - (first.left() + 30.0)).abs() < 0.5,
+        "{shown:?}"
+    );
+    // Pulled down off the strip: a card follows, nothing reorders.
+    let below = grab + Vec2::new(300.0, 120.0);
+    assert_eq!(frame(vec![egui::Event::PointerMoved(below)]), None);
+    let lifted =
+        ctx.data(|d| d.get_temp::<Option<(egui::Rect, bool)>>(egui::Id::new("tab_lifted")));
+    let (card, ready) = lifted.flatten().expect("lifted card");
+    assert!(card.contains(below) && !ready);
+    // Out of the window: ready to detach, and the card stays inside.
+    let outside = egui::pos2(950.0, 300.0);
+    frame(vec![egui::Event::PointerMoved(outside)]);
+    let lifted =
+        ctx.data(|d| d.get_temp::<Option<(egui::Rect, bool)>>(egui::Id::new("tab_lifted")));
+    let (card, ready) = lifted.flatten().expect("lifted card");
+    assert!(ready && card.right() <= 900.0);
+    let action = frame(vec![button(outside, false)]);
+    assert!(
+        matches!(action, Some(window_ui::TabAction::Detach { index: 0, .. })),
+        "{action:?}"
+    );
+    // Back on the strip after a drop inside: the tab slides home.
+    frame(vec![]);
+    let lifted =
+        ctx.data(|d| d.get_temp::<Option<(egui::Rect, bool)>>(egui::Id::new("tab_lifted")));
+    assert_eq!(lifted.flatten(), None);
+}
+
+#[test]
 fn a_file_changed_on_disk_while_its_tab_was_inactive_is_flagged_when_shown() {
     let mut f = Fixture::new();
     f.app.document_safety =
