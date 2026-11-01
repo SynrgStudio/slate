@@ -100,6 +100,25 @@ pub enum TabAction {
 }
 
 const TAB_FONT: f32 = 12.0;
+const TAB_CENTERS: &str = "slate_tab_centers";
+const TITLEBAR_HEIGHT: f32 = 30.0;
+
+/// Where a tab dropped at `screen` (physical pixels) goes among this
+/// window's tabs: by position over the tab strip, last anywhere else.
+pub(crate) fn tab_slot_at(ctx: &egui::Context, screen: (f32, f32)) -> usize {
+    let centers: Vec<f32> = ctx
+        .data(|d| d.get_temp(egui::Id::new(TAB_CENTERS)))
+        .unwrap_or_default();
+    let Some(inner) = ctx.input(|i| i.viewport().inner_rect) else {
+        return centers.len();
+    };
+    let ppp = ctx.pixels_per_point();
+    let local = egui::pos2(screen.0 / ppp, screen.1 / ppp) - inner.min.to_vec2();
+    if local.y > TITLEBAR_HEIGHT + 4.0 {
+        return centers.len();
+    }
+    centers.iter().filter(|x| **x < local.x).count()
+}
 const TAB_CORNERS: egui::CornerRadius = egui::CornerRadius {
     nw: 6,
     ne: 6,
@@ -117,6 +136,8 @@ struct Lifted {
     card: egui::Rect,
     text: String,
     detach_ready: bool,
+    /// Over another Slate window: letting go joins the tab to it.
+    joins_window: bool,
 }
 
 impl Lifted {
@@ -126,7 +147,9 @@ impl Lifted {
             egui::Id::new("slate_tab_lifted"),
         ));
         let accent = Color32::from_rgb(136, 192, 208);
-        let border = if self.detach_ready {
+        let border = if self.joins_window {
+            Color32::from_rgb(163, 190, 140)
+        } else if self.detach_ready {
             accent
         } else {
             Color32::from_rgb(76, 86, 106)
@@ -165,7 +188,12 @@ impl Lifted {
             galley,
             Color32::WHITE,
         );
-        let (hint, color) = if self.detach_ready {
+        let (hint, color) = if self.joins_window {
+            (
+                "Release: move to that window",
+                Color32::from_rgb(163, 190, 140),
+            )
+        } else if self.detach_ready {
             ("Release: new window", accent)
         } else {
             (
@@ -288,6 +316,13 @@ fn draw_tabs(
             rect
         })
         .collect();
+    // Where the tabs are, for a tab dropped here from another window.
+    ui.ctx().data_mut(|d| {
+        d.insert_temp(
+            egui::Id::new(TAB_CENTERS),
+            rects.iter().map(|r| r.center().x).collect::<Vec<f32>>(),
+        )
+    });
     let dt = ui.input(|i| i.stable_dt).min(0.1);
     let latest = ui.input(|i| i.pointer.latest_pos());
     let screen = ui.ctx().content_rect();
@@ -379,6 +414,7 @@ fn draw_tabs(
                 card,
                 text: tab.text.clone(),
                 detach_ready,
+                joins_window: detach_ready && crate::tab_drop::target_under_cursor().is_some(),
             });
         } else if dragging {
             ui.ctx().request_repaint();
@@ -603,7 +639,7 @@ pub fn titlebar_with_tabs(
     let ctx = ui.ctx().clone();
     resize_edges(&ctx);
     egui::Panel::top("slate_titlebar")
-        .exact_size(30.0)
+        .exact_size(TITLEBAR_HEIGHT)
         .frame(
             egui::Frame::new()
                 .fill(Color32::from_rgb(22, 28, 37))

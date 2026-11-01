@@ -591,6 +591,92 @@ fn a_saved_tab_dropped_outside_reopens_its_file_in_a_new_window() {
 }
 
 #[test]
+fn a_tab_dropped_onto_another_window_joins_its_tabs() {
+    // The source window lets go of an unsaved tab.
+    let mut f = Fixture::new();
+    f.app.buffer.type_text("traída de otra ventana");
+    f.app.dirty = true;
+    f.app.rename_tab(0, Some("Viajera"));
+    f.app.new_tab();
+    assert!(f.app.detach_tab(0, egui::pos2(500.0, 300.0)));
+    let handoff = fs::read_dir(f.root.join("handoff"))
+        .unwrap()
+        .flatten()
+        .next()
+        .unwrap()
+        .path();
+
+    // The target window has its own tabs.
+    let mut g = Fixture::new();
+    let a = g.file(
+        "a.md", "alpha
+",
+    );
+    let b = g.file(
+        "b.md", "beta
+",
+    );
+    g.open(&a);
+    g.open(&b);
+    let ctx = g.ctx.clone();
+    g.app.receive_tab(
+        single_instance::OpenRequest {
+            handoff: Some(handoff.clone()),
+            ..Default::default()
+        },
+        &ctx,
+    );
+    assert_eq!(g.labels(), ["a.md", "b.md", "Viajera"], "added last");
+    assert_eq!(g.app.tabs.active, 2);
+    assert_eq!(g.app.buffer.as_str(), "traída de otra ventana");
+    assert!(g.app.dirty && !handoff.exists());
+
+    // A file already open here is not duplicated: its tab comes forward.
+    g.app.receive_tab(
+        single_instance::OpenRequest {
+            path: Some(a.clone()),
+            ..Default::default()
+        },
+        &ctx,
+    );
+    assert_eq!(g.labels(), ["a.md", "b.md", "Viajera"]);
+    assert_eq!(g.app.tabs.active, 0);
+}
+
+#[test]
+fn a_dropped_tab_lands_between_the_tabs_under_the_cursor() {
+    let ctx = egui::Context::default();
+    let mut input = egui::RawInput::default();
+    input.viewports.insert(
+        egui::ViewportId::ROOT,
+        egui::ViewportInfo {
+            inner_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(100.0, 50.0),
+                Vec2::new(900.0, 500.0),
+            )),
+            ..Default::default()
+        },
+    );
+    let _ = ctx.run_ui(input, |_| {});
+    ctx.data_mut(|d| {
+        d.insert_temp(
+            egui::Id::new("slate_tab_centers"),
+            vec![50.0_f32, 150.0, 250.0],
+        )
+    });
+    let ppp = ctx.pixels_per_point();
+    let at = |x: f32, y: f32| ((100.0 + x) * ppp, (50.0 + y) * ppp);
+    assert_eq!(window_ui::tab_slot_at(&ctx, at(10.0, 15.0)), 0);
+    assert_eq!(window_ui::tab_slot_at(&ctx, at(200.0, 15.0)), 2);
+    assert_eq!(window_ui::tab_slot_at(&ctx, at(400.0, 15.0)), 3);
+    assert_eq!(
+        window_ui::tab_slot_at(&ctx, at(10.0, 300.0)),
+        3,
+        "below the strip: last"
+    );
+}
+
+#[test]
 fn unsaved_and_untitled_tabs_carry_their_text_to_the_new_window() {
     let mut f = Fixture::new();
     let a = f.file("a.md", "alpha\n");

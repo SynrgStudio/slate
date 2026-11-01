@@ -35,9 +35,12 @@ pub(crate) struct OpenRequest {
     /// top-left in points.
     pub(crate) handoff: Option<PathBuf>,
     pub(crate) position: Option<(f32, f32)>,
+    /// A tab dropped onto this window, at this screen point (physical
+    /// pixels): add it as a tab there (see `tab_drop`).
+    pub(crate) tab_at: Option<(f32, f32)>,
 }
 
-fn data_dir() -> Option<PathBuf> {
+pub(crate) fn data_dir() -> Option<PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .or_else(dirs_next::data_local_dir)?;
@@ -224,6 +227,10 @@ fn encode_request(token: &str, request: &OpenRequest) -> String {
     };
     let path = text(&request.path);
     let line = request.line.map(|l| l.to_string()).unwrap_or_default();
+    if let Some((x, y)) = request.tab_at {
+        let handoff = text(&request.handoff);
+        return format!("{token}\nTAB\t{x},{y}\t{handoff}\t{path}\n");
+    }
     if request.handoff.is_none() && request.position.is_none() {
         return format!("{token}\nOPEN\t{line}\t{path}\n");
     }
@@ -241,6 +248,18 @@ fn decode_request(token: &str, message: &str) -> Option<OpenRequest> {
         return None;
     }
     let record = lines.next()?;
+    if let Some(rest) = record.strip_prefix("TAB\t") {
+        let mut fields = rest.splitn(3, '\t');
+        let (x, y) = fields.next()?.split_once(',')?;
+        let handoff = fields.next()?;
+        let path = fields.next()?;
+        return Some(OpenRequest {
+            path: (!path.is_empty()).then(|| PathBuf::from(path)),
+            handoff: (!handoff.is_empty()).then(|| PathBuf::from(handoff)),
+            tab_at: Some((x.parse().ok()?, y.parse().ok()?)),
+            ..Default::default()
+        });
+    }
     let window = record.starts_with("WINDOW\t");
     // The path goes last: it may itself contain tabs.
     let mut fields = record.splitn(if window { 5 } else { 3 }, '\t');
@@ -274,6 +293,7 @@ fn decode_request(token: &str, message: &str) -> Option<OpenRequest> {
         path: (!path.is_empty()).then(|| PathBuf::from(path)),
         handoff,
         position,
+        tab_at: None,
     })
 }
 
@@ -332,10 +352,20 @@ mod tests {
             line: None,
             handoff: Some(PathBuf::from("C:\\data\\handoff\\1-2.json")),
             position: Some((-1280.5, 40.0)),
+            tab_at: None,
         };
         let encoded = encode_request("abc", &window);
         assert!(encoded.contains("\nWINDOW\t"));
         assert_eq!(decode_request("abc", &encoded), Some(window));
+        let tab = OpenRequest {
+            path: Some(PathBuf::from("C:\\notas\\día\ttab.md")),
+            handoff: Some(PathBuf::from("C:\\data\\handoff\\1-2.json")),
+            tab_at: Some((2560.0, -12.0)),
+            ..Default::default()
+        };
+        let encoded = encode_request("abc", &tab);
+        assert!(encoded.contains("\nTAB\t"));
+        assert_eq!(decode_request("abc", &encoded), Some(tab));
     }
 
     #[test]

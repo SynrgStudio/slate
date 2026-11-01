@@ -142,6 +142,8 @@ context: ~300–350 ms on this machine, Slate's own constructor < 0.5 ms.
   - The spare is cloaked (DWM) from creation, so eframe's show-after-first-
     paint never flashes, then hidden and trimmed: 3 MB working set, ~150 MB
     committed.
+  - A visible resident Slate checks every 30 s that its spare still exists
+    and starts another if it was closed or crashed (never two at once).
   - It accepts one claim, then stops listening and removes its file; a second
     claimer falls back to a normal start. Unclaimed, it quits when its owner
     process exits and never writes settings or session (its view of the

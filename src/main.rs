@@ -96,6 +96,7 @@ mod settings_ui;
 mod shortcuts;
 mod single_instance;
 mod spare;
+mod tab_drop;
 mod tabs;
 mod window_drag;
 mod window_ui;
@@ -395,6 +396,7 @@ fn main() -> eframe::Result {
             line: startup_line,
             handoff: handoff.clone(),
             position: position.map(|at| (at.x, at.y)),
+            tab_at: None,
         };
         if spare::claim(&request) {
             perf_log::mark("startup.claimed_spare_window", "");
@@ -472,6 +474,8 @@ fn main() -> eframe::Result {
                 }
                 if let Some(owner) = spare_owner {
                     app.become_spare(cc, owner);
+                } else if !scratch && !standalone_agenda {
+                    app.tab_drop_server = tab_drop::listen(&cc.egui_ctx);
                 }
                 Ok(Box::new(app))
             }),
@@ -985,6 +989,10 @@ struct SlateApp {
     /// Waiting hidden as the ready window (`--spare`) until claimed.
     spare_server: Option<single_instance::Server>,
     spare_owner: Option<u32>,
+    /// Receives tabs dropped onto this window from other Slate windows.
+    tab_drop_server: Option<single_instance::Server>,
+    /// Last time the resident primary made sure a spare exists.
+    spare_checked_at: Option<std::time::Instant>,
     /// Config: closing the primary window hides it in the tray.
     resident: bool,
     /// Resident mode is running in this process (tray icon installed).
@@ -1230,6 +1238,8 @@ impl SlateApp {
             instance_server: None,
             spare_server: None,
             spare_owner: None,
+            tab_drop_server: None,
+            spare_checked_at: None,
             resident: true,
             resident_active: false,
             window_hidden: false,
@@ -1506,6 +1516,16 @@ impl SlateApp {
         perf_log::mark("spare.ready", &format!("owner={owner}"));
     }
 
+    /// Tabs dropped onto this window from other Slate windows.
+    fn poll_dropped_tabs(&mut self, ctx: &egui::Context) {
+        let Some(server) = self.tab_drop_server.as_ref() else {
+            return;
+        };
+        for request in server.take_requests() {
+            self.receive_tab(request, ctx);
+        }
+    }
+
     /// The ready window was claimed: become the requested window.
     fn poll_spare(&mut self, ctx: &egui::Context) {
         let Some(request) = self
@@ -1517,6 +1537,7 @@ impl SlateApp {
         };
         self.spare_server = None;
         perf_log::mark("spare.claimed", "");
+        self.tab_drop_server = tab_drop::listen(ctx);
         // Settings may have changed since this window started.
         self.load_settings();
         self.show_window(ctx);
@@ -1543,6 +1564,20 @@ impl SlateApp {
     fn poll_resident(&mut self, ctx: &egui::Context) {
         if std::mem::take(&mut self.hide_on_first_frame) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+        // Keep a spare while visible (one that was closed or crashed is
+        // replaced); nothing runs while hidden.
+        if self.resident_active
+            && !self.window_hidden
+            && self
+                .spare_checked_at
+                .is_none_or(|at| at.elapsed() >= spare::CHECK_INTERVAL)
+        {
+            let first = self.spare_checked_at.is_none();
+            self.spare_checked_at = Some(std::time::Instant::now());
+            if !first {
+                spare::prepare_soon(std::process::id(), std::time::Duration::ZERO);
+            }
         }
         if resident::take_quit_request() {
             self.quit_for_real = true;
@@ -10331,6 +10366,7 @@ impl SlateApp {
         self.poll_file_open(&ctx);
         self.poll_instance_requests(&ctx);
         self.poll_spare(&ctx);
+        self.poll_dropped_tabs(&ctx);
         self.poll_resident(&ctx);
         if let Some(action) = self.pending_tab_action.take() {
             self.finish_pending_action(action, &ctx);
@@ -10389,7 +10425,13 @@ impl SlateApp {
             Some(window_ui::TabAction::Rename { index, alias }) => {
                 self.rename_tab(index, Some(&alias))
             }
-            Some(window_ui::TabAction::Detach { index, at }) => self.detach_tab(index, at),
+            Some(window_ui::TabAction::Detach { index, at }) => {
+                // Moving a window's only tab away closes (or hides) the window.
+                let only_tab = self.tabs_len() == 1;
+                if self.detach_tab(index, at) && only_tab {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
             None => {}
         }
         if self.recovery_open || self.file_conflict.is_some() {

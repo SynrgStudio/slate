@@ -440,16 +440,22 @@ impl SlateApp {
         true
     }
 
-    pub(super) fn detach_tab(&mut self, index: usize, at: egui::Pos2) {
+    pub(super) fn tabs_len(&self) -> usize {
+        self.tabs.list.len()
+    }
+
+    /// Moves tab `index` out of this window: onto another Slate window under
+    /// the cursor, or else into a new window at `at`. True when it moved.
+    pub(super) fn detach_tab(&mut self, index: usize, at: egui::Pos2) -> bool {
         // The moved tab must carry the file's real state.
         self.finish_background_save();
         if index >= self.tabs.list.len() {
-            return;
+            return false;
         }
         let path = self.tab_path(index).map(Path::to_path_buf);
         let label = self.tab_labels()[index].text.clone();
         let Ok(exe) = std::env::current_exe() else {
-            return;
+            return false;
         };
         // Unsaved text (or a tab without a file) travels in a handoff file.
         let handoff = match self.tab_handoff(index) {
@@ -457,11 +463,23 @@ impl SlateApp {
                 Ok(file) => Some(file),
                 Err(err) => {
                     self.status = format!("Could not move the tab: {err}");
-                    return;
+                    return false;
                 }
             },
             None => None,
         };
+        let moved_tab = |path: Option<PathBuf>| single_instance::OpenRequest {
+            path: if handoff.is_none() { path } else { None },
+            handoff: handoff.clone(),
+            ..Default::default()
+        };
+        if let Some(target) = tab_drop::target_under_cursor()
+            && tab_drop::send(&target, moved_tab(path.clone()))
+        {
+            self.tab_moved_away(index);
+            self.status = format!("Moved {label} to the other window");
+            return true;
+        }
         // Put the new window's tab strip under the pointer.
         let position = format!("{},{}", (at.x - 60.0).round(), (at.y - 14.0).round());
         let command = {
@@ -481,14 +499,8 @@ impl SlateApp {
         // A ready hidden window takes the tab in milliseconds; otherwise a
         // new process starts.
         let request = single_instance::OpenRequest {
-            path: if handoff.is_none() {
-                path.clone()
-            } else {
-                None
-            },
-            line: None,
-            handoff: handoff.clone(),
             position: Some(((at.x - 60.0).round(), (at.y - 14.0).round())),
+            ..moved_tab(path.clone())
         };
         let claimed = spare::claim(&request);
         // Tests check the command instead of starting a window.
@@ -508,23 +520,64 @@ impl SlateApp {
             Ok(_) => {
                 #[cfg(test)]
                 let launched = self.status.clone();
-                if index != self.tabs.active {
-                    self.activate_tab(index);
-                }
-                // The text now lives in the handoff file and the new window.
-                self.dirty = false;
-                self.close_active_tab_inner(false);
+                self.tab_moved_away(index);
                 self.status = format!("Moved {label} to a new window");
                 #[cfg(test)]
                 self.status.push_str(&format!(" · {launched}"));
+                true
             }
             Err(err) => {
                 if let Some(file) = handoff {
                     let _ = fs::remove_file(file);
                 }
                 self.status = format!("New window failed: {err}");
+                false
             }
         }
+    }
+
+    /// The tab's text now lives in the handoff file and the other window.
+    fn tab_moved_away(&mut self, index: usize) {
+        if index != self.tabs.active {
+            self.activate_tab(index);
+        }
+        self.dirty = false;
+        self.close_active_tab_inner(false);
+    }
+
+    /// A tab dropped here from another Slate window: added where it was
+    /// dropped (or last when dropped below the tab strip) and focused.
+    pub(super) fn receive_tab(
+        &mut self,
+        request: single_instance::OpenRequest,
+        ctx: &egui::Context,
+    ) {
+        self.finish_background_save();
+        let slot = request
+            .tab_at
+            .map_or(self.tabs.list.len(), |at| window_ui::tab_slot_at(ctx, at));
+        let existing = request
+            .path
+            .as_deref()
+            .and_then(|path| self.tab_index_for_path(path));
+        if let Some(index) = existing {
+            // Already open here: that tab is the one.
+            self.activate_tab(index);
+        } else {
+            if !self.active_tab_is_blank() {
+                self.new_tab();
+            }
+            if let Some(file) = &request.handoff {
+                self.apply_handoff(file);
+            } else if let Some(path) = request.path {
+                self.request_file_open(path, OpenDestination::Restore);
+            }
+            let last = self.tabs.list.len() - 1;
+            self.move_tab(self.tabs.active, slot.min(last));
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        self.focus_editor_once = true;
     }
 
     /// What has to travel with a tab: `None` when the file on disk is enough.

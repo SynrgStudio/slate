@@ -43,6 +43,13 @@ pub(crate) fn is_ready() -> bool {
     single_instance::spare_file().is_some_and(|file| single_instance::is_running(&file))
 }
 
+/// How often a visible resident Slate makes sure its spare still exists.
+pub(crate) const CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Last spare this process started: a spare takes a moment to start
+/// listening, and asking again meanwhile would start a second one.
+static LAST_PREPARED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
 /// Starts a spare for `owner` after `delay`, unless one is already waiting.
 pub(crate) fn prepare_soon(owner: u32, delay: Duration) {
     if cfg!(test) {
@@ -52,6 +59,15 @@ pub(crate) fn prepare_soon(owner: u32, delay: Duration) {
         std::thread::sleep(delay);
         if is_ready() {
             return;
+        }
+        {
+            let Ok(mut last) = LAST_PREPARED.lock() else {
+                return;
+            };
+            if last.is_some_and(|at| at.elapsed() < Duration::from_secs(15)) {
+                return;
+            }
+            *last = Some(std::time::Instant::now());
         }
         if let Ok(exe) = std::env::current_exe() {
             let spawned = std::process::Command::new(exe)

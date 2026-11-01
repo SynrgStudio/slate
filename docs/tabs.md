@@ -66,8 +66,7 @@ document keeps its own durable checkpoint.
    alias) passed with `--handoff`; the new window loads it, makes its own
    recovery checkpoint durable, then deletes the file. Only the primary
    window (single-instance owner) reads/writes `session.json`, so extra
-   windows never clobber the session. Dropping a tab into another Slate
-   window is not supported yet.
+   windows never clobber the session.
 5. Carried tabs (2026-11-01): a dragged tab is drawn under the pointer where
    it was grabbed, above its neighbours, and the others slide into their new
    places (~45 ms time constant; closing a tab slides the rest too). Pulled
@@ -77,3 +76,16 @@ document keeps its own durable checkpoint.
    border and "Release: new window". Dropped back inside, it slides home.
    With a ready spare (see `docs/speed-work.md`) the new window appears
    about 30 ms after the release.
+6. Joining windows (2026-11-01): a tab released over another Slate window
+   joins that window's tabs. Every editor window listens on its own
+   loopback port (`%LOCALAPPDATA%/slate/windows/<pid>`, same token scheme as
+   the single-instance channel, `src/tab_drop.rs`). On release the window
+   under the cursor is looked up (`WindowFromPoint`); if it belongs to
+   another Slate that listens, the tab goes there as a `TAB` record: the
+   path, or the handoff file with unsaved text, plus the cursor's screen
+   position. The receiving window inserts it between the tabs under the
+   cursor (last when dropped below the tab strip), focuses it, and a file
+   it already has open just comes forward instead of opening twice. While
+   dragging over such a window the card turns green: "Release: move to that
+   window". Moving a window's only tab away (to another window or a new
+   one) closes that window, or hides it in the tray for the resident one.
