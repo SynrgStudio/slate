@@ -47,7 +47,7 @@ pub(crate) enum DailyEventKind {
 }
 
 impl DailyEventKind {
-    fn section(self) -> &'static str {
+    pub(crate) fn section(self) -> &'static str {
         match self {
             Self::Captured => "Captured",
             Self::Completed => "Completed",
@@ -133,15 +133,25 @@ pub(crate) fn ensure_monthly_document(date: NaiveDate) -> Result<PathBuf, String
     }
     let current = fs::read_to_string(&path).unwrap_or_default();
     let next = ensure_day_in_document(&current, date);
-    fs::write(&path, next).map_err(|err| format!("Daily log write failed: {err}"))?;
+    write_if_changed(&path, &current, &next)?;
     Ok(path)
+}
+
+/// Replaces the log atomically, and only when something changed: an open
+/// copy elsewhere is not disturbed for nothing.
+fn write_if_changed(path: &std::path::Path, current: &str, next: &str) -> Result<(), String> {
+    if next == current {
+        return Ok(());
+    }
+    crate::safe_file::atomic_replace(path, next.as_bytes())
+        .map_err(|err| format!("Daily log write failed: {err}"))
 }
 
 pub(crate) fn append_event(event: &DailyEvent) -> Result<PathBuf, String> {
     let path = ensure_monthly_document(event.date)?;
     let current = fs::read_to_string(&path).unwrap_or_default();
     let next = append_event_to_document(&current, event);
-    fs::write(&path, next).map_err(|err| format!("Daily log write failed: {err}"))?;
+    write_if_changed(&path, &current, &next)?;
     Ok(path)
 }
 
@@ -160,11 +170,27 @@ pub(crate) fn ensure_day_in_document(document: &str, date: NaiveDate) -> String 
         doc = format!("{month_title}\n\n{doc}");
     }
     if !doc.contains(&day_heading) {
-        doc.push_str("\n\n");
-        doc.push_str(&day_heading);
-        doc.push('\n');
+        // Days stay in date order: before the first later day, if any.
+        match later_day_offset(&doc, date) {
+            Some(at) => doc.insert_str(at, &format!("\n{day_heading}\n")),
+            None => {
+                doc.push_str("\n\n");
+                doc.push_str(&day_heading);
+                doc.push('\n');
+            }
+        }
     }
     doc
+}
+
+/// Where the first day heading after `date` starts (at its preceding
+/// newline), if there is one.
+fn later_day_offset(document: &str, date: NaiveDate) -> Option<usize> {
+    document.match_indices("\n## ").find_map(|(at, _)| {
+        let text = document.get(at + 4..at + 14)?;
+        let day = NaiveDate::parse_from_str(text, "%Y-%m-%d").ok()?;
+        (day > date).then_some(at)
+    })
 }
 
 pub(crate) fn day_heading_byte(document: &str, date: NaiveDate) -> Option<usize> {
@@ -172,11 +198,6 @@ pub(crate) fn day_heading_byte(document: &str, date: NaiveDate) -> Option<usize>
 }
 
 pub(crate) fn append_event_to_document(document: &str, event: &DailyEvent) -> String {
-    let month_title = format!(
-        "# Slate Daily Log — {:04}-{:02}",
-        event.date.year(),
-        event.date.month()
-    );
     let day_heading = format!("## {}", event.date);
     let section_heading = format!("### {}", event.kind.section());
     let entry = render_event(event);
@@ -185,24 +206,7 @@ pub(crate) fn append_event_to_document(document: &str, event: &DailyEvent) -> St
         return document.to_string();
     }
 
-    let mut doc = document.trim_end().to_string();
-    if doc.is_empty() {
-        doc.push_str(&month_title);
-        doc.push('\n');
-    } else if !doc.starts_with("# Slate Daily Log") {
-        doc = format!("{month_title}\n\n{doc}");
-    }
-
-    if !doc.contains(&day_heading) {
-        doc.push_str("\n\n");
-        doc.push_str(&day_heading);
-        doc.push_str("\n\n");
-        doc.push_str(&section_heading);
-        doc.push('\n');
-        doc.push_str(&entry);
-        return doc;
-    }
-
+    let mut doc = ensure_day_in_document(document, event.date);
     if let Some(insert_at) = section_insert_offset(&doc, &day_heading, &section_heading) {
         let prefix = if insert_at > 0 && !doc[..insert_at].ends_with('\n') {
             "\n"
@@ -212,19 +216,14 @@ pub(crate) fn append_event_to_document(document: &str, event: &DailyEvent) -> St
         doc.insert_str(insert_at, &format!("{prefix}{entry}"));
         return doc;
     }
-
     if let Some(insert_at) = day_insert_offset(&doc, &day_heading) {
-        let block = format!("\n{section_heading}\n{entry}");
-        doc.insert_str(insert_at, &block);
-        return doc;
+        let prefix = if doc[..insert_at].ends_with('\n') {
+            ""
+        } else {
+            "\n"
+        };
+        doc.insert_str(insert_at, &format!("{prefix}\n{section_heading}\n{entry}"));
     }
-
-    doc.push_str("\n\n");
-    doc.push_str(&day_heading);
-    doc.push_str("\n\n");
-    doc.push_str(&section_heading);
-    doc.push('\n');
-    doc.push_str(&entry);
     doc
 }
 
@@ -361,6 +360,25 @@ mod tests {
         assert!(doc.contains("# Slate Daily Log — 2026-06"));
         assert!(doc.contains("## 2026-06-11"));
         assert!(!doc.contains("### Captured"));
+    }
+
+    #[test]
+    fn days_stay_in_date_order_whatever_order_they_are_written_in() {
+        let day = |d| NaiveDate::from_ymd_opt(2026, 6, d).unwrap();
+        let doc = ensure_day_in_document("", day(12));
+        let doc = ensure_day_in_document(&doc, day(10));
+        let mut late = event(DailyEventKind::Captured, "en medio");
+        late.date = day(11);
+        let doc = append_event_to_document(&doc, &late);
+        let at = |heading: &str| doc.find(heading).unwrap();
+        assert!(at("## 2026-06-10") < at("## 2026-06-11"), "{doc}");
+        assert!(at("## 2026-06-11") < at("## 2026-06-12"), "{doc}");
+        let entry = at("captured — en medio");
+        assert!(
+            at("## 2026-06-11") < entry && entry < at("## 2026-06-12"),
+            "{doc}"
+        );
+        assert_eq!(ensure_day_in_document(&doc, day(11)), doc.trim_end());
     }
 
     #[test]

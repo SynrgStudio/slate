@@ -22,6 +22,9 @@ pub(super) struct State {
     data: Data,
     buffers: HashMap<u64, PathBuf>,
     loaded: Option<PathBuf>,
+    /// Modification time and size when loaded: another window may change
+    /// the file, and then it is read again.
+    stamp: Option<(Option<std::time::SystemTime>, u64)>,
     base: Option<safe_file::Fingerprint>,
     error: Option<String>,
 }
@@ -43,10 +46,14 @@ fn key(path: &Path) -> String {
 }
 impl State {
     fn load(&mut self, path: &Path) {
-        if self.loaded.as_deref() == Some(path) {
+        let stamp = fs::metadata(path)
+            .ok()
+            .map(|metadata| (metadata.modified().ok(), metadata.len()));
+        if self.loaded.as_deref() == Some(path) && self.stamp == stamp {
             return;
         }
         self.loaded = Some(path.to_path_buf());
+        self.stamp = stamp;
         self.error = None;
         self.base = None;
         self.data = Data::default();
@@ -102,21 +109,48 @@ impl State {
             safe_file::checked_save(path, &bytes, self.base)
                 .map_err(|error| format!("{error:?}"))?,
         );
+        self.stamp = fs::metadata(path)
+            .ok()
+            .map(|metadata| (metadata.modified().ok(), metadata.len()));
         Ok(())
     }
+    /// Records `root` as the project of buffer `id` / document `path`.
+    /// Starts from the file as it is on disk, so another window's changes
+    /// are kept, and tries once more if it changed again meanwhile.
     fn associate(&mut self, id: u64, path: Option<&Path>, root: PathBuf) -> Result<(), String> {
         if path.is_none() {
             self.buffers.insert(id, root.clone());
         } else {
             self.buffers.remove(&id);
         }
-        if !self.data.roots.iter().any(|other| key(other) == key(&root)) {
-            self.data.roots.push(root.clone());
+        let file = self.loaded.clone().ok_or("No project metadata location")?;
+        let mut attempt = 0;
+        loop {
+            self.loaded = None;
+            self.load(&file);
+            let mut changed = false;
+            if !self.data.roots.iter().any(|other| key(other) == key(&root)) {
+                self.data.roots.push(root.clone());
+                changed = true;
+            }
+            if let Some(path) = path {
+                // A document inside the root needs no entry of its own.
+                let explicit = self.data.files.get(&key(path));
+                let covered =
+                    explicit.is_none() && self.project(id, Some(path)) == Some(root.clone());
+                if !covered && explicit.is_none_or(|old| key(old) != key(&root)) {
+                    self.data.files.insert(key(path), root.clone());
+                    changed = true;
+                }
+            }
+            if !changed && self.error.is_none() {
+                return Ok(());
+            }
+            match self.save() {
+                Err(_) if attempt == 0 && self.error.is_none() => attempt += 1,
+                result => return result,
+            }
         }
-        if let Some(path) = path {
-            self.data.files.insert(key(path), root);
-        }
-        self.save()
     }
 }
 impl SlateApp {
@@ -254,9 +288,19 @@ mod tests {
         first.load(&path);
         second.load(&path);
         first.associate(1, None, base.join("one")).unwrap();
-        let bytes = fs::read(&path).unwrap();
-        assert!(second.associate(2, None, base.join("two")).is_err());
-        assert_eq!(fs::read(&path).unwrap(), bytes);
+        // The second window starts from the file as the first one left it.
+        second.associate(2, None, base.join("two")).unwrap();
+        let mut reread = State::default();
+        reread.load(&path);
+        assert_eq!(reread.data.roots, vec![base.join("one"), base.join("two")]);
+        // And the first one sees the second's change without a restart.
+        let doc = base.join("two").join("a.md");
+        first.load(&path);
+        assert_eq!(first.project(3, Some(&doc)), Some(base.join("two")));
+        // A document already inside its root gets no entry of its own.
+        first.associate(3, Some(&doc), base.join("two")).unwrap();
+        reread.load(&path);
+        assert!(reread.data.files.is_empty());
         fs::remove_dir_all(base).unwrap();
     }
     #[test]

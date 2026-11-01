@@ -9,7 +9,7 @@ use eframe::egui::{self, Color32, FontFamily, FontId, RichText, Stroke};
 
 use crate::markdown::parse_checkbox_line;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ScratchEntry {
     pub(crate) heading: Option<String>,
     pub(crate) body: String,
@@ -40,7 +40,7 @@ pub(crate) fn archive_path() -> Option<PathBuf> {
     Some(dir.join("scratch.md"))
 }
 
-pub(crate) fn feedback_toast(ctx: &egui::Context, until: Option<f64>) {
+pub(crate) fn feedback_toast(ctx: &egui::Context, until: Option<f64>, message: &str) {
     let Some(until) = until else {
         return;
     };
@@ -58,7 +58,7 @@ pub(crate) fn feedback_toast(ctx: &egui::Context, until: Option<f64>) {
                 .inner_margin(egui::Margin::symmetric(14, 8))
                 .show(ui, |ui| {
                     ui.label(
-                        RichText::new("Agenda updated")
+                        RichText::new(message)
                             .font(FontId::new(15.0, FontFamily::Monospace))
                             .color(Color32::from_rgb(163, 190, 140)),
                     );
@@ -130,26 +130,28 @@ pub(crate) fn format_capture_entry(title: &str, text: &str) -> String {
     }
 }
 
-pub(crate) fn split_quickadds(text: &str) -> (Vec<String>, String) {
+/// Splits scratch text into Flow quickadds (`:qa`, `:quickadd` or `:inbox`
+/// lines, and checkbox lines) and the rest. Each quickadd keeps its original
+/// line, so one that fails can be put back.
+pub(crate) fn split_quickadds(text: &str) -> (Vec<(String, String)>, String) {
     let mut quickadds = Vec::new();
     let mut remaining = String::new();
     for line in text.lines() {
         let trimmed = line.trim_start();
         if let Some(rest) = trimmed.strip_prefix(':') {
-            let rest = rest.trim();
-            let task = rest
-                .strip_prefix("quickadd ")
-                .or_else(|| rest.strip_prefix("qa "))
-                .or_else(|| rest.strip_prefix("inbox "))
-                .unwrap_or(rest)
-                .trim();
-            if !task.is_empty() {
-                quickadds.push(task.to_string());
+            let rest = rest.trim_start();
+            // Any other line starting with ':' is just text.
+            let task = ["quickadd ", "qa ", "inbox "]
+                .iter()
+                .find_map(|command| rest.strip_prefix(command))
+                .map(str::trim);
+            if let Some(task) = task.filter(|task| !task.is_empty()) {
+                quickadds.push((task.to_string(), line.to_string()));
                 continue;
             }
         }
         if parse_checkbox_line(trimmed).is_some_and(|checkbox| !checkbox.text.trim().is_empty()) {
-            quickadds.push(trimmed.to_string());
+            quickadds.push((trimmed.to_string(), line.to_string()));
             continue;
         }
         remaining.push_str(line);
@@ -185,6 +187,15 @@ pub(crate) fn append_text_to_archive(path: &Path, text: &str) -> Result<(), Stri
         .map_err(|err| format!("Scratch append failed: {err}"))
 }
 
+/// An entry starts at the `## <date time>` heading the archive writes (or
+/// the "untitled scratch" one): a `## ` heading the user wrote inside an
+/// entry is part of it.
+fn is_entry_heading(text: &str) -> bool {
+    let text = text.trim();
+    text == "untitled scratch"
+        || chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S").is_ok()
+}
+
 pub(crate) fn parse_entries(text: &str) -> Vec<ScratchEntry> {
     let mut entries = Vec::new();
     let mut heading: Option<String> = None;
@@ -207,7 +218,10 @@ pub(crate) fn parse_entries(text: &str) -> Vec<ScratchEntry> {
         {
             continue;
         }
-        if let Some(rest) = line.strip_prefix("## ") {
+        if let Some(rest) = line
+            .strip_prefix("## ")
+            .filter(|rest| is_entry_heading(rest))
+        {
             flush(&mut entries, &mut heading, &mut body);
             heading = Some(rest.trim().to_string());
             seen_entry = true;
@@ -243,10 +257,21 @@ mod tests {
             "nota\n:quickadd comprar pan #casa\n: inbox llamar\n[] testeo @proyectocasa\nfin",
         );
         assert_eq!(
-            quickadds,
+            quickadds
+                .iter()
+                .map(|(task, _)| task.as_str())
+                .collect::<Vec<_>>(),
             vec!["comprar pan #casa", "llamar", "[] testeo @proyectocasa"]
         );
+        assert_eq!(
+            quickadds[1].1, ": inbox llamar",
+            "the original line is kept"
+        );
         assert_eq!(remaining, "nota\nfin");
+        // Other lines that start with ':' are text, not tasks.
+        let (quickadds, remaining) = split_quickadds(":) hola\n:qa\n:note: idea\nhttp://x");
+        assert!(quickadds.is_empty());
+        assert_eq!(remaining, ":) hola\n:qa\n:note: idea\nhttp://x");
     }
 
     #[test]
@@ -271,12 +296,18 @@ mod tests {
 
     #[test]
     fn scratch_entries_round_trip() {
-        let entries = parse_entries("# Scratch\n\n## uno\n\ntexto\n\n## dos\n\nmas");
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].title(), "uno");
-        assert_eq!(entries[0].body, "texto");
-        assert_eq!(entries[1].title(), "dos");
-        assert!(serialize_entries(&entries).contains("## uno"));
+        let entries = parse_entries(
+            "# Scratch\n\n## 2026-11-01 10:00:00\n\ntexto\n## Mis ideas\nmas\n\n## 2026-11-01 11:30:05\n\notra",
+        );
+        assert_eq!(
+            entries.len(),
+            2,
+            "a heading inside an entry does not split it"
+        );
+        assert_eq!(entries[0].title(), "2026-11-01 10:00:00");
+        assert_eq!(entries[0].body, "texto\n## Mis ideas\nmas");
+        assert_eq!(entries[1].body, "otra");
+        assert_eq!(parse_entries(&serialize_entries(&entries)), entries);
     }
 
     #[test]

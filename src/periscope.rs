@@ -298,9 +298,56 @@ pub(crate) fn move_selection(row_count: usize, selected: usize, delta: isize) ->
         .min(row_count.saturating_sub(1))
 }
 
+/// System and secret locations, shown in a warning colour: editing there is
+/// rarely what was meant.
+pub(crate) fn is_sensitive_path(path: &std::path::Path) -> bool {
+    let text = path.to_string_lossy().replace('\\', "/").to_lowercase();
+    let text = text.strip_prefix("//?/").unwrap_or(&text);
+    // Windows: the system and installed programs, on any drive.
+    let windows = text.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        && text.get(1..2) == Some(":")
+        && [
+            "/windows/",
+            "/program files/",
+            "/program files (x86)/",
+            "/programdata/",
+        ]
+        .iter()
+        .any(|root| text[2..].starts_with(root));
+    windows
+        || ["/etc/", "/boot/", "/usr/", "/var/"]
+            .iter()
+            .any(|root| text.starts_with(root))
+        || ["/.ssh/", "/.gnupg/", "/.aws/"]
+            .iter()
+            .any(|secret| text.contains(secret))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sensitive_paths_on_windows_and_unix() {
+        use std::path::Path;
+        for path in [
+            "/etc/hosts",
+            "/home/me/.ssh/config",
+            r"C:\Windows\System32\drivers\etc\hosts",
+            r"d:\Program Files\App\app.ini",
+            r"C:\Users\me\.ssh\config",
+            r"\\?\C:\ProgramData\x.json",
+        ] {
+            assert!(is_sensitive_path(Path::new(path)), "{path}");
+        }
+        for path in [
+            r"C:\Users\me\notes\windows\a.md",
+            "/home/me/etc/a.md",
+            r"D:\slate\README.md",
+        ] {
+            assert!(!is_sensitive_path(Path::new(path)), "{path}");
+        }
+    }
 
     #[test]
     fn native_word_order_is_not_filtered_out_and_filenames_rank_before_path_only_matches() {

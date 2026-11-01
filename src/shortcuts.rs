@@ -204,7 +204,6 @@ impl SlateApp {
                 recent_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
                 recent_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
                 recent_open |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
-                recent_open |= i.consume_key(egui::Modifiers::NONE, Key::Space);
                 recent_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
             }
             if self.lance_open {

@@ -7,8 +7,12 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod agenda;
 #[cfg(test)]
 mod async_open_tests;
+#[cfg(test)]
+mod bug_fix_tests;
 mod commands;
 mod daily;
+#[cfg(test)]
+mod daily_events_tests;
 #[cfg(test)]
 mod dialog_tests;
 mod dialog_ui;
@@ -507,17 +511,56 @@ pub(crate) fn record_flow_daily_events(
     old_items: &[AgendaItem],
     summary: &flow::FlowIndexSummary,
 ) -> Result<(), String> {
-    let relative_path = summary.known_file.path.clone();
-    let old_for_path = old_items
-        .iter()
-        .filter(|item| item.path == path)
-        .map(|item| (item.line_index, item))
-        .collect::<std::collections::HashMap<_, _>>();
+    for event in flow_daily_events(path, old_items, summary) {
+        daily::append_event(&event)?;
+    }
+    Ok(())
+}
 
+/// What a Flow file update means for the daily log: tasks captured (new)
+/// and completed.
+pub(crate) fn flow_daily_events(
+    path: &Path,
+    old_items: &[AgendaItem],
+    summary: &flow::FlowIndexSummary,
+) -> Vec<DailyEvent> {
+    let mut events = Vec::new();
+    let relative_path = summary.known_file.path.clone();
+    // Items are matched by title, not line: inserting a line above a task
+    // must not log it again. A changed title on a line that lost its old
+    // item is an edit of that item, not a new capture.
+    let mut old_by_title: std::collections::HashMap<&str, Vec<&AgendaItem>> =
+        std::collections::HashMap::new();
+    for item in old_items.iter().filter(|item| item.path == path) {
+        old_by_title
+            .entry(item.title.as_str())
+            .or_default()
+            .push(item);
+    }
+    let mut unmatched = Vec::new();
+    let mut matched = Vec::new();
     for task in &summary.tasks {
+        match old_by_title
+            .get_mut(task.title.as_str())
+            .and_then(|items| items.pop())
+        {
+            Some(old) => matched.push((task, Some(old))),
+            None => unmatched.push(task),
+        }
+    }
+    let leftover: std::collections::HashMap<usize, &AgendaItem> = old_by_title
+        .into_values()
+        .flatten()
+        .map(|item| (item.line_index, item))
+        .collect();
+    for task in unmatched {
+        matched.push((task, leftover.get(&task.line_index).copied()));
+    }
+    matched.sort_by_key(|(task, _)| task.line_index);
+
+    for (task, old) in matched {
         let source = format!("{}:{}", relative_path, task.line_number);
         let source_link = Some(format!("{}#L{}", path.display(), task.line_number));
-        let old = old_for_path.get(&task.line_index).copied();
         let event_kind = if old.is_none() {
             Some(DailyEventKind::Captured)
         } else if task.kind == flow::FlowItemKind::Task
@@ -540,9 +583,9 @@ pub(crate) fn record_flow_daily_events(
             source,
             source_link,
         );
-        daily::append_event(&event)?;
+        events.push(event);
     }
-    Ok(())
+    events
 }
 
 fn collect_link_target_files(root: &Path, out: &mut Vec<PathBuf>, limit: usize) {
@@ -581,17 +624,17 @@ fn find_note_file_matches(root: &Path, path: &Path, query: &str) -> bool {
         .unwrap_or(path)
         .display()
         .to_string();
-    if label.to_ascii_lowercase().contains(query)
+    if label.to_lowercase().contains(query)
         || path
             .file_stem()
             .and_then(|stem| stem.to_str())
-            .map(|stem| stem.to_ascii_lowercase().contains(query))
+            .map(|stem| stem.to_lowercase().contains(query))
             .unwrap_or(false)
     {
         return true;
     }
     fs::read_to_string(path)
-        .map(|contents| contents.to_ascii_lowercase().contains(query))
+        .map(|contents| contents.to_lowercase().contains(query))
         .unwrap_or(false)
 }
 
@@ -601,16 +644,16 @@ fn find_note_match_hint(root: &Path, path: &Path, query: &str) -> String {
         .unwrap_or(path)
         .display()
         .to_string();
-    if label.to_ascii_lowercase().contains(query) {
+    if label.to_lowercase().contains(query) {
         return "file".to_string();
     }
     let Ok(contents) = fs::read_to_string(path) else {
         return "note".to_string();
     };
     for line in contents.lines() {
-        let lower = line.to_ascii_lowercase();
+        let lower = line.to_lowercase();
         if let Some(heading) = parse_heading_line(line) {
-            if heading.text.to_ascii_lowercase().contains(query) {
+            if heading.text.to_lowercase().contains(query) {
                 return format!("heading: {}", heading.text.trim());
             }
         } else if lower.contains(query) {
@@ -691,10 +734,37 @@ fn line_start_offsets(contents: &str) -> Vec<usize> {
     offsets
 }
 
+/// Edits a text file (missing: empty) with `\n` line endings, writes it
+/// back with the endings it had, atomically, and returns what was written.
+fn edit_text_file(
+    path: &Path,
+    edit: impl FnOnce(&mut String) -> Result<(), String>,
+) -> Result<String, String> {
+    let original = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err.to_string()),
+    };
+    let crlf = original.contains("\r\n");
+    let mut text = if crlf {
+        original.replace("\r\n", "\n")
+    } else {
+        original
+    };
+    edit(&mut text)?;
+    if crlf {
+        text = text.replace('\n', "\r\n");
+    }
+    safe_file::atomic_replace(path, text.as_bytes())?;
+    Ok(text)
+}
+
 fn append_markdown_block(path: &Path, block: &str) -> Result<(), String> {
-    let mut contents = fs::read_to_string(path).unwrap_or_default();
-    append_markdown_block_to_string(&mut contents, block);
-    fs::write(path, contents).map_err(|err| err.to_string())
+    edit_text_file(path, |contents| {
+        append_markdown_block_to_string(contents, block);
+        Ok(())
+    })
+    .map(drop)
 }
 
 fn append_markdown_block_to_heading(
@@ -702,18 +772,19 @@ fn append_markdown_block_to_heading(
     heading: &link_ui::LinkHeadingOption,
     block: &str,
 ) -> Result<(), String> {
-    let mut contents = fs::read_to_string(path).unwrap_or_default();
-    let insert_at =
-        markdown_heading_insert_offset(&contents, heading).unwrap_or_else(|| contents.len());
-    let mut insertion = String::new();
-    if insert_at > 0 && !contents[..insert_at].ends_with('\n') {
+    edit_text_file(path, |contents| {
+        let insert_at = markdown_heading_insert_offset(contents, heading).unwrap_or(contents.len());
+        let mut insertion = String::new();
+        if insert_at > 0 && !contents[..insert_at].ends_with('\n') {
+            insertion.push('\n');
+        }
         insertion.push('\n');
-    }
-    insertion.push('\n');
-    insertion.push_str(block.trim_end());
-    insertion.push('\n');
-    contents.insert_str(insert_at, &insertion);
-    fs::write(path, contents).map_err(|err| err.to_string())
+        insertion.push_str(block.trim_end());
+        insertion.push('\n');
+        contents.insert_str(insert_at, &insertion);
+        Ok(())
+    })
+    .map(drop)
 }
 
 fn append_markdown_block_to_string(contents: &mut String, block: &str) {
@@ -864,6 +935,13 @@ impl PendingAction {
     }
 }
 
+/// What happened to scratch text: how many quickadds went to the inbox,
+/// and the text that could not be saved (quickadds and archive text).
+struct ScratchFlush {
+    quickadded: usize,
+    left: Option<String>,
+}
+
 struct DuplicatePlacement {
     snapshot: String,
     was_dirty: bool,
@@ -940,6 +1018,9 @@ struct SlateApp {
     scratch: bool,
     standalone_agenda: bool,
     scratch_close_after: Option<f64>,
+    /// Quickadds made by the last scratch-window archive (for its toast).
+    scratch_quickadded: usize,
+    feedback_toast_message: &'static str,
     agenda_updated_toast_until: Option<f64>,
     pending_flow_agenda_sync_at: Option<f64>,
     pending_action: Option<PendingAction>,
@@ -1186,6 +1267,8 @@ impl SlateApp {
             scratch,
             standalone_agenda,
             scratch_close_after: None,
+            scratch_quickadded: 0,
+            feedback_toast_message: "Agenda updated",
             agenda_updated_toast_until: None,
             pending_flow_agenda_sync_at: None,
             pending_action: None,
@@ -2049,7 +2132,7 @@ impl SlateApp {
             self.status = "No pending refile".to_string();
             return;
         };
-        if destination == draft.source_path {
+        if tabs::same_file(&destination, &draft.source_path) {
             self.status = "Refile target is the same file".to_string();
             return;
         }
@@ -2163,25 +2246,45 @@ impl SlateApp {
             };
             self.buffer.insert_text(&source_note);
             self.dirty = true;
+            // Refile asked for a saved source and wrote everything else to
+            // disk: the backlink is saved too, not left as a new change.
+            self.save_path(draft.source_path.clone());
             self.schedule_current_flow_buffer_agenda_sync_later();
             return Ok(());
         }
 
-        let mut contents = fs::read_to_string(&draft.source_path).map_err(|err| err.to_string())?;
-        let line_starts = line_start_offsets(&contents);
-        let insert_at = line_starts
-            .get(draft.source_line_index + 1)
-            .copied()
-            .unwrap_or(contents.len());
-        let needs_leading_newline =
-            insert_at == contents.len() && !contents.is_empty() && !contents.ends_with('\n');
-        let source_note = if needs_leading_newline {
-            format!("\n{backlink}")
-        } else {
-            backlink.to_string()
-        };
-        contents.insert_str(insert_at, &source_note);
-        fs::write(&draft.source_path, contents.clone()).map_err(|err| err.to_string())?;
+        let contents = edit_text_file(&draft.source_path, |contents| {
+            // The line may have moved since the refile started.
+            let lines: Vec<&str> = contents.lines().collect();
+            let line = (0..=lines.len())
+                .find_map(|distance| {
+                    [
+                        draft.source_line_index.checked_sub(distance),
+                        Some(draft.source_line_index + distance).filter(|_| distance > 0),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .find(|index| {
+                        lines
+                            .get(*index)
+                            .is_some_and(|line| line.trim() == draft.text)
+                    })
+                })
+                .ok_or_else(|| "the source line changed on disk".to_string())?;
+            let insert_at = line_start_offsets(contents)
+                .get(line + 1)
+                .copied()
+                .unwrap_or(contents.len());
+            let needs_leading_newline =
+                insert_at == contents.len() && !contents.is_empty() && !contents.ends_with('\n');
+            let source_note = if needs_leading_newline {
+                format!("\n{backlink}")
+            } else {
+                backlink.to_string()
+            };
+            contents.insert_str(insert_at, &source_note);
+            Ok(())
+        })?;
         let _ = self.refresh_flow_index_for_path(&draft.source_path, &contents);
         Ok(())
     }
@@ -2683,10 +2786,22 @@ impl SlateApp {
             || fs::metadata(&path)
                 .map(|metadata| metadata.len() == 0)
                 .unwrap_or(true);
+        // A file that does not end in a newline would glue the task onto
+        // its last line.
+        let ends_with_newline = || -> std::io::Result<bool> {
+            use std::io::{Read, Seek};
+            let mut file = fs::File::open(&path)?;
+            file.seek(std::io::SeekFrom::End(-1))?;
+            let mut last = [0u8];
+            file.read_exact(&mut last)?;
+            Ok(last[0] == b'\n')
+        };
         let entry = if needs_header {
             format!("# Inbox\n\n{task_line}\n")
-        } else {
+        } else if ends_with_newline().unwrap_or(true) {
             format!("{task_line}\n")
+        } else {
+            format!("\n{task_line}\n")
         };
 
         match fs::OpenOptions::new().create(true).append(true).open(&path) {
@@ -2754,7 +2869,7 @@ impl SlateApp {
         files.retain(|path| is_markdown_like_path(path));
         files.sort();
         files.dedup();
-        let query = self.find_note_query.trim().to_ascii_lowercase();
+        let query = self.find_note_query.trim().to_lowercase();
         const LIMIT: usize = 200;
         let mut matched = Vec::new();
         // Read and test files on all cores, batch by batch, so a common query still
@@ -2780,7 +2895,7 @@ impl SlateApp {
     }
 
     fn rebuild_find_note_rows(&mut self) {
-        let query = self.find_note_query.trim().to_ascii_lowercase();
+        let query = self.find_note_query.trim().to_lowercase();
         let root = self.project_root();
         let hints = if query.is_empty() {
             vec!["note".to_string(); self.find_note_files.len()]
@@ -2860,8 +2975,18 @@ impl SlateApp {
         self.find_note_open = false;
         if as_modal {
             self.open_link_preview(path, fragment);
-        } else if self.dirty {
-            self.status = "Save or discard changes before opening find-note result".to_string();
+        } else {
+            self.open_keeping_unsaved_text(path, fragment);
+        }
+    }
+
+    /// Opens `path` (at `fragment`). Unsaved text here stays in its tab and
+    /// the file opens in another one; windows without tabs ask first.
+    fn open_keeping_unsaved_text(&mut self, path: PathBuf, fragment: Option<String>) {
+        if self.dirty {
+            self.pending_project_file_path = Some(path);
+            self.pending_open_heading_fragment = fragment;
+            self.confirm(PendingAction::OpenProjectFile);
         } else {
             self.request_file_open(
                 path,
@@ -2869,8 +2994,8 @@ impl SlateApp {
                     .map(OpenDestination::Fragment)
                     .unwrap_or(OpenDestination::Restore),
             );
-            self.focus_editor_once = true;
         }
+        self.focus_editor_once = true;
     }
 
     fn handle_find_note_text_input(&mut self, ctx: &egui::Context) {
@@ -3716,32 +3841,53 @@ impl SlateApp {
         }
 
         let text = self.buffer.as_str().to_string();
-        let (quickadds, remaining) = scratch::split_quickadds(&text);
-        let mut quickadd_count = 0usize;
-        let requested_quickadds = quickadds.len();
-        for task in quickadds {
+        let flushed = self.flush_scratch_text(&text);
+        self.scratch_quickadded = flushed.quickadded;
+        match flushed.left {
+            None => {
+                self.dirty = false;
+                true
+            }
+            Some(left) => {
+                // Only what did not make it stays, so trying again does not
+                // add the same tasks twice.
+                if left != text {
+                    self.buffer.set_text(left);
+                }
+                false
+            }
+        }
+    }
+
+    /// Sends scratch text where it goes: quickadd lines to the Flow inbox,
+    /// the rest to the scratch archive.
+    fn flush_scratch_text(&mut self, text: &str) -> ScratchFlush {
+        let (quickadds, remaining) = scratch::split_quickadds(text);
+        let mut quickadded = 0usize;
+        let mut failed = Vec::new();
+        for (task, line) in quickadds {
             if self.quickadd_flow_task(&task) {
-                quickadd_count += 1;
+                quickadded += 1;
+            } else {
+                failed.push(line);
             }
         }
-
-        let archived = if remaining.trim().is_empty() {
-            false
-        } else {
-            self.append_text_to_scratch_archive(&remaining)
-        };
-
-        let saved =
-            (remaining.trim().is_empty() || archived) && quickadd_count == requested_quickadds;
-        if saved {
-            self.dirty = false;
-            if quickadd_count > 0 && archived {
-                self.status = format!("Scratch archived · quickadded {quickadd_count} Flow tasks");
-            } else if quickadd_count > 0 {
-                self.status = format!("Quickadded {quickadd_count} Flow tasks");
+        let archived =
+            !remaining.trim().is_empty() && self.append_text_to_scratch_archive(&remaining);
+        if !remaining.trim().is_empty() && !archived {
+            failed.push(remaining);
+        }
+        if failed.is_empty() {
+            if quickadded > 0 && archived {
+                self.status = format!("Scratch archived · quickadded {quickadded} Flow tasks");
+            } else if quickadded > 0 {
+                self.status = format!("Quickadded {quickadded} Flow tasks");
             }
         }
-        saved
+        ScratchFlush {
+            quickadded,
+            left: (!failed.is_empty()).then(|| failed.join("\n")),
+        }
     }
 
     fn close_scratch_with_feedback(&mut self, ctx: &egui::Context) {
@@ -3762,6 +3908,11 @@ impl SlateApp {
             let until = ctx.input(|input| input.time) + 0.4;
             self.scratch_close_after = Some(until);
             self.agenda_updated_toast_until = Some(until);
+            self.feedback_toast_message = if self.scratch_quickadded > 0 {
+                "Agenda updated"
+            } else {
+                "Scratch archived"
+            };
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         } else if !self.dirty {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -3772,6 +3923,7 @@ impl SlateApp {
 
     fn show_agenda_updated_toast(&mut self, ctx: &egui::Context) {
         self.agenda_updated_toast_until = Some(ctx.input(|input| input.time) + 0.4);
+        self.feedback_toast_message = "Agenda updated";
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
     }
 
@@ -4039,7 +4191,11 @@ impl SlateApp {
     }
 
     fn scratch_feedback_toast(&self, ctx: &egui::Context) {
-        scratch::feedback_toast(ctx, self.agenda_updated_toast_until);
+        scratch::feedback_toast(
+            ctx,
+            self.agenda_updated_toast_until,
+            self.feedback_toast_message,
+        );
     }
 
     fn archive_scratch_modal(&mut self) {
@@ -4052,31 +4208,16 @@ impl SlateApp {
             return;
         }
         let text = self.scratch_buffer.as_str().to_string();
-        let (quickadds, remaining) = scratch::split_quickadds(&text);
-        let mut quickadd_count = 0usize;
-        let requested_quickadds = quickadds.len();
-        for task in quickadds {
-            if self.quickadd_flow_task(&task) {
-                quickadd_count += 1;
+        match self.flush_scratch_text(&text).left {
+            None => {
+                self.forget_project_buffer(self.scratch_buffer.identity);
+                self.scratch_buffer.clear();
+                self.scratch_modal_open = false;
+                self.focus_editor_once = true;
             }
-        }
-
-        let archived = if remaining.trim().is_empty() {
-            false
-        } else {
-            self.append_text_to_scratch_archive(&remaining)
-        };
-
-        if (remaining.trim().is_empty() || archived) && quickadd_count == requested_quickadds {
-            self.forget_project_buffer(self.scratch_buffer.identity);
-            self.scratch_buffer.clear();
-            self.scratch_modal_open = false;
-            self.focus_editor_once = true;
-            if quickadd_count > 0 && archived {
-                self.status = format!("Scratch archived · quickadded {quickadd_count} Flow tasks");
-            } else if quickadd_count > 0 {
-                self.status = format!("Quickadded {quickadd_count} Flow tasks");
-            }
+            // Only what did not make it stays in the modal.
+            Some(left) if left != text => self.scratch_buffer.set_text(left),
+            Some(_) => {}
         }
     }
 
@@ -4208,21 +4349,33 @@ impl SlateApp {
         let index = self
             .selected_scratch_entry
             .min(self.scratch_entries.len() - 1);
-        let deleted = self.scratch_entries.remove(index);
-        self.selected_scratch_entry = self
-            .selected_scratch_entry
-            .min(self.scratch_entries.len().saturating_sub(1));
+        let selected = self.scratch_entries[index].clone();
         let Some(path) = self.scratch_archive_path() else {
             return;
         };
-        if let Some(dir) = path.parent() {
-            if let Err(err) = fs::create_dir_all(dir) {
+        // Entries may have been archived since the list was read: delete
+        // from the file as it is now, never from the old list.
+        let current = match fs::read_to_string(&path) {
+            Ok(text) => scratch::parse_entries(&text),
+            Err(err) => {
                 self.status = format!("Scratch delete failed: {err}");
                 return;
             }
-        }
-        match fs::write(&path, scratch::serialize_entries(&self.scratch_entries)) {
-            Ok(_) => self.status = format!("Deleted scratch entry {}", deleted.title()),
+        };
+        let Some(position) = current.iter().position(|entry| *entry == selected) else {
+            self.load_scratch_entries();
+            self.status = "That scratch entry changed on disk; list refreshed".to_string();
+            return;
+        };
+        let mut entries = current;
+        let deleted = entries.remove(position);
+        match safe_file::atomic_replace(&path, scratch::serialize_entries(&entries).as_bytes()) {
+            Ok(_) => {
+                self.scratch_entries = entries;
+                self.selected_scratch_entry =
+                    index.min(self.scratch_entries.len().saturating_sub(1));
+                self.status = format!("Deleted scratch entry {}", deleted.title());
+            }
             Err(err) => self.status = format!("Scratch delete failed: {err}"),
         }
     }
@@ -4434,6 +4587,9 @@ impl SlateApp {
         self.shortcut_help_open = false;
         self.palette_open = false;
         self.recent_picker_open = false;
+        // One picker at a time: the others would cover this one.
+        self.file_picker_open = false;
+        self.lance_open = false;
         self.command_line_focused = false;
         self.focus_command_line_once = false;
         self.command_history_index = None;
@@ -4555,13 +4711,22 @@ impl SlateApp {
     }
 
     fn remove_selected_lance_file(&mut self) {
-        if self.selected_lance_file >= self.lance_files.len() {
+        // Only a mark the filter shows: a hidden one is not "selected".
+        if !self
+            .lance_file_indices()
+            .contains(&self.selected_lance_file)
+        {
+            self.status = "No matching lance file".to_string();
             return;
         }
         let removed = self.lance_files.remove(self.selected_lance_file);
-        self.selected_lance_file = self
-            .selected_lance_file
-            .min(self.lance_files.len().saturating_sub(1));
+        let visible = self.lance_file_indices();
+        self.selected_lance_file = visible
+            .iter()
+            .copied()
+            .find(|index| *index >= self.selected_lance_file)
+            .or_else(|| visible.last().copied())
+            .unwrap_or(0);
         let _ = self.save_settings();
         self.status = format!("Removed lance mark {}", removed.display());
     }
@@ -5461,7 +5626,10 @@ impl SlateApp {
                     self.clamp_agenda_selection();
                 }
             }
-            Err(err) => self.status = err,
+            Err(err) => {
+                self.status = err;
+                self.reindex_agenda_item_file(&item);
+            }
         }
     }
 
@@ -5504,7 +5672,23 @@ impl SlateApp {
                     self.clamp_agenda_selection();
                 }
             }
-            Err(err) => self.status = err,
+            Err(err) => {
+                self.status = err;
+                self.reindex_agenda_item_file(&item);
+            }
+        }
+    }
+
+    /// The file of `item` changed under the agenda: index it as it is now
+    /// and show the agenda again.
+    fn reindex_agenda_item_file(&mut self, item: &AgendaItem) {
+        if let Ok(contents) = fs::read_to_string(&item.path) {
+            let _ = self.refresh_flow_index_for_path(&item.path, &contents);
+        }
+        if let Ok(mut items) = self.load_agenda_items() {
+            self.overlay_current_buffer_agenda_items(&mut items);
+            self.agenda_items = items;
+            self.clamp_agenda_selection();
         }
     }
 
@@ -5539,35 +5723,10 @@ impl SlateApp {
         item: &AgendaItem,
         replacement: &str,
     ) -> Result<(), String> {
-        let contents = fs::read_to_string(&item.path)
-            .map_err(|err| format!("Flow edit read failed: {err}"))?;
-        let mut lines = contents.lines().map(str::to_string).collect::<Vec<_>>();
-        let Some(line) = lines.get_mut(item.line_index) else {
-            return Err("Flow edit line not found".to_string());
-        };
-        *line = replacement.to_string();
-        let mut next = lines.join("\n");
-        if contents.ends_with('\n') {
-            next.push('\n');
-        }
-        let tmp = item.path.with_extension(format!(
-            "{}.tmp",
-            item.path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .unwrap_or("md")
-        ));
-        fs::write(&tmp, next).map_err(|err| format!("Flow edit write failed: {err}"))?;
-        fs::rename(&tmp, &item.path).map_err(|err| format!("Flow edit replace failed: {err}"))?;
-        let updated = fs::read_to_string(&item.path)
-            .map_err(|err| format!("Flow edit reindex read failed: {err}"))?;
-        flow::update_flow_index_for_file(
-            scope,
-            &Self::flow_sqlite_path_for_root(scope)?,
-            &item.path,
-            &updated,
-        )?;
-        Ok(())
+        Self::rewrite_flow_item_line(scope, item, |line| {
+            *line = replacement.to_string();
+            true
+        })
     }
 
     fn append_flow_token_to_file(
@@ -5575,43 +5734,94 @@ impl SlateApp {
         item: &AgendaItem,
         token: &str,
     ) -> Result<(), String> {
+        Self::rewrite_flow_item_line(scope, item, |line| {
+            if line
+                .split_whitespace()
+                .any(|word| word.eq_ignore_ascii_case(token))
+            {
+                return false;
+            }
+            line.push(' ');
+            line.push_str(token);
+            true
+        })
+    }
+
+    /// Changes the line of a Flow item in its file (not open here) and
+    /// reindexes it. The item is looked for where the index last saw it and
+    /// then nearby, by title: the file may have changed since, and another
+    /// line must never be overwritten. Line endings stay as they were and
+    /// the file is replaced atomically.
+    fn rewrite_flow_item_line(
+        scope: &Path,
+        item: &AgendaItem,
+        edit: impl FnOnce(&mut String) -> bool,
+    ) -> Result<(), String> {
         let contents = fs::read_to_string(&item.path)
-            .map_err(|err| format!("Flow organization read failed: {err}"))?;
-        let mut lines = contents.lines().map(str::to_string).collect::<Vec<_>>();
-        let Some(line) = lines.get_mut(item.line_index) else {
-            return Err("Flow organization line not found".to_string());
-        };
-        if line
-            .split_whitespace()
-            .any(|word| word.eq_ignore_ascii_case(token))
-        {
+            .map_err(|err| format!("Flow edit read failed: {err}"))?;
+        let Some(next) = Self::edit_flow_item_text(&contents, item, edit)? else {
             return Ok(());
-        }
-        line.push(' ');
-        line.push_str(token);
-        let mut next = lines.join("\n");
-        if contents.ends_with('\n') {
-            next.push('\n');
-        }
-        let tmp = item.path.with_extension(format!(
-            "{}.tmp",
-            item.path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .unwrap_or("md")
-        ));
-        fs::write(&tmp, next).map_err(|err| format!("Flow organization write failed: {err}"))?;
-        fs::rename(&tmp, &item.path)
-            .map_err(|err| format!("Flow organization replace failed: {err}"))?;
-        let updated = fs::read_to_string(&item.path)
-            .map_err(|err| format!("Flow organization reindex read failed: {err}"))?;
+        };
+        safe_file::atomic_replace(&item.path, next.as_bytes())
+            .map_err(|err| format!("Flow edit write failed: {err}"))?;
         flow::update_flow_index_for_file(
             scope,
             &Self::flow_sqlite_path_for_root(scope)?,
             &item.path,
-            &updated,
+            &next,
         )?;
         Ok(())
+    }
+
+    /// `contents` with the line of `item` edited (None when `edit` changed
+    /// nothing), keeping its line endings.
+    fn edit_flow_item_text(
+        contents: &str,
+        item: &AgendaItem,
+        edit: impl FnOnce(&mut String) -> bool,
+    ) -> Result<Option<String>, String> {
+        let eol = if contents.contains("\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        let body = contents.strip_suffix(eol).unwrap_or(contents);
+        let mut lines: Vec<String> = body.split(eol).map(str::to_string).collect();
+        let Some(index) = Self::find_flow_item_line(&lines, item) else {
+            return Err(format!(
+                "{}:{} changed on disk; agenda refreshed, try again",
+                item.relative_path, item.line_number
+            ));
+        };
+        if !edit(&mut lines[index]) {
+            return Ok(None);
+        }
+        let mut next = lines.join(eol);
+        if contents.ends_with(eol) {
+            next.push_str(eol);
+        }
+        Ok(Some(next))
+    }
+
+    /// The line that holds `item` now: where it was indexed, or the closest
+    /// line with the same title.
+    fn find_flow_item_line(lines: &[String], item: &AgendaItem) -> Option<usize> {
+        let title_at = |index: usize| {
+            let line = lines.get(index)?;
+            flow::parse_flow_task_line(line, index, None)
+                .or_else(|| flow::parse_flow_note_or_idea_line(line, index, None))
+                .map(|parsed| parsed.title)
+        };
+        let matches = |index: usize| title_at(index).is_some_and(|title| title == item.title);
+        (0..=lines.len()).find_map(|distance| {
+            [
+                item.line_index.checked_sub(distance),
+                Some(item.line_index + distance).filter(|_| distance > 0),
+            ]
+            .into_iter()
+            .flatten()
+            .find(|index| matches(*index))
+        })
     }
 
     fn jump_to_agenda_item_index(&mut self, index: usize) {
@@ -5701,48 +5911,57 @@ impl SlateApp {
             self.status = format!("Agenda cycle only applies to tasks, not {}", item.kind);
             return;
         }
-        if self.dirty {
-            self.status = "Save current buffer before agenda cycle".to_string();
-            return;
-        }
-
         if self.path.as_ref() == Some(&item.path) {
-            let line = item
-                .line_index
-                .min(self.buffer.line_count().saturating_sub(1));
-            if !Self::cycle_flow_buffer_line(&mut self.buffer, line, item.line_number) {
+            // Unsaved edits may have moved it: find it by its title.
+            let lines: Vec<String> = (0..self.buffer.line_count())
+                .map(|index| self.buffer.line(index).to_string())
+                .collect();
+            let Some(line) = Self::find_flow_item_line(&lines, &item) else {
+                self.status = format!(
+                    "Agenda cycle failed: {} is no longer in this buffer",
+                    item.title
+                );
+                return;
+            };
+            if !EditorView::cycle_checkbox_at_line(&mut self.buffer, line) {
                 self.status = format!("Agenda cycle failed: no checkbox on line {}", line + 1);
                 return;
             }
             self.search_state = None;
+            // Unsaved changes are the user's to save: only a clean file is
+            // saved right away.
+            let was_dirty = self.dirty;
             self.dirty = true;
-            self.save_path(item.path.clone());
+            if !was_dirty {
+                self.save_path(item.path.clone());
+            }
         } else {
-            let text = match fs::read_to_string(&item.path) {
-                Ok(text) => text,
-                Err(err) => {
-                    self.status = format!("Agenda cycle failed: {err}");
-                    return;
+            let mut cycled = false;
+            let result = Self::rewrite_flow_item_line(&self.flow_scope_root(), &item, |line| {
+                let mut buffer = EditorBuffer::from_text(line.clone());
+                cycled = EditorView::cycle_checkbox_at_line(&mut buffer, 0);
+                if cycled {
+                    *line = buffer.as_str().to_string();
                 }
-            };
-            let mut buffer = EditorBuffer::from_text(text);
-            let line = item.line_index.min(buffer.line_count().saturating_sub(1));
-            if !Self::cycle_flow_buffer_line(&mut buffer, line, item.line_number) {
-                self.status = format!("Agenda cycle failed: no checkbox on line {}", line + 1);
-                return;
-            }
-            if let Err(err) = fs::write(&item.path, buffer.as_str()) {
+                cycled
+            });
+            if let Err(err) = result {
                 self.status = format!("Agenda cycle failed: {err}");
+                self.reindex_agenda_item_file(&item);
                 return;
             }
-            if let Err(err) = self.refresh_flow_index_for_path(&item.path, buffer.as_str()) {
-                self.status = err;
+            if !cycled {
+                self.status = format!(
+                    "Agenda cycle failed: no checkbox on {}:{}",
+                    item.relative_path, item.line_number
+                );
                 return;
             }
         }
 
         match self.load_agenda_items() {
-            Ok(items) => {
+            Ok(mut items) => {
+                self.overlay_current_buffer_agenda_items(&mut items);
                 self.agenda_items = items;
                 self.clamp_agenda_selection();
                 self.agenda_scroll_to_selected = true;
@@ -5763,18 +5982,6 @@ impl SlateApp {
                 self.status = format!("Agenda cycle updated source but reload failed: {err}");
             }
         }
-    }
-
-    fn cycle_flow_buffer_line(
-        buffer: &mut EditorBuffer,
-        line_index: usize,
-        line_number: usize,
-    ) -> bool {
-        if EditorView::cycle_checkbox_at_line(buffer, line_index) {
-            return true;
-        }
-        let fallback = line_number.saturating_sub(1);
-        fallback != line_index && EditorView::cycle_checkbox_at_line(buffer, fallback)
     }
 
     fn project_root(&self) -> PathBuf {
@@ -6120,13 +6327,8 @@ impl SlateApp {
             self.status = "No Periscope result selected".to_string();
             return;
         };
-        if self.dirty {
-            self.status = "Save or discard changes before opening Periscope result".to_string();
-            return;
-        }
         self.periscope_open = false;
-        self.open_path(path);
-        self.focus_editor_once = true;
+        self.open_keeping_unsaved_text(path, None);
     }
 
     fn open_selected_periscope_result_as_modal(&mut self) {
@@ -7154,11 +7356,9 @@ impl SlateApp {
                 if expanded.is_dir() {
                     self.record_command_usage("open");
                     self.open_file_picker_at(expanded, FilePickerMode::Open);
-                } else if self.dirty {
-                    self.status = "Save or discard changes before opening another file".to_string();
                 } else {
                     self.record_command_usage("open");
-                    self.open_path(expanded);
+                    self.open_keeping_unsaved_text(expanded, None);
                 }
             }
             CommandLineAction::Alias(alias) => {

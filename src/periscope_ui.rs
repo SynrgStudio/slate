@@ -225,11 +225,7 @@ impl SlateApp {
                         }
                     };
                     let full = path.display().to_string();
-                    let sensitive = full.starts_with("/etc/")
-                        || full.starts_with("/boot/")
-                        || full.starts_with("/usr/")
-                        || full.starts_with("/var/")
-                        || full.contains("/.ssh/");
+                    let sensitive = periscope::is_sensitive_path(path);
                     let y = row_rect.center().y - 0.5;
                     painter.text(
                         egui::pos2(row_rect.left() + 8.0, y),

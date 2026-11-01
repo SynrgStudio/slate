@@ -1419,10 +1419,14 @@ mod tests {
         assert_eq!(app.periscope_request, Some(2));
         assert_eq!(app.periscope_results.first(), Some(&root.join("latest.md")));
         app.open_selected_periscope_result();
-        assert!(app.periscope_open);
+        // A window without tabs asks before replacing the unsaved text.
+        assert!(!app.periscope_open);
+        assert!(matches!(
+            app.pending_action,
+            Some(crate::PendingAction::OpenProjectFile)
+        ));
         assert!(app.dirty);
         assert_eq!(app.buffer.as_str(), "visible unsaved text");
-        app.periscope_open = false;
         app.poll_periscope_global_index();
         assert!(app.periscope_request.is_none());
         drop(app);

@@ -249,7 +249,7 @@ fn clean_main_action_uses_async_open_without_replacing_the_buffer_in_the_dialog(
     f.app.cancel_file_open();
 }
 #[test]
-fn main_open_action_refuses_dirty_document_without_modifying_disk() {
+fn main_open_action_keeps_unsaved_text_and_never_modifies_disk() {
     let mut f = Fixture::new();
     let target = f.root.join("target.md");
     let bytes = fs::read(&target).unwrap();
@@ -262,9 +262,29 @@ fn main_open_action_refuses_dirty_document_without_modifying_disk() {
     }
     f.click_action(4);
     assert!(!f.app.find_note_open);
-    assert!(f.app.status.contains("Save or discard"));
+    // A window without tabs asks first; nothing is replaced yet.
+    assert!(matches!(
+        f.app.pending_action,
+        Some(PendingAction::OpenProjectFile)
+    ));
     assert_eq!(f.app.path, Some(f.root.join("current.md")));
     assert_eq!(f.app.buffer.as_str(), "preserve unsaved text");
     assert!(f.app.dirty);
-    assert_eq!(fs::read(target).unwrap(), bytes);
+    assert_eq!(fs::read(&target).unwrap(), bytes);
+
+    // A window with tabs keeps the unsaved text in its tab and opens the
+    // note in another one.
+    let mut g = Fixture::new();
+    g.app.scratch = false;
+    g.app.find_note_rows = vec![FindNoteRow::File {
+        path: target.clone(),
+        match_hint: String::new(),
+    }];
+    for _ in 0..3 {
+        g.draw(Vec2::new(900.0, 600.0), vec![], false);
+    }
+    g.click_action(4);
+    assert_eq!(g.app.tabs_len(), 2);
+    assert!(g.app.tab_labels()[0].dirty, "the unsaved tab stays");
+    assert_eq!(fs::read(&target).unwrap(), bytes);
 }
