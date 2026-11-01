@@ -478,14 +478,32 @@ impl SlateApp {
             }
             command
         };
+        // A ready hidden window takes the tab in milliseconds; otherwise a
+        // new process starts.
+        let request = single_instance::OpenRequest {
+            path: if handoff.is_none() {
+                path.clone()
+            } else {
+                None
+            },
+            line: None,
+            handoff: handoff.clone(),
+            position: Some(((at.x - 60.0).round(), (at.y - 14.0).round())),
+        };
+        let claimed = spare::claim(&request);
         // Tests check the command instead of starting a window.
         #[cfg(test)]
         let spawned: std::io::Result<()> = {
+            let _ = claimed;
             self.status = format!("{command:?}");
             Ok(())
         };
         #[cfg(not(test))]
-        let spawned = { command }.spawn();
+        let spawned = if claimed {
+            Ok(())
+        } else {
+            { command }.spawn().map(drop)
+        };
         match spawned {
             Ok(_) => {
                 #[cfg(test)]

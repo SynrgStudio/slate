@@ -128,6 +128,24 @@ context: ~300–350 ms on this machine, Slate's own constructor < 0.5 ms.
     adds `slate --background` to the current user's Run key (off by default).
     `--background` exits at once when Slate is already running (new `PING`
     record in the single-instance protocol).
+- **New windows from a ready spare.** A new window (a tab dragged out, the
+  tray's "New window", `slate --new-window`) used to be a cold start, ~330 ms.
+  While a resident Slate runs it keeps one more Slate fully started but hidden
+  (`src/spare.rs`, `--spare <owner pid>`), started 3 s after the window that
+  prepares it so it never competes with a start. A new window claims it over
+  the single-instance channel (new `WINDOW` record: position, handoff file,
+  path, line); the spare's listener thread moves and shows the window itself
+  (`SetWindowPos` + `ShowWindowAsync`), then the app re-reads the settings and
+  opens what was asked. The claimed window prepares the next spare.
+  - Visible **26–32 ms after `slate --new-window`** on the hidden test desktop,
+    including the launcher process; a dragged-out tab claims it in-process.
+  - The spare is cloaked (DWM) from creation, so eframe's show-after-first-
+    paint never flashes, then hidden and trimmed: 3 MB working set, ~150 MB
+    committed.
+  - It accepts one claim, then stops listening and removes its file; a second
+    claimer falls back to a normal start. Unclaimed, it quits when its owner
+    process exits and never writes settings or session (its view of the
+    settings may be stale).
 
 ## 6. Keystroke-to-photon latency
 

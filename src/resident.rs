@@ -23,8 +23,8 @@ pub(crate) fn take_quit_request() -> bool {
 
 #[cfg(windows)]
 pub(crate) use win::{
-    allow_foreground_handoff, autostart_enabled, install, remove_tray, set_autostart, show_now,
-    trim_memory_soon,
+    allow_foreground_handoff, autostart_enabled, cloak, install, remember_window, remove_tray,
+    set_autostart, show_at, show_now, trim_memory_soon, when_process_exits,
 };
 
 #[cfg(not(windows))]
@@ -33,6 +33,14 @@ pub(crate) fn install(_cc: &eframe::CreationContext<'_>) {}
 pub(crate) fn remove_tray() {}
 #[cfg(not(windows))]
 pub(crate) fn show_now() {}
+#[cfg(not(windows))]
+pub(crate) fn remember_window(_cc: &eframe::CreationContext<'_>) {}
+#[cfg(not(windows))]
+pub(crate) fn cloak(_cloaked: bool) {}
+#[cfg(not(windows))]
+pub(crate) fn show_at(_position: Option<(f32, f32)>) {}
+#[cfg(not(windows))]
+pub(crate) fn when_process_exits(_process_id: u32, _then: impl FnOnce() + Send + 'static) {}
 #[cfg(not(windows))]
 pub(crate) fn trim_memory_soon() {}
 #[cfg(not(windows))]
@@ -163,6 +171,16 @@ mod win {
         fn SetForegroundWindow(hwnd: Hwnd) -> i32;
         fn IsWindowVisible(hwnd: Hwnd) -> i32;
         fn ShowWindowAsync(hwnd: Hwnd, command: i32) -> i32;
+        fn SetWindowPos(
+            hwnd: Hwnd,
+            after: Hwnd,
+            x: i32,
+            y: i32,
+            width: i32,
+            height: i32,
+            flags: u32,
+        ) -> i32;
+        fn GetDpiForWindow(hwnd: Hwnd) -> u32;
         fn AllowSetForegroundWindow(process_id: u32) -> i32;
     }
     #[link(name = "kernel32")]
@@ -170,6 +188,18 @@ mod win {
         fn GetModuleHandleW(name: *const u16) -> Handle;
         fn GetCurrentProcess() -> Handle;
         fn K32EmptyWorkingSet(process: Handle) -> i32;
+        fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> Handle;
+        fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
+        fn CloseHandle(handle: Handle) -> i32;
+    }
+    #[link(name = "dwmapi")]
+    unsafe extern "system" {
+        fn DwmSetWindowAttribute(
+            hwnd: Hwnd,
+            attribute: u32,
+            value: *const c_void,
+            size: u32,
+        ) -> i32;
     }
     #[link(name = "advapi32")]
     unsafe extern "system" {
@@ -201,8 +231,8 @@ mod win {
         HWND.load(Ordering::Relaxed) as Hwnd
     }
 
-    /// Adds the tray icon and listens for its clicks on the main window.
-    pub(crate) fn install(cc: &eframe::CreationContext<'_>) {
+    /// Keeps the main window's handle so it can be shown from any thread.
+    pub(crate) fn remember_window(cc: &eframe::CreationContext<'_>) {
         use raw_window_handle::{HasWindowHandle, RawWindowHandle};
         let Ok(handle) = cc.window_handle() else {
             return;
@@ -210,9 +240,17 @@ mod win {
         let RawWindowHandle::Win32(handle) = handle.as_raw() else {
             return;
         };
-        let hwnd = handle.hwnd.get() as Hwnd;
-        HWND.store(hwnd as isize, Ordering::Relaxed);
+        HWND.store(handle.hwnd.get(), Ordering::Relaxed);
         let _ = CONTEXT.set(cc.egui_ctx.clone());
+    }
+
+    /// Adds the tray icon and listens for its clicks on the main window.
+    pub(crate) fn install(cc: &eframe::CreationContext<'_>) {
+        remember_window(cc);
+        let hwnd = hwnd();
+        if hwnd.is_null() {
+            return;
+        }
         // SAFETY: plain Win32 calls on this thread's live main window.
         unsafe {
             TASKBAR_CREATED.store(
@@ -304,6 +342,75 @@ mod win {
         }
     }
 
+    /// A cloaked window is composed but never drawn on screen: eframe shows
+    /// every window after its first paint, which a window meant to start
+    /// hidden must not flash.
+    pub(crate) fn cloak(cloaked: bool) {
+        const DWMWA_CLOAK: u32 = 13;
+        let value = i32::from(cloaked);
+        // SAFETY: plain DWM call on our own window; a null HWND is rejected.
+        unsafe {
+            let hwnd = hwnd();
+            if !hwnd.is_null() {
+                DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_CLOAK,
+                    (&raw const value).cast(),
+                    std::mem::size_of::<i32>() as u32,
+                );
+            }
+        }
+    }
+
+    /// Moves the hidden window to `position` (outer top-left, in points) and
+    /// shows it, from any thread, without waiting for an egui frame.
+    pub(crate) fn show_at(position: Option<(f32, f32)>) {
+        const SWP_NOSIZE: u32 = 0x1;
+        const SWP_NOZORDER: u32 = 0x4;
+        const SWP_NOACTIVATE: u32 = 0x10;
+        const SWP_ASYNCWINDOWPOS: u32 = 0x4000;
+        let hwnd = hwnd();
+        if hwnd.is_null() {
+            return;
+        }
+        // SAFETY: plain Win32 calls on our own window; the async flag only
+        // posts the move to the window's thread instead of waiting for it.
+        unsafe {
+            if let Some((x, y)) = position {
+                let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+                SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    (x * scale).round() as i32,
+                    (y * scale).round() as i32,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+                );
+            }
+        }
+        cloak(false);
+        show_now();
+    }
+
+    /// Runs `then` on a background thread once process `process_id` has
+    /// exited (right away if it is already gone).
+    pub(crate) fn when_process_exits(process_id: u32, then: impl FnOnce() + Send + 'static) {
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        const INFINITE: u32 = u32::MAX;
+        std::thread::spawn(move || {
+            // SAFETY: the handle is only waited on and closed here.
+            unsafe {
+                let process = OpenProcess(SYNCHRONIZE, 0, process_id);
+                if !process.is_null() {
+                    WaitForSingleObject(process, INFINITE);
+                    CloseHandle(process);
+                }
+            }
+            then();
+        });
+    }
+
     /// Hands the hidden window's memory back to Windows once the hide has
     /// been drawn. Pages come back on demand if the window is shown again.
     pub(crate) fn trim_memory_soon() {
@@ -366,7 +473,9 @@ mod win {
                 show_now();
             }
             MENU_NEW_WINDOW => {
-                if let Ok(exe) = std::env::current_exe() {
+                if !crate::spare::claim(&Default::default())
+                    && let Ok(exe) = std::env::current_exe()
+                {
                     let _ = std::process::Command::new(exe).arg("--new-window").spawn();
                 }
             }

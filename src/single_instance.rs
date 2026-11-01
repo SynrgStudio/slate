@@ -8,8 +8,11 @@
 //! forwarding can never prevent Slate from opening.
 //!
 //! The token keeps other local users/processes that cannot read the user's data
-//! directory from injecting open requests. Payloads are a path and a line number
-//! only; documents are never transferred.
+//! directory from injecting open requests. Payloads are a path, a line number
+//! and, for a new window, where to put it and the moved tab's handoff file;
+//! documents are never transferred.
+//!
+//! The same channel claims the ready hidden window kept by `spare`.
 
 use std::{
     hash::{BuildHasher, Hasher},
@@ -24,17 +27,30 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(150);
 const REPLY_TIMEOUT: Duration = Duration::from_millis(1500);
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct OpenRequest {
     pub(crate) path: Option<PathBuf>,
     pub(crate) line: Option<usize>,
+    /// New windows only: a moved tab's text, and the window's outer
+    /// top-left in points.
+    pub(crate) handoff: Option<PathBuf>,
+    pub(crate) position: Option<(f32, f32)>,
 }
 
-pub(crate) fn instance_file() -> Option<PathBuf> {
+fn data_dir() -> Option<PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .or_else(dirs_next::data_local_dir)?;
-    Some(base.join("slate").join("instance"))
+    Some(base.join("slate"))
+}
+
+pub(crate) fn instance_file() -> Option<PathBuf> {
+    Some(data_dir()?.join("instance"))
+}
+
+/// Where the ready hidden window (see `spare`) listens.
+pub(crate) fn spare_file() -> Option<PathBuf> {
+    Some(data_dir()?.join("spare"))
 }
 
 /// Tries to hand `request` to a running Slate. Returns true only when the
@@ -80,11 +96,28 @@ pub(crate) struct Server {
 }
 
 impl Server {
-    /// `wake` is called from the listener thread after queuing a request
-    /// (the app passes a closure that requests an egui repaint).
+    /// `wake` is called from the listener thread with each request after
+    /// queuing it (the app passes a closure that requests an egui repaint).
     pub(crate) fn start(
         instance_file: PathBuf,
-        wake: impl Fn() + Send + 'static,
+        wake: impl Fn(&OpenRequest) + Send + 'static,
+    ) -> std::io::Result<Self> {
+        Self::listen(instance_file, false, wake)
+    }
+
+    /// Accepts a single request, then stops listening and removes its file:
+    /// a second claimer is refused and falls back to its own start.
+    pub(crate) fn start_one_shot(
+        instance_file: PathBuf,
+        wake: impl Fn(&OpenRequest) + Send + 'static,
+    ) -> std::io::Result<Self> {
+        Self::listen(instance_file, true, wake)
+    }
+
+    fn listen(
+        instance_file: PathBuf,
+        one_shot: bool,
+        wake: impl Fn(&OpenRequest) + Send + 'static,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         let port = listener.local_addr()?.port();
@@ -98,15 +131,22 @@ impl Server {
 
         let requests = Arc::new(Mutex::new(Vec::new()));
         let queue = Arc::clone(&requests);
+        let (file, written) = (instance_file.clone(), contents.clone());
         std::thread::Builder::new()
             .name("slate-instance".into())
             .spawn(move || {
                 for stream in listener.incoming().flatten() {
                     if let Some(request) = handle_connection(stream, &token) {
-                        if let Ok(mut queue) = queue.lock() {
-                            queue.push(request);
+                        if one_shot {
+                            remove_if_ours(&file, &written);
                         }
-                        wake();
+                        if let Ok(mut queue) = queue.lock() {
+                            queue.push(request.clone());
+                        }
+                        wake(&request);
+                        if one_shot {
+                            break;
+                        }
                     }
                 }
             })?;
@@ -127,9 +167,13 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
-        if std::fs::read_to_string(&self.instance_file).is_ok_and(|c| c == self.contents) {
-            let _ = std::fs::remove_file(&self.instance_file);
-        }
+        remove_if_ours(&self.instance_file, &self.contents);
+    }
+}
+
+pub(crate) fn remove_if_ours(file: &Path, contents: &str) {
+    if std::fs::read_to_string(file).is_ok_and(|c| c == contents) {
+        let _ = std::fs::remove_file(file);
     }
 }
 
@@ -173,13 +217,22 @@ fn parse_instance_file(contents: &str) -> Option<(u16, String)> {
 }
 
 fn encode_request(token: &str, request: &OpenRequest) -> String {
-    let path = request
-        .path
-        .as_ref()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let text = |path: &Option<PathBuf>| {
+        path.as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let path = text(&request.path);
     let line = request.line.map(|l| l.to_string()).unwrap_or_default();
-    format!("{token}\nOPEN\t{line}\t{path}\n")
+    if request.handoff.is_none() && request.position.is_none() {
+        return format!("{token}\nOPEN\t{line}\t{path}\n");
+    }
+    let position = request
+        .position
+        .map(|(x, y)| format!("{x},{y}"))
+        .unwrap_or_default();
+    let handoff = text(&request.handoff);
+    format!("{token}\nWINDOW\t{line}\t{position}\t{handoff}\t{path}\n")
 }
 
 fn decode_request(token: &str, message: &str) -> Option<OpenRequest> {
@@ -187,11 +240,30 @@ fn decode_request(token: &str, message: &str) -> Option<OpenRequest> {
     if lines.next()? != token {
         return None;
     }
-    let mut fields = lines.next()?.splitn(3, '\t');
-    if fields.next()? != "OPEN" {
+    let record = lines.next()?;
+    let window = record.starts_with("WINDOW\t");
+    // The path goes last: it may itself contain tabs.
+    let mut fields = record.splitn(if window { 5 } else { 3 }, '\t');
+    if fields.next()? != if window { "WINDOW" } else { "OPEN" } {
         return None;
     }
     let line = fields.next()?;
+    let (position, handoff) = if window {
+        let position = fields.next()?;
+        let handoff = fields.next()?;
+        let position = if position.is_empty() {
+            None
+        } else {
+            let (x, y) = position.split_once(',')?;
+            Some((x.parse().ok()?, y.parse().ok()?))
+        };
+        (
+            position,
+            (!handoff.is_empty()).then(|| PathBuf::from(handoff)),
+        )
+    } else {
+        (None, None)
+    };
     let path = fields.next()?;
     Some(OpenRequest {
         line: if line.is_empty() {
@@ -200,6 +272,8 @@ fn decode_request(token: &str, message: &str) -> Option<OpenRequest> {
             Some(line.parse().ok()?)
         },
         path: (!path.is_empty()).then(|| PathBuf::from(path)),
+        handoff,
+        position,
     })
 }
 
@@ -239,31 +313,43 @@ mod tests {
         let request = OpenRequest {
             path: Some(PathBuf::from("C:\\notas\\día\ttab.md")),
             line: Some(42),
+            ..Default::default()
         };
         let encoded = encode_request("abc", &request);
+        assert!(
+            encoded.contains("\nOPEN\t"),
+            "plain opens keep the old record"
+        );
         assert_eq!(decode_request("abc", &encoded), Some(request));
         assert_eq!(decode_request("wrong", &encoded), None);
-        let empty = OpenRequest {
-            path: None,
-            line: None,
-        };
+        let empty = OpenRequest::default();
         assert_eq!(
             decode_request("abc", &encode_request("abc", &empty)),
             Some(empty)
         );
+        let window = OpenRequest {
+            path: Some(PathBuf::from("C:\\notas\\día\ttab.md")),
+            line: None,
+            handoff: Some(PathBuf::from("C:\\data\\handoff\\1-2.json")),
+            position: Some((-1280.5, 40.0)),
+        };
+        let encoded = encode_request("abc", &window);
+        assert!(encoded.contains("\nWINDOW\t"));
+        assert_eq!(decode_request("abc", &encoded), Some(window));
     }
 
     #[test]
     fn forwards_open_requests_to_the_running_instance() {
         let file = temp_instance_file("forward");
         let (woke_tx, woke_rx) = mpsc::channel();
-        let server = Server::start(file.clone(), move || {
+        let server = Server::start(file.clone(), move |_| {
             let _ = woke_tx.send(());
         })
         .unwrap();
         let request = OpenRequest {
             path: Some(PathBuf::from("/tmp/notes.md")),
             line: Some(7),
+            ..Default::default()
         };
 
         assert!(forward(&file, &request));
@@ -279,7 +365,7 @@ mod tests {
         let file = temp_instance_file("ping");
         assert!(!is_running(&file), "no instance yet");
         let (woke_tx, woke_rx) = mpsc::channel();
-        let server = Server::start(file.clone(), move || {
+        let server = Server::start(file.clone(), move |_| {
             let _ = woke_tx.send(());
         })
         .unwrap();
@@ -292,10 +378,7 @@ mod tests {
     #[test]
     fn stale_or_forged_instance_files_fall_back_to_normal_start() {
         let file = temp_instance_file("stale");
-        let request = OpenRequest {
-            path: None,
-            line: None,
-        };
+        let request = OpenRequest::default();
         assert!(!forward(&file, &request), "missing file");
 
         // A port nobody listens on any more.
@@ -307,12 +390,32 @@ mod tests {
         std::fs::write(&file, format!("{closed_port} token\n")).unwrap();
         assert!(!forward(&file, &request), "stale port");
 
-        let server = Server::start(file.clone(), || {}).unwrap();
+        let server = Server::start(file.clone(), |_| {}).unwrap();
         let port = parse_instance_file(&std::fs::read_to_string(&file).unwrap())
             .unwrap()
             .0;
         std::fs::write(&file, format!("{port} forged-token\n")).unwrap();
         assert!(!forward(&file, &request), "wrong token is rejected");
         assert!(server.take_requests().is_empty());
+    }
+
+    #[test]
+    fn a_one_shot_listener_takes_one_claim_then_steps_aside() {
+        let file = temp_instance_file("one-shot");
+        let (woke_tx, woke_rx) = mpsc::channel();
+        let server = Server::start_one_shot(file.clone(), move |request| {
+            let _ = woke_tx.send(request.clone());
+        })
+        .unwrap();
+        assert!(is_running(&file), "pings do not use up the claim");
+        let claim = OpenRequest {
+            position: Some((10.0, 20.0)),
+            ..Default::default()
+        };
+        assert!(forward(&file, &claim));
+        assert_eq!(woke_rx.recv_timeout(Duration::from_secs(2)).unwrap(), claim);
+        assert!(!file.exists(), "a claimed window is no longer offered");
+        assert!(!forward(&file, &claim));
+        assert_eq!(server.take_requests(), vec![claim]);
     }
 }

@@ -95,6 +95,7 @@ mod search;
 mod settings_ui;
 mod shortcuts;
 mod single_instance;
+mod spare;
 mod tabs;
 mod window_drag;
 mod window_ui;
@@ -312,6 +313,7 @@ fn main() -> eframe::Result {
     let mut background = false;
     let mut position: Option<egui::Pos2> = None;
     let mut handoff: Option<PathBuf> = None;
+    let mut spare_owner: Option<u32> = None;
     let mut path = None;
     let mut startup_line = None;
     let mut args = raw_args.into_iter().peekable();
@@ -323,6 +325,10 @@ fn main() -> eframe::Result {
             "--new-window" | "-n" => new_window = true,
             "--background" => background = true,
             "--handoff" => handoff = args.next().map(PathBuf::from),
+            "--spare" => {
+                spare_owner = args.next().and_then(|value| value.parse().ok());
+                new_window = true;
+            }
             "--position" => {
                 position = args.next().and_then(|value| {
                     let (x, y) = value.split_once(',')?;
@@ -363,12 +369,37 @@ fn main() -> eframe::Result {
                     .as_deref()
                     .map(|p| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())),
                 line: startup_line,
+                ..Default::default()
             };
             if single_instance::forward(&file, &request) {
                 perf_log::mark("startup.forwarded_to_running_instance", "");
                 perf_log::flush();
                 return Ok(());
             }
+        }
+    }
+
+    if spare_owner.is_some() {
+        if spare::is_ready() {
+            perf_log::mark("spare.skipped", "another spare is ready");
+            perf_log::flush();
+            return Ok(());
+        }
+        spare::set_starting_as_spare();
+    } else if new_window && !scratch && !standalone_agenda {
+        // A ready hidden window shows itself in milliseconds.
+        let request = single_instance::OpenRequest {
+            path: path
+                .as_deref()
+                .map(|p| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())),
+            line: startup_line,
+            handoff: handoff.clone(),
+            position: position.map(|at| (at.x, at.y)),
+        };
+        if spare::claim(&request) {
+            perf_log::mark("startup.claimed_spare_window", "");
+            perf_log::flush();
+            return Ok(());
         }
     }
 
@@ -438,6 +469,9 @@ fn main() -> eframe::Result {
                 }
                 if let Some(file) = &handoff {
                     app.apply_handoff(file);
+                }
+                if let Some(owner) = spare_owner {
+                    app.become_spare(cc, owner);
                 }
                 Ok(Box::new(app))
             }),
@@ -948,6 +982,9 @@ struct SlateApp {
     reopen_last_file_on_startup: bool,
     single_instance: bool,
     instance_server: Option<single_instance::Server>,
+    /// Waiting hidden as the ready window (`--spare`) until claimed.
+    spare_server: Option<single_instance::Server>,
+    spare_owner: Option<u32>,
     /// Config: closing the primary window hides it in the tray.
     resident: bool,
     /// Resident mode is running in this process (tray icon installed).
@@ -1191,6 +1228,8 @@ impl SlateApp {
             reopen_last_file_on_startup: false,
             single_instance: true,
             instance_server: None,
+            spare_server: None,
+            spare_owner: None,
             resident: true,
             resident_active: false,
             window_hidden: false,
@@ -1365,6 +1404,7 @@ impl SlateApp {
             // a disk rescan would make those live agenda rows disappear.
             app.open_agenda();
         } else if !scratch
+            && !spare::starting_as_spare()
             && !(tabs::owns_session() && app.restore_session())
             && app.reopen_last_file_on_startup
         {
@@ -1401,7 +1441,7 @@ impl SlateApp {
             return;
         };
         let wake_ctx = ctx.clone();
-        match single_instance::Server::start(file, move || {
+        match single_instance::Server::start(file, move |_| {
             // A hidden window would only notice the request on eframe's 100 ms
             // throttled repaint; show it now, egui syncs on the next frame.
             resident::show_now();
@@ -1419,10 +1459,84 @@ impl SlateApp {
         }
         resident::install(cc);
         self.resident_active = true;
+        spare::prepare_soon(std::process::id(), spare::PREPARE_DELAY);
         if background {
             // eframe shows the window after its first paint; hide it right away.
             self.window_hidden = true;
             self.hide_on_first_frame = true;
+        }
+    }
+
+    /// `--spare`: wait hidden, fully started, until a new window claims
+    /// this one (see `spare`).
+    fn become_spare(&mut self, cc: &eframe::CreationContext<'_>, owner: u32) {
+        let Some(file) = single_instance::spare_file() else {
+            std::process::exit(0);
+        };
+        resident::remember_window(cc);
+        // eframe shows the window after its first paint; nothing may flash.
+        resident::cloak(true);
+        let wake_ctx = cc.egui_ctx.clone();
+        let server = match single_instance::Server::start_one_shot(file.clone(), move |request| {
+            spare::claimed();
+            resident::show_at(request.position);
+            wake_ctx.request_repaint();
+        }) {
+            Ok(server) => server,
+            Err(err) => {
+                perf_log::mark("spare.unavailable", &err.to_string());
+                std::process::exit(0);
+            }
+        };
+        let written = fs::read_to_string(&file).unwrap_or_default();
+        resident::when_process_exits(owner, move || {
+            // Nothing was opened yet: no settings or session to write.
+            if !spare::is_claimed() {
+                single_instance::remove_if_ours(&file, &written);
+                perf_log::mark("spare.owner_gone", "");
+                perf_log::flush();
+                std::process::exit(0);
+            }
+        });
+        self.spare_server = Some(server);
+        self.spare_owner = Some(owner);
+        self.window_hidden = true;
+        self.hide_on_first_frame = true;
+        resident::trim_memory_soon();
+        perf_log::mark("spare.ready", &format!("owner={owner}"));
+    }
+
+    /// The ready window was claimed: become the requested window.
+    fn poll_spare(&mut self, ctx: &egui::Context) {
+        let Some(request) = self
+            .spare_server
+            .as_ref()
+            .and_then(|server| server.take_requests().pop())
+        else {
+            return;
+        };
+        self.spare_server = None;
+        perf_log::mark("spare.claimed", "");
+        // Settings may have changed since this window started.
+        self.load_settings();
+        self.show_window(ctx);
+        if let Some(file) = request.handoff {
+            self.apply_handoff(&file);
+        } else if let Some(path) = request.path {
+            self.request_file_open(
+                path,
+                request
+                    .line
+                    .map(OpenDestination::Line)
+                    .unwrap_or(OpenDestination::Restore),
+            );
+        } else if self.reopen_last_file_on_startup
+            && let Some(last_path) = self.last_opened_path.clone()
+        {
+            self.open_path(last_path);
+        }
+        if let Some(owner) = self.spare_owner {
+            spare::prepare_soon(owner, spare::PREPARE_DELAY);
         }
     }
 
@@ -10121,6 +10235,10 @@ impl SlateApp {
 
 impl eframe::App for SlateApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.spare_server.is_some() {
+            // An unclaimed spare holds nothing, and its settings may be stale.
+            return;
+        }
         self.observe_document_safety(0.0, true);
         self.remember_current_cursor_position();
         if !self.discard_on_exit {
@@ -10212,6 +10330,7 @@ impl SlateApp {
         self.poll_background_save(&ctx);
         self.poll_file_open(&ctx);
         self.poll_instance_requests(&ctx);
+        self.poll_spare(&ctx);
         self.poll_resident(&ctx);
         if let Some(action) = self.pending_tab_action.take() {
             self.finish_pending_action(action, &ctx);
