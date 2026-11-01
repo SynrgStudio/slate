@@ -345,7 +345,7 @@ fn notes_colour_only_fenced_blocks_with_a_known_language() {
     let mut view = editor_view::EditorView::new();
     view.set_look(editor_view::EditorLook::default());
     let buffer = EditorBuffer::from_text(
-        "# def title\n```py\ndef go():\n```\n```toml\nkey = 1\n```\nlet after\n".into(),
+        "# def title\n```py\ndef go():\n```\n```brainfuck\n+[-]>.\n```\nlet after\n".into(),
     );
     assert_eq!(kinds(&view, &buffer, 0), None, "prose is not code");
     assert_eq!(kinds(&view, &buffer, 1), None, "the fence line itself");

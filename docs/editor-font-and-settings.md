@@ -72,14 +72,22 @@ temporary directory.
 Built in, no language server (`src/highlight.rs`): a small lexer per language
 colours keywords, types, functions, strings, numbers, constants, comments and
 macros/attributes/decorators. Rust (`rust`, `rs`), Python (`py`, `python`),
-JavaScript (`js`, `jsx`, `mjs`, `cjs`) and TypeScript (`ts`, `tsx`).
+JavaScript (`js`, `jsx`, `mjs`, `cjs`), TypeScript (`ts`, `tsx`), JSON
+(`json`, `jsonc`, `json5`), TOML (`toml`), YAML (`yaml`, `yml`), shell (`sh`,
+`bash`, `zsh`), PowerShell (`ps1`, `psm1`, `psd1`, `pwsh`, `powershell`), C
+(`c`), C++ (`cpp`, `cc`, `cxx`, `h`, `hpp`, `hh`, `hxx`), Go (`go`), SQL
+(`sql`), HTML/XML (`html`, `htm`, `xml`, `svg`) and CSS (`css`, `scss`,
+`less`). Fence tags are case-insensitive; files go by extension.
 
-- **Code files** (`.rs`, `.py`, `.js`, `.ts`…) are coloured whole and are no
-  longer rendered as Markdown (a Python `# comment` used to become a heading).
+- **Code files** (`.rs`, `.py`, `.js`, `.ts`, `.toml`, `.json`, `.html`…) are
+  coloured whole and are not rendered as Markdown (a Python `# comment` used
+  to become a heading).
 - **Notes**: fenced blocks with a known language tag are coloured; other
   fences stay plain, and so does the fence line itself.
 - Line by line: only what a line leaves open (block comment, multi-line or
-  raw string, Python triple quotes, JS template) carries to the next. The
+  raw string, Python/TOML triple quotes, JS template, Go raw string, shell
+  string, PowerShell here-string or `<# #>`, HTML comment or tag, YAML `|`/`>`
+  block) carries to the next. The
   state at the start of each line is cached up to the last line drawn, and an
   edit keeps the entries before the first changed line. Fragments colour the
   same as whole programs.
