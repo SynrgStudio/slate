@@ -307,3 +307,36 @@ fn text_and_gutter_share_vertical_center_at_default_and_large_font_sizes() {
         assert_eq!(number.galley.job.sections[0].format.font_id.size, 12.0);
     }
 }
+
+#[test]
+fn settings_the_core_does_not_know_survive_a_save() {
+    let ctx = egui::Context::default();
+    let mut app = app(&ctx);
+    let root = std::env::temp_dir().join(format!(
+        "slate-passthrough-settings-{}-{}",
+        std::process::id(),
+        crate::test_unique()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let config = root.join("config.toml");
+    fs::write(
+        &config,
+        "word_wrap = true\nflow_vaults = \"D:/notas\"\nagenda_week_start = monday\n",
+    )
+    .unwrap();
+    app.settings_path_override = Some(config.clone());
+    app.load_settings();
+    app.set_editor_font_size(15.0);
+    settings_writer::flush();
+    let saved = fs::read_to_string(&config).unwrap();
+    assert!(saved.contains("editor_font_size = 15"), "{saved}");
+    assert!(saved.contains("flow_vaults = \"D:/notas\"\n"), "{saved}");
+    assert!(saved.contains("agenda_week_start = monday\n"), "{saved}");
+    // Loading again does not duplicate them.
+    app.load_settings();
+    app.set_editor_font_size(16.0);
+    settings_writer::flush();
+    let saved = fs::read_to_string(&config).unwrap();
+    assert_eq!(saved.matches("flow_vaults").count(), 1, "{saved}");
+    let _ = fs::remove_dir_all(root);
+}

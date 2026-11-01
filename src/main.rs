@@ -1069,6 +1069,9 @@ struct SlateApp {
     instance_server: Option<single_instance::Server>,
     /// Waiting hidden as the ready window (`--spare`) until claimed.
     spare_server: Option<single_instance::Server>,
+    /// config.toml lines the core does not know (modules' settings), written
+    /// back unchanged.
+    config_passthrough: Vec<String>,
     spare_owner: Option<u32>,
     /// Receives tabs dropped onto this window from other Slate windows.
     tab_drop_server: Option<single_instance::Server>,
@@ -1327,6 +1330,7 @@ impl SlateApp {
             single_instance: true,
             instance_server: None,
             spare_server: None,
+            config_passthrough: Vec::new(),
             spare_owner: None,
             tab_drop_server: None,
             spare_checked_at: None,
@@ -6515,6 +6519,7 @@ impl SlateApp {
         };
 
         self.periscope_roots.clear();
+        self.config_passthrough.clear();
         for line in contents.lines() {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
@@ -6751,7 +6756,9 @@ impl SlateApp {
                         commands::merge_command_usage(&mut self.command_usage, usage);
                     }
                 }
-                _ => {}
+                // Settings of modules (or newer versions) are kept as they
+                // are, so saving here never loses them.
+                _ => self.config_passthrough.push(line.to_string()),
             }
         }
         commands::trim_command_history(&mut self.command_history, self.command_history_limit);
@@ -6933,6 +6940,10 @@ impl SlateApp {
                 "command_usage = \"{}|{}|{}\"\n",
                 usage.name, usage.count, usage.last_used
             ));
+        }
+        for line in &self.config_passthrough {
+            contents.push_str(line);
+            contents.push('\n');
         }
         // Off the UI thread; written before the process exits.
         settings_writer::write(
