@@ -1070,6 +1070,7 @@ impl SlateApp {
         }
         self.clear_recovery(document_safety::Slot::Main);
         self.forget_project_buffer(self.buffer.identity);
+        self.notify_modules_closed(self.buffer.identity);
         if self.tabs.list.len() == 1 {
             // The last tab stays, empty, like a fresh window.
             self.dirty = false;

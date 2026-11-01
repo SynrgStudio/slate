@@ -30,6 +30,8 @@ pub(crate) enum Command {
     CloseBuffer,
     Quit,
     QuitAll,
+    /// A command of an optional module, by its canonical name.
+    Module(&'static str),
 }
 
 pub(crate) struct CommandSpec {
@@ -446,13 +448,31 @@ pub(crate) fn command_name(command: Command) -> &'static str {
         Command::CloseBuffer => "close",
         Command::Quit => "quit",
         Command::QuitAll => "quit-all",
+        Command::Module(name) => name,
     }
+}
+
+thread_local! {
+    // The UI thread's view of the enabled modules' commands.
+    static MODULE_COMMANDS: std::cell::RefCell<Vec<&'static CommandSpec>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The enabled modules' commands (set by the module host).
+pub(crate) fn set_module_commands(specs: Vec<&'static CommandSpec>) {
+    MODULE_COMMANDS.with_borrow_mut(|current| *current = specs);
+}
+
+/// Every command: the core's, then the enabled modules'.
+pub(crate) fn all_command_specs() -> Vec<&'static CommandSpec> {
+    let modules = MODULE_COMMANDS.with_borrow(|specs| specs.clone());
+    COMMAND_SPECS.iter().chain(modules).collect()
 }
 
 pub(crate) fn canonical_command_name(token: &str) -> Option<&'static str> {
     let token = token.trim_start_matches(':');
-    COMMAND_SPECS
-        .iter()
+    all_command_specs()
+        .into_iter()
         .find(|spec| spec.name == token || spec.aliases.contains(&token))
         .map(|spec| spec.name)
 }
@@ -543,7 +563,7 @@ pub(crate) fn matching_command_specs(
 ) -> Vec<&'static CommandSpec> {
     let query = prefix.trim_start_matches(':').to_lowercase();
     if query.is_empty() {
-        let mut specs = COMMAND_SPECS.iter().collect::<Vec<_>>();
+        let mut specs = all_command_specs();
         specs.sort_by_key(|spec| {
             let boost = usage_boost(spec.name);
             (std::cmp::Reverse(boost), spec.name.len(), spec.name)
@@ -551,8 +571,8 @@ pub(crate) fn matching_command_specs(
         return specs.into_iter().take(limit).collect();
     }
 
-    let mut scored = COMMAND_SPECS
-        .iter()
+    let mut scored = all_command_specs()
+        .into_iter()
         .filter_map(|spec| command_spec_score(spec, &query).map(|score| (score, spec)))
         .collect::<Vec<_>>();
     scored.sort_by_key(|(score, spec)| {

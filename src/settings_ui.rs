@@ -443,6 +443,37 @@ impl SlateApp {
                                     if ui.checkbox(&mut enabled,RichText::new("Syntax highlighting (Rust, Python, JS/TS)").font(FontId::monospace(14.0))).changed() {self.selected_setting=30;self.set_editor_look(editor_view::EditorLook{syntax_highlighting:enabled,..look});}
                                 });setting_rects.push(row.response.rect);
                                 ui.label(RichText::new("The cursor glides when it jumps and lands at 90 ms. Text is never delayed: only the cursor and its trail animate. Weight 1–5: longer, stronger trail; Enter resets to 3.").font(FontId::monospace(13.0)).color(Color32::from_rgb(136,154,176)));
+                                ui.add_space(10.0);
+                                ui.label(RichText::new("Modules & vaults").font(FontId::monospace(14.0)).color(Color32::from_rgb(136,192,208)));
+                                for (offset, (id, name, description, enabled)) in self.module_host.list().into_iter().enumerate() {
+                                    let index = MODULE_ROWS_START + offset;
+                                    let row=egui::Frame::new().fill(if self.selected_setting==index {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
+                                        ui.set_width(ui.available_width());let mut on=enabled;
+                                        if ui.checkbox(&mut on,RichText::new(name).font(FontId::monospace(14.0))).on_hover_text(description).changed() {self.selected_setting=index;self.set_module_enabled(id,on);}
+                                    });setting_rects.push(row.response.rect);
+                                }
+                                let vault_row = MODULE_ROWS_START + self.module_host.list().len();
+                                let mut remove = None;
+                                let row=egui::Frame::new().fill(if self.selected_setting==vault_row {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new("Vaults").font(FontId::monospace(14.0)).color(Color32::from_rgb(216,222,233)));
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui| {
+                                            if ui.button("Add folder…").on_hover_text("Choose a folder of notes").clicked() {self.selected_setting=vault_row;self.open_vault_picker();}
+                                        });
+                                    });
+                                    if self.vaults.is_empty() {
+                                        ui.label(RichText::new("none yet · notes in a .git folder, or the file's own folder, are used instead").font(FontId::monospace(13.0)).color(Color32::from_rgb(136,154,176)));
+                                    }
+                                    for (index, vault) in self.vaults.iter().enumerate() {
+                                        ui.horizontal(|ui| {
+                                            if ui.small_button("✕").on_hover_text("Stop using this folder as a vault (files are not touched)").clicked() {remove=Some(index);}
+                                            ui.label(RichText::new(vault.display().to_string()).font(FontId::monospace(13.0)).color(Color32::from_rgb(190,200,216)));
+                                        });
+                                    }
+                                });setting_rects.push(row.response.rect);
+                                if let Some(index) = remove { self.remove_vault(index); }
+                                ui.label(RichText::new("Modules add features on top of the editor; off means not running at all. Vaults are your note folders: modules that look across notes (backlinks…) search there.").font(FontId::monospace(13.0)).color(Color32::from_rgb(136,154,176)));
                                 if reveal_selected {
                                     if let Some(rect) = setting_rects.get(self.selected_setting) { ui.scroll_to_rect(*rect, Some(egui::Align::Min)); }
                                 }

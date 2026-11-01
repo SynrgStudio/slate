@@ -74,7 +74,7 @@ fn settings_bounds_fixed_chrome_and_selection_reveal_at_small_and_large_sizes() 
         assert!(before.frame.contains_rect(before.footer));
         assert!(before.body.top() >= before.header.bottom());
         assert!(before.body.bottom() <= before.footer.top());
-        assert_eq!(before.rows.len(), 21 + footer_ui::FIELDS.len());
+        assert_eq!(before.rows.len(), 21 + footer_ui::FIELDS.len() + 2);
         assert!(
             before.rows[0].width() >= before.body.width() - 2.0,
             "unused right column: {:?}",

@@ -211,7 +211,8 @@ impl SlateApp {
                                         let header_height = 16.0;
                                         let row_height = 15.0;
                                         let table_height = header_height
-                                            + COMMAND_SPECS.len() as f32 * row_height
+                                            + commands::all_command_specs().len() as f32
+                                                * row_height
                                             + 16.0;
                                         let (table_rect, _) = ui.allocate_exact_size(
                                             Vec2::new(command_width, table_height),
@@ -252,7 +253,10 @@ impl SlateApp {
                                                 );
                                             }
 
-                                            for (row, spec) in COMMAND_SPECS.iter().enumerate() {
+                                            for (row, spec) in commands::all_command_specs()
+                                                .into_iter()
+                                                .enumerate()
+                                            {
                                                 let row_top =
                                                     top + header_height + row as f32 * row_height;
                                                 let row_rect = egui::Rect::from_min_size(
@@ -325,7 +329,10 @@ impl SlateApp {
                                                 );
                                             }
 
-                                            for (row, spec) in COMMAND_SPECS.iter().enumerate() {
+                                            for (row, spec) in commands::all_command_specs()
+                                                .into_iter()
+                                                .enumerate()
+                                            {
                                                 let row_top =
                                                     top + header_height + row as f32 * row_height;
                                                 let row_rect = egui::Rect::from_min_size(

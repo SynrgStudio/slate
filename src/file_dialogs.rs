@@ -14,6 +14,7 @@ pub(crate) enum FilePickerMode {
     Browse,
     InsertMarkdownLink,
     SetPeriscopeProject,
+    AddVault,
 }
 
 pub(crate) fn format_file_size(bytes: u64) -> String {

@@ -33,6 +33,10 @@ impl SlateApp {
             return;
         }
 
+        if self.handle_results_keys(ctx) {
+            return;
+        }
+
         if self.handle_link_inline_keyboard(ctx) {
             return;
         }
@@ -236,7 +240,7 @@ impl SlateApp {
                 file_enter_dir |= i.consume_key(egui::Modifiers::NONE, Key::ArrowRight);
                 file_parent |= i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft);
                 file_open |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
-                if self.file_picker_mode==FilePickerMode::SetPeriscopeProject {file_assign_current|=i.consume_key(egui::Modifiers::CTRL,Key::Enter);}
+                if matches!(self.file_picker_mode, FilePickerMode::SetPeriscopeProject | FilePickerMode::AddVault) {file_assign_current|=i.consume_key(egui::Modifiers::CTRL,Key::Enter);}
                 file_backspace |= i.consume_key(egui::Modifiers::NONE, Key::Backspace);
             }
             if self.periscope_open {
@@ -878,7 +882,12 @@ impl SlateApp {
         }
 
         if file_assign_current {
-            self.assign_document_project(self.file_picker_dir.clone());
+            if self.file_picker_mode == FilePickerMode::AddVault {
+                self.file_picker_open = false;
+                self.add_vault(self.file_picker_dir.clone());
+            } else {
+                self.assign_document_project(self.file_picker_dir.clone());
+            }
             return;
         }
         if file_open {
@@ -981,7 +990,7 @@ impl SlateApp {
         }
 
         if settings_next {
-            self.selected_setting = (self.selected_setting + 1).min(20 + footer_ui::FIELDS.len());
+            self.selected_setting = (self.selected_setting + 1).min(self.settings_last_row());
             return;
         }
 
@@ -1044,6 +1053,9 @@ impl SlateApp {
                     syntax_highlighting: false,
                     ..self.editor_look
                 }),
+                row if row >= MODULE_ROWS_START => {
+                    self.settings_module_row(row, Some(false), false)
+                }
                 _ => {}
             }
             return;
@@ -1171,6 +1183,11 @@ impl SlateApp {
                     },
                     ..self.editor_look
                 }),
+                row if row >= MODULE_ROWS_START => self.settings_module_row(
+                    row,
+                    (!settings_activate).then_some(true),
+                    settings_activate,
+                ),
                 _ => {}
             }
             return;

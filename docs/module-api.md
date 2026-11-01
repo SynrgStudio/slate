@@ -1,8 +1,23 @@
-# Module API (proposal)
+# Module API
 
 How optional modules (Flow, Agenda, Daily, references, …) plug into the
-core. Status: **proposal, not implemented**. The cut points it must cover
-are listed in `src/modules/README.md`.
+core. The cut points it must cover are listed in `src/modules/README.md`.
+
+## Status (2026-11-01)
+
+Implemented: the `Module` trait, the host (`src/module_api.rs`), `Cx` with
+status / open / result list / `wake_after` / waker / data folder / vaults,
+the document hooks (opened, edited with the changed line range, saved,
+closed), module commands in the palette, command line and help, the core
+result list (`src/results_ui.rs`), vaults (`src/vaults.rs`), Settings →
+Modules & vaults (on/off per module, `module.<id>` and `vault` keys in
+`config.toml`), slow hooks (≥ 4 ms) in the performance log.
+
+Connected modules: **References** (`:backlinks`, `:mentions`).
+
+Not yet: panels, editor extensions (`decorate`, `complete`, `on_enter`),
+module settings rows, the windows channel for modules. They come with the
+modules that need them (Agenda, Flow's editing aids).
 
 ## Rules
 

@@ -101,9 +101,10 @@ Slate should feel like opening a clean terminal and writing.
 
 Slate Flow is the local-first knowledge layer over ordinary Markdown files.
 
-> **Not available right now.** Flow, the agenda, daily logs, quickadd,
-> refile, backlinks and mentions were taken out of the core on 2026-11-01
-> to be rebuilt as modules on top of it, one at a time. The code is kept
+> **Not available right now.** Flow, the agenda, daily logs, quickadd and
+> refile were taken out of the core on 2026-11-01 to be rebuilt as modules
+> on top of it, one at a time. Backlinks and mentions are back as the first
+> module (`:backlinks`, `:mentions`, searching the file's vault). The code is kept
 > in `src/modules/`; see [`src/modules/README.md`](src/modules/README.md).
 > Everything below describes how they worked before.
 
@@ -321,8 +322,8 @@ Open the command line with `Ctrl+.`. Commands may be typed with or without the l
 
 ### Markdown/knowledge commands
 
-The agenda, quickadd, daily, refile, backlinks, mentions and flow-* commands
-are unavailable while Flow is rebuilt as a module (see above).
+The agenda, quickadd, daily, refile and flow-* commands are unavailable
+while Flow is rebuilt as a module (see above).
 
 ```text
 :open-link / :olink / :follow-link    open Markdown link under cursor

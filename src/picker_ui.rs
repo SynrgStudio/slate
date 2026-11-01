@@ -45,6 +45,7 @@ impl SlateApp {
                         FilePickerMode::Browse => "files",
                         FilePickerMode::InsertMarkdownLink => "insert link file",
                         FilePickerMode::SetPeriscopeProject => "create project",
+                        FilePickerMode::AddVault => "add vault",
                     };
                     (
                         title.to_string(),
@@ -457,8 +458,11 @@ impl SlateApp {
                         ui.horizontal(|ui| {
                             let actions: &[(&str, &str)] = match active {
                                 ActivePicker::File
-                                    if self.file_picker_mode
-                                        == FilePickerMode::SetPeriscopeProject =>
+                                    if matches!(
+                                        self.file_picker_mode,
+                                        FilePickerMode::SetPeriscopeProject
+                                            | FilePickerMode::AddVault
+                                    ) =>
                                 {
                                     &[
                                         ("↑↓", "select"),

@@ -8,6 +8,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod async_open_tests;
 #[cfg(test)]
 mod bug_fix_tests;
+#[cfg(test)]
+mod module_tests;
 mod commands;
 #[cfg(test)]
 mod dialog_tests;
@@ -62,8 +64,11 @@ mod help_ui;
 mod link_ui;
 mod markdown;
 mod markdown_files;
+mod module_api;
 #[allow(dead_code)]
 mod modules;
+mod results_ui;
+mod vaults;
 use markdown_files::{append_markdown_block, append_markdown_block_to_heading};
 mod parallel;
 mod perf_hud;
@@ -108,7 +113,7 @@ use std::{
 };
 
 use commands::{
-    COMMAND_SPECS, Command, CommandLineAction, CommandLineNumberMode, CommandSpec, CommandUsage,
+    Command, CommandLineAction, CommandLineNumberMode, CommandSpec, CommandUsage,
     best_command_token, clamp_history_limit, command_name, command_prefix, fuzzy_score,
     parse_command_line,
 };
@@ -729,6 +734,15 @@ struct SlateApp {
     /// config.toml lines the core does not know (modules' settings), written
     /// back unchanged.
     config_passthrough: Vec<String>,
+    /// Optional modules of this window and their on/off state.
+    module_host: module_api::Host,
+    module_ctx: egui::Context,
+    /// Revision each open document had when modules last heard of it.
+    module_seen: std::collections::HashMap<u64, u64>,
+    /// Result list shown for a module.
+    results: results_ui::Results,
+    /// Note folders (Settings → Modules & vaults).
+    vaults: Vec<PathBuf>,
     spare_owner: Option<u32>,
     /// Receives tabs dropped onto this window from other Slate windows.
     tab_drop_server: Option<single_instance::Server>,
@@ -951,6 +965,11 @@ impl SlateApp {
             instance_server: None,
             spare_server: None,
             config_passthrough: Vec::new(),
+            module_host: module_api::Host::new(modules::all()),
+            module_ctx: cc.egui_ctx.clone(),
+            module_seen: std::collections::HashMap::new(),
+            results: results_ui::Results::default(),
+            vaults: Vec::new(),
             spare_owner: None,
             tab_drop_server: None,
             spare_checked_at: None,
@@ -1540,6 +1559,7 @@ impl SlateApp {
                     loaded.timing.step("save_settings");
                     self.focus_editor_once = true;
                     self.status = format!("Opened {}", path.display());
+                    self.notify_modules_opened();
                     match pending.destination {
                         OpenDestination::Restore => {}
                         OpenDestination::Line(line) => self.goto_startup_line(line),
@@ -2868,6 +2888,7 @@ impl SlateApp {
                 self.adopt_tab_alias(&path);
                 let _ = self.save_settings();
                 self.status = format!("Saved {}", path.display());
+                self.notify_modules_saved();
                 if let Err(error) = self.persist_saved_project(&path, project) {
                     self.status
                         .push_str(&format!(" · project metadata not saved: {error}"));
@@ -3391,6 +3412,11 @@ impl SlateApp {
                 self.assign_document_project(path);
                 return;
             }
+            if self.file_picker_mode == FilePickerMode::AddVault {
+                self.file_picker_open = false;
+                self.add_vault(path);
+                return;
+            }
             self.file_picker_dir = path;
             self.file_query.clear();
             self.refresh_file_picker_entries();
@@ -3408,6 +3434,10 @@ impl SlateApp {
             }
             FilePickerMode::SetPeriscopeProject => {
                 self.status = "Choose a folder for this document's project".to_string();
+            }
+            FilePickerMode::AddVault => {
+                self.status =
+                    "Choose a folder: Enter on it, or Ctrl+Enter for the current one".to_string();
             }
             FilePickerMode::AddLance => {
                 self.file_picker_open = false;
@@ -3781,6 +3811,7 @@ impl SlateApp {
 
         self.periscope_roots.clear();
         self.config_passthrough.clear();
+        self.vaults.clear();
         for line in contents.lines() {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
@@ -3999,6 +4030,23 @@ impl SlateApp {
                 }
                 // Settings of modules (or newer versions) are kept as they
                 // are, so saving here never loses them.
+                "vault" => {
+                    let folder = Self::parse_config_string(value);
+                    if !folder.is_empty() {
+                        vaults::add(&mut self.vaults, PathBuf::from(folder));
+                    }
+                }
+                key if key.starts_with("module.")
+                    && self
+                        .module_host
+                        .list()
+                        .iter()
+                        .any(|(id, ..)| *id == &key[7..]) =>
+                {
+                    if let Some(enabled) = Self::parse_config_bool(value) {
+                        self.module_host.set_enabled(&key[7..], enabled);
+                    }
+                }
                 _ => self.config_passthrough.push(line.to_string()),
             }
         }
@@ -4176,6 +4224,15 @@ impl SlateApp {
             contents.push_str(&format!(
                 "command_usage = \"{}|{}|{}\"\n",
                 usage.name, usage.count, usage.last_used
+            ));
+        }
+        for (id, _, _, enabled) in self.module_host.list() {
+            contents.push_str(&format!("module.{id} = {enabled}\n"));
+        }
+        for vault in &self.vaults {
+            contents.push_str(&format!(
+                "vault = \"{}\"\n",
+                Self::escape_config_string(&vault.display().to_string())
             ));
         }
         for line in &self.config_passthrough {
@@ -4400,6 +4457,7 @@ impl SlateApp {
         self.focus_editor_once = true;
 
         match command {
+            Command::Module(name) => self.run_module_command(name, "", ctx),
             Command::New => {
                 if self.scratch {
                     if self.dirty {
@@ -4681,7 +4739,18 @@ impl SlateApp {
                     self.status = format!("Line numbers: {}", self.line_number_mode.label());
                 }
             },
-            CommandLineAction::Unknown(input) => self.status = format!("Unknown command: {input}"),
+            CommandLineAction::Unknown(input) => {
+                let (token, args) = input.split_once(' ').unwrap_or((input.as_str(), ""));
+                match commands::canonical_command_name(token)
+                    .filter(|name| self.module_host.command_owner(name).is_some())
+                {
+                    Some(name) => {
+                        self.record_command_usage(name);
+                        self.run_module_command(name, args.trim(), ctx);
+                    }
+                    None => self.status = format!("Unknown command: {input}"),
+                }
+            }
         }
     }
     fn select_word(&mut self) {
@@ -7468,6 +7537,7 @@ impl SlateApp {
             self.last_window_title = title;
         }
         self.poll_background_save(&ctx);
+        self.poll_modules(&ctx);
         self.poll_file_open(&ctx);
         self.poll_instance_requests(&ctx);
         self.poll_spare(&ctx);
@@ -7702,6 +7772,7 @@ impl SlateApp {
                                 if changed {
                                     self.dirty = true;
                                     self.search_state = None;
+                                    self.notify_modules_edited();
                                 }
                                 if let Some(byte) = self.editor_view.take_link_click_byte() {
                                     self.open_markdown_link_at_byte(byte);
@@ -7755,6 +7826,7 @@ impl SlateApp {
                             if changed {
                                 self.dirty = true;
                                 self.search_state = None;
+                                self.notify_modules_edited();
                             }
                             if let Some(byte) = self.editor_view.take_link_click_byte() {
                                 self.open_markdown_link_at_byte(byte);
@@ -8189,7 +8261,7 @@ impl SlateApp {
                             format!("lance {} ↑↓ select · type filter · Enter open · Ctrl+Enter modal · Ctrl+A add · Del remove", if self.lance_query.is_empty() { "".to_string() } else { format!("/{} ", self.lance_query) }),
                             footer_accent,
                         )
-                    } else if self.file_picker_open && self.file_picker_mode==FilePickerMode::SetPeriscopeProject {
+                    } else if self.file_picker_open && matches!(self.file_picker_mode, FilePickerMode::SetPeriscopeProject | FilePickerMode::AddVault) {
                         ("create project  Enter choose folder · → navigate · Ctrl+Enter use current folder · Esc cancel".into(),footer_accent)
                     } else if self.file_picker_open {
                         ("files  type filter · ↑↓ select · → enter folder · ← parent · Enter open · Esc close".to_string(), footer_accent)
@@ -8245,8 +8317,213 @@ impl SlateApp {
         self.scratch_modal_dialog(&ctx);
         self.capture_dialog(&ctx);
         self.scratch_entries_dialog(&ctx);
+        self.results_dialog(&ctx);
         self.scratch_feedback_toast(&ctx);
         self.observe_document_safety(ctx.input(|i| i.time), false);
+    }
+}
+
+/// First Settings row of the Modules & vaults section (one row per module,
+/// then the vaults row).
+const MODULE_ROWS_START: usize = 31;
+
+/// Calling module hooks and doing what modules ask.
+impl SlateApp {
+    /// Last row of the Settings dialog.
+    pub(crate) fn settings_last_row(&self) -> usize {
+        MODULE_ROWS_START + self.module_host.list().len()
+    }
+
+    /// Keyboard on a Modules & vaults row: `value` sets a module (None
+    /// toggles it); on the vaults row it opens the folder picker.
+    pub(crate) fn settings_module_row(&mut self, row: usize, value: Option<bool>, activate: bool) {
+        let modules = self.module_host.list();
+        match modules.get(row.wrapping_sub(MODULE_ROWS_START)) {
+            Some((id, _, _, enabled)) => {
+                let enabled = value.unwrap_or(!enabled);
+                self.set_module_enabled(id, enabled);
+            }
+            None if activate => self.open_vault_picker(),
+            None => {}
+        }
+    }
+
+    pub(crate) fn open_vault_picker(&mut self) {
+        self.settings_open = false;
+        let start = self
+            .path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.project_root());
+        self.open_file_picker_at(start, FilePickerMode::AddVault);
+        self.status = "Vault: Enter on a folder, or Ctrl+Enter for the current one".to_string();
+    }
+
+    fn apply_module_requests(&mut self, requests: Vec<module_api::Request>) {
+        for request in requests {
+            match request {
+                module_api::Request::Status(message) => self.status = message,
+                module_api::Request::Open { path, line } => self.open_module_target(path, line),
+                module_api::Request::Results { title, items } => {
+                    self.results.show(title, items);
+                    self.focus_editor_once = false;
+                }
+            }
+        }
+    }
+
+    /// Opens `path` (in a tab), at 0-based `line` if given.
+    fn open_module_target(&mut self, path: PathBuf, line: Option<usize>) {
+        if self
+            .path
+            .as_deref()
+            .is_some_and(|current| tabs::same_file(current, &path))
+        {
+            if let Some(line) = line {
+                self.goto_startup_line(line + 1);
+            }
+            self.focus_editor_once = true;
+            return;
+        }
+        self.open_keeping_unsaved_text(path, line.map(|line| format!("L{}", line + 1)));
+    }
+
+    fn run_module_command(&mut self, name: &'static str, args: &str, ctx: &egui::Context) {
+        let Some(owner) = self.module_host.command_owner(name) else {
+            return;
+        };
+        let doc = module_api::DocumentRef {
+            id: self.buffer.identity,
+            path: self.path.as_deref(),
+            revision: self.buffer.revision,
+            text: self.buffer.as_str(),
+        };
+        let requests = self
+            .module_host
+            .call(ctx, &self.vaults, Some(owner), name, |module, cx| {
+                module.run(cx, name, args, Some(doc))
+            });
+        self.apply_module_requests(requests);
+    }
+
+    fn notify_modules_opened(&mut self) {
+        let doc = module_api::DocumentRef {
+            id: self.buffer.identity,
+            path: self.path.as_deref(),
+            revision: self.buffer.revision,
+            text: self.buffer.as_str(),
+        };
+        self.module_seen.insert(doc.id, doc.revision);
+        let requests = self.module_host.call(
+            &self.module_ctx,
+            &self.vaults,
+            None,
+            "document_opened",
+            |module, cx| module.document_opened(cx, doc),
+        );
+        self.apply_module_requests(requests);
+    }
+
+    fn notify_modules_saved(&mut self) {
+        let doc = module_api::DocumentRef {
+            id: self.buffer.identity,
+            path: self.path.as_deref(),
+            revision: self.buffer.revision,
+            text: self.buffer.as_str(),
+        };
+        let requests = self.module_host.call(
+            &self.module_ctx,
+            &self.vaults,
+            None,
+            "document_saved",
+            |module, cx| module.document_saved(cx, doc),
+        );
+        self.apply_module_requests(requests);
+    }
+
+    /// The active document changed: the lines that may differ since the
+    /// modules last heard of it.
+    fn notify_modules_edited(&mut self) {
+        let seen = self
+            .module_seen
+            .insert(self.buffer.identity, self.buffer.revision);
+        let count = self.buffer.line_count();
+        let lines = match seen.and_then(|revision| self.buffer.unchanged_layout_edges(revision)) {
+            Some((prefix, suffix)) => {
+                prefix.min(count)..count.saturating_sub(suffix).max(prefix.min(count))
+            }
+            None => 0..count,
+        };
+        let doc = module_api::DocumentRef {
+            id: self.buffer.identity,
+            path: self.path.as_deref(),
+            revision: self.buffer.revision,
+            text: self.buffer.as_str(),
+        };
+        let requests = self.module_host.call(
+            &self.module_ctx,
+            &self.vaults,
+            None,
+            "document_edited",
+            |module, cx| module.document_edited(cx, doc, lines.clone()),
+        );
+        self.apply_module_requests(requests);
+    }
+
+    fn notify_modules_closed(&mut self, id: u64) {
+        self.module_seen.remove(&id);
+        let requests = self.module_host.call(
+            &self.module_ctx,
+            &self.vaults,
+            None,
+            "document_closed",
+            |module, cx| module.document_closed(cx, id),
+        );
+        self.apply_module_requests(requests);
+    }
+
+    /// Modules that asked to be woken.
+    fn poll_modules(&mut self, ctx: &egui::Context) {
+        for id in self.module_host.due() {
+            let requests =
+                self.module_host
+                    .call(ctx, &self.vaults, Some(id), "wake", |module, cx| {
+                        module.wake(cx)
+                    });
+            self.apply_module_requests(requests);
+        }
+    }
+
+    pub(crate) fn set_module_enabled(&mut self, id: &str, enabled: bool) {
+        self.module_host.set_enabled(id, enabled);
+        self.status = match self.save_settings() {
+            Ok(()) => format!("Module {id} {}", if enabled { "on" } else { "off" }),
+            Err(err) => format!("Settings save failed: {err}"),
+        };
+    }
+
+    pub(crate) fn add_vault(&mut self, folder: PathBuf) {
+        if !folder.is_dir() {
+            self.status = format!("Not a folder: {}", folder.display());
+            return;
+        }
+        let added = vaults::add(&mut self.vaults, folder.clone());
+        self.status = match (added, self.save_settings()) {
+            (false, _) => format!("Already a vault: {}", folder.display()),
+            (true, Ok(())) => format!("Vault added: {}", folder.display()),
+            (true, Err(err)) => format!("Settings save failed: {err}"),
+        };
+    }
+
+    pub(crate) fn remove_vault(&mut self, index: usize) {
+        if index < self.vaults.len() {
+            let removed = self.vaults.remove(index);
+            self.status = match self.save_settings() {
+                Ok(()) => format!("Vault removed: {}", removed.display()),
+                Err(err) => format!("Settings save failed: {err}"),
+            };
+        }
     }
 }
 

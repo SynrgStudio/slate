@@ -16,6 +16,7 @@ The complete code before the cut is at the git tag **`pre-module-cut`**.
 | `flow/` | compiled, tests run, **not connected** | Task grammar parser, SQLite cache, batch indexing, background writer, request files, `index.tsv` export, organization helpers |
 | `agenda/` | compiled, **not connected** | Agenda model: items from the cache, filters, week rows, live-buffer overlay |
 | `daily/` | compiled, tests run, **not connected** | Monthly daily log: day sections in date order, events |
+| `references/` | **connected** | `:backlinks` / `:mentions` over the file's vault, results in the core's result list |
 | `legacy/` | **not compiled** (reference only) | The glue that wired them into the editor: `SlateApp` methods, dialogs, key handling, editor aids, CLI |
 
 `legacy/` holds the old code verbatim, grouped by feature. It refers to
