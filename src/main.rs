@@ -6165,6 +6165,22 @@ impl SlateApp {
                         });
                     }
                 }
+                "cursor_trail_weight" => {
+                    if let Ok(weight) = value.trim().parse::<u8>() {
+                        self.apply_editor_look(editor_view::EditorLook {
+                            cursor_trail_weight: editor_view::clamp_trail_weight(weight),
+                            ..self.editor_look
+                        });
+                    }
+                }
+                "cursor_trail_typing" => {
+                    if let Some(enabled) = Self::parse_config_bool(value) {
+                        self.apply_editor_look(editor_view::EditorLook {
+                            cursor_trail_typing: enabled,
+                            ..self.editor_look
+                        });
+                    }
+                }
                 "cursor_color" => {
                     if let Some(color) = editor_view::color_from_hex(value) {
                         self.apply_editor_look(editor_view::EditorLook {
@@ -6405,11 +6421,13 @@ impl SlateApp {
         );
         contents.push_str(&format!("editor_font_size = {}\n", self.editor_font_size));
         contents.push_str(&format!(
-            "editor_font = \"{}\"\nblock_cursor = {}\ncursor_animation = {}\ncursor_trail = {}\ncursor_color = \"{}\"\n",
+            "editor_font = \"{}\"\nblock_cursor = {}\ncursor_animation = {}\ncursor_trail = {}\ncursor_trail_weight = {}\ncursor_trail_typing = {}\ncursor_color = \"{}\"\n",
             self.editor_look.font.config_value(),
             self.editor_look.block_cursor,
             self.editor_look.animate_cursor,
             self.editor_look.cursor_trail,
+            self.editor_look.cursor_trail_weight,
+            self.editor_look.cursor_trail_typing,
             editor_view::color_to_hex(self.editor_look.cursor_color)
         ));
         contents.push_str(&format!(
@@ -6518,7 +6536,15 @@ impl SlateApp {
                 .map_or_else(|| editor_view::color_to_hex(look.cursor_color), |(name, _)| (*name).to_string()),
             if look.block_cursor { "block" } else { "line" },
             if look.animate_cursor { " · animated" } else { "" },
-            if look.animate_cursor && look.cursor_trail { " with trail" } else { "" }
+            if look.cursor_trail {
+                format!(
+                    " · trail {}{}",
+                    look.cursor_trail_weight,
+                    if look.cursor_trail_typing { " (also typing)" } else { "" }
+                )
+            } else {
+                String::new()
+            }
         );
         self.status = match self.save_settings() {
             Ok(()) => summary,

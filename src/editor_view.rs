@@ -209,7 +209,17 @@ pub(crate) struct EditorLook {
     pub(crate) animate_cursor: bool,
     /// A fading smear follows the gliding caret.
     pub(crate) cursor_trail: bool,
+    /// 1–5: how long and how opaque the trail is.
+    pub(crate) cursor_trail_weight: u8,
+    /// A short trail also follows the caret while typing.
+    pub(crate) cursor_trail_typing: bool,
     pub(crate) cursor_color: Color32,
+}
+
+pub(crate) const DEFAULT_TRAIL_WEIGHT: u8 = 3;
+
+pub(crate) fn clamp_trail_weight(weight: u8) -> u8 {
+    weight.clamp(1, 5)
 }
 
 impl Default for EditorLook {
@@ -219,6 +229,8 @@ impl Default for EditorLook {
             block_cursor: false,
             animate_cursor: false,
             cursor_trail: false,
+            cursor_trail_weight: DEFAULT_TRAIL_WEIGHT,
+            cursor_trail_typing: false,
             cursor_color: CURSOR_COLORS[0].1,
         }
     }
@@ -252,9 +264,27 @@ pub(crate) fn cycle_cursor_color(color: Color32, forward: bool) -> Color32 {
 
 /// How long the caret takes to glide to a new place.
 const CURSOR_GLIDE_SECONDS: f64 = 0.09;
+
 /// With the trail on, the caret still lands after `CURSOR_GLIDE_SECONDS`;
-/// the trail's tail catches up a little later.
-const CURSOR_TRAIL_SECONDS: f64 = 0.16;
+/// the trail's tail catches up later, the heavier the trail the later.
+fn trail_seconds(weight: u8) -> f64 {
+    CURSOR_GLIDE_SECONDS + 0.035 * f64::from(clamp_trail_weight(weight))
+}
+
+/// Opacity of the trail right behind the caret.
+fn trail_opacity(weight: u8) -> f32 {
+    0.12 + 0.11 * f32::from(clamp_trail_weight(weight))
+}
+
+/// A caret animation in progress, in content coordinates.
+#[derive(Clone, Copy)]
+struct CursorGlide {
+    head_from: Pos2,
+    tail_from: Pos2,
+    started: f64,
+    /// Typing: the caret itself moves at once; only the trail follows.
+    instant_head: bool,
+}
 
 pub(crate) struct EditorView {
     font_size: f32,
@@ -265,8 +295,10 @@ pub(crate) struct EditorView {
     /// top), so scrolling never animates it.
     cursor_target: Option<Pos2>,
     cursor_drawn: Option<Pos2>,
-    /// Glide in progress: start position and start time.
-    cursor_glide: Option<(Pos2, f64)>,
+    cursor_glide: Option<CursorGlide>,
+    /// Where the trail's tail was last drawn, so a new keystroke continues
+    /// the trail instead of restarting it.
+    cursor_tail: Option<Pos2>,
     row_layout: RefCell<Option<RowLayout>>,
     fence_layout: RefCell<Option<FenceLayout>>,
     scroll_y: f32,
@@ -308,6 +340,7 @@ impl EditorView {
             cursor_target: None,
             cursor_drawn: None,
             cursor_glide: None,
+            cursor_tail: None,
             row_layout: RefCell::new(None),
             fence_layout: RefCell::new(None),
             scroll_y: 0.0,
@@ -3043,10 +3076,25 @@ impl EditorView {
             let typing_step = from.is_some_and(|from| {
                 from.y == target.y && (target.x - from.x).abs() <= cell_width * 1.5
             });
-            self.cursor_glide = match from {
-                Some(from) if self.look.animate_cursor && !typing_step => Some((from, now)),
-                _ => None,
-            };
+            let look = self.look;
+            self.cursor_glide = from.and_then(|from| {
+                let tail_from = self.cursor_tail.unwrap_or(from);
+                if typing_step {
+                    (look.cursor_trail && look.cursor_trail_typing).then_some(CursorGlide {
+                        head_from: target,
+                        tail_from,
+                        started: now,
+                        instant_head: true,
+                    })
+                } else {
+                    look.animate_cursor.then_some(CursorGlide {
+                        head_from: from,
+                        tail_from,
+                        started: now,
+                        instant_head: false,
+                    })
+                }
+            });
             self.cursor_target = Some(target);
         }
         // Ease-out cubic: fast start, gentle landing.
@@ -3055,28 +3103,42 @@ impl EditorView {
         let mut gliding = false;
         let mut tail = None;
         let drawn = match self.cursor_glide {
-            Some((from, started)) => {
-                let elapsed = now - started;
-                let total = if self.look.cursor_trail {
-                    CURSOR_TRAIL_SECONDS
+            Some(glide) => {
+                let elapsed = now - glide.started;
+                let head_seconds = if glide.instant_head {
+                    0.0
                 } else {
                     CURSOR_GLIDE_SECONDS
                 };
-                if elapsed >= total {
+                let tail_seconds = if self.look.cursor_trail {
+                    trail_seconds(self.look.cursor_trail_weight)
+                } else {
+                    head_seconds
+                };
+                if elapsed >= head_seconds.max(tail_seconds) {
                     self.cursor_glide = None;
                     target
                 } else {
                     animating = true;
-                    gliding = elapsed < CURSOR_GLIDE_SECONDS;
+                    gliding = elapsed < head_seconds;
                     if self.look.cursor_trail {
-                        tail = Some(from + (target - from) * ease(elapsed / CURSOR_TRAIL_SECONDS));
+                        tail = Some(
+                            glide.tail_from
+                                + (target - glide.tail_from) * ease(elapsed / tail_seconds),
+                        );
                     }
-                    from + (target - from) * ease(elapsed / CURSOR_GLIDE_SECONDS)
+                    if glide.instant_head {
+                        target
+                    } else {
+                        glide.head_from
+                            + (target - glide.head_from) * ease(elapsed / CURSOR_GLIDE_SECONDS)
+                    }
                 }
             }
             None => target,
         };
         self.cursor_drawn = Some(drawn);
+        self.cursor_tail = tail;
         let to_screen = |p: Pos2| egui::pos2(rect.left() + p.x, rect.top() + p.y - self.scroll_y);
         let at = to_screen(drawn);
         let color = self.look.cursor_color;
@@ -3095,7 +3157,12 @@ impl EditorView {
             }
         };
         if let Some(tail) = tail {
-            paint_cursor_trail(painter, shape(to_screen(tail)), shape(at), color);
+            paint_cursor_trail(
+                painter,
+                shape(to_screen(tail)),
+                shape(at),
+                color.gamma_multiply(trail_opacity(self.look.cursor_trail_weight)),
+            );
         }
         if self.look.block_cursor {
             let block = shape(at);
@@ -3139,6 +3206,7 @@ impl EditorView {
         self.cursor_target = None;
         self.cursor_drawn = None;
         self.cursor_glide = None;
+        self.cursor_tail = None;
     }
 
     pub(crate) fn text_width(&self, painter: &egui::Painter, text: &str, font: &FontId) -> f32 {
@@ -3446,13 +3514,12 @@ fn text_input_from_events(events: &[egui::Event]) -> Option<String> {
 }
 
 
-/// A smear from where the caret was (transparent) to where it is (about
-/// half opaque): every edge of the caret's shape swept from tail to head.
-fn paint_cursor_trail(painter: &egui::Painter, tail: egui::Rect, head: egui::Rect, color: Color32) {
+/// A smear from where the caret was (transparent) to where it is (`strong`):
+/// every edge of the caret's shape swept from tail to head.
+fn paint_cursor_trail(painter: &egui::Painter, tail: egui::Rect, head: egui::Rect, strong: Color32) {
     let corners = |r: egui::Rect| [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()];
     let (tail, head) = (corners(tail), corners(head));
     let faint = Color32::TRANSPARENT;
-    let strong = color.gamma_multiply(0.45);
     let mut mesh = egui::Mesh::default();
     for edge in 0..4 {
         let next = (edge + 1) % 4;

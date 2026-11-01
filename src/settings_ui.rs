@@ -459,7 +459,19 @@ impl SlateApp {
                                     ui.set_width(ui.available_width());let mut enabled=look.cursor_trail;
                                     if ui.checkbox(&mut enabled,RichText::new("Cursor trail while it glides").font(FontId::monospace(14.0))).changed() {self.selected_setting=26;self.set_editor_look(editor_view::EditorLook{cursor_trail:enabled,..look});}
                                 });setting_rects.push(row.response.rect);
-                                ui.label(RichText::new("The cursor glides when it jumps; typing stays instant. Text is never delayed. The trail needs animation on.").font(FontId::monospace(13.0)).color(Color32::from_rgb(136,154,176)));
+                                let row=egui::Frame::new().fill(if self.selected_setting==27 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new("Trail weight").font(FontId::monospace(14.0)));
+                                        let mut weight=look.cursor_trail_weight;
+                                        if ui.add(egui::Slider::new(&mut weight,1..=5)).changed() {self.selected_setting=27;self.set_editor_look(editor_view::EditorLook{cursor_trail_weight:weight,..look});}
+                                    });
+                                });setting_rects.push(row.response.rect);
+                                let row=egui::Frame::new().fill(if self.selected_setting==28 {selected_fill} else {normal_fill}).inner_margin(6).show(ui,|ui| {
+                                    ui.set_width(ui.available_width());let mut enabled=look.cursor_trail_typing;
+                                    if ui.checkbox(&mut enabled,RichText::new("Trail while typing too").font(FontId::monospace(14.0))).changed() {self.selected_setting=28;self.set_editor_look(editor_view::EditorLook{cursor_trail_typing:enabled,..look});}
+                                });setting_rects.push(row.response.rect);
+                                ui.label(RichText::new("The cursor glides when it jumps and lands at 90 ms. Text is never delayed: only the cursor and its trail animate. Weight 1–5: longer, stronger trail; Enter resets to 3.").font(FontId::monospace(13.0)).color(Color32::from_rgb(136,154,176)));
                                 if reveal_selected {
                                     if let Some(rect) = setting_rects.get(self.selected_setting) { ui.scroll_to_rect(*rect, Some(egui::Align::Min)); }
                                 }

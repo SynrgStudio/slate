@@ -1220,7 +1220,7 @@ impl SlateApp {
         }
 
         if settings_next {
-            self.selected_setting = (self.selected_setting + 1).min(16 + footer_ui::FIELDS.len());
+            self.selected_setting = (self.selected_setting + 1).min(18 + footer_ui::FIELDS.len());
             return;
         }
 
@@ -1257,6 +1257,16 @@ impl SlateApp {
                 }),
                 26 => self.set_editor_look(editor_view::EditorLook {
                     cursor_trail: false,
+                    ..self.editor_look
+                }),
+                27 => self.set_editor_look(editor_view::EditorLook {
+                    cursor_trail_weight: editor_view::clamp_trail_weight(
+                        self.editor_look.cursor_trail_weight.saturating_sub(1),
+                    ),
+                    ..self.editor_look
+                }),
+                28 => self.set_editor_look(editor_view::EditorLook {
+                    cursor_trail_typing: false,
                     ..self.editor_look
                 }),
                 _ => {}
@@ -1338,6 +1348,22 @@ impl SlateApp {
                 26 => self.set_editor_look(editor_view::EditorLook {
                     cursor_trail: if settings_activate {
                         !self.editor_look.cursor_trail
+                    } else {
+                        true
+                    },
+                    ..self.editor_look
+                }),
+                27 => self.set_editor_look(editor_view::EditorLook {
+                    cursor_trail_weight: if settings_activate {
+                        editor_view::DEFAULT_TRAIL_WEIGHT
+                    } else {
+                        editor_view::clamp_trail_weight(self.editor_look.cursor_trail_weight + 1)
+                    },
+                    ..self.editor_look
+                }),
+                28 => self.set_editor_look(editor_view::EditorLook {
+                    cursor_trail_typing: if settings_activate {
+                        !self.editor_look.cursor_trail_typing
                     } else {
                         true
                     },

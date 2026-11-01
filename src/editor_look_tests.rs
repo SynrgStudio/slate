@@ -121,6 +121,8 @@ fn jetbrains_mono_changes_the_text_metrics_and_everything_persists() {
         block_cursor: true,
         animate_cursor: false,
         cursor_trail: true,
+        cursor_trail_weight: 5,
+        cursor_trail_typing: true,
         cursor_color: editor_view::CURSOR_COLORS[3].1,
     });
     f.frame_after(0.016);
@@ -132,6 +134,8 @@ fn jetbrains_mono_changes_the_text_metrics_and_everything_persists() {
     assert!(config.contains("block_cursor = true"));
     assert!(config.contains("cursor_animation = false"));
     assert!(config.contains("cursor_trail = true"));
+    assert!(config.contains("cursor_trail_weight = 5"));
+    assert!(config.contains("cursor_trail_typing = true"));
     assert!(config.contains("cursor_color = \"#ebcb8b\""), "{config}");
     f.app.editor_look = Default::default();
     f.app.load_settings();
@@ -142,6 +146,8 @@ fn jetbrains_mono_changes_the_text_metrics_and_everything_persists() {
             block_cursor: true,
             animate_cursor: false,
             cursor_trail: true,
+            cursor_trail_weight: 5,
+            cursor_trail_typing: true,
             cursor_color: editor_view::CURSOR_COLORS[3].1,
         }
     );
@@ -184,4 +190,50 @@ fn cursor_colors_round_trip_and_cycle() {
     assert_eq!(editor_view::cycle_cursor_color(last, true), first);
     let custom = egui::Color32::from_rgb(1, 2, 3);
     assert_eq!(editor_view::cycle_cursor_color(custom, true), first);
+}
+
+#[test]
+fn typing_can_leave_a_short_trail_without_moving_the_cursor_late() {
+    let mut f = Fixture::new("hola\n");
+    f.app.apply_editor_look(editor_view::EditorLook {
+        cursor_trail: true,
+        cursor_trail_typing: true,
+        ..animated()
+    });
+    f.frame_after(0.016);
+    f.app.buffer.insert_text("x");
+    f.frame_after(0.016);
+    let (drawn, target, animating) = f.cursor();
+    assert_eq!(drawn, target, "the cursor is already after the new letter");
+    assert!(animating, "a short trail follows it");
+    f.frame_after(0.4);
+    assert!(!f.cursor().2);
+
+    // Off: typing draws no trail and schedules nothing.
+    f.app.apply_editor_look(editor_view::EditorLook {
+        cursor_trail: true,
+        ..animated()
+    });
+    f.app.buffer.insert_text("y");
+    f.frame_after(0.016);
+    assert!(!f.cursor().2);
+}
+
+#[test]
+fn a_heavier_trail_lasts_longer() {
+    let mut light = Fixture::new("uno\ndos\ntres\ncuatro\n");
+    let mut heavy = Fixture::new("uno\ndos\ntres\ncuatro\n");
+    for (f, weight) in [(&mut light, 1), (&mut heavy, 5)] {
+        f.app.apply_editor_look(editor_view::EditorLook {
+            cursor_trail: true,
+            cursor_trail_weight: weight,
+            ..animated()
+        });
+        f.frame_after(0.016);
+        f.app.buffer.move_to_bottom();
+        f.frame_after(0.0);
+        f.frame_after(0.15);
+    }
+    assert!(!light.cursor().2, "weight 1 is done by 150 ms");
+    assert!(heavy.cursor().2, "weight 5 is still trailing");
 }

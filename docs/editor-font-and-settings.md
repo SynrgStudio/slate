@@ -48,7 +48,14 @@ temporary directory.
   snow) plus a picker for any color.
 - **Cursor trail while it glides**: a fading smear from where the cursor was
   to where it is. The cursor still lands at 90 ms; the trail's tail catches
-  up by 160 ms, then nothing is drawn or scheduled. Needs animation on.
+  up later, then nothing is drawn or scheduled. Needs animation on.
+- **Trail weight** 1–5 (default 3): how long the tail lags (125–265 ms) and
+  how opaque it is right behind the cursor (23–67 %). ←/→ adjusts, Enter
+  resets to 3.
+- **Trail while typing too**: each keystroke leaves a short trail. The
+  cursor itself is already after the new letter; only the trail follows,
+  and a new key continues the trail from where its tail was.
 - Saved as `editor_font = "hack" | "jetbrains-mono"`, `block_cursor`,
-  `cursor_animation`, `cursor_trail` and `cursor_color = "#rrggbb"` in
+  `cursor_animation`, `cursor_trail`, `cursor_trail_weight`,
+  `cursor_trail_typing` and `cursor_color = "#rrggbb"` in
   `config.toml`; all off, Hack and snow by default.
