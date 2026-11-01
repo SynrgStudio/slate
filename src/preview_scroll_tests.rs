@@ -171,3 +171,52 @@ fn large_preview_materializes_visible_lines_and_preserves_bilateral_anchors_afte
     assert!(rendered < 50);
     assert!(skipped > 2900);
 }
+#[test]
+fn fenced_code_in_the_preview_uses_the_editor_colours() {
+    let ctx = egui::Context::default();
+    let mut app = fixture(&ctx);
+    app.apply_editor_look(editor_view::EditorLook::default());
+    app.buffer
+        .set_text("# Notes\n\n```rust\nfn main() { let x = 1; }\n```\nplain text\n".into());
+    let colours_drawn = |ctx: &egui::Context, app: &mut SlateApp| {
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(900.0, 560.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.preview_ui(ui));
+            },
+        );
+        let mut colours = Vec::new();
+        for clipped in output.shapes {
+            if let egui::Shape::Text(text) = clipped.shape {
+                for section in &text.galley.job.sections {
+                    colours.push((
+                        text.galley.job.text[section.byte_range.clone()].to_string(),
+                        section.format.color,
+                    ));
+                }
+            }
+        }
+        colours
+    };
+    let colours = colours_drawn(&ctx, &mut app);
+    let keyword = highlight::Token::Keyword.color();
+    assert!(
+        colours
+            .iter()
+            .any(|(text, colour)| text == "fn" && *colour == keyword),
+        "{colours:?}"
+    );
+    assert!(colours.iter().any(|(text, _)| text.contains("plain text")));
+    app.apply_editor_look(editor_view::EditorLook {
+        syntax_highlighting: false,
+        ..Default::default()
+    });
+    let colours = colours_drawn(&ctx, &mut app);
+    assert!(!colours.iter().any(|(_, colour)| *colour == keyword));
+}

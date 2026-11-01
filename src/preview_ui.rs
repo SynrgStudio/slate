@@ -87,7 +87,12 @@ impl SlateApp {
                         ));
                     }
                 } else {
-                    Self::preview_line(ui, line, layout.in_code(index));
+                    // Code in fences gets the editor's colours.
+                    let colors = layout
+                        .in_code(index)
+                        .then(|| self.editor_view.line_highlight(&self.buffer, index))
+                        .flatten();
+                    Self::preview_line(ui, line, layout.in_code(index), colors);
                 }
                 layout.measured(index, width, ui.cursor().top() - start_y);
                 index += span;
@@ -145,7 +150,12 @@ impl SlateApp {
     }
 
     /// One preview line that is not part of a table.
-    fn preview_line(ui: &mut egui::Ui, line: &str, in_code: bool) {
+    fn preview_line(
+        ui: &mut egui::Ui,
+        line: &str,
+        in_code: bool,
+        colors: Option<Vec<(std::ops::Range<usize>, highlight::Token)>>,
+    ) {
         let trimmed = line.trim_start();
         if let Some(fence) = parse_fenced_code_marker(line) {
             if !in_code {
@@ -170,11 +180,35 @@ impl SlateApp {
                 .fill(Color32::from_rgb(25, 31, 40))
                 .inner_margin(egui::Margin::symmetric(8, 3))
                 .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(line)
-                            .font(FontId::new(14.0, FontFamily::Monospace))
-                            .color(Color32::from_rgb(216, 222, 233)),
-                    );
+                    let font = FontId::new(14.0, FontFamily::Monospace);
+                    let plain = Color32::from_rgb(216, 222, 233);
+                    match colors {
+                        Some(tokens) => {
+                            let mut job = egui::text::LayoutJob::default();
+                            let mut at = 0;
+                            let mut append =
+                                |job: &mut egui::text::LayoutJob, end: usize, color| {
+                                    let end = end.min(line.len());
+                                    if end > at {
+                                        job.append(
+                                            &line[at..end],
+                                            0.0,
+                                            egui::TextFormat::simple(font.clone(), color),
+                                        );
+                                        at = end;
+                                    }
+                                };
+                            for (range, token) in tokens {
+                                append(&mut job, range.start, plain);
+                                append(&mut job, range.end, token.color());
+                            }
+                            append(&mut job, line.len(), plain);
+                            ui.label(job);
+                        }
+                        None => {
+                            ui.label(RichText::new(line).font(font).color(plain));
+                        }
+                    }
                 });
         } else if let Some(heading) = parse_heading_line(line) {
             let size = match heading.level {
