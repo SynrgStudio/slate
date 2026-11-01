@@ -396,9 +396,9 @@ fn main() -> eframe::Result {
             line: startup_line,
             handoff: handoff.clone(),
             position: position.map(|at| (at.x, at.y)),
-            tab_at: None,
+            ..Default::default()
         };
-        if spare::claim(&request) {
+        if spare::claim(&request).is_some() {
             perf_log::mark("startup.claimed_spare_window", "");
             perf_log::flush();
             return Ok(());
@@ -991,6 +991,13 @@ struct SlateApp {
     spare_owner: Option<u32>,
     /// Receives tabs dropped onto this window from other Slate windows.
     tab_drop_server: Option<single_instance::Server>,
+    /// A tab from another window is being dragged over this one: where it
+    /// would land, its label, when that was last said.
+    tab_drop_hover: Option<(usize, String, std::time::Instant)>,
+    /// The window last told a tab of ours is over it, and where.
+    drag_hover: Option<(PathBuf, (f32, f32))>,
+    /// A tab torn off into a new window that follows the cursor.
+    torn_tab: Option<tabs::TornTab>,
     /// Last time the resident primary made sure a spare exists.
     spare_checked_at: Option<std::time::Instant>,
     /// Config: closing the primary window hides it in the tray.
@@ -1240,6 +1247,9 @@ impl SlateApp {
             spare_owner: None,
             tab_drop_server: None,
             spare_checked_at: None,
+            tab_drop_hover: None,
+            drag_hover: None,
+            torn_tab: None,
             resident: true,
             resident_active: false,
             window_hidden: false,
@@ -1489,7 +1499,7 @@ impl SlateApp {
         let wake_ctx = cc.egui_ctx.clone();
         let server = match single_instance::Server::start_one_shot(file.clone(), move |request| {
             spare::claimed();
-            resident::show_at(request.position);
+            resident::show_at(request.position, !request.follow);
             wake_ctx.request_repaint();
         }) {
             Ok(server) => server,
@@ -1522,8 +1532,37 @@ impl SlateApp {
             return;
         };
         for request in server.take_requests() {
-            self.receive_tab(request, ctx);
+            if let Some(label) = request.hover {
+                self.tab_drop_hover = request.tab_at.map(|at| {
+                    (
+                        window_ui::tab_slot_at(ctx, at),
+                        label,
+                        std::time::Instant::now(),
+                    )
+                });
+            } else if let (Some(file), Some(at)) = (request.send_to.clone(), request.tab_at) {
+                self.send_tab_on(file, at, ctx);
+            } else {
+                self.tab_drop_hover = None;
+                self.receive_tab(request, ctx);
+            }
         }
+        // A drag that went away without saying so.
+        if self
+            .tab_drop_hover
+            .as_ref()
+            .is_some_and(|(_, _, at)| at.elapsed() > std::time::Duration::from_millis(600))
+        {
+            self.tab_drop_hover = None;
+        }
+        let shown = self
+            .tab_drop_hover
+            .as_ref()
+            .map(|(slot, label, _)| (*slot, label.clone()));
+        if shown.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        window_ui::set_drop_hover(ctx, shown);
     }
 
     /// The ready window was claimed: become the requested window.
@@ -1540,7 +1579,15 @@ impl SlateApp {
         self.tab_drop_server = tab_drop::listen(ctx);
         // Settings may have changed since this window started.
         self.load_settings();
-        self.show_window(ctx);
+        if request.follow {
+            // Following a tab still being dragged: the dragging window keeps
+            // the focus until the drop.
+            self.window_hidden = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            self.shown_at = Some(std::time::Instant::now());
+        } else {
+            self.show_window(ctx);
+        }
         if let Some(file) = request.handoff {
             self.apply_handoff(&file);
         } else if let Some(path) = request.path {
@@ -10367,6 +10414,7 @@ impl SlateApp {
         self.poll_instance_requests(&ctx);
         self.poll_spare(&ctx);
         self.poll_dropped_tabs(&ctx);
+        self.poll_tab_drag(&ctx);
         self.poll_resident(&ctx);
         if let Some(action) = self.pending_tab_action.take() {
             self.finish_pending_action(action, &ctx);
@@ -10425,6 +10473,7 @@ impl SlateApp {
             Some(window_ui::TabAction::Rename { index, alias }) => {
                 self.rename_tab(index, Some(&alias))
             }
+            Some(window_ui::TabAction::TearOff { index }) => self.tear_off_tab(index, &ctx),
             Some(window_ui::TabAction::Detach { index, at }) => {
                 // Moving a window's only tab away closes (or hides) the window.
                 let only_tab = self.tabs_len() == 1;

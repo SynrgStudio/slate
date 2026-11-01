@@ -439,9 +439,24 @@ fn a_dragged_tab_is_carried_by_the_pointer_and_lifts_off_to_detach() {
         ctx.data(|d| d.get_temp::<Option<(egui::Rect, bool)>>(egui::Id::new("tab_lifted")));
     let (card, ready) = lifted.flatten().expect("lifted card");
     assert!(card.contains(below) && !ready);
-    // Out of the window: ready to detach, and the card stays inside.
+    assert_eq!(window_ui::dragged_out_label(&ctx), None, "still inside");
+    // Out of the window: it asks once to become a window that follows the
+    // cursor, ready to detach, and the card stays inside.
     let outside = egui::pos2(950.0, 300.0);
-    frame(vec![egui::Event::PointerMoved(outside)]);
+    assert_eq!(
+        frame(vec![egui::Event::PointerMoved(outside)]),
+        Some(window_ui::TabAction::TearOff { index: 0 })
+    );
+    assert_eq!(
+        window_ui::dragged_out_label(&ctx).as_deref(),
+        Some("one.md")
+    );
+    let outside = egui::pos2(960.0, 310.0);
+    assert_eq!(
+        frame(vec![egui::Event::PointerMoved(outside)]),
+        None,
+        "asked once"
+    );
     let lifted =
         ctx.data(|d| d.get_temp::<Option<(egui::Rect, bool)>>(egui::Id::new("tab_lifted")));
     let (card, ready) = lifted.flatten().expect("lifted card");
@@ -641,6 +656,40 @@ fn a_tab_dropped_onto_another_window_joins_its_tabs() {
     );
     assert_eq!(g.labels(), ["a.md", "b.md", "Viajera"]);
     assert_eq!(g.app.tabs.active, 0);
+}
+
+#[test]
+fn a_tab_dragged_over_from_another_window_shows_where_it_would_land() {
+    let ctx = egui::Context::default();
+    let tabs: Vec<tabs::TabLabel> = ["one.md", "two.md"]
+        .iter()
+        .enumerate()
+        .map(|(id, text)| tabs::TabLabel {
+            id: id as u64,
+            text: text.to_string(),
+            dirty: false,
+            tooltip: String::new(),
+            rename_text: String::new(),
+        })
+        .collect();
+    let texts = |ctx: &egui::Context| {
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            window_ui::titlebar_with_tabs(ui, "Slate", &tabs, 0);
+        });
+        output
+            .shapes
+            .into_iter()
+            .filter_map(|clipped| match clipped.shape {
+                egui::Shape::Text(text) => Some(text.galley.job.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(!texts(&ctx).iter().any(|text| text == "viajera.md"));
+    window_ui::set_drop_hover(&ctx, Some((1, "viajera.md".into())));
+    assert!(texts(&ctx).iter().any(|text| text == "viajera.md"));
+    window_ui::set_drop_hover(&ctx, None);
+    assert!(!texts(&ctx).iter().any(|text| text == "viajera.md"));
 }
 
 #[test]

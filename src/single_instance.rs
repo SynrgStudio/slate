@@ -38,6 +38,14 @@ pub(crate) struct OpenRequest {
     /// A tab dropped onto this window, at this screen point (physical
     /// pixels): add it as a tab there (see `tab_drop`).
     pub(crate) tab_at: Option<(f32, f32)>,
+    /// New window that follows a dragged tab: show without taking focus.
+    pub(crate) follow: bool,
+    /// A tab dragged over this window, labelled so (`tab_at` is where);
+    /// an empty label with no `tab_at` means the drag left.
+    pub(crate) hover: Option<String>,
+    /// Send this window's tab to the window listening at this file, as if
+    /// dropped at `tab_at` (the end of a drag that tore it off).
+    pub(crate) send_to: Option<PathBuf>,
 }
 
 pub(crate) fn data_dir() -> Option<PathBuf> {
@@ -63,6 +71,16 @@ pub(crate) fn forward(instance_file: &Path, request: &OpenRequest) -> bool {
     // the foreground that this freshly launched process owns.
     crate::resident::allow_foreground_handoff();
     send(instance_file, |token| encode_request(token, request))
+}
+
+/// The process listening at `file`, as it recorded itself.
+pub(crate) fn listener_process_id(file: &Path) -> Option<u32> {
+    std::fs::read_to_string(file)
+        .ok()?
+        .split_whitespace()
+        .nth(2)?
+        .parse()
+        .ok()
 }
 
 /// True when a running Slate answers; it does not show or open anything.
@@ -125,7 +143,7 @@ impl Server {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         let port = listener.local_addr()?.port();
         let token = random_token();
-        let contents = format!("{port} {token}\n");
+        let contents = format!("{port} {token} {}\n", std::process::id());
         if let Some(parent) = instance_file.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -225,21 +243,29 @@ fn encode_request(token: &str, request: &OpenRequest) -> String {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default()
     };
+    let point = |at: Option<(f32, f32)>| at.map(|(x, y)| format!("{x},{y}")).unwrap_or_default();
     let path = text(&request.path);
     let line = request.line.map(|l| l.to_string()).unwrap_or_default();
-    if let Some((x, y)) = request.tab_at {
-        let handoff = text(&request.handoff);
-        return format!("{token}\nTAB\t{x},{y}\t{handoff}\t{path}\n");
-    }
-    if request.handoff.is_none() && request.position.is_none() {
-        return format!("{token}\nOPEN\t{line}\t{path}\n");
-    }
-    let position = request
-        .position
-        .map(|(x, y)| format!("{x},{y}"))
-        .unwrap_or_default();
     let handoff = text(&request.handoff);
-    format!("{token}\nWINDOW\t{line}\t{position}\t{handoff}\t{path}\n")
+    let at = point(request.tab_at);
+    let record = if let Some(label) = &request.hover {
+        if request.tab_at.is_none() {
+            "LEAVE".to_string()
+        } else {
+            format!("HOVER\t{at}\t{label}")
+        }
+    } else if request.send_to.is_some() {
+        format!("SENDTO\t{at}\t{}", text(&request.send_to))
+    } else if request.tab_at.is_some() {
+        format!("TAB\t{at}\t{handoff}\t{path}")
+    } else if request.handoff.is_none() && request.position.is_none() && !request.follow {
+        format!("OPEN\t{line}\t{path}")
+    } else {
+        let position = point(request.position);
+        let follow = if request.follow { "follow" } else { "" };
+        format!("WINDOW\t{line}\t{position}\t{handoff}\t{follow}\t{path}")
+    };
+    format!("{token}\n{record}\n")
 }
 
 fn decode_request(token: &str, message: &str) -> Option<OpenRequest> {
@@ -248,53 +274,78 @@ fn decode_request(token: &str, message: &str) -> Option<OpenRequest> {
         return None;
     }
     let record = lines.next()?;
-    if let Some(rest) = record.strip_prefix("TAB\t") {
-        let mut fields = rest.splitn(3, '\t');
-        let (x, y) = fields.next()?.split_once(',')?;
-        let handoff = fields.next()?;
-        let path = fields.next()?;
-        return Some(OpenRequest {
-            path: (!path.is_empty()).then(|| PathBuf::from(path)),
-            handoff: (!handoff.is_empty()).then(|| PathBuf::from(handoff)),
-            tab_at: Some((x.parse().ok()?, y.parse().ok()?)),
-            ..Default::default()
-        });
-    }
-    let window = record.starts_with("WINDOW\t");
-    // The path goes last: it may itself contain tabs.
-    let mut fields = record.splitn(if window { 5 } else { 3 }, '\t');
-    if fields.next()? != if window { "WINDOW" } else { "OPEN" } {
-        return None;
-    }
-    let line = fields.next()?;
-    let (position, handoff) = if window {
-        let position = fields.next()?;
-        let handoff = fields.next()?;
-        let position = if position.is_empty() {
-            None
-        } else {
-            let (x, y) = position.split_once(',')?;
-            Some((x.parse().ok()?, y.parse().ok()?))
-        };
-        (
-            position,
-            (!handoff.is_empty()).then(|| PathBuf::from(handoff)),
-        )
-    } else {
-        (None, None)
+    let point = |text: &str| -> Option<Option<(f32, f32)>> {
+        if text.is_empty() {
+            return Some(None);
+        }
+        let (x, y) = text.split_once(',')?;
+        Some(Some((x.parse().ok()?, y.parse().ok()?)))
     };
-    let path = fields.next()?;
-    Some(OpenRequest {
-        line: if line.is_empty() {
-            None
-        } else {
-            Some(line.parse().ok()?)
-        },
-        path: (!path.is_empty()).then(|| PathBuf::from(path)),
-        handoff,
-        position,
-        tab_at: None,
-    })
+    let file = |text: &str| (!text.is_empty()).then(|| PathBuf::from(text));
+    let (kind, rest) = record.split_once('\t').unwrap_or((record, ""));
+    // Paths and labels go last: they may themselves contain tabs.
+    match kind {
+        "LEAVE" => Some(OpenRequest {
+            hover: Some(String::new()),
+            ..Default::default()
+        }),
+        "HOVER" => {
+            let (at, label) = rest.split_once('\t')?;
+            Some(OpenRequest {
+                tab_at: Some(point(at)??),
+                hover: Some(label.to_string()),
+                ..Default::default()
+            })
+        }
+        "SENDTO" => {
+            let (at, target) = rest.split_once('\t')?;
+            Some(OpenRequest {
+                tab_at: Some(point(at)??),
+                send_to: Some(file(target)?),
+                ..Default::default()
+            })
+        }
+        "TAB" => {
+            let mut fields = rest.splitn(3, '\t');
+            let at = point(fields.next()?)??;
+            let handoff = fields.next()?;
+            let path = fields.next()?;
+            Some(OpenRequest {
+                path: file(path),
+                handoff: file(handoff),
+                tab_at: Some(at),
+                ..Default::default()
+            })
+        }
+        "OPEN" | "WINDOW" => {
+            let window = kind == "WINDOW";
+            let mut fields = rest.splitn(if window { 5 } else { 2 }, '\t');
+            let line = fields.next()?;
+            let (position, handoff, follow) = if window {
+                (
+                    point(fields.next()?)?,
+                    file(fields.next()?),
+                    fields.next()? == "follow",
+                )
+            } else {
+                (None, None, false)
+            };
+            let path = fields.next()?;
+            Some(OpenRequest {
+                line: if line.is_empty() {
+                    None
+                } else {
+                    Some(line.parse().ok()?)
+                },
+                path: file(path),
+                handoff,
+                position,
+                follow,
+                ..Default::default()
+            })
+        }
+        _ => None,
+    }
 }
 
 /// 128 bits from std's per-process randomly seeded hasher keys.
@@ -352,7 +403,8 @@ mod tests {
             line: None,
             handoff: Some(PathBuf::from("C:\\data\\handoff\\1-2.json")),
             position: Some((-1280.5, 40.0)),
-            tab_at: None,
+            follow: true,
+            ..Default::default()
         };
         let encoded = encode_request("abc", &window);
         assert!(encoded.contains("\nWINDOW\t"));
@@ -366,6 +418,25 @@ mod tests {
         let encoded = encode_request("abc", &tab);
         assert!(encoded.contains("\nTAB\t"));
         assert_eq!(decode_request("abc", &encoded), Some(tab));
+        for request in [
+            OpenRequest {
+                tab_at: Some((10.5, 20.0)),
+                hover: Some("notas\tdía.md".into()),
+                ..Default::default()
+            },
+            OpenRequest {
+                hover: Some(String::new()),
+                ..Default::default()
+            },
+            OpenRequest {
+                tab_at: Some((1.0, 2.0)),
+                send_to: Some(PathBuf::from("C:\\data\\windows\\42")),
+                ..Default::default()
+            },
+        ] {
+            let encoded = encode_request("abc", &request);
+            assert_eq!(decode_request("abc", &encoded), Some(request), "{encoded}");
+        }
     }
 
     #[test]

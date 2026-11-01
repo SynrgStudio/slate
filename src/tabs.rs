@@ -143,6 +143,16 @@ pub(crate) struct TabLabel {
     pub(crate) rename_text: String,
 }
 
+/// Where the cursor holds a torn-off tab's window (points from its top-left):
+/// over its first tab.
+const TORN_GRAB: (f32, f32) = (60.0, 14.0);
+
+/// A tab torn off into a window that follows the cursor until the drop.
+pub(crate) struct TornTab {
+    process_id: u32,
+    label: String,
+}
+
 /// A tab moving to a new window with unsaved text (or no file yet). Written
 /// by the old window, read and deleted by the new one after it has its own
 /// recovery checkpoint, so the text always exists in at least one place.
@@ -444,39 +454,54 @@ impl SlateApp {
         self.tabs.list.len()
     }
 
-    /// Moves tab `index` out of this window: onto another Slate window under
-    /// the cursor, or else into a new window at `at`. True when it moved.
-    pub(super) fn detach_tab(&mut self, index: usize, at: egui::Pos2) -> bool {
+    /// What carries tab `index` to another window: its path, or a handoff
+    /// file with its unsaved text (written here). None (with a status) when
+    /// the handoff cannot be written.
+    fn moved_tab_request(&mut self, index: usize) -> Option<single_instance::OpenRequest> {
         // The moved tab must carry the file's real state.
         self.finish_background_save();
         if index >= self.tabs.list.len() {
-            return false;
+            return None;
         }
-        let path = self.tab_path(index).map(Path::to_path_buf);
-        let label = self.tab_labels()[index].text.clone();
-        let Ok(exe) = std::env::current_exe() else {
-            return false;
-        };
         // Unsaved text (or a tab without a file) travels in a handoff file.
         let handoff = match self.tab_handoff(index) {
             Some(handoff) => match self.write_handoff(&handoff) {
                 Ok(file) => Some(file),
                 Err(err) => {
                     self.status = format!("Could not move the tab: {err}");
-                    return false;
+                    return None;
                 }
             },
             None => None,
         };
-        let moved_tab = |path: Option<PathBuf>| single_instance::OpenRequest {
-            path: if handoff.is_none() { path } else { None },
-            handoff: handoff.clone(),
+        Some(single_instance::OpenRequest {
+            path: if handoff.is_none() {
+                self.tab_path(index).map(Path::to_path_buf)
+            } else {
+                None
+            },
+            handoff,
             ..Default::default()
+        })
+    }
+
+    /// Moves tab `index` out of this window: onto another Slate window under
+    /// the cursor, or else into a new window at `at`. True when it moved.
+    pub(super) fn detach_tab(&mut self, index: usize, at: egui::Pos2) -> bool {
+        let Some(moved) = self.moved_tab_request(index) else {
+            return false;
         };
-        if let Some(target) = tab_drop::target_under_cursor()
-            && tab_drop::send(&target, moved_tab(path.clone()))
+        let (path, handoff) = (moved.path.clone(), moved.handoff.clone());
+        let label = self.tab_labels()[index].text.clone();
+        let Ok(exe) = std::env::current_exe() else {
+            return false;
+        };
+        let moved_tab = |_: Option<PathBuf>| moved.clone();
+        if let Some(target) = tab_drop::target_under_cursor(&[std::process::id()])
+            && tab_drop::send(&target, moved.clone())
         {
             self.tab_moved_away(index);
+            tab_drop::focus_window(target.process_id);
             self.status = format!("Moved {label} to the other window");
             return true;
         }
@@ -502,7 +527,7 @@ impl SlateApp {
             position: Some(((at.x - 60.0).round(), (at.y - 14.0).round())),
             ..moved_tab(path.clone())
         };
-        let claimed = spare::claim(&request);
+        let claimed = spare::claim(&request).is_some();
         // Tests check the command instead of starting a window.
         #[cfg(test)]
         let spawned: std::io::Result<()> = {
@@ -533,6 +558,117 @@ impl SlateApp {
                 self.status = format!("New window failed: {err}");
                 false
             }
+        }
+    }
+
+    /// Dragged out of the window: with a spare ready the tab becomes a new
+    /// window at once, which follows the cursor until the drop. Without one
+    /// nothing happens yet (the drop opens a window the usual way).
+    pub(super) fn tear_off_tab(&mut self, index: usize, ctx: &egui::Context) {
+        if self.torn_tab.is_some() || self.tabs.list.len() < 2 || !spare::is_ready() {
+            return;
+        }
+        let Some(cursor) = tab_drop::cursor() else {
+            return;
+        };
+        let label = self.tab_labels()[index].text.clone();
+        let Some(moved) = self.moved_tab_request(index) else {
+            return;
+        };
+        let scale = ctx.native_pixels_per_point().unwrap_or(1.0);
+        let request = single_instance::OpenRequest {
+            position: Some((
+                cursor.0 / scale - TORN_GRAB.0,
+                cursor.1 / scale - TORN_GRAB.1,
+            )),
+            follow: true,
+            ..moved.clone()
+        };
+        match spare::claim(&request) {
+            Some(process_id) => {
+                self.tab_moved_away(index);
+                self.torn_tab = Some(TornTab {
+                    process_id,
+                    label: label.clone(),
+                });
+                self.status = format!("Moved {label} to a new window");
+            }
+            None => {
+                if let Some(file) = moved.handoff {
+                    let _ = fs::remove_file(file);
+                }
+            }
+        }
+    }
+
+    /// Each frame: a torn-off tab's window follows the cursor; a dragged
+    /// tab (ours, torn off or not) tells the Slate window under it where it
+    /// would land. At the drop the torn-off window joins the window under
+    /// it, if any, or takes the focus.
+    pub(super) fn poll_tab_drag(&mut self, ctx: &egui::Context) {
+        if let Some(torn) = &self.torn_tab {
+            let (process_id, label) = (torn.process_id, torn.label.clone());
+            let target = tab_drop::target_under_cursor(&[process_id]);
+            if ctx.input(|i| i.pointer.primary_down()) {
+                if let Some(cursor) = tab_drop::cursor() {
+                    tab_drop::move_window(process_id, cursor, TORN_GRAB);
+                }
+                self.tell_drag_hover(target.as_ref(), &label);
+                ctx.request_repaint();
+                return;
+            }
+            self.tell_drag_hover(None, &label);
+            self.torn_tab = None;
+            match target {
+                Some(target) if tab_drop::send_on(process_id, &target) => {
+                    tab_drop::focus_window(target.process_id);
+                }
+                _ => tab_drop::focus_window(process_id),
+            }
+            return;
+        }
+        let dragged = window_ui::dragged_out_label(ctx);
+        let target = dragged
+            .as_ref()
+            .and_then(|_| tab_drop::target_under_cursor(&[std::process::id()]));
+        self.tell_drag_hover(target.as_ref(), dragged.as_deref().unwrap_or_default());
+    }
+
+    fn tell_drag_hover(&mut self, target: Option<&tab_drop::Target>, label: &str) {
+        let previous = self.drag_hover.take();
+        if let Some((file, _)) = &previous
+            && target.is_none_or(|target| &target.file != file)
+        {
+            tab_drop::leave(file);
+        }
+        if let Some(target) = target {
+            if previous.as_ref() != Some(&(target.file.clone(), target.cursor)) {
+                tab_drop::hover(target, label);
+            }
+            self.drag_hover = Some((target.file.clone(), target.cursor));
+        }
+    }
+
+    /// End of a drag that tore our tab off into this window: hand it on to
+    /// the window it was dropped on, and close if nothing is left here.
+    pub(super) fn send_tab_on(&mut self, file: PathBuf, cursor: (f32, f32), ctx: &egui::Context) {
+        let index = self.tabs.active;
+        let only_tab = self.tabs.list.len() == 1;
+        let Some(moved) = self.moved_tab_request(index) else {
+            return;
+        };
+        let target = tab_drop::Target {
+            process_id: 0,
+            file,
+            cursor,
+        };
+        if tab_drop::send(&target, moved.clone()) {
+            self.tab_moved_away(index);
+            if only_tab {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        } else if let Some(file) = moved.handoff {
+            let _ = fs::remove_file(file);
         }
     }
 

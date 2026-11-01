@@ -38,7 +38,7 @@ pub(crate) fn remember_window(_cc: &eframe::CreationContext<'_>) {}
 #[cfg(not(windows))]
 pub(crate) fn cloak(_cloaked: bool) {}
 #[cfg(not(windows))]
-pub(crate) fn show_at(_position: Option<(f32, f32)>) {}
+pub(crate) fn show_at(_position: Option<(f32, f32)>, _activate: bool) {}
 #[cfg(not(windows))]
 pub(crate) fn when_process_exits(_process_id: u32, _then: impl FnOnce() + Send + 'static) {}
 #[cfg(not(windows))]
@@ -364,7 +364,9 @@ mod win {
 
     /// Moves the hidden window to `position` (outer top-left, in points) and
     /// shows it, from any thread, without waiting for an egui frame.
-    pub(crate) fn show_at(position: Option<(f32, f32)>) {
+    /// `activate: false` leaves the foreground where it is (a window that
+    /// follows a tab still being dragged in another window).
+    pub(crate) fn show_at(position: Option<(f32, f32)>, activate: bool) {
         const SWP_NOSIZE: u32 = 0x1;
         const SWP_NOZORDER: u32 = 0x4;
         const SWP_NOACTIVATE: u32 = 0x10;
@@ -390,7 +392,12 @@ mod win {
             }
         }
         cloak(false);
-        show_now();
+        if activate {
+            show_now();
+        } else {
+            // SAFETY: plain Win32 call on our own window.
+            unsafe { ShowWindowAsync(hwnd, 8) }; // SW_SHOWNA
+        }
     }
 
     /// Runs `then` on a background thread once process `process_id` has
@@ -473,7 +480,7 @@ mod win {
                 show_now();
             }
             MENU_NEW_WINDOW => {
-                if !crate::spare::claim(&Default::default())
+                if crate::spare::claim(&Default::default()).is_none()
                     && let Ok(exe) = std::env::current_exe()
                 {
                     let _ = std::process::Command::new(exe).arg("--new-window").spawn();

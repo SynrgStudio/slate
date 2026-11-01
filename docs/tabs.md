@@ -89,3 +89,19 @@ document keeps its own durable checkpoint.
    dragging over such a window the card turns green: "Release: move to that
    window". Moving a window's only tab away (to another window or a new
    one) closes that window, or hides it in the tray for the resident one.
+7. Drop marker and torn-off windows (2026-11-01): while a tab is dragged
+   over another Slate window, the dragging window tells it where the cursor
+   is (`HOVER`, `LEAVE` when it goes); that window outlines itself in green
+   and shows a bar between its tabs where the tab would land, with the
+   tab's name beside it (cleared on its own if the messages stop for
+   600 ms). Dragged out of its window and not over another Slate window,
+   a tab with a spare ready is torn off at once: the spare becomes its
+   window without taking the focus (`follow`), and the dragging window
+   moves it under the cursor (`SetWindowPos`, asynchronous) until the
+   button is released. Released over a Slate window — the original one
+   included — the torn-off window hands the tab on (`SENDTO`, which sends
+   it as a `TAB`) and closes; released anywhere else, it takes the focus.
+   Without a spare, the card and release behaviour above still applies.
+   The window under the cursor is found by walking the top-level windows
+   front to back, skipping hidden, minimized, cloaked and click-through
+   ones and the torn-off window itself.

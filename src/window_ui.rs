@@ -90,6 +90,11 @@ pub enum TabAction {
         index: usize,
         alias: String,
     },
+    /// The tab was dragged out of the window: make it a window that follows
+    /// the cursor, if that can be done right away.
+    TearOff {
+        index: usize,
+    },
     /// The tab was dropped outside the window, at this screen position
     /// (ui points): open it in a new window there.
     Detach {
@@ -101,6 +106,20 @@ pub enum TabAction {
 
 const TAB_FONT: f32 = 12.0;
 const TAB_CENTERS: &str = "slate_tab_centers";
+const DROP_HOVER: &str = "slate_tab_drop_hover";
+const DRAGGED_OUT: &str = "slate_tab_dragged_out";
+
+/// A tab from another window is over this one: where it would land and its
+/// label (None when no tab is).
+pub(crate) fn set_drop_hover(ctx: &egui::Context, hover: Option<(usize, String)>) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(DROP_HOVER), hover));
+}
+
+/// The label of a tab of ours dragged out of this window, while it is.
+pub(crate) fn dragged_out_label(ctx: &egui::Context) -> Option<String> {
+    ctx.data(|d| d.get_temp::<Option<String>>(egui::Id::new(DRAGGED_OUT)))
+        .flatten()
+}
 const TITLEBAR_HEIGHT: f32 = 30.0;
 
 /// Where a tab dropped at `screen` (physical pixels) goes among this
@@ -129,6 +148,51 @@ const TAB_CORNERS: egui::CornerRadius = egui::CornerRadius {
 const LIFT_DISTANCE: f32 = 12.0;
 /// Time constant of tabs sliding into their new places.
 const SLIDE_SECONDS: f32 = 0.045;
+
+/// Where a tab dragged over from another window would land: a bar between
+/// the tabs with the tab's name beside it, and the window outlined.
+fn paint_drop_marker(
+    ui: &egui::Ui,
+    strip: egui::Rect,
+    rects: &[egui::Rect],
+    slot: usize,
+    label: &str,
+    font: &FontId,
+) {
+    let green = Color32::from_rgb(163, 190, 140);
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("slate_tab_drop_marker"),
+    ));
+    painter.rect_stroke(
+        ui.ctx().content_rect(),
+        0.0,
+        egui::Stroke::new(2.0_f32, green),
+        egui::StrokeKind::Inside,
+    );
+    let x = match slot.checked_sub(1).and_then(|before| rects.get(before)) {
+        Some(before) => before.right() + 1.0,
+        None => rects
+            .first()
+            .map_or(strip.left(), |first| first.left() - 1.0),
+    };
+    let x = x.clamp(strip.left() + 1.5, ui.ctx().content_rect().right() - 1.5);
+    painter.rect_filled(
+        egui::Rect::from_center_size(
+            egui::pos2(x, strip.center().y + 2.0),
+            Vec2::new(3.0, strip.height() - 6.0),
+        ),
+        1.5,
+        green,
+    );
+    let galley = painter.layout_no_wrap(label.to_string(), font.clone(), green);
+    let pill = egui::Rect::from_min_size(
+        egui::pos2(x + 5.0, strip.center().y - galley.size().y / 2.0 - 1.0),
+        galley.size() + Vec2::new(12.0, 4.0),
+    );
+    painter.rect_filled(pill, 4.0, Color32::from_rgb(30, 37, 48));
+    painter.galley(pill.min + Vec2::new(6.0, 2.0), galley, green);
+}
 
 /// A tab dragged off the strip: a card under the pointer that says what
 /// letting go does.
@@ -329,6 +393,7 @@ fn draw_tabs(
     let mut sliding = false;
     // A tab pulled off the strip, drawn after the others as a floating card.
     let mut lifted: Option<Lifted> = None;
+    let mut dragged_out: Option<String> = None;
     for (index, tab) in tabs.iter().enumerate() {
         let rect = rects[index];
         let visible = rect.intersect(strip);
@@ -358,6 +423,10 @@ fn draw_tabs(
         let slot_x = rect.left() - strip.left() + offset;
         let drawn_id = id.with("drawn_x");
         let grab_id = id.with("grab");
+        if response.drag_started() {
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(id.with("tear_off_tried"), false));
+        }
         if response.drag_started()
             && let Some(pos) = ui.input(|i| i.pointer.press_origin())
         {
@@ -410,11 +479,29 @@ fn draw_tabs(
                 (room.top() - card.top()).max(0.0)
                     + (room.bottom() - card.bottom() - 26.0).min(0.0),
             ));
+            let joins_window = detach_ready
+                && crate::tab_drop::target_under_cursor(&[std::process::id()]).is_some();
+            if detach_ready {
+                dragged_out = Some(tab.text.clone());
+                // Out of the window and not over another one: become a
+                // window that follows the cursor (asked once per drag).
+                let tried = id.with("tear_off_tried");
+                if !joins_window
+                    && tabs.len() > 1
+                    && !ui
+                        .ctx()
+                        .data(|d| d.get_temp::<bool>(tried))
+                        .unwrap_or(false)
+                {
+                    ui.ctx().data_mut(|d| d.insert_temp(tried, true));
+                    *action = Some(TabAction::TearOff { index });
+                }
+            }
             lifted = Some(Lifted {
                 card,
                 text: tab.text.clone(),
                 detach_ready,
-                joins_window: detach_ready && crate::tab_drop::target_under_cursor().is_some(),
+                joins_window,
             });
         } else if dragging {
             ui.ctx().request_repaint();
@@ -560,6 +647,16 @@ fn draw_tabs(
     }
     if sliding {
         ui.ctx().request_repaint();
+    }
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(egui::Id::new(DRAGGED_OUT), dragged_out));
+    // A tab from another window over this one: where it would land.
+    if let Some((slot, label)) = ui
+        .ctx()
+        .data(|d| d.get_temp::<Option<(usize, String)>>(egui::Id::new(DROP_HOVER)))
+        .flatten()
+    {
+        paint_drop_marker(ui, strip, &rects, slot, &label, &font);
     }
     #[cfg(test)]
     ui.ctx().data_mut(|data| {

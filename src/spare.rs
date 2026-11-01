@@ -29,13 +29,16 @@ pub(crate) fn starting_as_spare() -> bool {
     STARTING_AS_SPARE.load(Ordering::Relaxed)
 }
 
-/// Hands `request` to the ready window. False when there is none (or another
-/// claimer got it first): the caller starts a window the usual way.
-pub(crate) fn claim(request: &OpenRequest) -> bool {
+/// Hands `request` to the ready window and returns its process. None when
+/// there is none (or another claimer got it first): the caller starts a
+/// window the usual way.
+pub(crate) fn claim(request: &OpenRequest) -> Option<u32> {
     if cfg!(test) {
-        return false;
+        return None;
     }
-    single_instance::spare_file().is_some_and(|file| single_instance::forward(&file, request))
+    let file = single_instance::spare_file()?;
+    let process_id = single_instance::listener_process_id(&file)?;
+    single_instance::forward(&file, request).then_some(process_id)
 }
 
 /// True when a spare is waiting.
