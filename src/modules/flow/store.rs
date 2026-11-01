@@ -1,6 +1,6 @@
 //! Embedded SQLite cache. Connections never cross threads; writers use bounded transactions.
 #[cfg(test)]
-#[path = "flow_store_tests.rs"]
+#[path = "store_tests.rs"]
 mod tests;
 use crate::flow::{FlowKnownFile, FlowTask};
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};

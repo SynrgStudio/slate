@@ -4,13 +4,11 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-mod agenda;
 #[cfg(test)]
 mod async_open_tests;
 #[cfg(test)]
 mod bug_fix_tests;
 mod commands;
-mod daily;
 #[cfg(test)]
 mod daily_events_tests;
 #[cfg(test)]
@@ -60,14 +58,16 @@ mod aliases;
 mod drive_picker;
 mod everything_inventory;
 mod everything_ipc;
-mod flow;
 mod flow_api;
-mod flow_batch;
-mod flow_edit;
+mod modules;
+// Optional modules, reachable under their old names while the core still
+// calls them directly.
+pub(crate) use modules::flow::{
+    batch as flow_batch, edit as flow_edit, runtime as flow_runtime, store as flow_store,
+    worker as flow_worker,
+};
+pub(crate) use modules::{agenda, daily, flow};
 mod flow_error;
-mod flow_runtime;
-mod flow_store;
-mod flow_worker;
 mod goto;
 mod help_ui;
 mod index_export;
