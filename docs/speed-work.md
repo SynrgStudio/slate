@@ -206,3 +206,26 @@ Measured on the hidden test desktop, wgpu renderer, small note open:
   thread polled every 10–15 ms for the rest of the session; it now waits on a
   condition variable until the next request.
 
+## 9. Saving and dialogs off the critical path
+
+- **Ctrl+S in the background.** The checked, synced save (temp file, fsync,
+  replace) took on the UI thread (`benchmark_save_latency`): 13 / 21 / 29 ms
+  for 4 KB / 200 KB / 5 MB on C:, 39 / 57 / 412 ms on D:. Ctrl+S and `:w` now
+  copy the text and write it on a helper thread; typing continues and the tab
+  stays marked unsaved until the write is confirmed (`save.background` in the
+  performance log). Text typed meanwhile stays unsaved and is checkpointed
+  for recovery right away. The result lands on the document it came from
+  even if another tab is active by then. Anything that decides on the file —
+  every other command, closing a tab or the window, quitting, moving a tab to
+  a new window, Save As and the save prompts — first waits for it, as before.
+  Slate's own write is not reported as an external change.
+- **Find note** read each visible note in full on every frame to draw the ▸
+  marker; the answer is now kept per file and refreshed when its
+  modification time or size changes.
+- **First use of a glyph** (accents, CJK, emoji): at most 0.13 ms more than
+  typing it again (`benchmark_glyph_first_use`); nothing to prewarm.
+- **Still open: preview on huge documents.** Typing with the preview visible
+  on the 5 MB fixture costs ~21 ms per frame (vs ~0.8 ms without preview):
+  the preview walks all 27k lines every frame to place the visible ones.
+  Normal notes are unaffected (< 0.5 ms).
+

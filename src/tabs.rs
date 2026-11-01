@@ -393,7 +393,56 @@ impl SlateApp {
     /// A tab dropped outside the window opens in a new Slate window at `at`
     /// (screen points) and leaves this one. Unsaved text never moves between
     /// processes: such tabs are saved first.
+    /// A background save landed after its document moved to a background
+    /// tab: marks that tab saved (or conflicted). False if the tab is gone.
+    pub(super) fn land_save_in_background_tab(
+        &mut self,
+        pending: &PendingSave,
+        result: &Result<safe_file::Fingerprint, safe_file::SaveError>,
+    ) -> bool {
+        let Some(doc) = self
+            .tabs
+            .list
+            .iter_mut()
+            .filter_map(|tab| tab.doc.as_mut())
+            .find(|doc| {
+                doc.buffer.identity == pending.identity && doc.path.as_ref() == Some(&pending.path)
+            })
+        else {
+            return false;
+        };
+        match result {
+            Ok(base) => {
+                doc.disk_base = Some(*base);
+                doc.file_conflict = None;
+                if doc.buffer.revision == pending.revision {
+                    doc.dirty = false;
+                }
+                let text = doc.buffer.as_str().to_string();
+                self.remember_recent_file(pending.path.clone());
+                self.queue_flow_index_text(&pending.path, text);
+                let _ = self.save_settings();
+                self.status = format!("Saved {}", pending.path.display());
+                if let Err(error) =
+                    self.persist_saved_project(&pending.path, pending.project.clone())
+                {
+                    self.status
+                        .push_str(&format!(" · project metadata not saved: {error}"));
+                }
+            }
+            Err(safe_file::SaveError::Conflict) => {
+                doc.file_conflict = Some((document_safety::Slot::Main, pending.path.clone()));
+                self.status =
+                    "Save blocked: external change / existing destination; text preserved".into();
+            }
+            Err(err) => self.status = format!("Save failed: {err}"),
+        }
+        true
+    }
+
     pub(super) fn detach_tab(&mut self, index: usize, at: egui::Pos2) {
+        // The moved tab must carry the file's real state.
+        self.finish_background_save();
         if index >= self.tabs.list.len() {
             return;
         }

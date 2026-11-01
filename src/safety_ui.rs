@@ -58,9 +58,14 @@ impl SlateApp {
                     path,
                     expected,
                 } => {
+                    // Our own background save is rewriting this file.
+                    let saving = self
+                        .pending_save
+                        .as_ref()
+                        .is_some_and(|pending| pending.path == path);
                     let matches = match slot {
                         Slot::Main => {
-                            self.path.as_ref() == Some(&path) && self.disk_base == expected
+                            !saving && self.path.as_ref() == Some(&path) && self.disk_base == expected
                         }
                         Slot::Modal => {
                             self.link_preview_path.as_ref() == Some(&path)

@@ -650,3 +650,91 @@ fn a_tab_moved_to_another_window_is_not_offered_for_reopening() {
     f.app.reopen_closed_tab();
     assert_eq!(f.app.status, "No closed tab to reopen");
 }
+
+fn background_save(f: &mut Fixture) {
+    f.app.sync_saves = false;
+    let app = &mut f.app;
+    let _ = f
+        .ctx
+        .run_ui(egui::RawInput::default(), |ui| app.run_command(Command::Save, &ui.ctx().clone()));
+}
+
+#[test]
+fn typing_during_a_background_save_stays_unsaved_and_saves_next_time() {
+    let mut f = Fixture::new();
+    let note = f.file("nota.md", "hola\n");
+    f.open(&note);
+    f.app.buffer.move_to_bottom();
+    f.app.buffer.insert_text("uno\n");
+    f.app.dirty = true;
+    background_save(&mut f);
+    assert!(f.app.pending_save.is_some(), "the write runs on a helper thread");
+    // Typed before the write landed.
+    f.app.buffer.insert_text("dos\n");
+    f.app.finish_background_save();
+    assert_eq!(fs::read_to_string(&note).unwrap(), "hola\nuno\n");
+    assert!(f.app.dirty, "text typed after Ctrl+S is still unsaved");
+    background_save(&mut f);
+    f.app.finish_background_save();
+    assert_eq!(fs::read_to_string(&note).unwrap(), "hola\nuno\ndos\n");
+    assert!(!f.app.dirty);
+    assert!(f.app.file_conflict.is_none(), "our own writes are not external changes");
+}
+
+#[test]
+fn a_background_save_lands_on_its_tab_after_switching_tabs() {
+    let mut f = Fixture::new();
+    let a = f.file("a.md", "a\n");
+    let b = f.file("b.md", "b\n");
+    f.open(&a);
+    f.open(&b);
+    f.app.activate_tab(0);
+    f.app.buffer.insert_text("edit ");
+    f.app.dirty = true;
+    background_save(&mut f);
+    f.app.activate_tab(1);
+    // Wait for the helper thread, then let the frame poll pick it up.
+    for _ in 0..200 {
+        let app = &mut f.app;
+        let _ = f.ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.poll_background_save(&ui.ctx().clone())
+        });
+        if f.app.pending_save.is_none() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(f.app.pending_save.is_none());
+    assert_eq!(fs::read_to_string(&a).unwrap(), "edit a\n");
+    assert_eq!(f.app.path.as_deref(), Some(b.as_path()), "b stays active");
+    assert!(!f.app.tab_labels()[0].dirty, "a's tab is marked saved");
+    f.app.activate_tab(0);
+    assert!(!f.app.dirty);
+    // Saving a again is not mistaken for an external change.
+    f.app.buffer.insert_text("more ");
+    f.app.dirty = true;
+    background_save(&mut f);
+    f.app.finish_background_save();
+    // The cursor came back after "edit ".
+    assert_eq!(fs::read_to_string(&a).unwrap(), "edit more a\n");
+    assert!(f.app.file_conflict.is_none());
+}
+
+#[test]
+fn closing_a_tab_waits_for_its_background_save_instead_of_asking() {
+    let mut f = Fixture::new();
+    let a = f.file("a.md", "a\n");
+    let b = f.file("b.md", "b\n");
+    f.open(&a);
+    f.open(&b);
+    f.app.buffer.insert_text("x");
+    f.app.dirty = true;
+    background_save(&mut f);
+    let app = &mut f.app;
+    let _ = f.ctx.run_ui(egui::RawInput::default(), |ui| {
+        app.run_command(Command::CloseBuffer, &ui.ctx().clone())
+    });
+    assert!(f.app.pending_action.is_none(), "saved text needs no question");
+    assert_eq!(fs::read_to_string(&b).unwrap(), "xb\n");
+    assert_eq!(f.labels(), vec!["a.md"]);
+}

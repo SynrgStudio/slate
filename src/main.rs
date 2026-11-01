@@ -221,6 +221,18 @@ fn low_latency_wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
     options
 }
 
+/// A save running on a helper thread; applied to the document it was taken
+/// from (matched by buffer identity and path), even if another tab is active
+/// by the time it lands.
+struct PendingSave {
+    path: PathBuf,
+    identity: u64,
+    revision: u64,
+    project: Option<PathBuf>,
+    result: std::sync::mpsc::Receiver<Result<safe_file::Fingerprint, safe_file::SaveError>>,
+    started: std::time::Instant,
+}
+
 /// Direct3D 12 started on a helper thread while eframe creates the window.
 /// D3D12 keeps one device per adapter per process, so when wgpu probes the
 /// adapters and creates its device a moment later, the driver is already up.
@@ -930,6 +942,12 @@ struct SlateApp {
     /// Resident mode is running in this process (tray icon installed).
     resident_active: bool,
     window_hidden: bool,
+    /// A Ctrl+S whose synced write is still running on a helper thread.
+    pending_save: Option<PendingSave>,
+    /// Ctrl+S pressed again while saving: save once more when it lands.
+    save_again: bool,
+    /// Tests save synchronously unless they exercise the background path.
+    sync_saves: bool,
     /// When the window was last shown from the tray: the next frame's start
     /// logs how long the first visible frame took to build and paint.
     shown_at: Option<std::time::Instant>,
@@ -1163,6 +1181,9 @@ impl SlateApp {
             resident: true,
             resident_active: false,
             window_hidden: false,
+            pending_save: None,
+            save_again: false,
+            sync_saves: cfg!(test),
             shown_at: None,
             hide_on_first_frame: false,
             quit_for_real: false,
@@ -2032,6 +2053,11 @@ impl SlateApp {
     }
 
     fn queue_flow_index_after_save(&mut self, path: &Path) {
+        let text = self.buffer.as_str().to_string();
+        self.queue_flow_index_text(path, text);
+    }
+
+    fn queue_flow_index_text(&mut self, path: &Path, text: String) {
         if !flow::should_index_flow_path(path) {
             return;
         }
@@ -2043,7 +2069,7 @@ impl SlateApp {
             project_root,
             sqlite_path,
             path.to_path_buf(),
-            self.buffer.as_str().to_string(),
+            text,
         );
     }
 
@@ -3991,13 +4017,129 @@ impl SlateApp {
     }
 
     fn save_path(&mut self, path: PathBuf) {
+        // Never two writers on a file: a background save lands first.
+        self.finish_background_save();
         let project = self.document_project();
         let expected = if self.path.as_ref() == Some(&path) {
             self.disk_base
         } else {
             None
         };
-        match safe_file::checked_save(&path, self.buffer.as_str().as_bytes(), expected) {
+        let result = safe_file::checked_save(&path, self.buffer.as_str().as_bytes(), expected);
+        self.apply_save_result(path, project, result);
+    }
+
+    /// Ctrl+S / `:w`: the synced write (13–60 ms on this machine, ~400 ms for
+    /// 5 MB on a slow disk) runs on a helper thread so typing never waits for
+    /// the disk. The tab stays marked unsaved until the write is confirmed.
+    fn save_in_background(&mut self, ctx: &egui::Context) {
+        self.remember_current_cursor_position();
+        let Some(path) = self.path.clone() else {
+            self.save_as();
+            return;
+        };
+        if self.sync_saves {
+            self.save_path(path);
+            return;
+        }
+        if self.pending_save.is_some() {
+            self.save_again = true;
+            return;
+        }
+        let project = self.document_project();
+        let expected = self.disk_base;
+        let text = self.buffer.as_str().to_owned();
+        let (sender, result) = std::sync::mpsc::channel();
+        let wake = ctx.clone();
+        let target = path.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(safe_file::checked_save(&target, text.as_bytes(), expected));
+            wake.request_repaint();
+        });
+        self.pending_save = Some(PendingSave {
+            path,
+            identity: self.buffer.identity,
+            revision: self.buffer.revision,
+            project,
+            result,
+            started: std::time::Instant::now(),
+        });
+        self.status = "Saving…".into();
+    }
+
+    /// Applies a background save once its write has finished.
+    fn poll_background_save(&mut self, ctx: &egui::Context) {
+        let Some(pending) = &self.pending_save else {
+            return;
+        };
+        match pending.result.try_recv() {
+            Ok(result) => {
+                let pending = self.pending_save.take().unwrap();
+                self.land_background_save(pending, result);
+                if std::mem::take(&mut self.save_again) {
+                    self.save_in_background(ctx);
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.pending_save = None;
+                self.status = "Save failed: writer stopped; text kept unsaved".into();
+            }
+        }
+    }
+
+    /// Waits for a background save: before closing, quitting, moving a tab or
+    /// any other save, so they see the file as it really is.
+    fn finish_background_save(&mut self) {
+        if let Some(pending) = self.pending_save.take() {
+            let result = pending
+                .result
+                .recv()
+                .unwrap_or_else(|_| Err(safe_file::SaveError::Io("writer stopped".into())));
+            self.land_background_save(pending, result);
+            self.save_again = false;
+        }
+    }
+
+    fn land_background_save(
+        &mut self,
+        pending: PendingSave,
+        result: Result<safe_file::Fingerprint, safe_file::SaveError>,
+    ) {
+        perf_log::mark(
+            "save.background",
+            &format!(
+                "ms={:.1} ok={}",
+                pending.started.elapsed().as_secs_f64() * 1000.0,
+                result.is_ok()
+            ),
+        );
+        if self.buffer.identity == pending.identity && self.path.as_ref() == Some(&pending.path) {
+            let typed_since = self.buffer.revision != pending.revision;
+            let saved = result.is_ok();
+            self.apply_save_result(pending.path, pending.project, result);
+            if saved && typed_since {
+                // Saved what was there at Ctrl+S; newer typing stays unsaved
+                // and gets its recovery checkpoint right away.
+                self.dirty = true;
+                self.observe_document_safety(0.0, true);
+            }
+            return;
+        }
+        // The saved document is in a background tab now.
+        if !self.land_save_in_background_tab(&pending, &result) && result.is_ok() {
+            // Its tab was closed meanwhile; the file on disk is what was saved.
+            self.status = format!("Saved {}", pending.path.display());
+        }
+    }
+
+    fn apply_save_result(
+        &mut self,
+        path: PathBuf,
+        project: Option<PathBuf>,
+        result: Result<safe_file::Fingerprint, safe_file::SaveError>,
+    ) {
+        match result {
             Ok(base) => {
                 self.disk_base = Some(base);
                 self.clear_recovery(document_safety::Slot::Main);
@@ -6457,6 +6599,10 @@ impl SlateApp {
     }
 
     fn run_command(&mut self, command: Command, ctx: &egui::Context) {
+        if command != Command::Save {
+            // Closing, quitting, opening...: decide on the file as it is.
+            self.finish_background_save();
+        }
         self.record_command_usage(command_name(command));
         self.palette_open = false;
         self.recent_picker_open = false;
@@ -6525,7 +6671,7 @@ impl SlateApp {
             Command::Daily => self.open_daily_with_target(""),
             Command::Refile => self.start_refile_current_line(),
             Command::QuickAdd => self.open_scratch_modal(),
-            Command::Save => self.save(),
+            Command::Save => self.save_in_background(ctx),
             Command::SaveAs => self.open_save_as_modal(),
             Command::Scratch => self.open_scratch_modal(),
             Command::ScratchEntries => self.open_scratch_entries_modal(),
@@ -7185,6 +7331,7 @@ impl SlateApp {
     }
 
     fn request_close(&mut self, ctx: &egui::Context) {
+        self.finish_background_save();
         if self.resident_active && !self.quit_for_real {
             // Hiding keeps every tab, saved or not: nothing to ask.
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -7207,6 +7354,7 @@ impl SlateApp {
         if !ctx.input(|i| i.viewport().close_requested()) {
             return;
         }
+        self.finish_background_save();
         if self.standalone_agenda {
             self.agenda_open = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -9898,6 +10046,7 @@ impl SlateApp {
         self.poll_flow_organization_requests(&ctx);
         self.poll_flow_edit_requests(&ctx);
         self.poll_pending_flow_agenda_sync(&ctx);
+        self.poll_background_save(&ctx);
         self.poll_file_open(&ctx);
         self.poll_instance_requests(&ctx);
         self.poll_resident(&ctx);
@@ -9948,7 +10097,11 @@ impl SlateApp {
         };
         match window_ui::titlebar_with_tabs(ui, &self.title(), &labels, self.tabs.active) {
             Some(window_ui::TabAction::Activate(index)) => self.activate_tab(index),
-            Some(window_ui::TabAction::Close(index)) => self.close_tab(index),
+            Some(window_ui::TabAction::Close(index)) => {
+                // Decide on "unsaved?" with the file as it really is.
+                self.finish_background_save();
+                self.close_tab(index)
+            }
             Some(window_ui::TabAction::New) => self.new_tab(),
             Some(window_ui::TabAction::Move { from, to }) => self.move_tab(from, to),
             Some(window_ui::TabAction::Rename { index, alias }) => {
