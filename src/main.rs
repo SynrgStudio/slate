@@ -11,13 +11,11 @@ mod commands;
 mod daily;
 #[cfg(test)]
 mod dialog_tests;
-#[cfg(test)]
-mod resident_tests;
-#[cfg(test)]
-mod tabs_tests;
 mod dialog_ui;
 mod document_safety;
 mod editor_buffer;
+#[cfg(test)]
+mod editor_look_tests;
 mod editor_view;
 mod file_dialogs;
 mod file_loader;
@@ -28,11 +26,9 @@ mod find_note_ui_tests;
 mod footer_tests;
 mod footer_ui;
 mod form_dialogs;
-mod highlight;
 #[cfg(test)]
 mod frame_bench_tests;
-#[cfg(test)]
-mod editor_look_tests;
+mod highlight;
 #[cfg(test)]
 mod large_document_tests;
 mod notice_ui;
@@ -40,47 +36,42 @@ mod preview_layout;
 #[cfg(test)]
 mod preview_scroll_tests;
 #[cfg(test)]
+mod resident_tests;
+#[cfg(test)]
 mod resize_tests;
 mod safe_file;
-mod settings_writer;
 #[cfg(test)]
 mod safety_integration_tests;
 mod safety_ui;
 mod scroll_sync;
 #[cfg(test)]
 mod settings_tests;
+mod settings_writer;
+#[cfg(test)]
+mod tabs_tests;
 #[cfg(test)]
 use settings_tests::SettingsDialogGeometry;
+mod agenda_ui;
+mod aliases;
 mod drive_picker;
 mod everything_inventory;
 mod everything_ipc;
 mod flow;
+mod flow_api;
 mod flow_batch;
 mod flow_edit;
 mod flow_error;
 mod flow_runtime;
 mod flow_store;
+mod flow_worker;
 mod goto;
+mod help_ui;
 mod index_export;
 mod link_ui;
 mod markdown;
-mod perf_log;
 mod parallel;
-mod resident;
-mod single_instance;
-mod tabs;
-mod flow_api;
-mod flow_worker;
-mod preview_ui;
-mod periscope_ui;
-mod picker_ui;
-mod agenda_ui;
-mod aliases;
-mod save_as_ui;
-mod help_ui;
-mod settings_ui;
-mod shortcuts;
 mod perf_hud;
+mod perf_log;
 mod periscope;
 mod periscope_backend;
 #[cfg(test)]
@@ -89,17 +80,28 @@ mod periscope_setup;
 #[cfg(test)]
 mod periscope_setup_tests;
 mod periscope_store;
+mod periscope_ui;
 #[cfg(test)]
 mod picker_tests;
+mod picker_ui;
+mod preview_ui;
 mod project_membership;
 #[cfg(test)]
 mod project_membership_tests;
+mod resident;
+mod save_as_ui;
 mod scratch;
 mod search;
+mod settings_ui;
+mod shortcuts;
+mod single_instance;
+mod tabs;
 mod window_drag;
 mod window_ui;
 
-use flow_api::{append_flow_edit_request, append_flow_open_request, append_flow_organization_request};
+use flow_api::{
+    append_flow_edit_request, append_flow_open_request, append_flow_organization_request,
+};
 use std::{
     collections::HashSet,
     fs,
@@ -284,8 +286,7 @@ fn release_prewarmed_gpu() {
 /// A decode failure only costs the icon, never the start: egui-winit and
 /// eframe treat an empty `IconData` as "no icon".
 fn app_icon() -> egui::IconData {
-    eframe::icon_data::from_png_bytes(include_bytes!("../assets/slate-256.png"))
-        .unwrap_or_default()
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/slate-256.png")).unwrap_or_default()
 }
 
 fn main() -> eframe::Result {
@@ -335,17 +336,22 @@ fn main() -> eframe::Result {
         }
     }
 
-    let use_single_instance = !scratch
-        && !standalone_agenda
-        && !new_window
-        && SlateApp::config_single_instance_enabled();
+    let use_single_instance =
+        !scratch && !standalone_agenda && !new_window && SlateApp::config_single_instance_enabled();
     if background {
         // Start-with-Windows entry: only useful as the resident primary, and
         // never shows anything when Slate is already running.
-        let running = single_instance::instance_file()
-            .is_some_and(|file| single_instance::is_running(&file));
+        let running =
+            single_instance::instance_file().is_some_and(|file| single_instance::is_running(&file));
         if !use_single_instance || running {
-            perf_log::mark("startup.background_skipped", if running { "running" } else { "single instance off" });
+            perf_log::mark(
+                "startup.background_skipped",
+                if running {
+                    "running"
+                } else {
+                    "single instance off"
+                },
+            );
             perf_log::flush();
             return Ok(());
         }
@@ -459,9 +465,9 @@ fn main() -> eframe::Result {
 /// Appends Captured/Completed daily events for tasks that are new or newly
 /// done in `summary` compared with the cached `old_items`.
 pub(crate) fn record_flow_daily_events(
-path: &Path,
-old_items: &[AgendaItem],
-summary: &flow::FlowIndexSummary,
+    path: &Path,
+    old_items: &[AgendaItem],
+    summary: &flow::FlowIndexSummary,
 ) -> Result<(), String> {
     let relative_path = summary.known_file.path.clone();
     let old_for_path = old_items
@@ -1552,7 +1558,9 @@ impl SlateApp {
     }
 
     fn request_file_open(&mut self, path: PathBuf, destination: OpenDestination) {
-        if !self.scratch && !self.standalone_agenda && !self.prepare_tab_for_open(&path, &destination)
+        if !self.scratch
+            && !self.standalone_agenda
+            && !self.prepare_tab_for_open(&path, &destination)
         {
             return;
         }
@@ -1677,7 +1685,8 @@ impl SlateApp {
                     // rescan thread (first, before the folder scan): SQLite commits
                     // and fsyncs must not block the first frame of a just-opened file.
                     let indexes_flow = flow::should_index_flow_path(&path);
-                    let live = indexes_flow.then(|| (path.clone(), self.buffer.as_str().to_string()));
+                    let live =
+                        indexes_flow.then(|| (path.clone(), self.buffer.as_str().to_string()));
                     self.start_flow_background_scan_with_live(
                         Self::flow_project_root_for_path(&path),
                         false,
@@ -1688,7 +1697,10 @@ impl SlateApp {
                     loaded.timing.step("save_settings");
                     self.focus_editor_once = true;
                     self.status = if indexes_flow {
-                        format!("Opened {} · indexing Flow · scanning folder…", path.display())
+                        format!(
+                            "Opened {} · indexing Flow · scanning folder…",
+                            path.display()
+                        )
                     } else {
                         format!("Opened {} · scanning folder…", path.display())
                     };
@@ -2070,12 +2082,8 @@ impl SlateApp {
         let Ok(sqlite_path) = Self::flow_sqlite_path_for_root(&project_root) else {
             return;
         };
-        self.flow_worker.save_index(
-            project_root,
-            sqlite_path,
-            path.to_path_buf(),
-            text,
-        );
+        self.flow_worker
+            .save_index(project_root, sqlite_path, path.to_path_buf(), text);
     }
 
     fn queue_flow_agenda_sync(&mut self) {
@@ -6527,7 +6535,11 @@ impl SlateApp {
             ));
         }
         // Off the UI thread; written before the process exits.
-        settings_writer::write(path, contents.into_bytes(), settings_writer::Durability::Quick);
+        settings_writer::write(
+            path,
+            contents.into_bytes(),
+            settings_writer::Durability::Quick,
+        );
         Ok(())
     }
 
@@ -6561,16 +6573,31 @@ impl SlateApp {
             editor_view::CURSOR_COLORS
                 .iter()
                 .find(|(_, color)| *color == look.cursor_color)
-                .map_or_else(|| editor_view::color_to_hex(look.cursor_color), |(name, _)| (*name).to_string()),
+                .map_or_else(
+                    || editor_view::color_to_hex(look.cursor_color),
+                    |(name, _)| (*name).to_string()
+                ),
             if look.block_cursor { "block" } else { "line" },
-            if look.animate_cursor { " · animated" } else { "" },
-            if look.animate_cursor && look.cursor_stretch { " · stretch" } else { "" },
+            if look.animate_cursor {
+                " · animated"
+            } else {
+                ""
+            },
+            if look.animate_cursor && look.cursor_stretch {
+                " · stretch"
+            } else {
+                ""
+            },
             if look.cursor_pulse { " · pulse" } else { "" },
             if look.cursor_trail {
                 format!(
                     " · trail {}{}",
                     look.cursor_trail_weight,
-                    if look.cursor_trail_typing { " (also typing)" } else { "" }
+                    if look.cursor_trail_typing {
+                        " (also typing)"
+                    } else {
+                        ""
+                    }
                 )
             } else {
                 String::new()
@@ -9871,7 +9898,6 @@ impl SlateApp {
                 .set_scroll_position(self.preview_sync.position_for(offset));
         }
     }
-
 }
 
 impl SlateApp {
@@ -10089,7 +10115,6 @@ impl SlateApp {
                     });
             });
     }
-
 }
 
 impl eframe::App for SlateApp {

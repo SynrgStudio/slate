@@ -560,9 +560,8 @@ impl EditorBuffer {
 
         let region_start = self.line_start(start_line);
         let region_end = self.line_end(end_line);
-        let mut indented = String::with_capacity(
-            region_end - region_start + affected_starts.len() * 4,
-        );
+        let mut indented =
+            String::with_capacity(region_end - region_start + affected_starts.len() * 4);
         for (index, line) in self.text[region_start..region_end].split('\n').enumerate() {
             if index > 0 {
                 indented.push('\n');

@@ -4,7 +4,10 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    sync::{Mutex, atomic::{AtomicU64, Ordering}},
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -326,7 +329,11 @@ fn write_project_index_entries(
     index_path: &Path,
     entries: &BTreeMap<String, FlowKnownFile>,
 ) -> Result<(), String> {
-    let tmp_path = index_path.with_extension(format!("tsv.{}.{}.tmp", std::process::id(), NEXT_TEMP_INDEX.fetch_add(1, Ordering::Relaxed)));
+    let tmp_path = index_path.with_extension(format!(
+        "tsv.{}.{}.tmp",
+        std::process::id(),
+        NEXT_TEMP_INDEX.fetch_add(1, Ordering::Relaxed)
+    ));
     let mut contents = String::from(
         "# Slate Flow known files index\n\
          # Derived/rebuildable. Markdown files remain the source of truth.\n\
@@ -377,24 +384,36 @@ fn write_sqlite_cache(
     contents: &str,
 ) -> Result<(), String> {
     let document = crate::flow_store::Document {
-        known_file: known_file.clone(), tasks: tasks.to_vec(), contents: contents.to_string(),
+        known_file: known_file.clone(),
+        tasks: tasks.to_vec(),
+        contents: contents.to_string(),
     };
     crate::flow_store::with_writer(sqlite_path, |writer| writer.write_batch(&[document]))
 }
 
 /// Export the rebuildable TSV once after a scan, from committed DB rows rather
 /// than a stale snapshot. Serialize exporters with individual UI updates.
-pub(crate) fn export_cache_index(root: &Path, writer: &crate::flow_store::CacheWriter) -> Result<(), String> {
+pub(crate) fn export_cache_index(
+    root: &Path,
+    writer: &crate::flow_store::CacheWriter,
+) -> Result<(), String> {
     let _guard = INDEX_WRITE_LOCK.lock().map_err(|e| e.to_string())?;
     let dir = root.join(".slate");
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let entries = writer.known_files()?.into_iter().map(|file| (file.path.clone(), file)).collect();
+    let entries = writer
+        .known_files()?
+        .into_iter()
+        .map(|file| (file.path.clone(), file))
+        .collect();
     write_project_index_entries(&dir.join("index.tsv"), &entries)
 }
 
 pub(crate) fn export_database_index(root: &Path, database: &Path) -> Result<(), String> {
     let _guard = INDEX_WRITE_LOCK.lock().map_err(|e| e.to_string())?;
-    let entries = crate::flow_store::read_known_files(database)?.into_iter().map(|file| (file.path.clone(), file)).collect();
+    let entries = crate::flow_store::read_known_files(database)?
+        .into_iter()
+        .map(|file| (file.path.clone(), file))
+        .collect();
     let dir = root.join(".slate");
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     write_project_index_entries(&dir.join("index.tsv"), &entries)

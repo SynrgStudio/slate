@@ -84,10 +84,43 @@ pub(crate) enum LineState {
 }
 
 const RUST_KEYWORDS: &[&str] = &[
-    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
-    "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
-    "return", "static", "struct", "super", "trait", "type", "unsafe", "use", "where", "while",
-    "yield", "macro_rules", "union",
+    "as",
+    "async",
+    "await",
+    "break",
+    "const",
+    "continue",
+    "crate",
+    "dyn",
+    "else",
+    "enum",
+    "extern",
+    "fn",
+    "for",
+    "if",
+    "impl",
+    "in",
+    "let",
+    "loop",
+    "match",
+    "mod",
+    "move",
+    "mut",
+    "pub",
+    "ref",
+    "return",
+    "static",
+    "struct",
+    "super",
+    "trait",
+    "type",
+    "unsafe",
+    "use",
+    "where",
+    "while",
+    "yield",
+    "macro_rules",
+    "union",
 ];
 const RUST_CONSTANTS: &[&str] = &["true", "false", "self", "Self", "None", "Some", "Ok", "Err"];
 const RUST_TYPES: &[&str] = &[
@@ -107,16 +140,75 @@ const PYTHON_TYPES: &[&str] = &[
 ];
 
 const JS_KEYWORDS: &[&str] = &[
-    "async", "await", "break", "case", "catch", "class", "const", "continue", "debugger",
-    "default", "delete", "do", "else", "export", "extends", "finally", "for", "from", "function",
-    "get", "if", "import", "in", "instanceof", "let", "new", "of", "return", "set", "static",
-    "super", "switch", "throw", "try", "typeof", "var", "void", "while", "with", "yield", "as",
+    "async",
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "debugger",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "export",
+    "extends",
+    "finally",
+    "for",
+    "from",
+    "function",
+    "get",
+    "if",
+    "import",
+    "in",
+    "instanceof",
+    "let",
+    "new",
+    "of",
+    "return",
+    "set",
+    "static",
+    "super",
+    "switch",
+    "throw",
+    "try",
+    "typeof",
+    "var",
+    "void",
+    "while",
+    "with",
+    "yield",
+    "as",
 ];
 const TS_KEYWORDS: &[&str] = &[
-    "abstract", "declare", "enum", "implements", "interface", "keyof", "namespace", "private",
-    "protected", "public", "readonly", "type", "satisfies", "is", "infer", "override",
+    "abstract",
+    "declare",
+    "enum",
+    "implements",
+    "interface",
+    "keyof",
+    "namespace",
+    "private",
+    "protected",
+    "public",
+    "readonly",
+    "type",
+    "satisfies",
+    "is",
+    "infer",
+    "override",
 ];
-const JS_CONSTANTS: &[&str] = &["true", "false", "null", "undefined", "this", "NaN", "Infinity"];
+const JS_CONSTANTS: &[&str] = &[
+    "true",
+    "false",
+    "null",
+    "undefined",
+    "this",
+    "NaN",
+    "Infinity",
+];
 const TS_TYPES: &[&str] = &[
     "string", "number", "boolean", "any", "unknown", "never", "object", "bigint", "symbol",
 ];
@@ -269,7 +361,10 @@ impl Lexer<'_> {
                 _ if is_ident_start(c) => self.identifier(),
                 _ => {
                     // Skip one whole character (it may be multi-byte).
-                    self.at += self.line[self.at..].chars().next().map_or(1, char::len_utf8);
+                    self.at += self.line[self.at..]
+                        .chars()
+                        .next()
+                        .map_or(1, char::len_utf8);
                 }
             }
         }
@@ -311,7 +406,9 @@ impl Lexer<'_> {
             self.at += 1;
             Some(Token::Macro)
         } else if word.len() > 1
-            && word.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
+            && word
+                .bytes()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
             && word.bytes().any(|c| c.is_ascii_uppercase())
         {
             Some(Token::Constant)
@@ -583,9 +680,15 @@ mod tests {
 
     #[test]
     fn rust_multi_line_comments_and_strings_carry_over() {
-        let (first, state) =
-            tokens(Lang::Rust, LineState::Normal, "let a = 1; /* start /* nested */");
-        assert_eq!(first.last(), Some(&("/* start /* nested */", Token::Comment)));
+        let (first, state) = tokens(
+            Lang::Rust,
+            LineState::Normal,
+            "let a = 1; /* start /* nested */",
+        );
+        assert_eq!(
+            first.last(),
+            Some(&("/* start /* nested */", Token::Comment))
+        );
         assert_eq!(state, LineState::BlockComment { depth: 1 });
         let (second, state) = tokens(Lang::Rust, state, "still */ let b");
         assert_eq!(
@@ -692,7 +795,11 @@ mod tests {
         assert_eq!(state, LineState::Normal);
         let (_, state) = tokens(Lang::JavaScript, LineState::Normal, "/* a /* b");
         let (rest, state) = tokens(Lang::JavaScript, state, "c */ d */");
-        assert_eq!(rest, vec![("c */", Comment)], "JS block comments do not nest");
+        assert_eq!(
+            rest,
+            vec![("c */", Comment)],
+            "JS block comments do not nest"
+        );
         assert_eq!(state, LineState::Normal);
     }
 

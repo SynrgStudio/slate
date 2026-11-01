@@ -10,7 +10,9 @@ fn sample_note() -> String {
             "Un párrafo normal con **negrita**, *itálica*, `código` y un [link](https://example.com) \
              que ocupa más de una línea cuando la ventana es angosta, como pasa seguido.\n\n",
         );
-        text.push_str("- [ ] tarea pendiente @hoy\n- [x] tarea hecha\n- item con [[wiki link]]\n\n");
+        text.push_str(
+            "- [ ] tarea pendiente @hoy\n- [x] tarea hecha\n- item con [[wiki link]]\n\n",
+        );
         text.push_str("```rust\nfn main() {\n    println!(\"hola\");\n}\n```\n\n");
         text.push_str("| a | b | c |\n|---|---|---|\n| 1 | 2 | 3 |\n\n");
     }
@@ -63,7 +65,8 @@ fn typing_frame(label: &str, text: String, path: Option<&str>, highlight: bool) 
                 ..Default::default()
             },
             |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| eframe::App::ui(&mut app, ui, &mut frame));
+                egui::CentralPanel::default()
+                    .show(ctx, |ui| eframe::App::ui(&mut app, ui, &mut frame));
             },
         );
         let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
@@ -77,7 +80,11 @@ fn typing_frame(label: &str, text: String, path: Option<&str>, highlight: bool) 
         .map(|n| run(vec![egui::Event::Text("x".into())], 10 + n))
         .collect();
     drop(run);
-    assert_eq!(app.buffer.as_str().len(), len + 400, "keys must reach the editor");
+    assert_eq!(
+        app.buffer.as_str().len(),
+        len + 400,
+        "keys must reach the editor"
+    );
     times.sort_by(f64::total_cmp);
     let pick = |q: f64| times[((times.len() - 1) as f64 * q) as usize];
     println!(
@@ -98,7 +105,10 @@ fn benchmark_wgpu_startup() {
     let total = std::time::Instant::now();
     let mut last = std::time::Instant::now();
     let mut step = |name: &str| {
-        println!("WGPU_STARTUP {name} ms={:.1}", last.elapsed().as_secs_f64() * 1000.0);
+        println!(
+            "WGPU_STARTUP {name} ms={:.1}",
+            last.elapsed().as_secs_f64() * 1000.0
+        );
         last = std::time::Instant::now();
     };
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -124,7 +134,10 @@ fn benchmark_wgpu_startup() {
         Default::default(),
     );
     step("egui renderer (shader + pipeline)");
-    println!("WGPU_STARTUP total ms={:.1}", total.elapsed().as_secs_f64() * 1000.0);
+    println!(
+        "WGPU_STARTUP total ms={:.1}",
+        total.elapsed().as_secs_f64() * 1000.0
+    );
 }
 
 #[test]
@@ -136,13 +149,22 @@ fn benchmark_wgpu_adapters() {
         backends: wgpu::Backends::DX12,
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
-    println!("ADAPTERS instance ms={:.1}", started.elapsed().as_secs_f64() * 1000.0);
+    println!(
+        "ADAPTERS instance ms={:.1}",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
     let started = std::time::Instant::now();
     let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::DX12));
-    println!("ADAPTERS enumerate ms={:.1}", started.elapsed().as_secs_f64() * 1000.0);
+    println!(
+        "ADAPTERS enumerate ms={:.1}",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
     for adapter in adapters {
         let info = adapter.get_info();
-        println!("ADAPTERS {} {:?} {:?}", info.name, info.device_type, info.backend);
+        println!(
+            "ADAPTERS {} {:?} {:?}",
+            info.name, info.device_type, info.backend
+        );
     }
 }
 
@@ -166,13 +188,21 @@ fn benchmark_glyph_first_use() {
         let started = std::time::Instant::now();
         let output = ctx.run(
             egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1400.0, 900.0))),
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1400.0, 900.0),
+                )),
                 time: Some(n as f64 * 0.016),
-                events: if text.is_empty() { vec![] } else { vec![egui::Event::Text(text.into())] },
+                events: if text.is_empty() {
+                    vec![]
+                } else {
+                    vec![egui::Event::Text(text.into())]
+                },
                 ..Default::default()
             },
             |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| eframe::App::ui(&mut app, ui, &mut frame));
+                egui::CentralPanel::default()
+                    .show(ctx, |ui| eframe::App::ui(&mut app, ui, &mut frame));
             },
         );
         std::hint::black_box(ctx.tessellate(output.shapes, output.pixels_per_point));
@@ -187,7 +217,10 @@ fn benchmark_glyph_first_use() {
         println!("GLYPH {text} first_ms={first:.3} again_ms={again:.3}");
     }
     drop(run);
-    assert!(app.buffer.as_str().ends_with("ßß"), "keys must reach the editor");
+    assert!(
+        app.buffer.as_str().ends_with("ßß"),
+        "keys must reach the editor"
+    );
 }
 
 /// What Ctrl+S costs on the UI thread: the synced, checked replace.
@@ -208,7 +241,12 @@ fn benchmark_save_latency() {
                 times.push(started.elapsed().as_secs_f64() * 1000.0);
             }
             times.sort_by(f64::total_cmp);
-            println!("SAVE {} {label} median_ms={:.2} max_ms={:.2}", dir.display(), times[3], times[6]);
+            println!(
+                "SAVE {} {label} median_ms={:.2} max_ms={:.2}",
+                dir.display(),
+                times[3],
+                times[6]
+            );
             let _ = fs::remove_file(&path);
         }
     }

@@ -128,7 +128,9 @@ fn worker(shared: Arc<Shared>, cache: PathBuf) {
             if active.is_none() {
                 pending = shared
                     .wake
-                    .wait_while(pending, |p| p.is_none() && !shared.stop.load(Ordering::Relaxed))
+                    .wait_while(pending, |p| {
+                        p.is_none() && !shared.stop.load(Ordering::Relaxed)
+                    })
                     .unwrap();
             }
             pending.take()
@@ -1004,10 +1006,8 @@ mod tests {
     #[ignore = "manual Everything multi-page import into owned temporary DB"]
     fn live_inventory_import_repo_metadata_into_temporary_cache() {
         let root = PathBuf::from("D:/slate");
-        let base = std::env::temp_dir().join(format!(
-            "slate-inventory-live-{}",
-            crate::test_unique()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("slate-inventory-live-{}", crate::test_unique()));
         let cache = base.join("paths.sqlite3");
         let scan = import_scan(vec![root.clone()]);
         let start = Instant::now();
@@ -1041,10 +1041,7 @@ mod tests {
     }
     #[test]
     fn inventory_import_pages_all_paths_and_metadata_without_any_filesystem_inventory() {
-        let base = std::env::temp_dir().join(format!(
-            "slate-inventory-{}",
-            crate::test_unique()
-        ));
+        let base = std::env::temp_dir().join(format!("slate-inventory-{}", crate::test_unique()));
         let root = base.join("does-not-exist");
         let cache = base.join("cache/index.sqlite3");
         let scan = import_scan(vec![root.clone()]);
@@ -1129,10 +1126,8 @@ mod tests {
     #[test]
     fn live_inventory_growth_shrinkage_and_duplicate_paths_finish_without_restarting() {
         for mode in 0..4 {
-            let base = std::env::temp_dir().join(format!(
-                "slate-inventory-churn-{}",
-                crate::test_unique()
-            ));
+            let base = std::env::temp_dir()
+                .join(format!("slate-inventory-churn-{}", crate::test_unique()));
             let root = base.join("nonexistent-root");
             let cache = base.join("cache/index.sqlite3");
             let scan = import_scan(vec![root.clone()]);
@@ -1176,10 +1171,8 @@ mod tests {
     }
     #[test]
     fn native_inventory_only_requests_fallback_for_unindexed_roots() {
-        let base = std::env::temp_dir().join(format!(
-            "slate-inventory-mixed-{}",
-            crate::test_unique()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("slate-inventory-mixed-{}", crate::test_unique()));
         let native = base.join("native-without-a-filesystem-root");
         let fallback = base.join("unindexed-root");
         let cache = base.join("cache/index.sqlite3");
@@ -1328,10 +1321,8 @@ mod tests {
     }
     #[test]
     fn inventory_cancel_and_out_of_scope_entries_do_not_mark_ready() {
-        let base = std::env::temp_dir().join(format!(
-            "slate-inventory-cancel-{}",
-            crate::test_unique()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("slate-inventory-cancel-{}", crate::test_unique()));
         let root = base.join("root");
         let cache = base.join("cache/index.sqlite3");
         let scan = import_scan(vec![root.clone()]);
@@ -1363,10 +1354,8 @@ mod tests {
     }
     #[test]
     fn periscope_settings_roundtrip_roots_and_keyboard_toggle_use_owned_config() {
-        let root = std::env::temp_dir().join(format!(
-            "slate-periscope-config-{}",
-            crate::test_unique()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("slate-periscope-config-{}", crate::test_unique()));
         fs::create_dir_all(&root).unwrap();
         let ctx = eframe::egui::Context::default();
         let cc = eframe::CreationContext::_new_kittest(ctx.clone());
@@ -1399,10 +1388,8 @@ mod tests {
     }
     #[test]
     fn app_applies_only_latest_search_and_keeps_dirty_main_when_open_is_requested() {
-        let root = std::env::temp_dir().join(format!(
-            "slate-periscope-ui-{}",
-            crate::test_unique()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("slate-periscope-ui-{}", crate::test_unique()));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("earlier.md"), "earlier").unwrap();
         fs::write(root.join("latest.md"), "latest").unwrap();
@@ -1444,10 +1431,8 @@ mod tests {
     }
     #[test]
     fn unavailable_everything_automatically_falls_back_without_touching_documents() {
-        let root = std::env::temp_dir().join(format!(
-            "slate-periscope-fallback-{}",
-            crate::test_unique()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("slate-periscope-fallback-{}", crate::test_unique()));
         fs::create_dir_all(&root).unwrap();
         let document = root.join("needle.md");
         fs::write(&document, "document unchanged").unwrap();
@@ -1482,10 +1467,8 @@ mod tests {
     }
     #[test]
     fn coalescing_returns_latest_query_and_cancel_discards_late_result() {
-        let root = std::env::temp_dir().join(format!(
-            "slate-periscope-worker-{}",
-            crate::test_unique()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("slate-periscope-worker-{}", crate::test_unique()));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("café.md"), "not read by scanner").unwrap();
         fs::write(root.join("latest.md"), "text").unwrap();

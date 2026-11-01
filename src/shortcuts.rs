@@ -1252,7 +1252,10 @@ impl SlateApp {
                     ..self.editor_look
                 }),
                 25 => self.set_editor_look(editor_view::EditorLook {
-                    cursor_color: editor_view::cycle_cursor_color(self.editor_look.cursor_color, false),
+                    cursor_color: editor_view::cycle_cursor_color(
+                        self.editor_look.cursor_color,
+                        false,
+                    ),
                     ..self.editor_look
                 }),
                 26 => self.set_editor_look(editor_view::EditorLook {
@@ -1323,7 +1326,11 @@ impl SlateApp {
                 } else {
                     true
                 }),
-                20 => self.set_resident(if settings_activate { !self.resident } else { true }),
+                20 => self.set_resident(if settings_activate {
+                    !self.resident
+                } else {
+                    true
+                }),
                 21 => self.set_start_with_windows(if settings_activate {
                     !self.start_with_windows
                 } else {

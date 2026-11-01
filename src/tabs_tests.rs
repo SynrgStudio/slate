@@ -654,9 +654,9 @@ fn a_tab_moved_to_another_window_is_not_offered_for_reopening() {
 fn background_save(f: &mut Fixture) {
     f.app.sync_saves = false;
     let app = &mut f.app;
-    let _ = f
-        .ctx
-        .run_ui(egui::RawInput::default(), |ui| app.run_command(Command::Save, &ui.ctx().clone()));
+    let _ = f.ctx.run_ui(egui::RawInput::default(), |ui| {
+        app.run_command(Command::Save, &ui.ctx().clone())
+    });
 }
 
 #[test]
@@ -668,7 +668,10 @@ fn typing_during_a_background_save_stays_unsaved_and_saves_next_time() {
     f.app.buffer.insert_text("uno\n");
     f.app.dirty = true;
     background_save(&mut f);
-    assert!(f.app.pending_save.is_some(), "the write runs on a helper thread");
+    assert!(
+        f.app.pending_save.is_some(),
+        "the write runs on a helper thread"
+    );
     // Typed before the write landed.
     f.app.buffer.insert_text("dos\n");
     f.app.finish_background_save();
@@ -678,7 +681,10 @@ fn typing_during_a_background_save_stays_unsaved_and_saves_next_time() {
     f.app.finish_background_save();
     assert_eq!(fs::read_to_string(&note).unwrap(), "hola\nuno\ndos\n");
     assert!(!f.app.dirty);
-    assert!(f.app.file_conflict.is_none(), "our own writes are not external changes");
+    assert!(
+        f.app.file_conflict.is_none(),
+        "our own writes are not external changes"
+    );
 }
 
 #[test]
@@ -734,7 +740,10 @@ fn closing_a_tab_waits_for_its_background_save_instead_of_asking() {
     let _ = f.ctx.run_ui(egui::RawInput::default(), |ui| {
         app.run_command(Command::CloseBuffer, &ui.ctx().clone())
     });
-    assert!(f.app.pending_action.is_none(), "saved text needs no question");
+    assert!(
+        f.app.pending_action.is_none(),
+        "saved text needs no question"
+    );
     assert_eq!(fs::read_to_string(&b).unwrap(), "xb\n");
     assert_eq!(f.labels(), vec!["a.md"]);
 }

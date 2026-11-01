@@ -65,7 +65,9 @@ impl SlateApp {
                         .is_some_and(|pending| pending.path == path);
                     let matches = match slot {
                         Slot::Main => {
-                            !saving && self.path.as_ref() == Some(&path) && self.disk_base == expected
+                            !saving
+                                && self.path.as_ref() == Some(&path)
+                                && self.disk_base == expected
                         }
                         Slot::Modal => {
                             self.link_preview_path.as_ref() == Some(&path)

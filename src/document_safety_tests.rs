@@ -372,7 +372,16 @@ fn each_tab_keeps_its_own_record_across_switches_and_crash_scan() {
     let mut manager = Manager::new(ctx, Some(f.0.clone()));
     let observe = |manager: &mut Manager, text: &str, revision: u64| {
         manager.observe(
-            Slot::Main, None, None, text, revision, 0, true, 0.0, true, None,
+            Slot::Main,
+            None,
+            None,
+            text,
+            revision,
+            0,
+            true,
+            0.0,
+            true,
+            None,
         );
     };
     // Tab 1 active and dirty, then switch to tab 2 and edit it.

@@ -1052,15 +1052,7 @@ impl EditorView {
         }
 
         if keyboard_enabled && has_keyboard_focus {
-            self.paint_cursor(
-                &painter,
-                buffer,
-                &rows,
-                rect,
-                text_x,
-                line_height,
-                &font,
-            );
+            self.paint_cursor(&painter, buffer, &rows, rect, text_x, line_height, &font);
         } else {
             self.forget_cursor_position();
         }
@@ -2325,9 +2317,15 @@ impl EditorView {
         if !render_markdown {
             // Code files, and fenced blocks while Markdown is shown raw.
             if self.paint_highlighted_row(
-                    painter, buffer, row, text_x, y, line_height, font, text_color,
-                )
-            {
+                painter,
+                buffer,
+                row,
+                text_x,
+                y,
+                line_height,
+                font,
+                text_color,
+            ) {
                 return;
             }
             painter.text(
@@ -2350,7 +2348,14 @@ impl EditorView {
             if cursor_in_this_code_block {
                 if matches!(code_kind, CodeLineKind::Body)
                     && self.paint_highlighted_row(
-                        painter, buffer, row, text_x, y, line_height, font, text_color,
+                        painter,
+                        buffer,
+                        row,
+                        text_x,
+                        y,
+                        line_height,
+                        font,
+                        text_color,
                     )
                 {
                     return;
@@ -3386,9 +3391,9 @@ impl EditorView {
         }
         // Stretch: each corner of the shape travels on its own clock, the
         // ones facing the jump fastest, so the caret leans into the move.
-        let stretched = self.cursor_glide.filter(|glide| {
-            gliding && self.look.cursor_stretch && !glide.instant_head
-        });
+        let stretched = self
+            .cursor_glide
+            .filter(|glide| gliding && self.look.cursor_stretch && !glide.instant_head);
         if let Some(glide) = stretched {
             let elapsed = now - glide.started;
             let travel = target - glide.head_from;
@@ -3409,7 +3414,8 @@ impl EditorView {
             let points = corners
                 .iter()
                 .map(|corner| {
-                    let lead = f64::from(((*corner - center).dot(direction) / reach).clamp(-1.0, 1.0));
+                    let lead =
+                        f64::from(((*corner - center).dot(direction) / reach).clamp(-1.0, 1.0));
                     // lead 1 → STRETCH_LEAD, lead -1 → STRETCH_LAG.
                     let share = STRETCH_LAG - (STRETCH_LAG - STRETCH_LEAD) * (lead + 1.0) / 2.0;
                     *corner + travel * ease(elapsed / (CURSOR_GLIDE_SECONDS * share))
@@ -3480,7 +3486,11 @@ impl EditorView {
     /// (drawn, target, animating) for tests.
     #[cfg(test)]
     pub(crate) fn cursor_state(&self) -> (Option<Pos2>, Option<Pos2>, bool) {
-        (self.cursor_drawn, self.cursor_target, self.cursor_glide.is_some())
+        (
+            self.cursor_drawn,
+            self.cursor_target,
+            self.cursor_glide.is_some(),
+        )
     }
 
     fn forget_cursor_position(&mut self) {
@@ -3795,11 +3805,22 @@ fn text_input_from_events(events: &[egui::Event]) -> Option<String> {
     }
 }
 
-
 /// A smear from where the caret was (transparent) to where it is (`strong`):
 /// every edge of the caret's shape swept from tail to head.
-fn paint_cursor_trail(painter: &egui::Painter, tail: egui::Rect, head: egui::Rect, strong: Color32) {
-    let corners = |r: egui::Rect| [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()];
+fn paint_cursor_trail(
+    painter: &egui::Painter,
+    tail: egui::Rect,
+    head: egui::Rect,
+    strong: Color32,
+) {
+    let corners = |r: egui::Rect| {
+        [
+            r.left_top(),
+            r.right_top(),
+            r.right_bottom(),
+            r.left_bottom(),
+        ]
+    };
     let (tail, head) = (corners(tail), corners(head));
     let faint = Color32::TRANSPARENT;
     let mut mesh = egui::Mesh::default();

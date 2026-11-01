@@ -30,7 +30,11 @@ fn file_has_headings(path: &Path) -> bool {
         return known;
     }
     let has = fs::read_to_string(path)
-        .map(|contents| contents.lines().any(|line| parse_heading_line(line).is_some()))
+        .map(|contents| {
+            contents
+                .lines()
+                .any(|line| parse_heading_line(line).is_some())
+        })
         .unwrap_or(false);
     SEEN.with_borrow_mut(|seen| {
         if seen.len() > 4096 {

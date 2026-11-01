@@ -130,10 +130,16 @@ fn jetbrains_mono_changes_the_text_metrics_and_everything_persists() {
     });
     f.frame_after(0.016);
     let jetbrains = f.cursor().1.unwrap();
-    assert_ne!(hack.x, jetbrains.x, "the editor now measures with JetBrains Mono");
+    assert_ne!(
+        hack.x, jetbrains.x,
+        "the editor now measures with JetBrains Mono"
+    );
 
     let config = fs::read_to_string(f.root.join("config.toml")).unwrap();
-    assert!(config.contains("editor_font = \"jetbrains-mono\""), "{config}");
+    assert!(
+        config.contains("editor_font = \"jetbrains-mono\""),
+        "{config}"
+    );
     assert!(config.contains("block_cursor = true"));
     assert!(config.contains("cursor_animation = false"));
     assert!(config.contains("cursor_trail = true"));
@@ -163,12 +169,14 @@ fn jetbrains_mono_changes_the_text_metrics_and_everything_persists() {
 
 #[test]
 fn with_a_trail_the_cursor_lands_on_time_and_the_trail_catches_up() {
-    let mut f = Fixture::new("uno
+    let mut f = Fixture::new(
+        "uno
 dos
 tres
 cuatro
 cinco
-");
+",
+    );
     f.app.apply_editor_look(editor_view::EditorLook {
         cursor_trail: true,
         ..animated()
@@ -190,7 +198,10 @@ fn cursor_colors_round_trip_and_cycle() {
         let hex = editor_view::color_to_hex(color);
         assert_eq!(editor_view::color_from_hex(&hex), Some(color));
     }
-    assert_eq!(editor_view::color_from_hex("\"#12aBcd\""), Some(egui::Color32::from_rgb(0x12, 0xab, 0xcd)));
+    assert_eq!(
+        editor_view::color_from_hex("\"#12aBcd\""),
+        Some(egui::Color32::from_rgb(0x12, 0xab, 0xcd))
+    );
     assert_eq!(editor_view::color_from_hex("nope"), None);
     let first = editor_view::CURSOR_COLORS[0].1;
     let last = editor_view::CURSOR_COLORS[editor_view::CURSOR_COLORS.len() - 1].1;
@@ -258,7 +269,10 @@ fn a_stretched_jump_lands_exactly_and_then_rests() {
     f.app.buffer.move_to_bottom();
     f.frame_after(0.0);
     f.frame_after(0.1);
-    assert!(f.cursor().2, "the trailing edge is still catching up at 100 ms");
+    assert!(
+        f.cursor().2,
+        "the trailing edge is still catching up at 100 ms"
+    );
     f.frame_after(0.1);
     let (drawn, target, animating) = f.cursor();
     assert!(!animating);
@@ -279,7 +293,10 @@ fn a_pulse_follows_a_jump_but_not_typing() {
     assert!(!f.app.editor_view.cursor_pulsing(), "typing does not pulse");
     f.app.buffer.move_to_bottom();
     f.frame_after(0.016);
-    assert!(f.app.editor_view.cursor_pulsing(), "a jump pulses, even without the glide");
+    assert!(
+        f.app.editor_view.cursor_pulsing(),
+        "a jump pulses, even without the glide"
+    );
     f.frame_after(0.3);
     f.frame_after(0.016);
     assert!(!f.app.editor_view.cursor_pulsing(), "and then it rests");
@@ -336,8 +353,16 @@ fn notes_colour_only_fenced_blocks_with_a_known_language() {
         kinds(&view, &buffer, 2).unwrap()[0],
         ("def".to_string(), highlight::Token::Keyword)
     );
-    assert_eq!(kinds(&view, &buffer, 5), None, "unknown languages stay plain");
-    assert_eq!(kinds(&view, &buffer, 7), None, "after the block it is prose again");
+    assert_eq!(
+        kinds(&view, &buffer, 5),
+        None,
+        "unknown languages stay plain"
+    );
+    assert_eq!(
+        kinds(&view, &buffer, 7),
+        None,
+        "after the block it is prose again"
+    );
 
     view.set_look(editor_view::EditorLook {
         syntax_highlighting: false,

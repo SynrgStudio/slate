@@ -8,10 +8,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "slate-find-ui-{}",
-            crate::test_unique()
-        ));
+        let root = std::env::temp_dir().join(format!("slate-find-ui-{}", crate::test_unique()));
         fs::create_dir_all(&root).unwrap();
         fs::write(
             root.join("target.md"),

@@ -315,11 +315,18 @@ pub(crate) fn load_items_from_cache(
     let mut items = crate::flow_store::read_tasks(sqlite_path)?
         .into_iter()
         .map(|row| AgendaItem {
-            path: root.join(&row.path), relative_path: row.path,
-            line_number: row.line_number, line_index: row.line_index, kind: row.kind,
-            state: row.state, title: row.title, tags: split_cache_list(&row.tags),
-            projects: split_cache_list(&row.projects), priority: non_empty_string(&row.priority),
-            due: parse_cache_date(&row.due), scheduled: parse_cache_date(&row.scheduled),
+            path: root.join(&row.path),
+            relative_path: row.path,
+            line_number: row.line_number,
+            line_index: row.line_index,
+            kind: row.kind,
+            state: row.state,
+            title: row.title,
+            tags: split_cache_list(&row.tags),
+            projects: split_cache_list(&row.projects),
+            priority: non_empty_string(&row.priority),
+            due: parse_cache_date(&row.due),
+            scheduled: parse_cache_date(&row.scheduled),
             heading: non_empty_string(&row.heading),
         })
         .filter(|item| item.path.exists())

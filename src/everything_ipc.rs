@@ -599,10 +599,7 @@ mod win {
         }
         #[test]
         fn public_query_works_without_readiness_api_and_rejection_is_distinguished() {
-            let name = format!(
-                "SlateEverythingMock{}",
-                crate::test_unique()
-            );
+            let name = format!("SlateEverythingMock{}", crate::test_unique());
             let stop = Arc::new(AtomicBool::new(false));
             let (tx, rx) = mpsc::channel();
             let thread = {

@@ -9,10 +9,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "slate-preparation-{}",
-            crate::test_unique()
-        ));
+        let root = std::env::temp_dir().join(format!("slate-preparation-{}", crate::test_unique()));
         fs::create_dir_all(root.join("files")).unwrap();
         fs::write(root.join("files/café.md"), "private content stays on disk").unwrap();
         let cache = root.join("cache/paths.sqlite3");

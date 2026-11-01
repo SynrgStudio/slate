@@ -7,10 +7,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "slate-project-ui-{}",
-            crate::test_unique()
-        ));
+        let root = std::env::temp_dir().join(format!("slate-project-ui-{}", crate::test_unique()));
         fs::create_dir_all(root.join("project")).unwrap();
         let ctx = egui::Context::default();
         let cc = eframe::CreationContext::_new_kittest(ctx.clone());
