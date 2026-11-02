@@ -21,7 +21,6 @@ pub(crate) struct DocumentRef<'a> {
     pub(crate) id: u64,
     pub(crate) path: Option<&'a Path>,
     pub(crate) revision: u64,
-    #[allow(dead_code)] // API for the modules being rebuilt (Flow, Agenda)
     pub(crate) text: &'a str,
 }
 
@@ -69,7 +68,6 @@ impl Waker {
 /// A module's door into the core during one hook call.
 pub(crate) struct Cx<'a> {
     pub(crate) vaults: &'a [PathBuf],
-    #[allow(dead_code)] // API for the modules being rebuilt (Flow, Agenda)
     data_dir: PathBuf,
     waker: Waker,
     requests: Vec<Request>,
@@ -107,7 +105,6 @@ impl Cx<'_> {
 
     /// The module's own folder for derived data (never next to the user's
     /// files). Created on demand by the module.
-    #[allow(dead_code)] // API for the modules being rebuilt (Flow, Agenda)
     pub(crate) fn data_dir(&self) -> &Path {
         &self.data_dir
     }
@@ -116,6 +113,12 @@ impl Cx<'_> {
     /// nearest folder with `.git`, else the file's own folder.
     pub(crate) fn vault_for(&self, path: &Path) -> PathBuf {
         crate::vaults::vault_for(self.vaults, path)
+    }
+
+    /// The declared vault holding `path` (Settings → Modules & vaults), if
+    /// any: for modules that only work inside folders the user chose.
+    pub(crate) fn declared_vault(&self, path: &Path) -> Option<PathBuf> {
+        crate::vaults::declared(self.vaults, path)
     }
 }
 
@@ -139,6 +142,9 @@ pub(crate) trait Module {
     fn document_opened(&mut self, _cx: &mut Cx, _doc: DocumentRef) {}
     /// `lines`: the lines that may have changed (0-based, end exclusive).
     fn document_edited(&mut self, _cx: &mut Cx, _doc: DocumentRef, _lines: Range<usize>) {}
+    /// The active document was edited and then left alone for `IDLE_AFTER`:
+    /// the moment to look at its whole text (once per pause, not per key).
+    fn document_idle(&mut self, _cx: &mut Cx, _doc: DocumentRef) {}
     fn document_saved(&mut self, _cx: &mut Cx, _doc: DocumentRef) {}
     fn document_closed(&mut self, _cx: &mut Cx, _id: u64) {}
     /// It asked to be woken (`Cx::wake_after`, a `Waker`).
@@ -156,6 +162,9 @@ struct Slot {
 pub(crate) struct Host {
     slots: Vec<Slot>,
 }
+
+/// A pause in typing this long makes the core call `document_idle`.
+pub(crate) const IDLE_AFTER: Duration = Duration::from_millis(800);
 
 /// Hooks slower than this are written to the performance log.
 const SLOW_HOOK: Duration = Duration::from_millis(4);

@@ -7,6 +7,20 @@ use std::path::{Path, PathBuf};
 /// The vault holding `path`: the innermost declared vault containing it,
 /// else the nearest folder with `.git`, else the file's own folder.
 pub(crate) fn vault_for(vaults: &[PathBuf], path: &Path) -> PathBuf {
+    if let Some(vault) = declared(vaults, path) {
+        return vault;
+    }
+    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let folder = path.parent().map(Path::to_path_buf).unwrap_or(path.clone());
+    folder
+        .ancestors()
+        .find(|dir| dir.join(".git").is_dir())
+        .map(Path::to_path_buf)
+        .unwrap_or(folder)
+}
+
+/// The innermost declared vault holding `path`, if any.
+pub(crate) fn declared(vaults: &[PathBuf], path: &Path) -> Option<PathBuf> {
     let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let key = |p: &Path| {
         let text = p.to_string_lossy().replace('\\', "/");
@@ -18,22 +32,59 @@ pub(crate) fn vault_for(vaults: &[PathBuf], path: &Path) -> PathBuf {
         }
     };
     let path_key = key(&path);
-    if let Some(vault) = vaults
+    vaults
         .iter()
         .filter(|vault| {
             let vault_key = key(vault);
             path_key == vault_key || path_key.starts_with(&format!("{vault_key}/"))
         })
         .max_by_key(|vault| key(vault).len())
-    {
-        return vault.clone();
+        .cloned()
+}
+
+/// The Markdown notes under `dir` (skipping build and tool folders), at most
+/// `max`. True as second value when the walk stopped at `max`.
+pub(crate) fn notes(dir: &Path, max: usize) -> (Vec<PathBuf>, bool) {
+    fn walk(dir: &Path, max: usize, out: &mut Vec<PathBuf>) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            if out.len() >= max {
+                return true;
+            }
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if kind.is_dir() {
+                let name = entry.file_name();
+                if !crate::file_dialogs::default_should_skip_dir(&name.to_string_lossy())
+                    && walk(&path, max, out)
+                {
+                    return true;
+                }
+            } else if kind.is_file() && is_note(&path) {
+                out.push(path);
+            }
+        }
+        false
     }
-    let folder = path.parent().map(Path::to_path_buf).unwrap_or(path.clone());
-    folder
-        .ancestors()
-        .find(|dir| dir.join(".git").is_dir())
-        .map(Path::to_path_buf)
-        .unwrap_or(folder)
+    let mut out = Vec::new();
+    let truncated = walk(dir, max, &mut out);
+    (out, truncated)
+}
+
+/// A Markdown file, by extension.
+pub(crate) fn is_note(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "md" | "markdown" | "mdown" | "mkd"
+            )
+        })
 }
 
 /// Adds `folder` unless it (or the same folder spelled differently) is

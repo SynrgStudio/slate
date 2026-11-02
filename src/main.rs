@@ -739,6 +739,8 @@ struct SlateApp {
     module_ctx: egui::Context,
     /// Revision each open document had when modules last heard of it.
     module_seen: std::collections::HashMap<u64, u64>,
+    /// When modules hear the active document went quiet after edits.
+    module_idle_at: Option<std::time::Instant>,
     /// Result list shown for a module.
     results: results_ui::Results,
     /// Note folders (Settings → Modules & vaults).
@@ -968,6 +970,7 @@ impl SlateApp {
             module_host: module_api::Host::new(modules::all()),
             module_ctx: cc.egui_ctx.clone(),
             module_seen: std::collections::HashMap::new(),
+            module_idle_at: None,
             results: results_ui::Results::default(),
             vaults: Vec::new(),
             spare_owner: None,
@@ -3792,6 +3795,11 @@ impl SlateApp {
     }
 
     fn settings_path() -> Option<PathBuf> {
+        // Tests never read or write the user's settings (they set
+        // `settings_path_override` when they need a file).
+        if cfg!(test) {
+            return None;
+        }
         let mut dir = dirs_next::config_dir()?;
         dir.push("slate");
         Some(dir.join("config.toml"))
@@ -8333,6 +8341,45 @@ impl SlateApp {
         MODULE_ROWS_START + self.module_host.list().len()
     }
 
+    /// Settings tabs, each with its rows in the order they are shown.
+    pub(crate) fn settings_tabs(&self) -> Vec<(&'static str, Vec<usize>)> {
+        vec![
+            ("General", vec![0, 2, 6, 19, 20]),
+            ("Editor", vec![1, 3, 4, 5, 7, 21, 30]),
+            ("Cursor", (22..=29).collect()),
+            ("Footer", (8..8 + footer_ui::FIELDS.len()).collect()),
+            ("Periscope", vec![18]),
+            ("Modules", (MODULE_ROWS_START..=self.settings_last_row()).collect()),
+        ]
+    }
+
+    /// The tab holding the selected row.
+    pub(crate) fn settings_tab(&self) -> usize {
+        self.settings_tabs()
+            .iter()
+            .position(|(_, rows)| rows.contains(&self.selected_setting))
+            .unwrap_or(0)
+    }
+
+    /// ↑↓: the previous or next row of the current tab (stops at its ends).
+    pub(crate) fn settings_step_row(&mut self, step: isize) {
+        let tabs = self.settings_tabs();
+        let rows = &tabs[self.settings_tab()].1;
+        let at = rows
+            .iter()
+            .position(|row| *row == self.selected_setting)
+            .unwrap_or(0);
+        let next = (at as isize + step).clamp(0, rows.len() as isize - 1) as usize;
+        self.selected_setting = rows[next];
+    }
+
+    /// Tab / Shift+Tab: the first row of the next or previous tab (wraps).
+    pub(crate) fn settings_step_tab(&mut self, step: isize) {
+        let tabs = self.settings_tabs();
+        let next = (self.settings_tab() as isize + step).rem_euclid(tabs.len() as isize);
+        self.selected_setting = tabs[next as usize].1[0];
+    }
+
     /// Keyboard on a Modules & vaults row: `value` sets a module (None
     /// toggles it); on the vaults row it opens the folder picker.
     pub(crate) fn settings_module_row(&mut self, row: usize, value: Option<bool>, activate: bool) {
@@ -8468,6 +8515,26 @@ impl SlateApp {
             |module, cx| module.document_edited(cx, doc, lines.clone()),
         );
         self.apply_module_requests(requests);
+        self.module_idle_at = Some(std::time::Instant::now() + module_api::IDLE_AFTER);
+        self.module_ctx
+            .request_repaint_after(module_api::IDLE_AFTER);
+    }
+
+    /// The active document went quiet after edits (see `IDLE_AFTER`).
+    fn notify_modules_idle(&mut self, ctx: &egui::Context) {
+        self.module_idle_at = None;
+        let doc = module_api::DocumentRef {
+            id: self.buffer.identity,
+            path: self.path.as_deref(),
+            revision: self.buffer.revision,
+            text: self.buffer.as_str(),
+        };
+        let requests = self
+            .module_host
+            .call(ctx, &self.vaults, None, "document_idle", |module, cx| {
+                module.document_idle(cx, doc)
+            });
+        self.apply_module_requests(requests);
     }
 
     fn notify_modules_closed(&mut self, id: u64) {
@@ -8484,6 +8551,14 @@ impl SlateApp {
 
     /// Modules that asked to be woken.
     fn poll_modules(&mut self, ctx: &egui::Context) {
+        if let Some(at) = self.module_idle_at {
+            let now = std::time::Instant::now();
+            if now >= at {
+                self.notify_modules_idle(ctx);
+            } else {
+                ctx.request_repaint_after(at - now);
+            }
+        }
         for id in self.module_host.due() {
             let requests =
                 self.module_host

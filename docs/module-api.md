@@ -3,17 +3,19 @@
 How optional modules (Flow, Agenda, Daily, references, …) plug into the
 core. The cut points it must cover are listed in `src/modules/README.md`.
 
-## Status (2026-11-01)
+## Status (2026-11-02)
 
 Implemented: the `Module` trait, the host (`src/module_api.rs`), `Cx` with
 status / open / result list / `wake_after` / waker / data folder / vaults,
-the document hooks (opened, edited with the changed line range, saved,
-closed), module commands in the palette, command line and help, the core
+the document hooks (opened, edited with the changed line range, idle after
+a pause in typing, saved, closed), module commands in the palette, command line and help, the core
 result list (`src/results_ui.rs`), vaults (`src/vaults.rs`), Settings →
 Modules & vaults (on/off per module, `module.<id>` and `vault` keys in
 `config.toml`), slow hooks (≥ 4 ms) in the performance log.
 
-Connected modules: **References** (`:backlinks`, `:mentions`).
+Connected modules: **References** (`:backlinks`, `:mentions`) and **Flow**
+(the task index of declared vaults; `:flow` lists the open tasks,
+`:flow-reindex` rebuilds it; see `src/modules/flow/module.rs`).
 
 Not yet: panels, editor extensions (`decorate`, `complete`, `on_enter`),
 module settings rows, the windows channel for modules. They come with the
@@ -59,6 +61,7 @@ trait Module {
     fn start(&mut self, cx: &mut Cx) {}
     fn document_opened(&mut self, cx: &mut Cx, doc: DocumentRef) {}
     fn document_edited(&mut self, cx: &mut Cx, doc: DocumentRef, lines: Range<usize>) {}
+    fn document_idle(&mut self, cx: &mut Cx, doc: DocumentRef) {} // 800 ms after the last edit
     fn document_saved(&mut self, cx: &mut Cx, doc: DocumentRef) {}
     fn document_closed(&mut self, cx: &mut Cx, id: DocumentId) {}
     fn wake(&mut self, cx: &mut Cx) {}            // when it asked to be woken
@@ -92,7 +95,7 @@ vaults, the windows channel, a background job runner.
 
 | Feature | Hooks |
 |---|---|
-| Flow index | `document_opened/edited/saved` → its worker reparses the changed lines and updates SQLite; incremental vault scan in the background (mtime/size) |
+| Flow index | declared vaults only; `document_opened` → incremental vault scan on its thread (size/mtime, at most once a minute); `document_idle` → the note's unsaved items shadow the index in memory; `document_saved` → the note is reindexed. Item identity by content (path, kind, title, repeat) |
 | Agenda | `commands` (`:agenda`), `panel`, opens items with `cx.open_at(path, line)`, edits via `cx.replace_line` or the windows channel |
 | Daily | `commands` (`:daily`), events from Flow on `document_saved` |
 | Quickadd / inbox | `commands`; Scratch gets a generic "send to" hook later |

@@ -71,6 +71,7 @@ impl SlateApp {
         let mut settings_previous = false;
         let mut settings_next = false;
         let mut settings_activate = false;
+        let mut settings_tab_step = 0isize;
         let mut recent_previous = false;
         let mut recent_next = false;
         let mut recent_open = false;
@@ -174,6 +175,12 @@ impl SlateApp {
                 settings_next |= i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
                 settings_activate |= i.consume_key(egui::Modifiers::NONE, Key::Enter);
                 settings_activate |= i.consume_key(egui::Modifiers::NONE, Key::Space);
+                if i.consume_key(egui::Modifiers::SHIFT, Key::Tab) {
+                    settings_tab_step -= 1;
+                }
+                if i.consume_key(egui::Modifiers::NONE, Key::Tab) {
+                    settings_tab_step += 1;
+                }
             }
             if self.recent_picker_open {
                 recent_previous |= i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
@@ -984,13 +991,18 @@ impl SlateApp {
             return;
         }
 
+        if settings_tab_step != 0 {
+            self.settings_step_tab(settings_tab_step);
+            return;
+        }
+
         if settings_previous {
-            self.selected_setting = self.selected_setting.saturating_sub(1);
+            self.settings_step_row(-1);
             return;
         }
 
         if settings_next {
-            self.selected_setting = (self.selected_setting + 1).min(self.settings_last_row());
+            self.settings_step_row(1);
             return;
         }
 

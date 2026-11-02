@@ -13,7 +13,7 @@ The complete code before the cut is at the git tag **`pre-module-cut`**.
 
 | Path | State | What |
 |---|---|---|
-| `flow/` | compiled, tests run, **not connected** | Task grammar parser, SQLite cache, batch indexing, background writer, request files, `index.tsv` export, organization helpers |
+| `flow/` | **index connected** (`module.rs`, `index.rs`); the rest compiled, not connected | `module.rs` + `index.rs`: the Flow module (task index of declared vaults, `:flow`, `:flow-reindex`) on the task grammar parser in `mod.rs`. Still from before the cut: old SQLite cache, batch indexing, background writer, request files, `index.tsv` export, organization helpers |
 | `agenda/` | compiled, **not connected** | Agenda model: items from the cache, filters, week rows, live-buffer overlay |
 | `daily/` | compiled, tests run, **not connected** | Monthly daily log: day sections in date order, events |
 | `references/` | **connected** | `:backlinks` / `:mentions` over the file's vault, results in the core's result list |

@@ -2,7 +2,9 @@
 
 pub(crate) mod batch;
 pub(crate) mod edit;
+pub(crate) mod index;
 pub(crate) mod index_export;
+pub(crate) mod module;
 pub(crate) mod runtime;
 pub(crate) mod store;
 pub(crate) mod worker;
@@ -40,7 +42,7 @@ impl FlowPriority {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum FlowItemKind {
     Task,
     Note,

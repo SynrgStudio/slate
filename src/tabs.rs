@@ -955,6 +955,11 @@ impl SlateApp {
         if index == self.tabs.active || index >= self.tabs.list.len() {
             return;
         }
+        // Modules waiting for a pause in this document hear it now.
+        if self.module_idle_at.is_some() {
+            let ctx = self.module_ctx.clone();
+            self.notify_modules_idle(&ctx);
+        }
         let old = self.tabs.active;
         let old_id = self.tabs.list[old].id;
         let new_id = self.tabs.list[index].id;

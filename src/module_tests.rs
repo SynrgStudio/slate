@@ -91,6 +91,57 @@ fn modules_can_be_turned_off_and_vaults_survive_a_restart() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn tasks_list_the_vault_with_unsaved_text_after_a_pause() {
+    let root = temp_root("tasks");
+    let note = root.join("plan.md");
+    fs::write(&note, "- [ ] saved task
+").unwrap();
+    fs::write(root.join("other.md"), "- [ ] elsewhere #x
+- [x] finished
+").unwrap();
+    let (mut app, ctx) = app(&root);
+    app.vaults = vec![root.clone()];
+    app.path = Some(note.clone());
+    app.buffer
+        .set_text("- [ ] saved task
+- [ ] typed, not saved
+".into());
+    // A pause after typing: modules see the unsaved text.
+    app.module_idle_at = Some(std::time::Instant::now());
+    let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.poll_modules(ui.ctx()));
+
+    app.command_line = ":flow".into();
+    let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.run_command_line(ui.ctx()));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !app.results.open && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.poll_modules(ui.ctx()));
+    }
+    assert!(app.results.open, "results arrive: {}", app.status);
+    let mut labels: Vec<_> = app.results.items.iter().map(|item| item.label.clone()).collect();
+    labels.sort();
+    assert_eq!(
+        labels,
+        vec!["[ ] elsewhere  #x", "[ ] saved task", "[ ] typed, not saved"]
+    );
+    let typed = app
+        .results
+        .items
+        .iter()
+        .find(|item| item.label.contains("typed"))
+        .unwrap();
+    assert_eq!((typed.path.clone(), typed.line), (note.clone(), Some(1)));
+
+    // Outside a vault Flow does nothing and says where to add one.
+    app.vaults.clear();
+    app.results.open = false;
+    app.command_line = ":flow".into();
+    let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.run_command_line(ui.ctx()));
+    assert!(app.status.contains("Settings"), "{}", app.status);
+    let _ = fs::remove_dir_all(root);
+}
+
 fn app_with_config(root: &Path) -> (SlateApp, egui::Context) {
     app(root)
 }

@@ -8,7 +8,7 @@ use module_api::ResultItem;
 pub(super) struct Results {
     pub(super) open: bool,
     title: String,
-    items: Vec<ResultItem>,
+    pub(super) items: Vec<ResultItem>,
     query: String,
     /// Indices of `items` matching `query`, best first.
     shown: Vec<usize>,

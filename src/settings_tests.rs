@@ -74,7 +74,7 @@ fn settings_bounds_fixed_chrome_and_selection_reveal_at_small_and_large_sizes() 
         assert!(before.frame.contains_rect(before.footer));
         assert!(before.body.top() >= before.header.bottom());
         assert!(before.body.bottom() <= before.footer.top());
-        assert_eq!(before.rows.len(), 21 + footer_ui::FIELDS.len() + 2);
+        assert_eq!(before.rows.len(), app.settings_last_row() + 1);
         assert!(
             before.rows[0].width() >= before.body.width() - 2.0,
             "unused right column: {:?}",
@@ -114,6 +114,8 @@ fn settings_bounds_fixed_chrome_and_selection_reveal_at_small_and_large_sizes() 
 fn wheel_moves_settings_content_but_not_header_or_footer() {
     let ctx = egui::Context::default();
     let mut app = app(&ctx);
+    // The footer tab has enough rows to scroll.
+    app.selected_setting = 8;
     let size = Vec2::new(900.0, 560.0);
     let mut before = SettingsDialogGeometry::default();
     for n in 0..10 {
@@ -140,7 +142,7 @@ fn wheel_moves_settings_content_but_not_header_or_footer() {
     assert_eq!(before.frame, after.frame);
     assert_eq!(before.header, after.header);
     assert_eq!(before.footer, after.footer);
-    assert!(after.rows[0].top() < before.rows[0].top() - 20.0);
+    assert!(after.rows[8].top() < before.rows[8].top() - 20.0);
 }
 #[test]
 fn palette_header_and_footer_stay_fixed_while_commands_scroll() {
@@ -339,4 +341,47 @@ fn settings_the_core_does_not_know_survive_a_save() {
     let saved = fs::read_to_string(&config).unwrap();
     assert_eq!(saved.matches("flow_vaults").count(), 1, "{saved}");
     let _ = fs::remove_dir_all(root);
+}
+#[test]
+fn tab_switches_settings_tabs_and_arrows_stay_inside_one() {
+    let ctx = egui::Context::default();
+    let mut app = app(&ctx);
+    let key = |key, modifiers| egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers,
+    };
+    let mut press = |app: &mut SlateApp, event| {
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![event],
+                ..Default::default()
+            },
+            |ctx| app.shortcuts(ctx),
+        );
+    };
+    let names: Vec<_> = app.settings_tabs().iter().map(|(name, _)| *name).collect();
+    assert_eq!(app.settings_tab(), 0);
+    press(&mut app, key(Key::Tab, egui::Modifiers::NONE));
+    assert_eq!(names[app.settings_tab()], "Editor");
+    assert_eq!(app.selected_setting, 1);
+    press(&mut app, key(Key::ArrowDown, egui::Modifiers::NONE));
+    assert_eq!(app.selected_setting, 3, "next row of the same tab");
+    press(&mut app, key(Key::ArrowUp, egui::Modifiers::NONE));
+    press(&mut app, key(Key::ArrowUp, egui::Modifiers::NONE));
+    assert_eq!(app.selected_setting, 1, "stops at the tab's first row");
+    press(&mut app, key(Key::Tab, egui::Modifiers::SHIFT));
+    press(&mut app, key(Key::Tab, egui::Modifiers::SHIFT));
+    assert_eq!(names[app.settings_tab()], "Modules", "wraps around");
+    // Every row belongs to exactly one tab.
+    let mut rows: Vec<usize> = app.settings_tabs().into_iter().flat_map(|(_, rows)| rows).collect();
+    rows.sort();
+    assert_eq!(rows, (0..=app.settings_last_row()).collect::<Vec<_>>());
+    // Only the current tab is drawn.
+    app.selected_setting = 8;
+    let geometry = draw(&mut app, &ctx, Vec2::new(900.0, 560.0), 0.0, vec![]);
+    assert!(geometry.rows[8].is_positive());
+    assert!(!geometry.rows[0].is_positive());
 }

@@ -131,8 +131,7 @@ impl Module for References {
 
 /// Every line in the vault's notes that links to (or names) `target`.
 fn find(kind: Kind, vault: &Path, target: &Path) -> Vec<ResultItem> {
-    let mut files = Vec::new();
-    collect_notes(vault, &mut files);
+    let (files, _) = crate::vaults::notes(vault, MAX_FILES);
     let target_abs = normalize(target);
     let names = mention_names(target);
     let found = crate::parallel::par_map(&files, |file| {
@@ -161,34 +160,6 @@ fn find(kind: Kind, vault: &Path, target: &Path) -> Vec<ResultItem> {
             .collect::<Vec<_>>()
     });
     found.into_iter().flatten().collect()
-}
-
-fn collect_notes(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if out.len() >= MAX_FILES {
-            return;
-        }
-        let path = entry.path();
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        if kind.is_dir() {
-            let name = entry.file_name();
-            if !crate::file_dialogs::default_should_skip_dir(&name.to_string_lossy()) {
-                collect_notes(&path, out);
-            }
-        } else if kind.is_file()
-            && path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "md" | "markdown"))
-        {
-            out.push(path);
-        }
-    }
 }
 
 fn normalize(path: &Path) -> String {
