@@ -119,6 +119,16 @@ pub(crate) fn cursor() -> Option<(f32, f32)> {
     win::cursor()
 }
 
+/// Whether the primary mouse button is down, asked of the system: a window
+/// that lost the mouse mid-drag never hears it go up. None in tests and
+/// where unknown.
+pub(crate) fn button_down() -> Option<bool> {
+    if cfg!(test) {
+        return None;
+    }
+    win::button_down()
+}
+
 /// Moves the top-level window of `process_id` so its top-left is `cursor`
 /// minus `grab` (physical pixels; `grab` is in points of that window).
 /// Returns false while that window cannot be found yet.
@@ -175,6 +185,8 @@ mod win {
             flags: u32,
         ) -> i32;
         fn SetForegroundWindow(hwnd: Hwnd) -> i32;
+        fn GetAsyncKeyState(key: i32) -> i16;
+        fn GetSystemMetrics(index: i32) -> i32;
     }
     #[link(name = "dwmapi")]
     unsafe extern "system" {
@@ -182,14 +194,31 @@ mod win {
     }
 
     const GW_HWNDNEXT: u32 = 2;
+    const GW_OWNER: u32 = 4;
     const GWL_EXSTYLE: i32 = -20;
     const WS_EX_TRANSPARENT: isize = 0x20;
     const DWMWA_CLOAKED: u32 = 14;
+    const VK_LBUTTON: i32 = 0x01;
+    const VK_RBUTTON: i32 = 0x02;
+    const SM_SWAPBUTTON: i32 = 23;
 
     pub(super) fn cursor() -> Option<(f32, f32)> {
         let mut point = Point::default();
         // SAFETY: `point` is a local out-parameter.
         (unsafe { GetCursorPos(&mut point) } != 0).then_some((point.x as f32, point.y as f32))
+    }
+
+    pub(super) fn button_down() -> Option<bool> {
+        // SAFETY: plain queries. The key state is the physical button, so a
+        // left-handed (swapped) mouse's primary button is the right one.
+        unsafe {
+            let key = if GetSystemMetrics(SM_SWAPBUTTON) != 0 {
+                VK_RBUTTON
+            } else {
+                VK_LBUTTON
+            };
+            Some(GetAsyncKeyState(key) as u16 & 0x8000 != 0)
+        }
     }
 
     fn process_of(hwnd: Hwnd) -> u32 {
@@ -250,11 +279,15 @@ mod win {
         })
     }
 
-    /// The titled top-level window of `process_id` (shown or not).
+    /// The main window of `process_id` (shown or not): titled and owned by
+    /// no other window. The system adds owned, titled helper windows to a
+    /// process (input method, touch tooltip), sometimes above the main one.
     fn window_of(process_id: u32) -> Option<Hwnd> {
-        // SAFETY: plain query.
-        windows().find(|hwnd| {
-            process_of(*hwnd) == process_id && unsafe { GetWindowTextLengthW(*hwnd) } > 0
+        // SAFETY: plain queries.
+        windows().find(|hwnd| unsafe {
+            process_of(*hwnd) == process_id
+                && GetWindow(*hwnd, GW_OWNER).is_null()
+                && GetWindowTextLengthW(*hwnd) > 0
         })
     }
 
@@ -294,6 +327,9 @@ mod win {
 #[cfg(not(windows))]
 mod win {
     pub(super) fn cursor() -> Option<(f32, f32)> {
+        None
+    }
+    pub(super) fn button_down() -> Option<bool> {
         None
     }
     pub(super) fn window_at(_point: (f32, f32), _skip: &[u32]) -> Option<u32> {

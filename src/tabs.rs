@@ -485,6 +485,7 @@ impl SlateApp {
         if let Some(target) = tab_drop::target_under_cursor(&[std::process::id()])
             && tab_drop::send(&target, moved.clone())
         {
+            perf_log::mark("tab.detach", &format!("joined={}", target.process_id));
             self.tab_moved_away(index);
             tab_drop::focus_window(target.process_id);
             self.status = format!("Moved {label} to the other window");
@@ -528,6 +529,7 @@ impl SlateApp {
         };
         match spawned {
             Ok(_) => {
+                perf_log::mark("tab.detach", &format!("new_window spare={claimed}"));
                 #[cfg(test)]
                 let launched = self.status.clone();
                 self.tab_moved_away(index);
@@ -571,6 +573,7 @@ impl SlateApp {
         };
         match spare::claim(&request) {
             Some(process_id) => {
+                perf_log::mark("tab.torn_off", &format!("window={process_id}"));
                 self.tab_moved_away(index);
                 self.torn_tab = Some(TornTab {
                     process_id,
@@ -594,7 +597,10 @@ impl SlateApp {
         if let Some(torn) = &self.torn_tab {
             let (process_id, label) = (torn.process_id, torn.label.clone());
             let target = tab_drop::target_under_cursor(&[process_id]);
-            if ctx.input(|i| i.pointer.primary_down()) {
+            // The system knows the button even if this window lost the mouse.
+            let down = tab_drop::button_down()
+                .unwrap_or_else(|| ctx.input(|i| i.pointer.primary_down()));
+            if down {
                 if let Some(cursor) = tab_drop::cursor() {
                     tab_drop::move_window(process_id, cursor, TORN_GRAB);
                 }
@@ -606,9 +612,13 @@ impl SlateApp {
             self.torn_tab = None;
             match target {
                 Some(target) if tab_drop::send_on(process_id, &target) => {
+                    perf_log::mark("tab.torn_drop", &format!("joined={}", target.process_id));
                     tab_drop::focus_window(target.process_id);
                 }
-                _ => tab_drop::focus_window(process_id),
+                _ => {
+                    perf_log::mark("tab.torn_drop", "joined=none");
+                    tab_drop::focus_window(process_id);
+                }
             }
             return;
         }
@@ -674,6 +684,7 @@ impl SlateApp {
         ctx: &egui::Context,
     ) {
         self.finish_background_save();
+        perf_log::mark("tab.received", "");
         let slot = request
             .tab_at
             .map_or(self.tabs.list.len(), |at| window_ui::tab_slot_at(ctx, at));

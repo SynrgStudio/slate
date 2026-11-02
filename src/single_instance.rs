@@ -68,8 +68,12 @@ pub(crate) fn spare_file() -> Option<PathBuf> {
 /// running instance acknowledged it.
 pub(crate) fn forward(instance_file: &Path, request: &OpenRequest) -> bool {
     // The running (possibly hidden) window is about to show itself; let it take
-    // the foreground that this freshly launched process owns.
-    crate::resident::allow_foreground_handoff();
+    // the foreground that this freshly launched process owns. Not while a tab
+    // is being dragged: a window taking the foreground then takes the mouse
+    // from the window doing the drag, which never hears the button go up.
+    if request.hover.is_none() && !request.follow && request.send_to.is_none() {
+        crate::resident::allow_foreground_handoff();
+    }
     send(instance_file, |token| encode_request(token, request))
 }
 

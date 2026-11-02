@@ -423,9 +423,12 @@ fn draw_tabs(
         let slot_x = rect.left() - strip.left() + offset;
         let drawn_id = id.with("drawn_x");
         let grab_id = id.with("grab");
+        let dropped_id = id.with("dropped");
         if response.drag_started() {
-            ui.ctx()
-                .data_mut(|d| d.insert_temp(id.with("tear_off_tried"), false));
+            ui.ctx().data_mut(|d| {
+                d.insert_temp(id.with("tear_off_tried"), false);
+                d.insert_temp(dropped_id, false);
+            });
         }
         if response.drag_started()
             && let Some(pos) = ui.input(|i| i.pointer.press_origin())
@@ -440,11 +443,17 @@ fn draw_tabs(
         let mut drawn: f32 = ui.ctx().data(|d| d.get_temp(drawn_id)).unwrap_or(slot_x);
         let mut pulled_off = false;
         let mut detach_ready = false;
+        let mut released_unheard = false;
         match latest.filter(|_| dragging) {
             Some(pos) => {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                 pulled_off = pos.y > bar.bottom() + LIFT_DISTANCE || !screen.contains(pos);
                 detach_ready = !screen.expand(4.0).contains(pos);
+                // Released over another window, which got the mouse: this
+                // window never hears it, but the system knows.
+                released_unheard = detach_ready
+                    && crate::tab_drop::button_down() == Some(false)
+                    && !ui.ctx().data(|d| d.get_temp::<bool>(dropped_id)).unwrap_or(false);
                 let carried = (pos.x - grab.x).clamp(
                     strip.left(),
                     (strip.right() - rect.width()).max(strip.left()),
@@ -481,7 +490,7 @@ fn draw_tabs(
             ));
             let joins_window = detach_ready
                 && crate::tab_drop::target_under_cursor(&[std::process::id()]).is_some();
-            if detach_ready {
+            if detach_ready && !released_unheard {
                 dragged_out = Some(tab.text.clone());
                 // Out of the window and not over another one: become a
                 // window that follows the cursor (asked once per drag).
@@ -608,10 +617,15 @@ fn draw_tabs(
             painter.line_segment([c + Vec2::new(-3.5, -3.5), c + Vec2::new(3.5, 3.5)], stroke);
             painter.line_segment([c + Vec2::new(-3.5, 3.5), c + Vec2::new(3.5, -3.5)], stroke);
         }
-        if response.drag_stopped() {
-            // Dropped outside the window: move the tab to a new window.
+        if response.drag_stopped() || released_unheard {
+            // Dropped outside the window: move the tab to a new window (once:
+            // a release this window did not hear may be heard later).
             let screen = ui.ctx().content_rect();
-            if let Some(pos) = ui.input(|i| i.pointer.latest_pos())
+            let dropped = ui
+                .ctx()
+                .data_mut(|d| std::mem::replace(d.get_temp_mut_or(dropped_id, false), true));
+            if !dropped
+                && let Some(pos) = ui.input(|i| i.pointer.latest_pos())
                 && !screen.expand(4.0).contains(pos)
             {
                 let origin = ui

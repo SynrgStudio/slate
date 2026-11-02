@@ -1234,12 +1234,11 @@ impl SlateApp {
                 self.receive_tab(request, ctx);
             }
         }
-        // A drag that went away without saying so.
-        if self
-            .tab_drop_hover
-            .as_ref()
-            .is_some_and(|(_, _, at)| at.elapsed() > std::time::Duration::from_millis(600))
-        {
+        // A drag that went away without saying so, or is over: the button is up.
+        let released = tab_drop::button_down() == Some(false);
+        if self.tab_drop_hover.as_ref().is_some_and(|(_, _, at)| {
+            released || at.elapsed() > std::time::Duration::from_millis(600)
+        }) {
             self.tab_drop_hover = None;
         }
         let shown = self
