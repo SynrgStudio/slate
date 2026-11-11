@@ -93,6 +93,51 @@ impl SlateApp {
             }
         }
     }
+    /// Reloads the open file as one more step of its undo history: the text
+    /// before it stays one Ctrl+Z away (and in `:undo`).
+    pub(super) fn reload_main_from_disk(&mut self) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        self.finish_background_save();
+        let text = match std::fs::read(&path).map(String::from_utf8) {
+            Ok(Ok(text)) => text,
+            Ok(Err(_)) => {
+                self.status = format!("Reload failed: {} is not UTF-8 text", path.display());
+                return;
+            }
+            Err(error) => {
+                self.status = format!("Reload failed: {error}");
+                return;
+            }
+        };
+        let had_unsaved = self.dirty;
+        let changed = self
+            .buffer
+            .replace_text_as(&text, crate::history::Kind::External, None);
+        self.buffer.mark_saved();
+        self.disk_base = Some(crate::safe_file::fingerprint(text.as_bytes()));
+        self.file_conflict = None;
+        self.dirty = false;
+        self.clear_recovery(Slot::Main);
+        self.search_state = None;
+        self.editor_view.request_scroll_to_cursor(&self.buffer);
+        if changed {
+            self.notify_modules_edited();
+        }
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.status = match (changed, had_unsaved) {
+            (false, _) => format!("{name} already matches the file on disk"),
+            (true, true) => {
+                format!("Reloaded {name} from disk · Ctrl+Z brings back your unsaved text")
+            }
+            (true, false) => format!("Reloaded {name} from disk · Ctrl+Z undoes the reload"),
+        };
+    }
+
     pub(super) fn restore_selected_recovery(&mut self) {
         if self.dirty || self.link_preview_dirty || !self.scratch_buffer.as_str().is_empty() {
             self.status = "Save current buffers before restoring another draft".into();
@@ -281,13 +326,9 @@ impl SlateApp {
                     self.file_conflict = None;
                     self.save_as();
                 } else {
-                    self.file_conflict = None;
-                    if self.dirty {
-                        self.pending_project_file_path = Some(path);
-                        self.confirm(PendingAction::OpenProjectFile);
-                    } else {
-                        self.open_path(path);
-                    }
+                    // Unsaved text is not lost: the reload is one more step
+                    // of the history, and Ctrl+Z goes back to it.
+                    self.reload_main_from_disk();
                 }
             } else if self.link_preview_dirty {
                 self.status = "Save a modal copy before reloading".into();

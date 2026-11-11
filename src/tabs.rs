@@ -186,7 +186,7 @@ pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
     a == b || normalize(a) == normalize(b)
 }
 
-fn file_label(path: Option<&Path>) -> String {
+pub(super) fn file_label(path: Option<&Path>) -> String {
     path.and_then(|p| p.file_name())
         .and_then(|name| name.to_str())
         .unwrap_or("untitled")
@@ -412,9 +412,8 @@ impl SlateApp {
             Ok(base) => {
                 doc.disk_base = Some(*base);
                 doc.file_conflict = None;
-                if doc.buffer.revision == pending.revision {
-                    doc.dirty = false;
-                }
+                doc.buffer.mark_saved_at(pending.node);
+                doc.dirty = !doc.buffer.at_saved_state();
                 self.remember_recent_file(pending.path.clone());
                 let _ = self.save_settings();
                 self.status = format!("Saved {}", pending.path.display());
@@ -781,6 +780,10 @@ impl SlateApp {
         let cursor = handoff.cursor.min(handoff.text.len());
         self.buffer.set_text(handoff.text);
         self.buffer.set_cursor(cursor);
+        if !handoff.dirty {
+            // The text is the file's: undoing back to it leaves nothing unsaved.
+            self.buffer.mark_saved();
+        }
         self.path = handoff.path;
         self.disk_base = handoff.disk_base;
         self.dirty = handoff.dirty;

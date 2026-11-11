@@ -10,12 +10,18 @@ mod async_open_tests;
 mod bug_fix_tests;
 #[cfg(test)]
 mod module_tests;
+#[cfg(test)]
+mod undo_history_tests;
+#[cfg(all(test, feature = "wgpu"))]
+mod screenshot_tests;
 mod commands;
 #[cfg(test)]
 mod dialog_tests;
 mod dialog_ui;
 mod document_safety;
 mod editor_buffer;
+mod history;
+mod line_diff;
 #[cfg(test)]
 mod editor_look_tests;
 mod editor_view;
@@ -68,6 +74,8 @@ mod module_api;
 #[allow(dead_code)]
 mod modules;
 mod results_ui;
+mod undo_ui;
+mod vaults_ui;
 mod vaults;
 use markdown_files::{append_markdown_block, append_markdown_block_to_heading};
 mod parallel;
@@ -223,7 +231,8 @@ fn low_latency_wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
 struct PendingSave {
     path: PathBuf,
     identity: u64,
-    revision: u64,
+    /// The history state being written: it becomes the saved one.
+    node: u64,
     project: Option<PathBuf>,
     result: std::sync::mpsc::Receiver<Result<safe_file::Fingerprint, safe_file::SaveError>>,
     started: std::time::Instant,
@@ -637,8 +646,8 @@ impl PendingAction {
 }
 
 struct DuplicatePlacement {
-    snapshot: String,
-    was_dirty: bool,
+    /// The history state before the duplicate: Esc goes back to it.
+    start: u64,
 }
 
 #[derive(Clone)]
@@ -743,6 +752,9 @@ struct SlateApp {
     module_idle_at: Option<std::time::Instant>,
     /// Result list shown for a module.
     results: results_ui::Results,
+    /// `:vaults`.
+    vaults_dialog: vaults_ui::VaultsDialog,
+    undo_dialog: undo_ui::UndoDialog,
     /// Note folders (Settings → Modules & vaults).
     vaults: Vec<PathBuf>,
     spare_owner: Option<u32>,
@@ -853,6 +865,18 @@ struct SlateApp {
     save_as_open: bool,
     save_as_dir: PathBuf,
     save_as_filename: String,
+    /// The name Save As started with (the document's, or untitled.md).
+    save_as_default_name: String,
+    /// The name field was typed in this folder: it filters the list.
+    save_as_edited: bool,
+    /// A folder or file was chosen on purpose (arrows, click, typing that
+    /// found it): Enter acts on it instead of saving here.
+    save_as_armed: bool,
+    /// The name is shown selected: the first key typed replaces it.
+    save_as_name_fresh: bool,
+    /// Asking before Save As replaces this existing file (as it was when
+    /// asked: if it changes meanwhile the save is still refused).
+    save_as_overwrite: Option<(PathBuf, Option<safe_file::Fingerprint>)>,
     save_as_entries: Vec<PathBuf>,
     selected_save_as_entry: usize,
     scratch_modal_open: bool,
@@ -972,6 +996,8 @@ impl SlateApp {
             module_seen: std::collections::HashMap::new(),
             module_idle_at: None,
             results: results_ui::Results::default(),
+            vaults_dialog: vaults_ui::VaultsDialog::default(),
+            undo_dialog: undo_ui::UndoDialog::default(),
             vaults: Vec::new(),
             spare_owner: None,
             tab_drop_server: None,
@@ -1074,6 +1100,11 @@ impl SlateApp {
             save_as_open: false,
             save_as_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             save_as_filename: String::new(),
+            save_as_default_name: String::new(),
+            save_as_edited: false,
+            save_as_armed: false,
+            save_as_name_fresh: false,
+            save_as_overwrite: None,
             save_as_entries: Vec::new(),
             selected_save_as_entry: 0,
             scratch_modal_open: false,
@@ -2756,14 +2787,19 @@ impl SlateApp {
     }
 
     fn save_path(&mut self, path: PathBuf) {
-        // Never two writers on a file: a background save lands first.
-        self.finish_background_save();
-        let project = self.document_project();
         let expected = if self.path.as_ref() == Some(&path) {
             self.disk_base
         } else {
             None
         };
+        self.save_path_expecting(path, expected);
+    }
+
+    /// Saves to `path` if it is still as `expected` (None: it must not exist).
+    fn save_path_expecting(&mut self, path: PathBuf, expected: Option<safe_file::Fingerprint>) {
+        // Never two writers on a file: a background save lands first.
+        self.finish_background_save();
+        let project = self.document_project();
         let result = safe_file::checked_save(&path, self.buffer.as_str().as_bytes(), expected);
         self.apply_save_result(path, project, result);
     }
@@ -2798,7 +2834,7 @@ impl SlateApp {
         self.pending_save = Some(PendingSave {
             path,
             identity: self.buffer.identity,
-            revision: self.buffer.revision,
+            node: self.buffer.history_position(),
             project,
             result,
             started: std::time::Instant::now(),
@@ -2854,14 +2890,16 @@ impl SlateApp {
             ),
         );
         if self.buffer.identity == pending.identity && self.path.as_ref() == Some(&pending.path) {
-            let typed_since = self.buffer.revision != pending.revision;
             let saved = result.is_ok();
             self.apply_save_result(pending.path, pending.project, result);
-            if saved && typed_since {
+            if saved {
                 // Saved what was there at Ctrl+S; newer typing stays unsaved
                 // and gets its recovery checkpoint right away.
-                self.dirty = true;
-                self.observe_document_safety(0.0, true);
+                self.buffer.mark_saved_at(pending.node);
+                if !self.buffer.at_saved_state() {
+                    self.dirty = true;
+                    self.observe_document_safety(0.0, true);
+                }
             }
             return;
         }
@@ -2886,6 +2924,7 @@ impl SlateApp {
                 self.path = Some(path.clone());
                 self.last_open_dir = path.parent().map(PathBuf::from);
                 self.dirty = false;
+                self.buffer.mark_saved();
                 self.remember_recent_file(path.clone());
                 self.adopt_tab_alias(&path);
                 let _ = self.save_settings();
@@ -3687,6 +3726,11 @@ impl SlateApp {
             .and_then(|name| name.to_str())
             .unwrap_or("untitled.md")
             .to_string();
+        self.save_as_default_name = self.save_as_filename.clone();
+        self.save_as_overwrite = None;
+        self.save_as_edited = false;
+        self.save_as_armed = false;
+        self.save_as_name_fresh = true;
         self.save_as_entries = file_dialogs::scan_directory_entries(
             &self.save_as_dir,
             file_dialogs::default_should_skip_dir,
@@ -3698,7 +3742,46 @@ impl SlateApp {
     }
 
     fn save_as_entry_indices(&self) -> Vec<usize> {
-        file_dialogs::named_entry_indices(&self.save_as_entries, &self.save_as_filename)
+        let filter = if self.save_as_edited {
+            self.save_as_filename.as_str()
+        } else {
+            ""
+        };
+        file_dialogs::named_entry_indices(&self.save_as_entries, filter)
+    }
+
+    /// Shows folder `dir`. The name to save is kept; text typed only to find
+    /// a folder goes back to the name it replaced.
+    fn save_as_show_dir(&mut self, dir: PathBuf) {
+        if self.save_as_edited {
+            self.save_as_filename = self.save_as_default_name.clone();
+        }
+        self.save_as_edited = false;
+        self.save_as_armed = false;
+        self.save_as_name_fresh = true;
+        self.save_as_dir = dir;
+        self.refresh_save_as_entries();
+    }
+
+    /// Typing or deleting in the name field.
+    fn save_as_name_changed(&mut self) {
+        self.save_as_name_fresh = false;
+        // A search deleted away gives the name back.
+        if self.save_as_filename.is_empty() {
+            self.save_as_filename = self.save_as_default_name.clone();
+            self.save_as_edited = false;
+            self.save_as_armed = false;
+            self.save_as_name_fresh = true;
+            self.selected_save_as_entry = self.save_as_entry_indices().first().copied().unwrap_or(0);
+            return;
+        }
+        self.save_as_edited = true;
+        let first = self.save_as_entry_indices().first().copied();
+        self.selected_save_as_entry = first.unwrap_or(0);
+        // A name with an extension is a file to save, not a search.
+        self.save_as_armed = first.is_some()
+            && !self.save_as_filename.trim().is_empty()
+            && !self.save_as_filename.contains('.');
     }
 
     fn refresh_save_as_entries(&mut self) {
@@ -3714,6 +3797,7 @@ impl SlateApp {
         let indices = self.save_as_entry_indices();
         self.selected_save_as_entry =
             file_dialogs::move_selected_index(&indices, self.selected_save_as_entry, delta);
+        self.save_as_armed = !indices.is_empty();
     }
 
     fn save_as_enter_selected_dir(&mut self) {
@@ -3725,9 +3809,7 @@ impl SlateApp {
             return;
         };
         if path.is_dir() {
-            self.save_as_dir = path;
-            self.save_as_filename.clear();
-            self.refresh_save_as_entries();
+            self.save_as_show_dir(path);
         }
     }
 
@@ -3736,9 +3818,7 @@ impl SlateApp {
             return;
         };
         if let Some(parent) = self.save_as_dir.parent().map(PathBuf::from) {
-            self.save_as_dir = parent;
-            self.save_as_filename.clear();
-            self.refresh_save_as_entries();
+            self.save_as_show_dir(parent);
             if let Some(index) = self
                 .save_as_entries
                 .iter()
@@ -3749,31 +3829,57 @@ impl SlateApp {
         }
     }
 
-    fn confirm_save_as(&mut self) {
-        let filename = self.save_as_filename.trim();
-        let path = if filename.is_empty() {
-            let Some(selected) = self
-                .save_as_entries
-                .get(self.selected_save_as_entry)
-                .cloned()
-            else {
-                self.status = "Save as needs a file name".to_string();
-                return;
-            };
-            if selected.is_dir() {
-                self.save_as_dir = selected;
-                self.refresh_save_as_entries();
-                return;
-            }
-            selected
-        } else {
-            let input = PathBuf::from(filename);
-            if input.is_absolute() {
-                input
-            } else {
-                self.save_as_dir.join(input)
-            }
+    /// The answer to "replace the existing file?".
+    fn answer_save_as_overwrite(&mut self, replace: bool) {
+        let Some((path, base)) = self.save_as_overwrite.take() else {
+            return;
         };
+        if !replace {
+            self.status = format!("Kept {}", path.display());
+            return;
+        }
+        self.save_as_open = false;
+        self.save_path_expecting(path, base);
+        self.focus_editor_once = true;
+    }
+
+    /// Enter: into the folder chosen on purpose; otherwise save the name
+    /// in the folder shown.
+    fn confirm_save_as(&mut self) {
+        let chosen = self
+            .save_as_armed
+            .then(|| self.save_as_entries.get(self.selected_save_as_entry).cloned())
+            .flatten()
+            .filter(|_| self.save_as_entry_indices().contains(&self.selected_save_as_entry));
+        if let Some(folder) = chosen.as_ref().filter(|path| path.is_dir()) {
+            self.save_as_show_dir(folder.clone());
+            return;
+        }
+        let filename = self.save_as_filename.trim();
+        if filename.is_empty() {
+            self.status = "Save as: type a file name".to_string();
+            return;
+        }
+        let input = PathBuf::from(filename);
+        let path = if input.is_absolute() {
+            input
+        } else {
+            self.save_as_dir.join(input)
+        };
+        if path.is_dir() {
+            self.status = format!("{} is a folder", path.display());
+            return;
+        }
+        // Another existing file: ask before replacing it.
+        let own_file = self
+            .path
+            .as_deref()
+            .is_some_and(|current| tabs::same_file(current, &path));
+        if path.exists() && !own_file {
+            let base = safe_file::disk_fingerprint(&path).ok().flatten();
+            self.save_as_overwrite = Some((path, base));
+            return;
+        }
         self.save_as_open = false;
         self.save_path(path);
         self.focus_editor_once = true;
@@ -4507,6 +4613,8 @@ impl SlateApp {
             Command::LineNumbersAbsolute => self.set_line_number_mode(LineNumberMode::Absolute),
             Command::LineNumbersRelative => self.set_line_number_mode(LineNumberMode::Relative),
             Command::PerfHud => self.perf_hud.toggle(),
+            Command::Vaults => self.open_vaults_dialog(),
+            Command::UndoHistory => self.open_undo_dialog(),
             Command::Settings => {
                 self.settings_open = true;
                 self.selected_setting = 0;
@@ -4837,13 +4945,9 @@ impl SlateApp {
     }
 
     fn start_duplicate_placement(&mut self) {
-        let snapshot = self.buffer.as_str().to_string();
-        let was_dirty = self.dirty;
+        let start = self.buffer.history_position();
         if self.buffer.duplicate_current_line() {
-            self.duplicate_placement = Some(DuplicatePlacement {
-                snapshot,
-                was_dirty,
-            });
+            self.duplicate_placement = Some(DuplicatePlacement { start });
             self.dirty = true;
             self.search_state = None;
             self.editor_view.request_scroll_to_cursor(&self.buffer);
@@ -4863,8 +4967,9 @@ impl SlateApp {
 
     fn cancel_duplicate_placement(&mut self) {
         if let Some(placement) = self.duplicate_placement.take() {
-            self.buffer.set_text(placement.snapshot);
-            self.dirty = placement.was_dirty;
+            // Back to before the duplicate; the rest of the history stays.
+            self.buffer.jump_to(placement.start);
+            self.dirty = !self.buffer.at_saved_state();
             self.search_state = None;
             self.editor_view.request_scroll_to_cursor(&self.buffer);
             self.status = "Duplicate placement cancelled".to_string();
@@ -5665,7 +5770,9 @@ impl SlateApp {
 
         if undo {
             if self.buffer.undo() {
-                self.dirty = true;
+                // Back at the saved text: nothing unsaved any more.
+                self.dirty = !self.buffer.at_saved_state();
+                self.notify_modules_edited();
                 self.editor_view.request_scroll_to_cursor(&self.buffer);
                 self.status = "Undo".to_string();
             } else {
@@ -5678,7 +5785,8 @@ impl SlateApp {
 
         if redo {
             if self.buffer.redo() {
-                self.dirty = true;
+                self.dirty = !self.buffer.at_saved_state();
+                self.notify_modules_edited();
                 self.editor_view.request_scroll_to_cursor(&self.buffer);
                 self.status = "Redo".to_string();
             } else {
@@ -6443,8 +6551,11 @@ impl SlateApp {
         if text.chars().any(|ch| ch.is_control()) {
             return;
         }
+        if self.save_as_name_fresh {
+            self.save_as_filename.clear();
+        }
         self.save_as_filename.push_str(&text);
-        self.selected_save_as_entry = self.save_as_entry_indices().first().copied().unwrap_or(0);
+        self.save_as_name_changed();
     }
 
     fn handle_command_line_text_input(&mut self, ctx: &egui::Context) {
@@ -7729,6 +7840,7 @@ impl SlateApp {
                     && !self.scratch_entries_open
                     && !self.capture_modal_open
                     && !self.shortcut_help_open
+                    && !self.undo_dialog.open
                     && self.search_state.is_none();
                 let active_line_text_highlight = self
                     .duplicate_placement
@@ -8325,6 +8437,8 @@ impl SlateApp {
         self.capture_dialog(&ctx);
         self.scratch_entries_dialog(&ctx);
         self.results_dialog(&ctx);
+        self.vaults_dialog(&ctx);
+        self.undo_dialog(&ctx);
         self.scratch_feedback_toast(&ctx);
         self.observe_document_safety(ctx.input(|i| i.time), false);
     }

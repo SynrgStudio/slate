@@ -1,21 +1,4 @@
-/// One reversible text change: `removed` was replaced by `inserted` at `start`.
-/// The cursor/selection are the state to restore when this entry is applied
-/// (pre-edit state on the undo stack, post-edit state on the redo stack).
-struct UndoEntry {
-    start: usize,
-    removed: String,
-    inserted: String,
-    cursor: usize,
-    selection: Option<(usize, usize)>,
-    typing: bool,
-    recorded_at: std::time::Instant,
-}
-
-impl UndoEntry {
-    fn heap_bytes(&self) -> usize {
-        self.removed.len() + self.inserted.len()
-    }
-}
+use crate::history::{GapText, History, Kind};
 
 struct LayoutChange {
     before: u64,
@@ -24,10 +7,11 @@ struct LayoutChange {
     suffix_lines: usize,
 }
 
-const MAX_UNDO_ENTRIES: usize = 10_000;
-const MAX_UNDO_BYTES: usize = 64 * 1024 * 1024;
 const TYPING_GROUP_PAUSE: std::time::Duration = std::time::Duration::from_millis(1000);
 const TYPING_GROUP_MAX_BYTES: usize = 256;
+/// Jumps longer than this rebuild the target text once and change the
+/// buffer in one splice, instead of one splice per step.
+const DIRECT_STEPS: usize = 16;
 
 static NEXT_BUFFER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -38,9 +22,7 @@ pub(crate) struct EditorBuffer {
     layout_changes: std::collections::VecDeque<LayoutChange>,
     cursor: usize,
     selection: Option<(usize, usize)>,
-    undo_stack: std::collections::VecDeque<UndoEntry>,
-    redo_stack: Vec<UndoEntry>,
-    undo_bytes: usize,
+    history: History,
     typing_revision: Option<u64>,
     pub(crate) revision: u64,
 }
@@ -50,6 +32,8 @@ impl EditorBuffer {
         Self::from_text(String::new())
     }
 
+    /// A buffer whose text is what its file holds (or empty): its starting
+    /// state counts as saved.
     pub(crate) fn from_text(text: String) -> Self {
         let mut buffer = Self {
             identity: NEXT_BUFFER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -58,9 +42,7 @@ impl EditorBuffer {
             layout_changes: std::collections::VecDeque::new(),
             cursor: 0,
             selection: None,
-            undo_stack: std::collections::VecDeque::new(),
-            redo_stack: Vec::new(),
-            undo_bytes: 0,
+            history: History::new(true),
             typing_revision: None,
             revision: 0,
         };
@@ -72,68 +54,90 @@ impl EditorBuffer {
         &self.text
     }
 
-    /// Bytes held by undo/redo history (deltas only, never whole-document copies).
+    /// Bytes held by the undo history (changes only, never whole documents).
     #[allow(dead_code)]
     pub(crate) fn undo_history_bytes(&self) -> usize {
-        self.undo_bytes
-            + self
-                .redo_stack
-                .iter()
-                .map(UndoEntry::heap_bytes)
-                .sum::<usize>()
+        self.history.bytes()
     }
 
-    fn push_undo(&mut self, entry: UndoEntry) {
-        self.undo_bytes += entry.heap_bytes();
-        self.undo_stack.push_back(entry);
-        while self.undo_stack.len() > MAX_UNDO_ENTRIES
-            || (self.undo_bytes > MAX_UNDO_BYTES && self.undo_stack.len() > 1)
-        {
-            if let Some(dropped) = self.undo_stack.pop_front() {
-                self.undo_bytes -= dropped.heap_bytes();
-            }
-        }
+    pub(crate) fn history(&self) -> &History {
+        &self.history
     }
 
-    fn pop_undo(&mut self) -> Option<UndoEntry> {
-        let entry = self.undo_stack.pop_back()?;
-        self.undo_bytes -= entry.heap_bytes();
-        Some(entry)
+    /// The text is exactly what was last saved (or opened).
+    pub(crate) fn at_saved_state(&self) -> bool {
+        self.history.at_saved()
     }
 
-    fn clear_history(&mut self) {
-        self.undo_stack.clear();
-        self.redo_stack.clear();
-        self.undo_bytes = 0;
+    /// The text now is on disk. Typing after this starts a new step, so the
+    /// saved state stays exactly what was written.
+    pub(crate) fn mark_saved(&mut self) {
+        self.history.mark_saved();
         self.typing_revision = None;
+    }
+
+    /// A save of state `seq` (see [`Self::history_position`]) landed.
+    pub(crate) fn mark_saved_at(&mut self, seq: u64) {
+        self.history.mark_saved_seq(seq);
+    }
+
+    /// The current state, to mark it saved once a background write lands.
+    /// Typing after this starts a new step.
+    pub(crate) fn history_position(&mut self) -> u64 {
+        self.typing_revision = None;
+        self.history.current_seq()
     }
 
     /// Replaces `start..end` with `replacement`, records one undo delta and keeps
     /// the line index/layout tracking incremental. Cursor placement is the caller's job.
     fn edit(&mut self, start: usize, end: usize, replacement: &str) {
-        let entry = UndoEntry {
+        self.edit_as(start, end, replacement, Kind::Edit);
+    }
+
+    fn edit_as(&mut self, start: usize, end: usize, replacement: &str, kind: Kind) {
+        self.history.push(
             start,
-            removed: self.text[start..end].to_string(),
-            inserted: replacement.to_string(),
-            cursor: self.cursor,
-            selection: self.selection,
-            typing: false,
-            recorded_at: std::time::Instant::now(),
-        };
-        self.push_undo(entry);
-        self.redo_stack.clear();
+            self.text[start..end].to_string(),
+            replacement.to_string(),
+            self.cursor,
+            self.selection,
+            kind,
+        );
         self.typing_revision = None;
         self.splice_text(start, end, replacement);
     }
 
     /// Like [`Self::edit`] but derives the smallest changed range from a full new text.
     fn edit_to(&mut self, new_text: String) {
+        self.edit_to_as(&new_text, Kind::Edit);
+    }
+
+    fn edit_to_as(&mut self, new_text: &str, kind: Kind) -> bool {
         if new_text == self.text {
-            return;
+            return false;
         }
-        let (start, old_end) = Self::changed_old_byte_range(&self.text, &new_text);
+        let (start, old_end) = Self::changed_old_byte_range(&self.text, new_text);
         let new_end = new_text.len() - (self.text.len() - old_end);
-        self.edit(start, old_end, &new_text[start..new_end]);
+        self.edit_as(start, old_end, &new_text[start..new_end], kind);
+        true
+    }
+
+    /// Makes the whole text `new_text` as one undoable step of `kind` (a
+    /// reload from disk, lines brought back from the history). The cursor
+    /// goes to `cursor`, or stays where it was.
+    pub(crate) fn replace_text_as(
+        &mut self,
+        new_text: &str,
+        kind: Kind,
+        cursor: Option<usize>,
+    ) -> bool {
+        let previous = self.cursor;
+        if !self.edit_to_as(new_text, kind) {
+            return false;
+        }
+        self.selection = None;
+        self.cursor = self.clamp_to_char_boundary(cursor.unwrap_or(previous));
+        true
     }
 
     fn splice_text(&mut self, start: usize, end: usize, replacement: &str) {
@@ -170,39 +174,88 @@ impl EditorBuffer {
         });
     }
 
-    pub(crate) fn undo(&mut self) -> bool {
-        let Some(mut entry) = self.pop_undo() else {
+    /// Undoes history node `index` on the text (node state → parent state).
+    fn unapply(&mut self, index: u32) {
+        let i = index as usize;
+        let start = self.history.nodes[i].start;
+        let end = start + self.history.nodes[i].inserted.len();
+        let removed = std::mem::take(&mut self.history.nodes[i].removed);
+        self.splice_text(start, end, &removed);
+        self.history.nodes[i].removed = removed;
+    }
+
+    /// Redoes history node `index` on the text (parent state → node state).
+    fn apply(&mut self, index: u32) {
+        let i = index as usize;
+        let start = self.history.nodes[i].start;
+        let end = start + self.history.nodes[i].removed.len();
+        let inserted = std::mem::take(&mut self.history.nodes[i].inserted);
+        self.splice_text(start, end, &inserted);
+        self.history.nodes[i].inserted = inserted;
+    }
+
+    /// Goes to history state `target`: undoing up to the state both share and
+    /// redoing down the other branch. Redo then follows the branch taken.
+    fn go_to(&mut self, target: u32) -> bool {
+        let from = self.history.current;
+        if target == from {
             return false;
-        };
-        let (cursor, selection) = (self.cursor, self.selection);
-        let end = entry.start + entry.inserted.len();
-        let removed = std::mem::take(&mut entry.removed);
-        self.splice_text(entry.start, end, &removed);
-        entry.removed = removed;
-        self.restore_cursor_state(entry.cursor, entry.selection);
-        entry.cursor = cursor;
-        entry.selection = selection;
-        self.redo_stack.push(entry);
+        }
+        let (ups, downs) = self.history.path(from, target);
+        let leaving = (self.cursor, self.selection);
+        if ups.len() + downs.len() <= DIRECT_STEPS {
+            for &up in &ups {
+                self.unapply(up);
+            }
+            for &down in &downs {
+                self.apply(down);
+            }
+        } else {
+            let mut text = GapText::new(&self.text);
+            self.history.rewind(&mut text, &ups, &downs);
+            let new_text = text.to_string();
+            let (start, old_end) = Self::changed_old_byte_range(&self.text, &new_text);
+            let new_end = new_text.len() - (self.text.len() - old_end);
+            self.splice_text(start, old_end, &new_text[start..new_end]);
+        }
+        if let Some(&left) = ups.first() {
+            self.history.nodes[left as usize].after = Some(leaving);
+        }
+        for &step in ups.iter().chain(&downs) {
+            let parent = self.history.nodes[step as usize].parent;
+            self.history.nodes[parent as usize].last_child = step;
+        }
+        self.history.current = target;
+        if let Some(&down) = downs.last() {
+            let node = &self.history.nodes[down as usize];
+            let (cursor, selection) = node
+                .after
+                .unwrap_or((node.start + node.inserted.len(), None));
+            self.restore_cursor_state(cursor, selection);
+        } else if let Some(&up) = ups.last() {
+            let node = &self.history.nodes[up as usize];
+            let (cursor, selection) = (node.cursor_before, node.selection_before);
+            self.restore_cursor_state(cursor, selection);
+        }
         self.typing_revision = None;
         true
     }
 
+    pub(crate) fn undo(&mut self) -> bool {
+        let parent = self.history.current_node().parent;
+        parent != crate::history::NONE && self.go_to(parent)
+    }
+
     pub(crate) fn redo(&mut self) -> bool {
-        let Some(mut entry) = self.redo_stack.pop() else {
-            return false;
-        };
-        let (cursor, selection) = (self.cursor, self.selection);
-        let end = entry.start + entry.removed.len();
-        let inserted = std::mem::take(&mut entry.inserted);
-        self.splice_text(entry.start, end, &inserted);
-        entry.inserted = inserted;
-        self.restore_cursor_state(entry.cursor, entry.selection);
-        entry.cursor = cursor;
-        entry.selection = selection;
-        entry.typing = false;
-        self.push_undo(entry);
-        self.typing_revision = None;
-        true
+        let child = self.history.current_node().last_child;
+        child != crate::history::NONE && self.go_to(child)
+    }
+
+    /// Goes to the history state with stable id `seq`.
+    pub(crate) fn jump_to(&mut self, seq: u64) -> bool {
+        self.history
+            .index_of(seq)
+            .is_some_and(|target| self.go_to(target))
     }
 
     /// Inserts keyboard-typed text. Consecutive typing of a word is grouped into one
@@ -215,37 +268,32 @@ impl EditorBuffer {
             _ => None,
         };
         let can_group = single.is_some_and(|ch| {
+            let top = self.history.current_node();
+            let word_then_space =
+                ch.is_whitespace() && !top.inserted.ends_with(char::is_whitespace);
             self.selection.is_none()
-                && self.redo_stack.is_empty()
                 && self.typing_revision == Some(self.revision)
-                && self.undo_stack.back().is_some_and(|top| {
-                    let word_then_space =
-                        ch.is_whitespace() && !top.inserted.ends_with(char::is_whitespace);
-                    top.typing
-                        && top.start + top.inserted.len() == self.cursor
-                        && top.inserted.len() < TYPING_GROUP_MAX_BYTES
-                        && top.recorded_at.elapsed() < TYPING_GROUP_PAUSE
-                        && !word_then_space
-                })
+                && top.kind == Kind::Typing
+                // A state with branches below, or the saved one, stays as it is.
+                && top.children == 0
+                && !self.history.at_saved()
+                && top.start + top.inserted.len() == self.cursor
+                && top.inserted.len() < TYPING_GROUP_MAX_BYTES
+                && top.recorded_at.elapsed() < TYPING_GROUP_PAUSE
+                && !word_then_space
         });
         if can_group {
             let cursor = self.cursor;
             self.splice_text(cursor, cursor, text);
             self.cursor = cursor + text.len();
-            if let Some(top) = self.undo_stack.back_mut() {
-                top.inserted.push_str(text);
-                top.recorded_at = std::time::Instant::now();
-            }
-            self.undo_bytes += text.len();
+            self.history.extend_current(text);
             self.typing_revision = Some(self.revision);
             return;
         }
         let revision = self.revision;
         self.insert_text(text);
         if self.revision != revision && single.is_some() {
-            if let Some(top) = self.undo_stack.back_mut() {
-                top.typing = true;
-            }
+            self.history.set_current_kind(Kind::Typing);
             self.typing_revision = Some(self.revision);
         }
     }
@@ -255,12 +303,15 @@ impl EditorBuffer {
         &mut self.text
     }
 
+    /// Replaces the text and starts the history over (not saved: callers that
+    /// load a file mark it).
     pub(crate) fn set_text(&mut self, text: String) {
         self.layout_changes.clear();
         self.text = text;
         self.cursor = self.cursor.min(self.text.len());
         self.selection = None;
-        self.clear_history();
+        self.history.reset(false);
+        self.typing_revision = None;
         self.revision = self.revision.wrapping_add(1);
         self.rebuild_line_index();
     }
@@ -274,7 +325,8 @@ impl EditorBuffer {
         self.layout_changes.clear();
         self.cursor = self.cursor.min(self.text.len());
         self.selection = None;
-        self.clear_history();
+        self.history.reset(false);
+        self.typing_revision = None;
         self.revision = self.revision.wrapping_add(1);
         self.rebuild_line_index();
     }
@@ -1449,16 +1501,139 @@ mod tests {
     }
 
     #[test]
-    fn editor_buffer_undo_clears_redo_after_new_edit() {
+    fn editor_buffer_edit_after_undo_starts_a_branch_and_keeps_the_old_one() {
         let mut buffer = EditorBuffer::new();
 
         buffer.insert_text("hello");
         buffer.insert_text(" world");
+        let world = buffer.history().current_seq();
         assert!(buffer.undo());
         buffer.insert_text(" slate");
 
         assert_eq!(buffer.as_str(), "hello slate");
-        assert!(!buffer.redo());
+        assert!(!buffer.redo(), "the new branch has nothing to redo");
+        assert!(buffer.jump_to(world), "the undone branch is still there");
+        assert_eq!(buffer.as_str(), "hello world");
+        assert!(buffer.undo());
+        assert!(buffer.redo(), "redo follows the branch visited last");
+        assert_eq!(buffer.as_str(), "hello world");
+    }
+
+    #[test]
+    fn editor_buffer_knows_when_undo_returns_to_the_saved_text() {
+        let mut buffer = EditorBuffer::from_text("saved".to_string());
+        assert!(buffer.at_saved_state());
+        buffer.move_to_bottom();
+        buffer.type_text("!");
+        assert!(!buffer.at_saved_state());
+        assert!(buffer.undo());
+        assert!(buffer.at_saved_state());
+        buffer.type_text("?");
+        buffer.mark_saved();
+        // Typing after a save is a new step: the saved state stays exact.
+        buffer.type_text("?");
+        assert!(!buffer.at_saved_state());
+        assert!(buffer.undo());
+        assert_eq!(buffer.as_str(), "saved?");
+        assert!(buffer.at_saved_state());
+        buffer.set_text("not from disk".to_string());
+        assert!(!buffer.at_saved_state());
+    }
+
+    #[test]
+    fn editor_buffer_history_tree_rebuilds_every_state_after_random_travel() {
+        use std::collections::HashMap;
+        for (max_nodes, max_bytes) in [(usize::MAX, usize::MAX), (60, usize::MAX), (400, 900)] {
+            let mut buffer = EditorBuffer::from_text("café 雪
+second line
+".repeat(3));
+            if max_nodes != usize::MAX {
+                buffer.history =
+                    crate::history::History::with_limits(true, max_nodes, max_bytes);
+            }
+            let mut seen: HashMap<u64, String> = HashMap::new();
+            seen.insert(buffer.history().current_seq(), buffer.as_str().to_string());
+            let mut seed = 2026_u64 ^ max_nodes as u64;
+            let mut random = |limit: usize| {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((seed >> 33) as usize) % limit.max(1)
+            };
+            for step in 0..4000 {
+                let op = random(12);
+                match op {
+                    0..=3 => {
+                        let bounds: Vec<usize> = buffer
+                            .as_str()
+                            .char_indices()
+                            .map(|(index, _)| index)
+                            .chain([buffer.as_str().len()])
+                            .collect();
+                        let first = bounds[random(bounds.len())];
+                        let last = bounds[random(bounds.len())];
+                        let text = ["x", "雪", "
+", "line
+", "", "abc"][random(6)];
+                        buffer.set_selection(first.min(last), first.max(last));
+                        buffer.insert_text(text);
+                    }
+                    4 | 5 => {
+                        let bounds = buffer.as_str().len();
+                        buffer.set_cursor(random(bounds + 1));
+                        for ch in ["w", "o", "r", "d", " ", "z"].iter().take(1 + random(6)) {
+                            buffer.type_text(ch);
+                            seen.insert(
+                                buffer.history().current_seq(),
+                                buffer.as_str().to_string(),
+                            );
+                        }
+                    }
+                    6 | 7 => {
+                        buffer.undo();
+                    }
+                    8 => {
+                        buffer.redo();
+                    }
+                    _ => {
+                        let reachable: Vec<u64> = seen
+                            .keys()
+                            .copied()
+                            .filter(|seq| buffer.history().index_of(*seq).is_some())
+                            .collect();
+                        let target = reachable[random(reachable.len())];
+                        buffer.jump_to(target);
+                    }
+                }
+                let seq = buffer.history().current_seq();
+                if op >= 6 {
+                    assert_eq!(
+                        Some(buffer.as_str()),
+                        seen.get(&seq).map(String::as_str),
+                        "step {step} op {op} limits {max_nodes}"
+                    );
+                }
+                // Typing may have grown the current step: its text is the latest.
+                seen.insert(seq, buffer.as_str().to_string());
+                if step % 97 == 0 {
+                    let history = buffer.history();
+                    for (seq, text) in &seen {
+                        if let Some(index) = history.index_of(*seq) {
+                            assert_eq!(&history.text_of(buffer.as_str(), index), text);
+                        }
+                    }
+                    let fresh = EditorBuffer::from_text(buffer.as_str().to_string());
+                    assert_eq!(buffer.line_count(), fresh.line_count());
+                    for line in 0..fresh.line_count() {
+                        assert_eq!(buffer.line_start(line), fresh.line_start(line));
+                    }
+                }
+            }
+            assert!(buffer.history().len() <= max_nodes);
+            if max_bytes != usize::MAX {
+                assert!(buffer.undo_history_bytes() <= max_bytes);
+            }
+        }
     }
 
     #[test]

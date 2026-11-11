@@ -16,6 +16,8 @@ impl SlateApp {
                     ("Ctrl+H", "open this help"),
                     ("Esc", "close modal / cancel active mode"),
                     ("Ctrl+S", "save"),
+                    ("Ctrl+Z / Ctrl+Y", "undo / redo (branches are kept)"),
+                    ("Ctrl+Shift+Z", "undo history: graph, diff, bring lines back"),
                     ("Ctrl+Alt+S", "save as"),
                     ("Ctrl+O", "open file"),
                     ("Ctrl+M", "toggle Markdown preview"),

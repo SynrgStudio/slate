@@ -17,6 +17,8 @@ pub(crate) enum Command {
     TogglePreview,
     ToggleWrap,
     Settings,
+    Vaults,
+    UndoHistory,
     PerfHud,
     LineNumbersAbsolute,
     LineNumbersRelative,
@@ -380,6 +382,20 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
         palette_command: Some(Command::LineNumbersRelative),
     },
     CommandSpec {
+        name: "undo",
+        aliases: &["history", "undo-tree", "undotree"],
+        summary: "Undo history as a graph: every state, nothing lost (Ctrl+Shift+Z)",
+        hint: ":undo",
+        palette_command: Some(Command::UndoHistory),
+    },
+    CommandSpec {
+        name: "vaults",
+        aliases: &["vault"],
+        summary: "Your note folders: add, remove, browse",
+        hint: ":vaults",
+        palette_command: Some(Command::Vaults),
+    },
+    CommandSpec {
         name: "settings",
         aliases: &["set", "prefs", "preferences"],
         summary: "Open settings",
@@ -435,6 +451,8 @@ pub(crate) fn command_name(command: Command) -> &'static str {
         Command::TogglePreview => "preview",
         Command::ToggleWrap => "wrap",
         Command::Settings => "settings",
+        Command::Vaults => "vaults",
+        Command::UndoHistory => "undo",
         Command::PerfHud => "perf",
         Command::LineNumbersAbsolute => "line-numbers-absolute",
         Command::LineNumbersRelative => "line-numbers-relative",
@@ -802,6 +820,10 @@ pub(crate) fn parse_command_line(raw: &str) -> CommandLineAction {
         "line-numbers-absolute" | "ln-abs" => CommandLineAction::Run(Command::LineNumbersAbsolute),
         "line-numbers-relative" | "ln-rel" => CommandLineAction::Run(Command::LineNumbersRelative),
         "settings" | "set" | "prefs" | "preferences" => CommandLineAction::Run(Command::Settings),
+        "vaults" | "vault" => CommandLineAction::Run(Command::Vaults),
+        "undo" | "history" | "undo-tree" | "undotree" => {
+            CommandLineAction::Run(Command::UndoHistory)
+        }
         "perf" | "perf-hud" | "hud" | "timings" => CommandLineAction::Run(Command::PerfHud),
         _ => CommandLineAction::Unknown(input.to_string()),
     }

@@ -225,7 +225,7 @@ fn saving_copy_of_clean_modal_uses_visible_modal_text_not_main_or_new_disk_text(
     assert_eq!(fs::read_to_string(path).unwrap(), "new external text");
 }
 #[test]
-fn reload_of_dirty_main_requests_confirmation_without_discarding_text() {
+fn reload_of_dirty_main_keeps_the_unsaved_text_one_undo_away() {
     let mut f = Fixture::new();
     let path = f.file("main.txt", "external text");
     f.app.path = Some(path.clone());
@@ -233,10 +233,12 @@ fn reload_of_dirty_main_requests_confirmation_without_discarding_text() {
     f.app.dirty = true;
     f.app.file_conflict = Some((document_safety::Slot::Main, path));
     notice_key(&mut f, Key::R);
-    assert!(f.app.dirty);
+    assert!(!f.app.dirty);
+    assert!(f.app.file_conflict.is_none());
+    assert_eq!(f.app.buffer.as_str(), "external text");
+    assert!(f.app.status.contains("Ctrl+Z brings back your unsaved text"));
+    let reload = f.app.buffer.history().current_node();
+    assert_eq!(reload.kind, crate::history::Kind::External);
+    assert!(f.app.buffer.undo());
     assert_eq!(f.app.buffer.as_str(), "my unsaved text");
-    assert!(matches!(
-        f.app.pending_action,
-        Some(PendingAction::OpenProjectFile)
-    ));
 }

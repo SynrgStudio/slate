@@ -589,6 +589,14 @@ impl SlateApp {
                         self.selected_setting = vault_row;
                         self.open_vault_picker();
                     }
+                    if ui
+                        .button("Manage… (:vaults)")
+                        .on_hover_text("All vaults: browse, add, remove, open in Explorer")
+                        .clicked()
+                    {
+                        self.settings_open = false;
+                        self.open_vaults_dialog();
+                    }
                 });
             });
             if self.vaults.is_empty() {

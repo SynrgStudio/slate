@@ -29,11 +29,64 @@ impl SlateApp {
                 return;
             }
         }
+        if self.save_as_open && self.save_as_overwrite.is_some() {
+            let (replace, keep) = ctx.input_mut(|input| {
+                (
+                    input.consume_key(egui::Modifiers::NONE, Key::Enter)
+                        | input.consume_key(egui::Modifiers::NONE, Key::Y),
+                    input.consume_key(egui::Modifiers::NONE, Key::Escape)
+                        | input.consume_key(egui::Modifiers::NONE, Key::N),
+                )
+            });
+            // Nothing else reaches the dialog while it asks.
+            ctx.input_mut(|input| input.events.clear());
+            if replace || keep {
+                self.answer_save_as_overwrite(replace);
+            }
+            return;
+        }
+        if self.save_as_open {
+            // Drives: ← at a drive's root, or Ctrl+L, as in the file picker.
+            if drive_picker::is_open(ctx) {
+                if let Some(dir) = drive_picker::handle_input(ctx) {
+                    self.save_as_show_dir(dir);
+                }
+                return;
+            }
+            let choose_drive = ctx.input_mut(|input| {
+                input.consume_key(egui::Modifiers::CTRL, Key::L)
+                    || (self.save_as_dir.parent().is_none()
+                        && input.consume_key(egui::Modifiers::NONE, Key::ArrowLeft))
+            });
+            if choose_drive {
+                drive_picker::open(ctx, &self.save_as_dir);
+                return;
+            }
+        }
         if self.scratch_close_after.is_some() {
             return;
         }
 
         if self.handle_results_keys(ctx) {
+            return;
+        }
+
+        if self.handle_vaults_keys(ctx) {
+            return;
+        }
+
+        if self.handle_undo_keys(ctx) {
+            return;
+        }
+
+        // Ctrl+Shift+Z: the undo history as a graph (Ctrl+Z/Ctrl+Y stay
+        // plain undo and redo).
+        if self.editor_shortcuts_allowed()
+            && ctx.input_mut(|input| {
+                input.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, Key::Z)
+            })
+        {
+            self.open_undo_dialog();
             return;
         }
 
@@ -745,9 +798,12 @@ impl SlateApp {
         }
 
         if save_as_backspace {
-            self.save_as_filename.pop();
-            self.selected_save_as_entry =
-                self.save_as_entry_indices().first().copied().unwrap_or(0);
+            if self.save_as_name_fresh {
+                self.save_as_filename.clear();
+            } else {
+                self.save_as_filename.pop();
+            }
+            self.save_as_name_changed();
             return;
         }
 
