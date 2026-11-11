@@ -2,7 +2,7 @@
 //! on every drive, greps folders and knows what changed lately. A
 //! background process keeps the index; this talks to it over its pipe
 //! (`\\.\pipe\seek-<user>`): a little-endian u32 length, then that many
-//! bytes of JSON, both ways. If the pipe isn't there, the installed
+//! bytes of JSON, both ways, as Seek's PROTOCOL.md (version 1) says. If the pipe isn't there, the installed
 //! `seek.exe --daemon` is started (it outlives Slate, and serves agents
 //! and other programs from the same index).
 //!
@@ -20,8 +20,12 @@ use std::{
 
 /// Never taken for a newer Seek (a newer build makes the daemon step aside).
 const BUILD: &str = concat!("0.0.0 slate ", env!("CARGO_PKG_VERSION"));
+/// The protocol version this was written for.
+const API: u32 = 1;
 /// How long to wait for a daemon that is starting.
-const START_WAIT: Duration = Duration::from_secs(6);
+const START_WAIT: Duration = Duration::from_secs(15);
+/// Right after Seek starts, its indexes load (about a second).
+const LOADING_WAIT: Duration = Duration::from_secs(3);
 
 #[derive(Debug)]
 pub(crate) enum Error {
@@ -29,8 +33,9 @@ pub(crate) enum Error {
     NotInstalled,
     /// The pipe broke or never answered.
     Unreachable(String),
-    /// Seek answered with an error (a bad query, an older Seek...).
-    Seek(String),
+    /// Seek answered with an error: its `code` (`bad_args`, `not_found`,
+    /// `unknown_command`...; empty from a Seek before 0.5.0) and why.
+    Seek { code: String, text: String },
 }
 
 impl std::fmt::Display for Error {
@@ -41,10 +46,12 @@ impl std::fmt::Display for Error {
                 "Seek isn't installed: get it from github.com/SynrgStudio/seek"
             ),
             Error::Unreachable(why) => write!(f, "Seek didn't answer ({why})"),
-            Error::Seek(text) if text.contains("Unknown tool") => {
+            Error::Seek { code, text }
+                if code == "unknown_command" || code == "api_too_new" || text.contains("Unknown tool") =>
+            {
                 write!(f, "Seek is too old for Slate: update it")
             }
-            Error::Seek(text) => write!(f, "{}", text.lines().next().unwrap_or(text)),
+            Error::Seek { text, .. } => write!(f, "{}", text.lines().next().unwrap_or(text)),
         }
     }
 }
@@ -113,50 +120,59 @@ impl Client {
         near: Option<&Path>,
         max: usize,
     ) -> Result<Rows, Error> {
-        let mut args = json!({ "query": query });
+        let mut args = json!({ "query": query, "max": max });
         if let Some(path) = path {
             args["path"] = json!(path.display().to_string());
         }
         if let Some(near) = near {
             args["near"] = json!(near.display().to_string());
         }
-        let text = self.call(json!({ "tool": "__rows", "max": max, "args": args }))?;
+        let text = self.call(json!({ "tool": "find.rows", "args": args }))?;
         parse_rows(&text)
     }
 
     /// The state of each drive's index.
     pub(crate) fn status(&mut self) -> Result<Status, Error> {
-        let text = self.call(json!({ "tool": "__status_rows" }))?;
+        let text = self.call(json!({ "tool": "status.rows" }))?;
         parse_status(&text)
     }
 
     /// Tells Seek the user opened `path`, so it ranks higher and shows in
     /// recent files.
     pub(crate) fn opened(&mut self, path: &Path) -> Result<(), Error> {
-        self.call(json!({ "tool": "__opened", "args": { "path": path.display().to_string() } }))
+        self.call(json!({ "tool": "opened", "args": { "path": path.display().to_string() } }))
             .map(|_| ())
     }
 
     fn call(&mut self, mut request: Value) -> Result<String, Error> {
+        request["api"] = json!(API);
         request["build"] = json!(BUILD);
         let request = request.to_string();
-        // A pipe kept open may have closed (Seek restarted): one retry.
-        for attempt in 0..2 {
+        let loading_until = Instant::now() + LOADING_WAIT;
+        let mut broken = false;
+        loop {
             let pipe = match self.pipe.as_mut() {
                 Some(pipe) => pipe,
                 None => self.pipe.insert(connect()?),
             };
-            match exchange(pipe, request.as_bytes()) {
-                Ok(reply) => return parse_reply(&reply),
+            match exchange(pipe, request.as_bytes()).map(|reply| parse_reply(&reply)) {
+                // Seek has just started: its indexes are loading.
+                Ok(Err(Error::Seek { code, .. }))
+                    if code == "index_loading" && Instant::now() < loading_until =>
+                {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                Ok(result) => return result,
+                // A pipe kept open may have closed (Seek restarted): one retry.
                 Err(error) => {
                     self.pipe = None;
-                    if attempt == 1 {
+                    if broken {
                         return Err(Error::Unreachable(error.to_string()));
                     }
+                    broken = true;
                 }
             }
         }
-        unreachable!()
     }
 }
 
@@ -202,7 +218,9 @@ fn parse_reply(reply: &[u8]) -> Result<String, Error> {
         .map_err(|error| Error::Unreachable(format!("unreadable reply: {error}")))?;
     let text = value["text"].as_str().unwrap_or_default().to_string();
     if value["error"].as_bool() == Some(true) {
-        return Err(Error::Seek(text));
+        // A code this doesn't know is as good as "failed".
+        let code = value["code"].as_str().unwrap_or("failed").to_string();
+        return Err(Error::Seek { code, text });
     }
     Ok(text)
 }
@@ -212,11 +230,14 @@ fn parse_rows(text: &str) -> Result<Rows, Error> {
     let mut lines = text.lines();
     let head: Vec<&str> = lines.next().unwrap_or_default().split('\t').collect();
     if head.first() != Some(&"#rows") {
-        return Err(Error::Seek(text.to_string()));
+        return Err(unexpected(text));
     }
+    // Rows may gain fields at the end: read the ones known, by position.
     let entries = lines
         .filter_map(|line| {
-            let (kind, path) = line.split_once('\t')?;
+            let mut fields = line.split('\t');
+            let kind = fields.next()?;
+            let path = fields.next()?;
             Some((kind == "D", PathBuf::from(path)))
         })
         .collect();
@@ -237,7 +258,7 @@ fn parse_status(text: &str) -> Result<Status, Error> {
     let mut lines = text.lines();
     let head: Vec<&str> = lines.next().unwrap_or_default().split('\t').collect();
     if head.first() != Some(&"#rows") {
-        return Err(Error::Seek(text.to_string()));
+        return Err(unexpected(text));
     }
     let drives = lines
         .filter_map(|line| {
@@ -256,6 +277,13 @@ fn parse_status(text: &str) -> Result<Status, Error> {
         version: head.get(1).unwrap_or(&"").to_string(),
         drives,
     })
+}
+
+fn unexpected(text: &str) -> Error {
+    Error::Seek {
+        code: "failed".into(),
+        text: text.to_string(),
+    }
 }
 
 /// Opens the pipe, starting Seek if it isn't running.
@@ -280,7 +308,7 @@ fn connect() -> Result<File, Error> {
         if Instant::now() > deadline {
             return Err(Error::Unreachable("its background process didn't start".into()));
         }
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -397,7 +425,8 @@ mod tests {
 
     #[test]
     fn rows_parse_with_their_kind_and_folders() {
-        let text = "#rows\t3\t1\tnear\nF\tC:\\notes\\inbox.md\nD\tC:\\notes\\in box\n";
+        // The second row has a field a later Seek may add: it is ignored.
+        let text = "#rows\t3\t1\tnear\nF\tC:\\notes\\inbox.md\nD\tC:\\notes\\in box\tnew field\n";
         let rows = parse_rows(text).unwrap();
         assert_eq!(rows.total, 3);
         assert!(rows.exact);
@@ -409,13 +438,26 @@ mod tests {
                 (true, PathBuf::from("C:\\notes\\in box")),
             ]
         );
-        assert!(matches!(parse_rows("find needs a query"), Err(Error::Seek(_))));
+        assert!(matches!(parse_rows("find needs a query"), Err(Error::Seek { .. })));
     }
 
     #[test]
     fn replies_with_an_error_say_why() {
-        let error = parse_reply(br#"{"text":"Unknown tool: __rows","error":true}"#).unwrap_err();
+        let error = parse_reply(
+            br#"{"api":1,"version":"0.5.0","text":"no such command","error":true,"code":"unknown_command"}"#,
+        )
+        .unwrap_err();
         assert_eq!(error.to_string(), "Seek is too old for Slate: update it");
+        // Before 0.5.0: no code, and the text said so.
+        let old = parse_reply(br#"{"text":"Unknown tool: find.rows","error":true}"#).unwrap_err();
+        assert_eq!(old.to_string(), "Seek is too old for Slate: update it");
+        match parse_reply(br#"{"text":"C:/nope isn't there","error":true,"code":"not_found"}"#) {
+            Err(Error::Seek { code, text }) => {
+                assert_eq!(code, "not_found");
+                assert_eq!(text, "C:/nope isn't there");
+            }
+            other => panic!("{other:?}"),
+        }
         assert_eq!(parse_reply(br#"{"text":"ok"}"#).unwrap(), "ok");
         assert!(matches!(parse_reply(b"not json"), Err(Error::Unreachable(_))));
     }

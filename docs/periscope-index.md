@@ -1,6 +1,6 @@
 # Periscope: file search with Seek
 
-Periscope (`:periscope`, `:ps`, `:fzf`) finds files by name. The names come from [Seek](https://github.com/SynrgStudio/seek). Seek runs as a background process and keeps a live index of every file name on every fixed drive, kept current by drive watchers. It also serves agents and other programs from the same index. Slate talks to it over its pipe (`src/seek.rs`), on Periscope's worker thread.
+Periscope (`:periscope`, `:ps`, `:fzf`) finds files by name. The names come from [Seek](https://github.com/SynrgStudio/seek). Seek runs as a background process and keeps a live index of every file name on every fixed drive, kept current by drive watchers. It also serves agents and other programs from the same index. Slate talks to it over its pipe with version 1 of Seek's [protocol for programs](https://github.com/SynrgStudio/seek/blob/main/PROTOCOL.md) (`src/seek.rs`), on Periscope's worker thread.
 
 ## What a search does
 
@@ -17,7 +17,7 @@ Periscope (`:periscope`, `:ps`, `:fzf`) finds files by name. The names come from
   - asks again every 5 s while Periscope is open;
   - asks Seek for 500 rows and shows the best 100 files, so matching folders can be grouped.
 - **First index:** on a machine indexing a drive for the first time, the status line says which drive, and how many names it has so far. Seek can't know the total in advance, so there is no percentage.
-- **Opened files:** each file Slate opens is reported to Seek (`__opened`), so it ranks higher everywhere.
+- **Opened files:** each file Slate opens is reported to Seek (`opened`), so it ranks higher everywhere.
 
 ## When Seek isn't running
 
