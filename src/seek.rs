@@ -337,27 +337,131 @@ fn seek_exe() -> Option<PathBuf> {
     installed.is_file().then_some(installed)
 }
 
+/// Starts `seek.exe --daemon` detached, out of Slate's job when allowed (so
+/// it outlives Slate), and inheriting **no** handles: it lives for hours,
+/// and `std::process::Command` would hand it every inheritable handle Slate
+/// has, such as the pipes of whoever started Slate (a `cargo test | tail`
+/// then never ends). As Seek starts itself.
+#[cfg(windows)]
 fn start_daemon() -> Result<(), Error> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[repr(C)]
+    struct StartupInfo {
+        cb: u32,
+        reserved: *mut u16,
+        desktop: *mut u16,
+        title: *mut u16,
+        x: u32,
+        y: u32,
+        x_size: u32,
+        y_size: u32,
+        x_count_chars: u32,
+        y_count_chars: u32,
+        fill_attribute: u32,
+        flags: u32,
+        show_window: u16,
+        reserved2_size: u16,
+        reserved2: *mut u8,
+        std_input: *mut std::ffi::c_void,
+        std_output: *mut std::ffi::c_void,
+        std_error: *mut std::ffi::c_void,
+    }
+    #[repr(C)]
+    struct ProcessInformation {
+        process: *mut std::ffi::c_void,
+        thread: *mut std::ffi::c_void,
+        process_id: u32,
+        thread_id: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateProcessW(
+            application: *const u16,
+            command_line: *mut u16,
+            process_attributes: *const std::ffi::c_void,
+            thread_attributes: *const std::ffi::c_void,
+            inherit_handles: i32,
+            creation_flags: u32,
+            environment: *const std::ffi::c_void,
+            current_directory: *const u16,
+            startup_info: *const StartupInfo,
+            process_information: *mut ProcessInformation,
+        ) -> i32;
+        fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+    }
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
     let exe = seek_exe().ok_or(Error::NotInstalled)?;
-    let mut command = std::process::Command::new(&exe);
-    command.arg("--daemon");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
-        // Out of Slate's job if allowed, so it doesn't die with Slate.
-        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
-        if command.spawn().is_ok() {
+    let flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT;
+    let mut last_error = io::Error::other("not started");
+    // Out of Slate's job if the job allows it; else inside it.
+    for flags in [flags | CREATE_BREAKAWAY_FROM_JOB, flags] {
+        let mut command_line: Vec<u16> = format!("\"{}\" --daemon", exe.display())
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        let application: Vec<u16> = exe.as_os_str().encode_wide().chain([0]).collect();
+        let startup = StartupInfo {
+            cb: std::mem::size_of::<StartupInfo>() as u32,
+            reserved: std::ptr::null_mut(),
+            desktop: std::ptr::null_mut(),
+            title: std::ptr::null_mut(),
+            x: 0,
+            y: 0,
+            x_size: 0,
+            y_size: 0,
+            x_count_chars: 0,
+            y_count_chars: 0,
+            fill_attribute: 0,
+            flags: 0,
+            show_window: 0,
+            reserved2_size: 0,
+            reserved2: std::ptr::null_mut(),
+            std_input: std::ptr::null_mut(),
+            std_output: std::ptr::null_mut(),
+            std_error: std::ptr::null_mut(),
+        };
+        let mut info = ProcessInformation {
+            process: std::ptr::null_mut(),
+            thread: std::ptr::null_mut(),
+            process_id: 0,
+            thread_id: 0,
+        };
+        // SAFETY: every pointer is valid for the call, the command line is
+        // writable and NUL-terminated, and both handles returned are closed.
+        let started = unsafe {
+            CreateProcessW(
+                application.as_ptr(),
+                command_line.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                flags,
+                std::ptr::null(),
+                std::ptr::null(),
+                &startup,
+                &mut info,
+            )
+        };
+        if started != 0 {
+            unsafe {
+                CloseHandle(info.thread);
+                CloseHandle(info.process);
+            }
             return Ok(());
         }
-        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        last_error = io::Error::last_os_error();
     }
-    command
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| Error::Unreachable(format!("couldn't start {}: {error}", exe.display())))
+    Err(Error::Unreachable(format!("couldn't start {}: {last_error}", exe.display())))
+}
+
+#[cfg(not(windows))]
+fn start_daemon() -> Result<(), Error> {
+    Err(Error::NotInstalled)
 }
 
 /// 812345 → "812,345".
@@ -473,6 +577,18 @@ mod tests {
         assert_eq!(ready.indexing(), None);
         assert_eq!(thousands(1_234_567), "1,234,567");
         assert_eq!(thousands(12), "12");
+    }
+
+    /// Starts a Seek of its own: run with SEEK_HOME set to a temporary
+    /// folder (a separate instance) and the output piped, as in
+    /// `cargo test starting_seek -- --ignored | tail`; the pipeline must end.
+    #[test]
+    #[ignore]
+    fn starting_seek_never_holds_the_callers_pipes() {
+        assert!(std::env::var_os("SEEK_HOME").is_some(), "set SEEK_HOME: never the user's Seek");
+        let mut client = Client::default();
+        let status = client.status().expect("a Seek of its own starts and answers");
+        println!("started Seek {}", status.version);
     }
 
     /// Talks to the Seek on this machine. `cargo test seek -- --ignored`.
