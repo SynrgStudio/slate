@@ -121,7 +121,6 @@ impl SlateApp {
                                 "Editor" => self.settings_editor(ui, &mut setting_rects),
                                 "Cursor" => self.settings_cursor(ui, &mut setting_rects),
                                 "Footer" => self.settings_footer(ui, &mut setting_rects),
-                                "Periscope" => self.settings_periscope(ui, &mut setting_rects),
                                 _ => self.settings_modules(ui, &mut setting_rects),
                             }
                             if reveal_selected
@@ -520,37 +519,6 @@ impl SlateApp {
                 self.set_footer_option(index, on);
             }
         }
-    }
-
-    fn settings_periscope(&mut self, ui: &mut egui::Ui, rects: &mut Vec<(usize, egui::Rect)>) {
-        let (rect, changed) = checkbox_row(
-            ui,
-            self.selected_setting == 18,
-            self.periscope_everything,
-            "Use Everything when available",
-        );
-        rects.push((18, rect));
-        if let Some(on) = changed {
-            self.selected_setting = 18;
-            self.set_periscope_everything(on);
-        }
-        hint(
-            ui,
-            "Otherwise: SQLite metadata index in the background. No service is installed.",
-        );
-        let scope = if self.periscope_roots.is_empty() {
-            "Global scope: local fixed drives (Windows).".to_string()
-        } else {
-            format!(
-                "Global scope: {}",
-                self.periscope_roots
-                    .iter()
-                    .map(|root| root.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(" · ")
-            )
-        };
-        hint(ui, &scope);
     }
 
     fn settings_modules(&mut self, ui: &mut egui::Ui, rects: &mut Vec<(usize, egui::Rect)>) {

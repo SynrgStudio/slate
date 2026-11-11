@@ -171,8 +171,7 @@ impl SlateApp {
             .project(self.buffer.identity, self.path.as_deref())
     }
     pub(super) fn create_document_project(&mut self) {
-        if self.periscope_setup.visible
-            || self.recovery_open
+        if self.recovery_open
             || self.file_conflict.is_some()
             || self.pending_action.is_some()
             || self.link_preview_open

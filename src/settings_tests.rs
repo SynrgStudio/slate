@@ -378,7 +378,11 @@ fn tab_switches_settings_tabs_and_arrows_stay_inside_one() {
     // Every row belongs to exactly one tab.
     let mut rows: Vec<usize> = app.settings_tabs().into_iter().flat_map(|(_, rows)| rows).collect();
     rows.sort();
-    assert_eq!(rows, (0..=app.settings_last_row()).collect::<Vec<_>>());
+    // (18 was Periscope's "Use Everything", gone since Seek searches.)
+    assert_eq!(
+        rows,
+        (0..=app.settings_last_row()).filter(|row| *row != 18).collect::<Vec<_>>()
+    );
     // Only the current tab is drawn.
     app.selected_setting = 8;
     let geometry = draw(&mut app, &ctx, Vec2::new(900.0, 560.0), 0.0, vec![]);

@@ -143,33 +143,6 @@ pub(crate) fn path_score_lower(
     Some(score + path_lower.len().saturating_sub(query_lower.len()))
 }
 
-pub(crate) fn rank_native_paths(
-    mut paths: Vec<PathBuf>,
-    query: &str,
-    limit: usize,
-) -> Vec<PathBuf> {
-    let query = query.trim().to_lowercase();
-    let terms = query.split_whitespace().collect::<Vec<_>>();
-    paths.sort_by_cached_key(|path| {
-        let name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_lowercase();
-        let score = if name == query {
-            0
-        } else if name.starts_with(&query) {
-            1
-        } else if terms.iter().all(|term| name.contains(term)) {
-            2
-        } else {
-            3
-        };
-        (score, name, path.clone())
-    });
-    paths.truncate(limit);
-    paths
-}
 pub(crate) fn rank_paths(
     mut paths: Vec<PathBuf>,
     root: &Path,
@@ -349,24 +322,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn native_word_order_is_not_filtered_out_and_filenames_rank_before_path_only_matches() {
-        let paths = vec![
-            PathBuf::from("C:/Desktop/Abrir Miniaturas Lychee.cmd"),
-            PathBuf::from("C:/abrir/miniatures/other.cmd"),
-        ];
-        let ranked = rank_native_paths(paths, "mi abrir", 100);
-        assert_eq!(ranked.len(), 2);
-        assert!(ranked[0].to_string_lossy().contains("Lychee"));
-        assert!(
-            path_score_lower(
-                "c:/desktop/abrir miniaturas lychee.cmd",
-                "abrir miniaturas lychee.cmd",
-                "mi abrir"
-            )
-            .is_some()
-        );
-    }
     #[test]
     fn spaced_and_abbreviated_command_names_match_without_executing_them() {
         assert!(

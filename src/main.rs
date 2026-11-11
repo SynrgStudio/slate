@@ -61,8 +61,6 @@ mod tabs_tests;
 use settings_tests::SettingsDialogGeometry;
 mod aliases;
 mod drive_picker;
-mod everything_inventory;
-mod everything_ipc;
 // Optional modules: dormant until they are reconnected through the core's
 // hooks (see src/modules/README.md).
 mod goto;
@@ -85,10 +83,6 @@ mod periscope;
 mod periscope_backend;
 #[cfg(test)]
 mod periscope_results_tests;
-mod periscope_setup;
-#[cfg(test)]
-mod periscope_setup_tests;
-mod periscope_store;
 mod periscope_ui;
 #[cfg(test)]
 mod picker_tests;
@@ -100,6 +94,7 @@ mod project_membership_tests;
 mod resident;
 mod save_as_ui;
 mod scratch;
+mod seek;
 mod search;
 mod settings_ui;
 mod shortcuts;
@@ -115,8 +110,6 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
-    sync::mpsc::{self, Receiver, TryRecvError},
-    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -293,6 +286,7 @@ fn main() -> eframe::Result {
     perf_log::init(std::time::Instant::now());
     normalize_cursor_environment();
     perf_log::mark("startup.environment_ready", "");
+    periscope_backend::remove_old_path_cache();
 
     let raw_args = std::env::args().skip(1).collect::<Vec<_>>();
 
@@ -831,10 +825,7 @@ struct SlateApp {
     periscope_expanded_folders: HashSet<PathBuf>,
     periscope_backend_status: String,
     periscope_engine: periscope_backend::Manager,
-    periscope_setup: periscope_setup::Setup,
     periscope_request: Option<u64>,
-    periscope_roots: Vec<PathBuf>,
-    periscope_everything: bool,
     periscope_global_loading: bool,
     find_note_open: bool,
     find_note_query: String,
@@ -1066,10 +1057,7 @@ impl SlateApp {
             periscope_expanded_folders: HashSet::new(),
             periscope_backend_status: String::new(),
             periscope_engine: periscope_backend::Manager::default(),
-            periscope_setup: periscope_setup::Setup::default(),
             periscope_request: None,
-            periscope_roots: Vec::new(),
-            periscope_everything: true,
             periscope_global_loading: false,
             find_note_open: false,
             find_note_query: String::new(),
@@ -2985,6 +2973,8 @@ impl SlateApp {
     }
 
     fn remember_recent_file(&mut self, path: PathBuf) {
+        // Seek ranks what the user opens higher, in Slate and everywhere.
+        seek::report_opened(&path);
         self.last_opened_path = Some(path.clone());
         self.recent_files.retain(|recent| recent != &path);
         self.recent_files.insert(0, path);
@@ -3498,7 +3488,7 @@ impl SlateApp {
     }
 
     fn open_periscope(&mut self) {
-        self.begin_periscope_setup();
+        self.choose_periscope_scope();
     }
     fn choose_periscope_scope(&mut self) {
         self.shortcut_help_open = false;
@@ -3529,9 +3519,6 @@ impl SlateApp {
     }
 
     fn open_global_periscope(&mut self) {
-        if self.periscope_setup.visible {
-            return;
-        }
         self.periscope_prompt_open = false;
         self.periscope_open = true;
         self.periscope_mode = PeriscopeMode::Global;
@@ -3542,6 +3529,18 @@ impl SlateApp {
         self.refresh_periscope_results();
         self.status = "Periscope global".to_string();
         self.focus_editor_once = false;
+    }
+
+    pub(crate) fn choose_periscope_project(&mut self) {
+        if let Some(root) = self.periscope_project_root.clone() {
+            self.periscope_prompt_open = false;
+            self.periscope_mode = PeriscopeMode::Project;
+            self.periscope_open = true;
+            self.refresh_periscope_results();
+            self.status = format!("Periscope project: {}", root.display());
+        } else {
+            self.open_global_periscope();
+        }
     }
 
     fn toggle_periscope_mode(&mut self) {
@@ -3626,21 +3625,20 @@ impl SlateApp {
     }
 
     fn refresh_periscope_results(&mut self) {
-        if self.periscope_setup.visible {
-            return;
-        }
         self.periscope_results.clear();
         self.periscope_global_loading = true;
-        self.periscope_backend_status = "Searching index… · latest query wins".into();
+        self.periscope_backend_status = "Seek · searching…".into();
+        let project = self.periscope_mode == PeriscopeMode::Project;
+        // Searching every drive, what is close to the project (or to this
+        // document) ranks first.
+        let near = self
+            .periscope_project_root
+            .clone()
+            .or_else(|| self.path.as_ref().and_then(|path| path.parent().map(Path::to_path_buf)));
         self.periscope_request = Some(self.periscope_engine.request(periscope_backend::Request {
             query: self.periscope_query.clone(),
-            project: if self.periscope_mode == PeriscopeMode::Project {
-                self.periscope_project_root.clone()
-            } else {
-                None
-            },
-            roots: self.periscope_roots.clone(),
-            everything: self.periscope_everything,
+            project: if project { self.periscope_project_root.clone() } else { None },
+            near: if project { None } else { near },
         }));
         self.selected_periscope_result = self
             .selected_periscope_result
@@ -3922,7 +3920,6 @@ impl SlateApp {
             return;
         };
 
-        self.periscope_roots.clear();
         self.config_passthrough.clear();
         self.vaults.clear();
         for line in contents.lines() {
@@ -3936,17 +3933,9 @@ impl SlateApp {
                             enabled;
                     }
                 }
-                "periscope_everything" => {
-                    if let Some(enabled) = Self::parse_config_bool(value) {
-                        self.periscope_everything = enabled;
-                    }
-                }
-                "periscope_root" => {
-                    let path = PathBuf::from(Self::parse_config_string(value));
-                    if path.is_absolute() && !self.periscope_roots.contains(&path) {
-                        self.periscope_roots.push(path);
-                    }
-                }
+                // Periscope searched with Everything over these roots; Seek
+                // replaced both. Dropped on the next save.
+                "periscope_everything" | "periscope_root" => {}
                 "editor_font_size" => {
                     if let Ok(size) = value.trim().parse::<f32>() {
                         self.apply_editor_font_size(size);
@@ -4271,16 +4260,6 @@ impl SlateApp {
             self.editor_look.syntax_highlighting,
             editor_view::color_to_hex(self.editor_look.cursor_color)
         ));
-        contents.push_str(&format!(
-            "periscope_everything = {}\n",
-            self.periscope_everything
-        ));
-        for root in &self.periscope_roots {
-            contents.push_str(&format!(
-                "periscope_root = \"{}\"\n",
-                Self::escape_config_string(&root.display().to_string())
-            ));
-        }
         for (index, (key, _)) in footer_ui::FIELDS.iter().enumerate() {
             contents.push_str(&format!("{key} = {}\n", self.footer_options.enabled[index]));
         }
@@ -6889,10 +6868,6 @@ impl SlateApp {
     }
 
     fn periscope_prompt_dialog(&mut self, ctx: &egui::Context) {
-        if self.periscope_setup.visible {
-            self.periscope_setup_dialog(ctx);
-            return;
-        }
         self.render_periscope_prompt(ctx);
     }
 
@@ -7665,7 +7640,6 @@ impl SlateApp {
         if let Some(action) = self.pending_tab_action.take() {
             self.finish_pending_action(action, &ctx);
         }
-        self.poll_periscope_setup(&ctx);
         self.poll_periscope_global_index();
         if self.periscope_open {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
@@ -7989,8 +7963,6 @@ impl SlateApp {
                     "files"
                 } else if self.periscope_open {
                     "periscope"
-                } else if self.periscope_setup.visible {
-                    "periscope setup"
                 } else if self.periscope_prompt_open {
                     "periscope?"
                 } else if self.link_heading_picker_open {
@@ -8388,8 +8360,6 @@ impl SlateApp {
                         ("periscope  type search · ↑↓ select · Tab project/global · Enter open · Ctrl+Enter modal".to_string(), footer_accent)
                     } else if self.find_note_open {
                         ("find-note  type filter · ↑↓ select · Tab/←/→ headings · Enter main · Shift+Enter front modal".to_string(), footer_accent)
-                    } else if self.periscope_setup.visible {
-                        (self.periscope_setup.hint().to_string(),footer_accent)
                     } else if self.periscope_prompt_open {
                         ("periscope  Y/Enter project · N global · Esc cancel".to_string(), footer_accent)
                     } else if self.link_inline_anchor.is_some() {
@@ -8462,7 +8432,6 @@ impl SlateApp {
             ("Editor", vec![1, 3, 4, 5, 7, 21, 30]),
             ("Cursor", (22..=29).collect()),
             ("Footer", (8..8 + footer_ui::FIELDS.len()).collect()),
-            ("Periscope", vec![18]),
             ("Modules", (MODULE_ROWS_START..=self.settings_last_row()).collect()),
         ]
     }

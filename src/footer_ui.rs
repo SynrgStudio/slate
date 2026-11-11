@@ -138,8 +138,7 @@ pub(super) fn fitted_hints(
 }
 impl SlateApp {
     pub(super) fn open_command_palette(&mut self) {
-        if self.periscope_setup.visible
-            || self.pending_action.is_some()
+        if self.pending_action.is_some()
             || self.recovery_open
             || self.file_conflict.is_some()
         {

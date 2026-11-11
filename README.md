@@ -384,15 +384,19 @@ Periscope is Slate's fzf-style file search.
 
 Behavior:
 
-- Project mode searches the nearest `.git` root.
-- If no `.git` root exists, Slate can choose a project folder or jump to Home mode.
-- Home mode indexes `$HOME` in the background and searches the local file list in memory.
-- Path-aware queries match components in order:
+- Names come from [Seek](https://github.com/SynrgStudio/seek), a live index of every
+  file name on every drive (see [docs/periscope-index.md](docs/periscope-index.md)).
+- Global mode searches every drive, ranking exact names, what you used lately and
+  what is near the current project or document first; typos still find the file.
+- Project mode searches only below the document's project folder, leaving out
+  what `.gitignore` leaves out.
+- Seek's query syntax works as typed:
 
   ```text
-  descargas rmenu main
-  lua periscope readme
-  etc/ssh config
+  inbox .md
+  notes/ todo
+  report !draft !target/
+  "meeting notes"
   ```
 
 - Folder results can expand inline.
@@ -679,7 +683,9 @@ Important source modules:
 | `src/commands.rs` | Command registry, aliases, commandline parsing, fuzzy command matching |
 | `src/markdown.rs` | Lightweight line-based Markdown parsing |
 | `src/file_dialogs.rs` | Slate-owned open/save picker behavior |
-| `src/periscope.rs` | Project/home file search and path scoring |
+| `src/periscope.rs` | Periscope rows, folder grouping and path scoring |
+| `src/periscope_backend.rs` | Periscope searches on a worker thread, through Seek |
+| `src/seek.rs` | Client for Seek, the file-name index (pipe protocol, starts the daemon) |
 | `src/scratch.rs` | Scratch/capture/archive helpers |
 | `src/modules/` | Optional modules (Flow, Agenda, Daily), disconnected while they are rebuilt; see its README |
 | `src/link_ui.rs` | Link/backlink/mention/find-note UI helpers |

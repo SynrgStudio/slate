@@ -18,17 +18,7 @@ impl SlateApp {
                 .as_ref()
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "no project".to_string()),
-            PeriscopeMode::Global => {
-                if self.periscope_roots.is_empty() {
-                    "local fixed drives · Everything / SQLite".into()
-                } else {
-                    self.periscope_roots
-                        .iter()
-                        .map(|root| root.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(" · ")
-                }
-            }
+            PeriscopeMode::Global => "every drive".to_string(),
         };
 
         let subtitle = format!("{scope} · {}", self.periscope_backend_status);

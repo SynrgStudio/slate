@@ -20,8 +20,7 @@ command palette likewise keeps its header/input/footer outside scrolling results
 Existing stationary help and Open/Recent/Lance picker layouts are retained.
 Settings also includes ten persisted Footer visibility checkboxes after the font
 row; see [compact-footer.md](compact-footer.md) for behavior and defaults.
-The following Periscope checkbox enables optional Everything integration; the
-independent SQLite backend remains available. See [periscope-index.md](periscope-index.md).
+Periscope has no settings: it searches with Seek. See [periscope-index.md](periscope-index.md).
 
 Headless regression tests cover Settings dimensions and chrome at 420×260,
 900×560 and 1200×800, scrolling, keyboard selection, font persistence/clamping,

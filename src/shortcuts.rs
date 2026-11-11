@@ -3,10 +3,6 @@ use super::*;
 
 impl SlateApp {
     pub(super) fn shortcuts(&mut self, ctx: &egui::Context) {
-        if self.periscope_setup.visible {
-            self.handle_periscope_setup_input(ctx);
-            return;
-        }
         if self.recovery_open || self.file_conflict.is_some() {
             return;
         }
@@ -1073,7 +1069,6 @@ impl SlateApp {
                 6 => self.set_reopen_last_file_on_startup(false),
                 7 => self.set_editor_font_size(self.editor_font_size - 1.0),
                 8..=17 => self.set_footer_option(self.selected_setting - 8, false),
-                18 => self.set_periscope_everything(false),
                 19 => self.set_resident(false),
                 20 => self.set_start_with_windows(false),
                 21 => self.set_editor_look(editor_view::EditorLook {
@@ -1160,11 +1155,6 @@ impl SlateApp {
                         },
                     );
                 }
-                18 => self.set_periscope_everything(if settings_activate {
-                    !self.periscope_everything
-                } else {
-                    true
-                }),
                 19 => self.set_resident(if settings_activate {
                     !self.resident
                 } else {

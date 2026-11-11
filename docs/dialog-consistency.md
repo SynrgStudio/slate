@@ -18,7 +18,7 @@ outer whole-dialog scrolling. Bodies retain their own scrolling behavior.
 `src/form_dialogs.rs` migrates:
 
 - Periscope scope prompt: project folder / Global / cancel, same handlers as keys.
-  Global now uses the Everything/SQLite engine, not the legacy Home walk;
+  Global searches every drive with Seek, not the legacy Home walk;
   see [periscope-index.md](periscope-index.md).
 - Capture: optional title keeps initial focus; the captured-text preview scrolls
   vertically using visible rows instead of stopping after 220 pt. Long individual
