@@ -765,3 +765,9 @@ Slate also takes broad inspiration from terminal editors, command palettes, mini
 No dashboard. No ceremony. No permanent sidebar yelling for attention.
 
 Just text, commands, capture, and enough structure to make thinking easier.
+
+---
+
+## License
+
+GPL-3.0 or later (see [LICENSE](LICENSE)), like [Seek](https://github.com/SynrgStudio/seek), which Periscope searches with.
