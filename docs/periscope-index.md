@@ -21,7 +21,7 @@ Periscope (`:periscope`, `:ps`, `:fzf`) finds files by name. The names come from
 
 ## When Seek isn't running
 
-If the pipe isn't there, Slate starts the installed `seek.exe --daemon` (`%LOCALAPPDATA%\Programs\Seek`) and waits for it. It runs detached, outside Slate's job, and keeps running after Slate closes. If Seek isn't installed, Periscope says so, with where to get it.
+If the pipe isn't there, Slate starts the installed `seek.exe --daemon` (`%LOCALAPPDATA%\Programs\Seek`) and waits for it. It runs detached, outside Slate's job, and keeps running after Slate closes. If Seek isn't installed, Periscope says so, with where to get it. Every call has the time limit PROTOCOL.md gives (5 s, or 45 s for searches, which wait for the index right after Seek starts). Past it, Periscope says Seek may be stuck, and the next search opens a new connection. Slate never kills Seek.
 
 Shipping Seek inside Slate is planned through Seek's own Rust crate and its `bundled` option (SynrgStudio/seek#21, #22, #23). An installed Seek will be preferred. See issue #1.
 

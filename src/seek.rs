@@ -26,6 +26,11 @@ const API: u32 = 1;
 const START_WAIT: Duration = Duration::from_secs(15);
 /// Right after Seek starts, its indexes load (about a second).
 const LOADING_WAIT: Duration = Duration::from_secs(3);
+/// The longest Seek may take (PROTOCOL.md, "Timeouts"): commands that don't
+/// touch the index, and searches, which right after Seek starts wait for
+/// its index and the drives' change journals.
+const QUICK: Duration = Duration::from_secs(5);
+const SEARCH: Duration = Duration::from_secs(45);
 
 #[derive(Debug)]
 pub(crate) enum Error {
@@ -33,6 +38,8 @@ pub(crate) enum Error {
     NotInstalled,
     /// The pipe broke or never answered.
     Unreachable(String),
+    /// No answer within the time Seek may take: it may be stuck.
+    TimedOut(Duration),
     /// Seek answered with an error: its `code` (`bad_args`, `not_found`,
     /// `unknown_command`...; empty from a Seek before 0.5.0) and why.
     Seek { code: String, text: String },
@@ -46,6 +53,11 @@ impl std::fmt::Display for Error {
                 "Seek isn't installed: get it from github.com/SynrgStudio/seek"
             ),
             Error::Unreachable(why) => write!(f, "Seek didn't answer ({why})"),
+            Error::TimedOut(limit) => write!(
+                f,
+                "Seek didn't answer in {} s: it may be stuck (`seek --status` says)",
+                limit.as_secs()
+            ),
             Error::Seek { code, text }
                 if code == "unknown_command" || code == "api_too_new" || text.contains("Unknown tool") =>
             {
@@ -127,24 +139,24 @@ impl Client {
         if let Some(near) = near {
             args["near"] = json!(near.display().to_string());
         }
-        let text = self.call(json!({ "tool": "find.rows", "args": args }))?;
+        let text = self.call(json!({ "tool": "find.rows", "args": args }), SEARCH)?;
         parse_rows(&text)
     }
 
     /// The state of each drive's index.
     pub(crate) fn status(&mut self) -> Result<Status, Error> {
-        let text = self.call(json!({ "tool": "status.rows" }))?;
+        let text = self.call(json!({ "tool": "status.rows" }), QUICK)?;
         parse_status(&text)
     }
 
     /// Tells Seek the user opened `path`, so it ranks higher and shows in
     /// recent files.
     pub(crate) fn opened(&mut self, path: &Path) -> Result<(), Error> {
-        self.call(json!({ "tool": "opened", "args": { "path": path.display().to_string() } }))
+        self.call(json!({ "tool": "opened", "args": { "path": path.display().to_string() } }), QUICK)
             .map(|_| ())
     }
 
-    fn call(&mut self, mut request: Value) -> Result<String, Error> {
+    fn call(&mut self, mut request: Value, limit: Duration) -> Result<String, Error> {
         request["api"] = json!(API);
         request["build"] = json!(BUILD);
         let request = request.to_string();
@@ -155,7 +167,7 @@ impl Client {
                 Some(pipe) => pipe,
                 None => self.pipe.insert(connect()?),
             };
-            match exchange(pipe, request.as_bytes()).map(|reply| parse_reply(&reply)) {
+            match exchange_within(pipe, request.as_bytes(), limit).map(|reply| parse_reply(&reply)) {
                 // Seek has just started: its indexes are loading.
                 Ok(Err(Error::Seek { code, .. }))
                     if code == "index_loading" && Instant::now() < loading_until =>
@@ -163,6 +175,12 @@ impl Client {
                     thread::sleep(Duration::from_millis(100));
                 }
                 Ok(result) => return result,
+                // The rest of the reply may still come: this connection is
+                // done, and the next call opens another.
+                Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                    self.pipe = None;
+                    return Err(Error::TimedOut(limit));
+                }
                 // A pipe kept open may have closed (Seek restarted): one retry.
                 Err(error) => {
                     self.pipe = None;
@@ -194,6 +212,67 @@ pub(crate) fn report_opened(path: &Path) {
         sender
     });
     let _ = sender.send(path.to_path_buf());
+}
+
+/// [`exchange`], given up after `limit`: a watchdog cancels the read (or
+/// write) this thread is blocked in, which then fails with `TimedOut`.
+#[cfg(windows)]
+fn exchange_within(
+    stream: &mut (impl Read + Write),
+    request: &[u8],
+    limit: Duration,
+) -> io::Result<Vec<u8>> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentThreadId() -> u32;
+        fn OpenThread(access: u32, inherit: i32, thread_id: u32) -> *mut std::ffi::c_void;
+        fn CancelSynchronousIo(thread: *mut std::ffi::c_void) -> i32;
+        fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+    }
+    const THREAD_TERMINATE: u32 = 0x0001;
+    // SAFETY: plain calls; the handle is closed below.
+    let thread = unsafe { OpenThread(THREAD_TERMINATE, 0, GetCurrentThreadId()) };
+    if thread.is_null() {
+        return exchange(stream, request);
+    }
+    struct Handle(*mut std::ffi::c_void);
+    // SAFETY: a thread handle may be used from any thread.
+    unsafe impl Send for Handle {}
+    let handle = Handle(thread);
+    let (done, finished) = mpsc::channel::<()>();
+    let timed_out = std::sync::atomic::AtomicBool::new(false);
+    let timed_out = &timed_out;
+    let result = thread::scope(|scope| {
+        scope.spawn(move || {
+            let handle = handle;
+            if let Err(mpsc::RecvTimeoutError::Timeout) = finished.recv_timeout(limit) {
+                timed_out.store(true, std::sync::atomic::Ordering::SeqCst);
+                // SAFETY: the handle is open until the scope ends.
+                unsafe { CancelSynchronousIo(handle.0) };
+            }
+        });
+        let result = exchange(stream, request);
+        let _ = done.send(());
+        result
+    });
+    // SAFETY: opened above, used by nobody now.
+    unsafe { CloseHandle(thread) };
+    match result {
+        Err(_) if timed_out.load(std::sync::atomic::Ordering::SeqCst) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "no answer in time",
+        )),
+        other => other,
+    }
+}
+
+#[cfg(not(windows))]
+fn exchange_within(
+    stream: &mut (impl Read + Write),
+    request: &[u8],
+    _limit: Duration,
+) -> io::Result<Vec<u8>> {
+    exchange(stream, request)
 }
 
 /// One request and its reply on a stream.
@@ -525,6 +604,40 @@ mod tests {
             sent: Vec::new(),
         };
         assert!(exchange(&mut cut, b"{}").is_err());
+    }
+
+    /// A Seek that never answers: the call gives up at its limit.
+    #[test]
+    fn a_silent_seek_times_out_instead_of_blocking_forever() {
+        struct Silent {
+            reader: io::PipeReader,
+        }
+        impl Read for Silent {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.reader.read(buf)
+            }
+        }
+        impl Write for Silent {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        // Nothing is ever written to the other end, which stays open.
+        let (reader, _writer) = io::pipe().unwrap();
+        let mut silent = Silent { reader };
+        let started = Instant::now();
+        let error = exchange_within(&mut silent, b"{}", Duration::from_millis(300)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+        // A quick answer is not cut.
+        let mut fake = Fake {
+            reply: io::Cursor::new(framed(r#"{"text":"ok"}"#)),
+            sent: Vec::new(),
+        };
+        assert!(exchange_within(&mut fake, b"{}", Duration::from_secs(5)).is_ok());
     }
 
     #[test]
