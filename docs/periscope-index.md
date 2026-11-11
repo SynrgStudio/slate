@@ -1,6 +1,6 @@
 # Periscope: file search with Seek
 
-Periscope (`:periscope`, `:ps`, `:fzf`) finds files by name. The names come from [Seek](https://github.com/SynrgStudio/seek). Seek runs as a background process and keeps a live index of every file name on every fixed drive, kept current by drive watchers. It also serves agents and other programs from the same index. Slate talks to it over its pipe with version 1 of Seek's [protocol for programs](https://github.com/SynrgStudio/seek/blob/main/PROTOCOL.md) (`src/seek.rs`), on Periscope's worker thread.
+Periscope (`:periscope`, `:ps`, `:fzf`) finds files by name. The names come from [Seek](https://github.com/SynrgStudio/seek). Seek runs as a background process and keeps a live index of every file name on every fixed drive, kept current by drive watchers. It also serves agents and other programs from the same index. Slate talks to it through Seek's own Rust crate, `seek-client`, which speaks version 1 of Seek's [protocol for programs](https://github.com/SynrgStudio/seek/blob/main/PROTOCOL.md) over its pipe. `src/seek.rs` adds Slate's messages and the types Periscope reads, and the calls run on Periscope's worker thread.
 
 ## What a search does
 
@@ -21,9 +21,16 @@ Periscope (`:periscope`, `:ps`, `:fzf`) finds files by name. The names come from
 
 ## When Seek isn't running
 
-If the pipe isn't there, Slate starts the installed `seek.exe --daemon` (`%LOCALAPPDATA%\Programs\Seek`) and waits for it. It runs detached, outside Slate's job, and keeps running after Slate closes. If Seek isn't installed, Periscope says so, with where to get it. Every call has the time limit PROTOCOL.md gives (5 s, or 45 s for searches, which wait for the index right after Seek starts). Past it, Periscope says Seek may be stuck, and the next search opens a new connection. Slate never kills Seek.
+Slate carries Seek. The crate's `bundled` feature builds Seek 0.5.1's `seek.exe` into `slate.exe` (about 1 MB), after checking it against the release's SHA-256. When the pipe isn't there, the crate starts the newest Seek it knows of:
 
-Shipping Seek inside Slate is planned through Seek's own Rust crate and its `bundled` option (SynrgStudio/seek#21, #22, #23). An installed Seek will be preferred. See issue #1.
+- the installed one (`%LOCALAPPDATA%\Programs\Seek\seek.exe`), which wins at the same version;
+- or the one Slate carries, written to `%LOCALAPPDATA%\slate\seek\seek-<version>.exe` only when it is the one started. Older versions there are deleted when nothing runs them.
+
+Either way it runs as `--daemon`, detached, outside Slate's job, inheriting none of Slate's handles, and keeps running after Slate closes. If a Seek older than one of those runs, it is replaced. Seek's data lives in `%LOCALAPPDATA%\Seek`, shared with an installed Seek and with agents.
+
+Every call has the time limit PROTOCOL.md gives (5 s, or 45 s for searches, which wait for the index right after Seek starts). Past it, Periscope says Seek may be stuck, and the next search opens a new connection. Slate never kills Seek.
+
+**Building:** the first build downloads that `seek.exe` from Seek's release. Without network, set `SEEK_CLIENT_EXE` to it; it is checked against the same hash.
 
 ## History
 

@@ -8,6 +8,8 @@ repository = "https://github.com/SynrgStudio/slate"
 [dependencies]
 chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
 dirs-next = "2.0.0"
+# Seek's client, carrying Seek 0.5.1 for machines without it (Seek is GPL-3.0).
+seek-client = { git = "https://github.com/SynrgStudio/seek", rev = "020b1418c47b05f7d87c07b8c6b83c532a43799e", features = ["bundled"] }
 memchr = "2"
 # Blocks on wgpu setup futures (GPU prewarm); already used by eframe.
 pollster = "0.4"

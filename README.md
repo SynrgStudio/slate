@@ -386,6 +386,8 @@ Behavior:
 
 - Names come from [Seek](https://github.com/SynrgStudio/seek), a live index of every
   file name on every drive (see [docs/periscope-index.md](docs/periscope-index.md)).
+  Slate carries Seek, so this works where Seek isn't installed; an installed Seek
+  is used when it's as new or newer.
 - Global mode searches every drive, ranking exact names, what you used lately and
   what is near the current project or document first; typos still find the file.
 - Project mode searches only below the document's project folder, leaving out
@@ -685,7 +687,7 @@ Important source modules:
 | `src/file_dialogs.rs` | Slate-owned open/save picker behavior |
 | `src/periscope.rs` | Periscope rows, folder grouping and path scoring |
 | `src/periscope_backend.rs` | Periscope searches on a worker thread, through Seek |
-| `src/seek.rs` | Client for Seek, the file-name index (pipe protocol, starts the daemon) |
+| `src/seek.rs` | Seek, the file-name index, through Seek's `seek-client` crate (which carries Seek and starts it): Slate's messages and types |
 | `src/scratch.rs` | Scratch/capture/archive helpers |
 | `src/modules/` | Optional modules (Flow, Agenda, Daily), disconnected while they are rebuilt; see its README |
 | `src/link_ui.rs` | Link/backlink/mention/find-note UI helpers |
@@ -771,3 +773,5 @@ Just text, commands, capture, and enough structure to make thinking easier.
 ## License
 
 GPL-3.0 or later (see [LICENSE](LICENSE)), like [Seek](https://github.com/SynrgStudio/seek), which Periscope searches with.
+
+Slate's binary carries Seek 0.5.1's `seek.exe`, under the GPL-3.0 (the same [LICENSE](LICENSE)). Its source is at [github.com/SynrgStudio/seek/tree/v0.5.1](https://github.com/SynrgStudio/seek/tree/v0.5.1). Seek's client crate, `seek-client`, is MIT OR Apache-2.0.
