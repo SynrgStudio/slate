@@ -9,20 +9,17 @@
 //! `%LOCALAPPDATA%\slate\seek\` only when it is the one started. It also
 //! keeps the time limits, reconnects, and replaces an older Seek running.
 //!
-//! This module adds what is Slate's: its messages, a short wait while a
-//! Seek just started loads its index, and the types Periscope reads.
+//! This module adds what is Slate's: its messages, and the types Periscope
+//! reads.
 use seek_client::{Code, DriveState, MatchKind, Seek};
 use std::{
     path::{Path, PathBuf},
     sync::{OnceLock, mpsc},
     thread,
-    time::{Duration, Instant},
 };
 
 /// Who asks, in Seek's log and status.
 const CLIENT: &str = concat!("slate ", env!("CARGO_PKG_VERSION"));
-/// Right after Seek starts, its indexes load (about a second).
-const LOADING_WAIT: Duration = Duration::from_secs(3);
 
 /// The Seek release Slate carries ("0.5.1"), for the license notice.
 #[allow(dead_code)]
@@ -156,7 +153,7 @@ impl Client {
     }
 
     /// Connects when there is no connection yet (a failed connect is tried
-    /// again on the next call), and waits a moment for a Seek just started.
+    /// again on the next call).
     fn call<T>(
         &mut self,
         request: impl Fn(&Seek) -> seek_client::Result<T>,
@@ -171,16 +168,7 @@ impl Client {
                     .map_err(Error)?,
             ),
         };
-        let loading_until = Instant::now() + LOADING_WAIT;
-        loop {
-            match request(seek) {
-                Err(seek_client::Error::Seek {
-                    code: Code::IndexLoading,
-                    ..
-                }) if Instant::now() < loading_until => thread::sleep(Duration::from_millis(100)),
-                result => return result.map_err(Error),
-            }
-        }
+        request(seek).map_err(Error)
     }
 }
 
@@ -318,7 +306,7 @@ mod tests {
         let mut client = Client::default();
         let status = client.status().expect("the Seek Slate carries starts and answers");
         assert_eq!(Some(status.0.version.as_str()), BUNDLED);
-        let exe = local.join(format!(r"slate\seek\seek-{}.exe", BUNDLED.unwrap()));
+        let exe = local.join(format!(r"slate\seek\{}\seek.exe", BUNDLED.unwrap()));
         assert!(exe.is_file(), "{} is written", exe.display());
     }
 

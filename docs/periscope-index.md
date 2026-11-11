@@ -24,7 +24,7 @@ Periscope (`:periscope`, `:ps`, `:fzf`) finds files by name. The names come from
 Slate carries Seek. The crate's `bundled` feature builds Seek 0.5.1's `seek.exe` into `slate.exe` (about 1 MB), after checking it against the release's SHA-256. When the pipe isn't there, the crate starts the newest Seek it knows of:
 
 - the installed one (`%LOCALAPPDATA%\Programs\Seek\seek.exe`), which wins at the same version;
-- or the one Slate carries, written to `%LOCALAPPDATA%\slate\seek\seek-<version>.exe` only when it is the one started. Older versions there are deleted when nothing runs them.
+- or the one Slate carries, written to `%LOCALAPPDATA%\slate\seek\<version>\seek.exe` only when it is the one started, so its process is named `seek`, as an installed one's. Older versions there are deleted when nothing runs them.
 
 Either way it runs as `--daemon`, detached, outside Slate's job, inheriting none of Slate's handles, and keeps running after Slate closes. If a Seek older than one of those runs, it is replaced. Seek's data lives in `%LOCALAPPDATA%\Seek`, shared with an installed Seek and with agents.
 
